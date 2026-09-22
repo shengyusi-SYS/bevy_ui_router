@@ -3,6 +3,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(all(test, feature = "bsn"))]
+mod native_tests;
+
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
@@ -500,12 +503,12 @@ enum PendingFailedBranchTerminal {
     Task {
         task: RootFrameTask,
         failure: ViewFailureKind,
-        message: &'static str,
+        message: String,
     },
     TaskWithPhysicalResidual {
         task: RootFrameTask,
         failure: ViewFailureKind,
-        message: &'static str,
+        message: String,
     },
     Request(FailureCleanupRequest),
     BackTargetPendingRejected {
@@ -521,6 +524,12 @@ pub(crate) struct PendingFailedBranch {
 }
 
 impl PendingFailedBranch {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn take_native_failure(
+        &mut self,
+    ) -> Option<crate::presentation::native_failure::NativeFailureOwner> {
+        self.branch.take_native_failure()
+    }
     pub(crate) const fn branch(&self) -> &FailedPreparedBranch {
         &self.branch
     }
@@ -1058,13 +1067,23 @@ pub(crate) struct FrozenBackTargetDriverZeroPhysicalProof {
 }
 
 pub(crate) struct BackTargetDriverZeroPhysicalOwner {
-    pending: PendingCommit,
+    physical: BackTargetDriverUnverifiedPhysicalOwner,
     proof: FrozenBackTargetDriverZeroPhysicalProof,
 }
 
 pub(crate) enum BackTargetDriverUnverifiedPhysicalOwner {
     Pending(PendingCommit),
     Residual(FailedPreparedBranch),
+}
+
+impl BackTargetDriverUnverifiedPhysicalOwner {
+    #[cfg(feature = "bsn")]
+    fn native_failure(&self) -> Option<&crate::presentation::native_failure::NativeFailureOwner> {
+        match self {
+            Self::Residual(branch) => branch.native_failure(),
+            Self::Pending(_) => None,
+        }
+    }
 }
 
 pub(crate) struct FrozenBackTargetDriverPhysicalPartitionProof {
@@ -1093,9 +1112,7 @@ impl BackTargetDriverReportablePhysicalOwner {
 
     pub(crate) fn into_unverified(self) -> BackTargetDriverUnverifiedPhysicalOwner {
         match self {
-            Self::ProvenZero(owner) => {
-                BackTargetDriverUnverifiedPhysicalOwner::Pending(owner.pending)
-            }
+            Self::ProvenZero(owner) => owner.physical,
             Self::Residual(owner) => {
                 BackTargetDriverUnverifiedPhysicalOwner::Residual(owner.branch)
             }
@@ -1119,7 +1136,7 @@ pub(crate) struct PendingBackTargetDriverAwaitingReport {
     source: BackTargetDriverPhysicalPartitionSource,
     physical: BackTargetDriverUnverifiedPhysicalOwner,
     kind: ViewFailureKind,
-    message: &'static str,
+    message: String,
 }
 
 pub(crate) struct PendingBackTargetDriverReceiverMismatch {
@@ -1127,7 +1144,7 @@ pub(crate) struct PendingBackTargetDriverReceiverMismatch {
     task: RootFrameTask,
     physical: BackTargetDriverUnverifiedPhysicalOwner,
     kind: ViewFailureKind,
-    message: &'static str,
+    message: String,
     mismatch: PreparationReceiverMismatchView,
 }
 
@@ -1136,7 +1153,7 @@ pub(crate) struct PendingBackTargetDriverPhysicalIndeterminate {
     task: RootFrameTask,
     physical: BackTargetDriverPhysicalIndeterminateOwner,
     kind: ViewFailureKind,
-    message: &'static str,
+    message: String,
 }
 
 pub(crate) struct PendingBackTargetAppliedReportInput {
@@ -1320,6 +1337,8 @@ pub(crate) enum PreparationRetryEvidence {
 
 pub(crate) enum PreparationPermanentEvidence {
     PhysicalPreparationContradiction(LifecyclePreflightEvidence),
+    #[cfg(feature = "bsn")]
+    NativeCleanup(crate::presentation::native_frame::NativeCleanupPreparationError),
 }
 
 pub(crate) struct PreparationPermanentOwner<Owner> {
@@ -1909,7 +1928,7 @@ pub(crate) struct PendingBackTargetDriverStagingMismatch {
     physical: BackTargetDriverUnverifiedPhysicalOwner,
     task: RootFrameTask,
     kind: ViewFailureKind,
-    message: &'static str,
+    message: String,
     evidence: BackTargetDriverStagingMismatchEvidence,
 }
 
@@ -1932,7 +1951,7 @@ struct MountNewStagingSeed {
     outlet: bevy_ui_router_core::slot::RouteSlotKey,
     slot: bevy_ui_router_core::ids::RouteSlotId,
     anchor: bevy_ecs::prelude::Entity,
-    anchor_claim: crate::registry::ExactRegistryClaim,
+    anchor_binding: crate::presentation::OutletBinding,
     baseline_anchor_children: Vec<bevy_ecs::prelude::Entity>,
 }
 
@@ -1946,13 +1965,20 @@ impl MountNewStagingSeed {
     ) -> Option<Self> {
         let outlet_record = parent.outlet(outlet)?;
         let anchor = outlet_record.anchor();
-        let baseline_anchor_children = expected_children(parent, anchor);
         let actual = world
             .get::<bevy_ecs::hierarchy::Children>(anchor)
             .map(|children| children.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
+        let baseline_anchor_children = if outlet_record.anchor_binding().is_native() {
+            actual.clone()
+        } else {
+            expected_children(parent, anchor)
+        };
         (outlet_record.parent() == parent.frame()
             && outlet_record.key() == outlet
+            && outlet_record
+                .anchor_binding()
+                .is_current(world, parent.frame(), true)
             && actual == baseline_anchor_children)
             .then(|| Self {
                 request,
@@ -1960,7 +1986,7 @@ impl MountNewStagingSeed {
                 outlet: outlet.clone(),
                 slot,
                 anchor,
-                anchor_claim: outlet_record.anchor_claim().clone(),
+                anchor_binding: outlet_record.anchor_binding().clone(),
                 baseline_anchor_children,
             })
     }
@@ -1981,7 +2007,7 @@ impl MountNewStagingSeed {
         (residual.parent() == &self.parent
             && residual.outlet() == &self.outlet
             && residual.anchor() == self.anchor
-            && residual.anchor_claim() == &self.anchor_claim)
+            && residual.anchor_binding() == &self.anchor_binding)
             .then_some(())?;
         self.seal_entity(world, residual.entity(), residual.claim().clone())
     }
@@ -2047,7 +2073,7 @@ impl MountNewStagingSeed {
             entity,
             claim,
             self.anchor,
-            self.anchor_claim,
+            self.anchor_binding,
             expected_anchor_children,
         )
     }
@@ -2438,6 +2464,8 @@ pub(crate) struct RouterEntry {
     pending_host_confirmation: Option<PendingHostConfirmation>,
     pending_commit: Option<PendingCommit>,
     pending_frame_drive: Option<PendingFrameDrive>,
+    #[cfg(feature = "bsn")]
+    native_residuals: Vec<crate::presentation::native_failure::NativeTerminalResidual>,
     pending_stale_output_cleanup: Option<PendingStaleOutputCleanup>,
     #[cfg(test)]
     delayed_driver_report_replay: Option<TestingDelayedDriverReportReplayState>,
@@ -2745,7 +2773,7 @@ struct ProvenEmptyChildSlotBindingProjection {
     parent: RouteFrameVersion,
     outlet: bevy_ui_router_core::slot::RouteSlotKey,
     slot_id: bevy_ui_router_core::ids::RouteSlotId,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: crate::presentation::OutletBinding,
     expected_support_relationships: Vec<bevy_ecs::entity::Entity>,
 }
 
@@ -3078,13 +3106,15 @@ struct BackNoTargetAuthorityGraphObservedOutletProjection {
     parent: RouteFrameVersion,
     outlet: bevy_ui_router_core::slot::RouteSlotKey,
     anchor: bevy_ecs::entity::Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: crate::presentation::OutletBinding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BackNoTargetAuthorityGraphObservedSlotProjection {
     slot: BackNoTargetAuthorityGraphObservedClaimProjection,
     anchor: BackNoTargetAuthorityGraphObservedClaimProjection,
+    anchor_source: BackNoTargetAuthorityGraphObservedClaimProjection,
+    anchor_binding_current: bool,
     owner_outlets: Vec<BackNoTargetAuthorityGraphObservedOutletProjection>,
     observed_anchor_children: Vec<bevy_ecs::entity::Entity>,
 }
@@ -3128,7 +3158,7 @@ fn observe_back_no_target_authority_graph_slot(
                 parent: outlet.parent().clone(),
                 outlet: outlet.key().clone(),
                 anchor: outlet.anchor(),
-                anchor_claim: outlet.anchor_claim().clone(),
+                anchor_binding: outlet.anchor_binding().clone(),
             },
         )
         .collect::<Vec<_>>();
@@ -3137,10 +3167,10 @@ fn observe_back_no_target_authority_graph_slot(
             .cmp(&right.outlet)
             .then_with(|| left.anchor.to_bits().cmp(&right.anchor.to_bits()))
             .then_with(|| {
-                left.anchor_claim
-                    .entity()
+                left.anchor_binding
+                    .anchor()
                     .to_bits()
-                    .cmp(&right.anchor_claim.entity().to_bits())
+                    .cmp(&right.anchor_binding.anchor().to_bits())
             })
     });
     let mut observed_anchor_children = world
@@ -3151,6 +3181,12 @@ fn observe_back_no_target_authority_graph_slot(
     BackNoTargetAuthorityGraphObservedSlotProjection {
         slot: observe_back_no_target_authority_graph_claim(world, registry, slot.slot()),
         anchor: observe_back_no_target_authority_graph_claim(world, registry, slot.anchor()),
+        anchor_source: observe_back_no_target_authority_graph_claim(
+            world,
+            registry,
+            slot.anchor_claim().entity(),
+        ),
+        anchor_binding_current: slot.anchor_binding().is_current(world, slot.parent(), true),
         owner_outlets,
         observed_anchor_children,
     }
@@ -3729,7 +3765,7 @@ fn freeze_back_no_target_authority_graph(
         .child_slots()
         .iter()
         .map(|slot| {
-            let mut expected_support_relationships = slot.expected_anchor_children().to_vec();
+            let mut expected_support_relationships = slot.current_anchor_children(world);
             expected_support_relationships.sort_by_key(|entity| entity.to_bits());
             BackNoTargetAuthorityGraphSlotProjection {
                 claim: slot.slot_claim().clone(),
@@ -3737,7 +3773,7 @@ fn freeze_back_no_target_authority_graph(
                     parent: slot.parent().clone(),
                     outlet: slot.outlet().clone(),
                     slot_id: slot.slot_id(),
-                    anchor_claim: slot.anchor_claim().clone(),
+                    anchor_binding: slot.anchor_binding().clone(),
                     expected_support_relationships,
                 },
             }
@@ -4048,12 +4084,9 @@ fn freeze_back_no_target_authority_graph(
                     && outlet.anchor_claim() == slot.anchor_claim()
                     && parent.claims().any(|claim| claim == slot.anchor_claim())
             })
-            && registry
-                .record(slot.anchor())
-                .is_some_and(|record| record.claim() == *slot.anchor_claim())
-            && cleanup_claim_has_exact_authority(world, slot.anchor_claim())
+            && slot.anchor_binding().is_current(world, slot.parent(), true)
             && slot
-                .expected_anchor_children()
+                .current_anchor_children(world)
                 .iter()
                 .all(|expected| observed_anchor_children.contains(expected));
         if !binding_is_exact {
@@ -4254,18 +4287,10 @@ pub(crate) fn freeze_back_no_target_proven_empty(
                 .get::<bevy_ecs::hierarchy::ChildOf>(slot.slot())
                 .map(bevy_ecs::hierarchy::ChildOf::parent)
                 != Some(slot.anchor())
-            || !matches!(
-                slot.anchor_claim().owner(),
-                RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. })
-                    if frame == slot.parent()
-            )
             || !parent_frame
                 .claims()
                 .any(|claim| claim == slot.anchor_claim())
-            || registry
-                .record(slot.anchor())
-                .is_none_or(|record| record.claim() != *slot.anchor_claim())
-            || !cleanup_claim_has_exact_authority(world, slot.anchor_claim())
+            || !slot.anchor_binding().is_current(world, slot.parent(), true)
         {
             return indeterminate(
                 owner,
@@ -4277,7 +4302,7 @@ pub(crate) fn freeze_back_no_target_proven_empty(
             .map(|children| children.iter().copied().collect::<Vec<_>>())
             .unwrap_or_default();
         if slot
-            .expected_anchor_children()
+            .current_anchor_children(world)
             .iter()
             .any(|expected| !observed_anchor_children.contains(expected))
         {
@@ -4290,8 +4315,8 @@ pub(crate) fn freeze_back_no_target_proven_empty(
             parent: slot.parent().clone(),
             outlet: slot.outlet().clone(),
             slot_id: slot.slot_id(),
-            anchor_claim: slot.anchor_claim().clone(),
-            expected_support_relationships: slot.expected_anchor_children().to_vec(),
+            anchor_binding: slot.anchor_binding().clone(),
+            expected_support_relationships: slot.current_anchor_children(world),
         };
         let mut mounted_children = active
             .frames()
@@ -4541,11 +4566,15 @@ fn back_no_target_current_authority_is_exact(
                 .get::<bevy_ecs::hierarchy::ChildOf>(slot.slot())
                 .map(bevy_ecs::hierarchy::ChildOf::parent)
                 == Some(slot.anchor())
-                && slot.expected_anchor_children().iter().all(|expected| {
-                    world
-                        .get::<bevy_ecs::hierarchy::Children>(slot.anchor())
-                        .is_some_and(|children| children.contains(expected))
-                })
+                && world
+                    .get::<Children>(slot.anchor())
+                    .is_some_and(|children| children.contains(&slot.slot()))
+                && (slot.anchor_binding().is_native()
+                    || slot.expected_anchor_children().iter().all(|expected| {
+                        world
+                            .get::<bevy_ecs::hierarchy::Children>(slot.anchor())
+                            .is_some_and(|children| children.contains(expected))
+                    }))
         })
 }
 
@@ -4695,7 +4724,7 @@ pub(crate) fn classify_back_no_target(
         world,
         active.claims().chain(std::iter::once(&host.top_slot_claim)),
         active
-            .interactive_entities()
+            .live_interactive_entities(world)
             .into_iter()
             .chain(std::iter::once(host.top_slot)),
         0,
@@ -5684,6 +5713,7 @@ enum ProjectionlessFailCloseContinuation {
 }
 
 pub(crate) struct AuthorityProtocolResidualOwner {
+    back_target: Option<Box<PendingBackTargetExecution>>,
     kind: AuthorityProtocolResidualKind,
     isolation_contradiction: Option<AuthorityIsolationContradiction>,
     active: Option<RealizedBranch>,
@@ -5697,6 +5727,10 @@ pub(crate) struct AuthorityProtocolResidualOwner {
 }
 
 enum AuthorityProtocolResidualKind {
+    #[cfg(feature = "bsn")]
+    NativeCreation(crate::presentation::native_scene::NativeSceneIsolationFailure),
+    #[cfg(feature = "bsn")]
+    NativeCleanup(crate::presentation::native_frame::NativeCleanupPreparationError),
     Authority(BeginAuthoritySettlementErrorKind),
     AuthorityIsolation(AuthorityIsolationContradiction),
     CleanupLedger(CleanupLedgerReserveErrorKind),
@@ -5716,6 +5750,22 @@ struct CleanupSettlementPermanentInertOwner {
 }
 
 impl RouterEntry {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn native_terminal_input_targets<'a>(
+        &'a self,
+        world: &'a World,
+    ) -> impl Iterator<Item = Entity> + 'a {
+        self.native_residuals
+            .iter()
+            .flat_map(move |residual| residual.input_targets(world))
+    }
+
+    #[cfg(feature = "bsn")]
+    pub(crate) fn native_terminal_shell_claims(&self) -> impl Iterator<Item = &ExactRegistryClaim> {
+        self.native_residuals
+            .iter()
+            .flat_map(|residual| residual.shell_claims())
+    }
     fn captured_delayed_driver_report(
         &self,
         task: &RootFrameTask,
@@ -6187,6 +6237,8 @@ impl RouterNavigation {
             pending_host_confirmation: None,
             pending_commit: None,
             pending_frame_drive: None,
+            #[cfg(feature = "bsn")]
+            native_residuals: Vec::new(),
             pending_stale_output_cleanup: None,
             #[cfg(test)]
             delayed_driver_report_replay: None,
@@ -7955,6 +8007,208 @@ enum DriverReportApplicationError {
     Realization(DeferredRealizationFailure),
 }
 
+#[cfg(feature = "bsn")]
+enum NativeFailureTransferError {
+    Capacity,
+    Isolation(crate::presentation::native_scene::NativeSceneIsolationFailure),
+}
+
+#[cfg(all(test, feature = "bsn"))]
+#[derive(Resource)]
+struct NativeFailureTransferCapacity;
+
+#[cfg(feature = "bsn")]
+fn prepare_native_failure_transfer(
+    world: &World,
+    destination: &mut Vec<crate::presentation::native_failure::NativeTerminalResidual>,
+    owner: Option<&crate::presentation::native_failure::NativeFailureOwner>,
+) -> Result<(), NativeFailureTransferError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    owner
+        .validate_settled(world)
+        .map_err(NativeFailureTransferError::Isolation)?;
+    if owner.residual().is_some() {
+        #[cfg(test)]
+        let requested = if world.contains_resource::<NativeFailureTransferCapacity>() {
+            usize::MAX
+        } else {
+            1
+        };
+        #[cfg(not(test))]
+        let requested = 1;
+        destination
+            .try_reserve(requested)
+            .map_err(|_| NativeFailureTransferError::Capacity)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bsn")]
+fn complete_native_failure_transfer(
+    destination: &mut Vec<crate::presentation::native_failure::NativeTerminalResidual>,
+    owner: Option<crate::presentation::native_failure::NativeFailureOwner>,
+) {
+    if let Some(residual) = owner.and_then(|owner| owner.into_terminal()) {
+        destination.push(residual);
+    }
+}
+
+#[cfg(feature = "bsn")]
+fn prepare_native_completed_ledger_transfer(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    ledger: CleanupLedger,
+) -> Option<CleanupLedger> {
+    match prepare_native_failure_transfer(
+        world,
+        &mut entry.native_residuals,
+        ledger.native_failure(),
+    ) {
+        Ok(()) => Some(ledger),
+        Err(NativeFailureTransferError::Capacity) => {
+            entry.cleanup_ledger = Some(ledger);
+            None
+        }
+        Err(NativeFailureTransferError::Isolation(reason)) => {
+            if let Err(ledger) = authority_isolation::fail_closed_cleanup_ledger_protocol(
+                world,
+                entry,
+                ledger,
+                Some(AuthorityProtocolResidualKind::NativeCreation(reason)),
+            ) {
+                entry.cleanup_ledger = Some(ledger);
+            }
+            None
+        }
+    }
+}
+
+#[cfg(feature = "bsn")]
+fn reject_native_task(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    pending: PendingCommit,
+    task: RootFrameTask,
+    kind: ViewFailureKind,
+    failure: crate::presentation::native_failure::NativeFailureOwner,
+) {
+    let message = failure.error.to_string();
+    let has_residual = failure.residual().is_some();
+    let isolation = failure.validate_settled(world);
+    let branch = failed_prepared_branch(pending, None).with_native_failure(failure);
+    if let Err(reason) = isolation {
+        let failed = PendingFailedBranch {
+            terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                task,
+                failure: kind,
+                message,
+            },
+            branch,
+        };
+        if let Err(failed) = fail_closed_failed_owner_protocol(
+            world,
+            entry,
+            failed,
+            AuthorityProtocolResidualKind::NativeCreation(reason),
+        ) {
+            entry.pending_failed_branch = Some(failed);
+        }
+        return;
+    }
+    match route_back_target_frame_failure(
+        world,
+        entry,
+        BackTargetDriverUnverifiedPhysicalOwner::Residual(branch),
+        task,
+        kind,
+        message.clone(),
+    ) {
+        RouteBackTargetFrameFailureOutcome::Handled => {}
+        RouteBackTargetFrameFailureOutcome::NonTarget {
+            physical: BackTargetDriverUnverifiedPhysicalOwner::Residual(branch),
+            task,
+        } => {
+            let terminal = if has_residual {
+                PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                    task,
+                    failure: kind,
+                    message,
+                }
+            } else if branch.frames().is_empty() {
+                PendingFailedBranchTerminal::Task {
+                    task,
+                    failure: kind,
+                    message,
+                }
+            } else {
+                nested_failure_terminal(&mut entry.engine, task, kind, message)
+            };
+            entry.pending_failed_branch = Some(PendingFailedBranch { terminal, branch });
+        }
+        _ => unreachable!("the native pre-frame failure retains its pending physical owner"),
+    }
+}
+
+#[cfg(feature = "bsn")]
+fn realize_native_task(
+    world: &mut World,
+    engine: &RouterEngine,
+    host: ValidatedHostCandidate,
+    top_slot: Entity,
+    top_claim: ExactRegistryClaim,
+    branch: Option<&PreparedBranch>,
+    active: Option<&RealizedBranch>,
+    task: &RootFrameTask,
+    prepared: crate::bsn::PreparedBsnScene,
+) -> Result<RealizedFrame, crate::presentation::native_frame::NativeFrameFailure> {
+    use crate::presentation::RealizationError;
+    use crate::presentation::native_frame::*;
+    match task.mount_target() {
+        FrameMountTarget::TopSlot { .. } => realize_native_root(
+            world,
+            host,
+            top_slot,
+            top_claim,
+            task.frame().clone(),
+            prepared,
+        ),
+        FrameMountTarget::ChildOutlet { .. } => {
+            let Some(branch) = branch else {
+                return Err(NativeFrameFailure::before_mount(
+                    RealizationError::InvalidMount,
+                    prepared,
+                ));
+            };
+            if active.is_none() {
+                let (Some(parent), Some(slot)) = (branch.last_frame(), branch.child_slots().last())
+                else {
+                    return Err(NativeFrameFailure::before_mount(
+                        RealizationError::InvalidMount,
+                        prepared,
+                    ));
+                };
+                return realize_native_child(world, parent, slot, task, prepared);
+            }
+            let Ok(projection) = engine.reconciliation_projection_for_task(task) else {
+                return Err(NativeFrameFailure::before_mount(
+                    RealizationError::InvalidMount,
+                    prepared,
+                ));
+            };
+            let Some(mount) = seal_reconciliation_staging_mount(&projection, active, branch, task)
+            else {
+                return Err(NativeFrameFailure::before_mount(
+                    RealizationError::InvalidMount,
+                    prepared,
+                ));
+            };
+            realize_native_reconciliation_child(world, &mount, task, prepared)
+        }
+    }
+}
+
 fn apply_applied_driver_report(
     world: &mut World,
     engine: &mut RouterEngine,
@@ -8099,6 +8353,7 @@ fn install_failure_cleanup_permanent_authority(
         None => (None, None),
     };
     let mut residual = Some(AuthorityProtocolResidualOwner {
+        back_target: None,
         kind: AuthorityProtocolResidualKind::FailureCleanupPermanentAuthority,
         isolation_contradiction,
         active,
@@ -8156,10 +8411,21 @@ fn install_failure_cleanup_permanent(
             );
         }
         FailureCleanupPermanentOutcome::ProvenZero { zero, owner } => {
-            match entry
-                .engine
-                .complete_failure_cleanup_zero_terminal(owner, zero, drop)
-            {
+            // The caller prepared the native destination before submitting the
+            // manifest; the Core classification above performs no World writes.
+            #[cfg(feature = "bsn")]
+            let native_residuals = &mut entry.native_residuals;
+            match entry.engine.complete_failure_cleanup_zero_terminal(
+                owner,
+                zero,
+                |mut physical| {
+                    #[cfg(feature = "bsn")]
+                    complete_native_failure_transfer(
+                        native_residuals,
+                        physical.branch.take_native_failure(),
+                    );
+                },
+            ) {
                 FailureCleanupZeroTerminalOutcome::Terminal => {}
                 FailureCleanupZeroTerminalOutcome::Mismatch {
                     zero,
@@ -8208,6 +8474,24 @@ fn complete_zero_physical_failure(
             terminal: PendingFailedBranchTerminal::Request(request),
             branch,
         });
+    }
+    #[cfg(feature = "bsn")]
+    if let Err(error) =
+        prepare_native_failure_transfer(world, &mut entry.native_residuals, branch.native_failure())
+    {
+        let failed = PendingFailedBranch {
+            terminal: PendingFailedBranchTerminal::Request(request),
+            branch,
+        };
+        return match error {
+            NativeFailureTransferError::Capacity => Err(failed),
+            NativeFailureTransferError::Isolation(reason) => fail_closed_failed_owner_protocol(
+                world,
+                entry,
+                failed,
+                AuthorityProtocolResidualKind::NativeCreation(reason),
+            ),
+        };
     }
     let manifest = world
         .get_resource::<RouteEntityRegistry>()
@@ -8304,13 +8588,18 @@ fn complete_zero_physical_failure(
         .prepare_failure_cleanup_completion(completion)
         .expect("an exact empty cleanup completion is current");
     let mut retained_prepared_prefix = None;
+    #[cfg(feature = "bsn")]
+    let native_residuals = &mut entry.native_residuals;
     let disposition = entry
         .engine
         .complete_prepared_failure_cleanup_with_ledger(owner, ledger, |mut ledger| {
-            retained_prepared_prefix = ledger
+            let completed = ledger
                 .take_failed_prepared_owner()
                 .expect("the zero ledger retains its typed physical owner")
-                .into_retained_prepared_prefix();
+                .into_completed();
+            retained_prepared_prefix = completed.retained_prepared_prefix;
+            #[cfg(feature = "bsn")]
+            complete_native_failure_transfer(native_residuals, completed.native_failure);
         })
         .expect("the zero ledger commits before Core continuation");
     match disposition {
@@ -8385,7 +8674,7 @@ fn stale_driver_report_owner(pending: PendingCommit, task: RootFrameTask) -> Pen
         terminal: PendingFailedBranchTerminal::Task {
             task,
             failure: ViewFailureKind::Apply,
-            message: "route view report application became stale",
+            message: "route view report application became stale".into(),
         },
         branch: failed_prepared_branch(pending, None),
     }
@@ -8395,8 +8684,9 @@ fn nested_failure_terminal(
     engine: &mut RouterEngine,
     task: RootFrameTask,
     failure: ViewFailureKind,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> PendingFailedBranchTerminal {
+    let message = message.into();
     if engine.inspect_report_identity(&task).is_err() {
         return PendingFailedBranchTerminal::Task {
             task,
@@ -8412,7 +8702,7 @@ fn nested_failure_terminal(
 }
 
 fn failed_branch_primary_claims(branch: &FailedPreparedBranch) -> Vec<&ExactRegistryClaim> {
-    branch
+    let claims = branch
         .frames()
         .iter()
         .chain(branch.detached_frames())
@@ -8430,7 +8720,18 @@ fn failed_branch_primary_claims(branch: &FailedPreparedBranch) -> Vec<&ExactRegi
                 .iter()
                 .map(|slot| slot.slot().slot_claim()),
         )
-        .collect()
+        .collect::<Vec<_>>();
+    #[cfg(feature = "bsn")]
+    let claims = claims
+        .into_iter()
+        .chain(
+            branch
+                .native_failure()
+                .into_iter()
+                .flat_map(|failure| failure.claims()),
+        )
+        .collect();
+    claims
 }
 
 fn failed_cleanup_claim_is_current(world: &World, claim: &ExactRegistryClaim) -> bool {
@@ -8540,7 +8841,17 @@ fn isolate_failed_prepared_branch(
         .unwrap_or_default();
     let exact_isolation_claims = failed_branch_primary_claims(branch)
         .into_iter()
-        .filter(|claim| failed_cleanup_claim_is_current(world, claim))
+        .filter(|claim| {
+            #[cfg(feature = "bsn")]
+            if branch
+                .native_failure()
+                .and_then(|failure| failure.residual())
+                .is_some_and(|residual| residual.claim_identity_is_exact(world, claim))
+            {
+                return true;
+            }
+            failed_cleanup_claim_is_current(world, claim)
+        })
         .filter(|claim| !active_claims.contains(claim))
         .cloned()
         .collect::<Vec<_>>();
@@ -8800,7 +9111,7 @@ fn isolate_exact_failed_prepared_branch(
         protected_active_focus = active_claims
             .iter()
             .map(ExactRegistryClaim::entity)
-            .chain(active.interactive_entities().iter().copied())
+            .chain(active.live_interactive_entities(world).iter().copied())
             .collect();
         exact_isolation_claims.retain(|claim| !active_claims.contains(claim));
     }
@@ -9094,6 +9405,25 @@ fn begin_sealed_old_output_host_loss(
                     task,
                 },
             ));
+        }
+        #[cfg(feature = "bsn")]
+        AuthoritySettlementBeginOutcome::NativeCleanupContradiction { active, error, .. } => {
+            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::NativeCleanup(error),
+            ) {
+                retain_frame_task_after_authority_retry(
+                    entry,
+                    had_active,
+                    active,
+                    pending,
+                    task,
+                    retry_effect,
+                );
+            }
         }
         AuthoritySettlementBeginOutcome::RetryablePreparation { active, .. }
         | AuthoritySettlementBeginOutcome::ProtocolContradiction { active, .. }
@@ -9719,7 +10049,8 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         .active
                                         .take()
                                         .unwrap_or_else(RealizedBranch::empty);
-                                    if entry.captured_delayed_driver_report(&task).is_some() {
+                                    let reconciled = entry.engine.reconciliation_projection_for_task(&task).is_ok();
+                                    if reconciled && entry.captured_delayed_driver_report(&task).is_some() {
                                         begin_sealed_old_output_host_loss(
                                             world,
                                             entry,
@@ -9731,16 +10062,28 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         );
                                         continue;
                                     }
-                                    let logical_roots =
-                                        entry.engine.authority_settlement_logical_roots();
-                                    match begin_authority_settlement(
+                                    let outcome = if reconciled {
+                                        let logical_roots = entry.engine.authority_settlement_logical_roots();
+                                        begin_authority_settlement(
                                         world,
                                         entry,
                                         active,
                                         pending,
                                         Some(logical_roots),
-                                    ) {
+                                        )
+                                    } else {
+                                        begin_unstarted_fallback_host_loss(world, entry, active, pending, &task)
+                                    };
+                                    match outcome {
                                         AuthoritySettlementBeginOutcome::Begun => {}
+                                        #[cfg(feature = "bsn")]
+                                        AuthoritySettlementBeginOutcome::NativeCleanupContradiction { active, pending, error } => {
+                                            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                                                world, entry, active, pending, AuthorityProtocolResidualKind::NativeCleanup(error),
+                                            ) {
+                                                retain_frame_task_after_authority_retry(entry, had_active, active, pending, task, retry_effect);
+                                            }
+                                        }
                                         AuthoritySettlementBeginOutcome::TriggerContradiction { active, pending, kind } => {
                                             if let Err((active, pending)) = fail_closed_normal_owner_protocol(
                                                 world, entry, active, pending, AuthorityProtocolResidualKind::AuthorityTrigger(kind),
@@ -9949,6 +10292,42 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     }
                                     continue;
                                 };
+                                #[cfg(feature = "bsn")]
+                                let native_result = if let Some(factory) = drivers.native_mut(&driver_key) {
+                                    if entry.engine.inspect_report_identity(&task).is_err() {
+                                        entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+                                        continue;
+                                    }
+                                    let focus_owner = match crate::native_focus::begin(world, &task) {
+                                        Ok(owner) => owner,
+                                        Err(error) => {
+                                            let failure = crate::presentation::native_failure::NativeFailureOwner::preparation(&task, crate::bsn::BsnPreparationError::Focus(error).into());
+                                            reject_native_task(world, entry, pending, task, ViewFailureKind::Build, failure);
+                                            continue;
+                                        }
+                                    };
+                                    let prepared = match crate::bsn::prepare_bsn_view(world, factory, task.input()) {
+                                        Ok(prepared) => prepared,
+                                        Err(failure) => {
+                                            let failure = crate::presentation::native_failure::NativeFailureOwner::preparation(&task, failure);
+                                            reject_native_task(world, entry, pending, task, ViewFailureKind::Build, failure);
+                                            continue;
+                                        }
+                                    };
+                                    let realized = realize_native_task(world, &entry.engine, host_candidate.clone(), top_slot, top_slot_claim.clone(), (!realizing_root).then_some(&pending.branch), entry.active.as_ref(), &task, prepared);
+                                    match crate::presentation::native_frame::finish_focus(world, focus_owner, realized) {
+                                        Ok(frame) => Some(Ok(frame)),
+                                        Err(crate::presentation::native_frame::NativeFrameFailure::Mount(failure)) => Some(Err(DriverReportApplicationError::Realization(failure))),
+                                        Err(crate::presentation::native_frame::NativeFrameFailure::Creation(failure)) => {
+                                            let failure = crate::presentation::native_failure::NativeFailureOwner::creation(&task, failure);
+                                            reject_native_task(world, entry, pending, task, ViewFailureKind::Apply, failure);
+                                            continue;
+                                        }
+                                    }
+                                } else { None };
+                                #[cfg(not(feature = "bsn"))]
+                                let native_result: Option<Result<RealizedFrame, DriverReportApplicationError>> = None;
+                                let realized = if let Some(result) = native_result { result } else {
                                 let Some(driver) = drivers.get_mut(&driver_key) else {
                                     let (pending, task) =
                                         match route_back_target_frame_failure(
@@ -10047,7 +10426,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                             PendingFailedBranchTerminal::Task {
                                                                 task,
                                                                 failure: ViewFailureKind::Apply,
-                                                                message: "route view report identity became stale",
+                                                                message: "route view report identity became stale".into(),
                                                             },
                                                         branch: failed_prepared_branch(pending, None),
                                                     });
@@ -10127,7 +10506,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     });
                                     continue;
                                 }
-                                let realized = apply_applied_driver_report_to_branch(
+                                apply_applied_driver_report_to_branch(
                                     world,
                                     &mut entry.engine,
                                     host_candidate,
@@ -10137,7 +10516,8 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     entry.active.as_ref(),
                                     &task,
                                     artifact,
-                                );
+                                )
+                                };
                                 let realized = match realized {
                                     Ok(realized) => realized,
                                     Err(DriverReportApplicationError::Stale) => {
@@ -10176,7 +10556,8 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         continue;
                                     }
                                     Err(DriverReportApplicationError::Realization(failure)) => {
-                                        let (_error, residual) = failure.into_parts();
+                                        let (error, residual) = failure.into_parts();
+                                        let message = format!("frame realization rejected: {error:?}");
                                         if let Some(residual) = residual {
                                             let failed_branch = match pending.branch.push_frame(residual) {
                                                 Ok(()) => failed_prepared_branch(pending, None),
@@ -10195,7 +10576,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                 ),
                                                 task,
                                                 ViewFailureKind::Apply,
-                                                "frame realization rejected",
+                                                message.clone(),
                                             ) {
                                                 RouteBackTargetFrameFailureOutcome::Handled => {}
                                                 RouteBackTargetFrameFailureOutcome::NonTarget {
@@ -10209,14 +10590,14 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                         PendingFailedBranchTerminal::TaskWithPhysicalResidual {
                                                             task,
                                                             failure: ViewFailureKind::Apply,
-                                                            message: "frame realization rejected",
+                                                            message: message.clone(),
                                                         }
                                                     } else {
                                                         nested_failure_terminal(
                                                             &mut entry.engine,
                                                             task,
                                                             ViewFailureKind::Apply,
-                                                            "frame realization rejected",
+                                                            message.clone(),
                                                         )
                                                     };
                                                     entry.pending_failed_branch = Some(
@@ -10246,7 +10627,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                     ),
                                                     task,
                                                     ViewFailureKind::Apply,
-                                                    "frame realization rejected",
+                                                    message.clone(),
                                                 ) {
                                                     RouteBackTargetFrameFailureOutcome::Handled => {
                                                         continue;
@@ -10271,7 +10652,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                             let failure = entry.engine.report_failed(
                                                 task,
                                                 ViewFailureKind::Apply,
-                                                "frame realization rejected",
+                                                message,
                                             );
                                             if let Ok(Some(request)) = failure {
                                                 entry.pending_failed_branch =
@@ -10314,7 +10695,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                 PendingFailedBranchTerminal::TaskWithPhysicalResidual {
                                                     task,
                                                     failure: ViewFailureKind::Apply,
-                                                    message: "frame branch append rejected",
+                                                    message: "frame branch append rejected".into(),
                                                 }
                                             } else {
                                                 nested_failure_terminal(
@@ -10401,7 +10782,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                             PendingFailedBranchTerminal::Task {
                                                                 task,
                                                                 failure: ViewFailureKind::Apply,
-                                                                message: "parent frame preflight rejected",
+                                                                message: "parent frame preflight rejected".into(),
                                                             },
                                                         branch: failed_prepared_branch(pending, None),
                                                     });
@@ -10450,7 +10831,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                 PendingFailedBranchTerminal::Task {
                                                     task,
                                                     failure: ViewFailureKind::Apply,
-                                                    message: "parent outlet report rejected",
+                                                    message: "parent outlet report rejected".into(),
                                                 }
                                             }
                                             Some(EngineAction::FailureCleanup(request)) => {
@@ -10789,6 +11170,8 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
             );
         },
     );
+    #[cfg(feature = "bsn")]
+    let _ = crate::native_focus::observe(world, &[]);
     newly_bound_entries
 }
 
@@ -10808,6 +11191,11 @@ enum ReconciliationPreflightOutcome {
 }
 
 pub(crate) enum ReconciliationPreparationDecision {
+    #[cfg(feature = "bsn")]
+    NativeCleanupRetry {
+        owner: TargetPreparationOwner,
+        evidence: crate::presentation::native_frame::NativeCleanupPreparationError,
+    },
     Ready(BackTargetReadyAcceptanceOwner),
     PendingRejected {
         owner: TargetPreparationOwner,
@@ -11044,7 +11432,7 @@ fn reconciliation_preflight(
 }
 
 pub(crate) fn classify_back_target(
-    world: &World,
+    world: &mut World,
     entry: &mut RouterEntry,
     owner: TargetPreparationOwner,
 ) -> ReconciliationPreparationOutcome {
@@ -11110,9 +11498,28 @@ pub(crate) fn classify_back_target(
             )
         }
         ReconciliationPreflightOutcome::Ready {
-            splice,
+            mut splice,
             focus_leaving,
         } => {
+            #[cfg(feature = "bsn")]
+            if let Err(error) = splice.prepare_native_cleanup(world) {
+                let owner = TargetPreparationOwner {
+                    splice,
+                    history,
+                    continuation,
+                };
+                return ReconciliationPreparationOutcome::Matched(if error.is_retryable() {
+                    ReconciliationPreparationDecision::NativeCleanupRetry {
+                        owner,
+                        evidence: error,
+                    }
+                } else {
+                    ReconciliationPreparationDecision::Permanent(PreparationPermanentOwner {
+                        owner,
+                        evidence: PreparationPermanentEvidence::NativeCleanup(error),
+                    })
+                });
+            }
             let focus_leaving = complete_back_target_focus_source(world, &splice, focus_leaving);
 
             let transitions = splice.lifecycle_transitions();
@@ -12834,6 +13241,7 @@ fn observe_back_target_driver_physical_partition(
     world: &World,
     entry: &RouterEntry,
     task: BackTargetDriverTaskPhysicalProjection,
+    physical: Option<&BackTargetDriverUnverifiedPhysicalOwner>,
 ) -> Result<BackTargetDriverPhysicalPartitionProjection, BackTargetDriverPhysicalIndeterminateReason>
 {
     let host = entry
@@ -12868,10 +13276,23 @@ fn observe_back_target_driver_physical_partition(
             .map(|record| record.claim().clone())
             .collect(),
     )?;
-    if target_claims
-        .iter()
-        .any(|claim| !cleanup_claim_has_exact_authority(world, claim))
-    {
+    if target_claims.iter().any(|claim| {
+        #[cfg(feature = "bsn")]
+        if let Some(failure) =
+            physical.and_then(BackTargetDriverUnverifiedPhysicalOwner::native_failure)
+        {
+            if failure.source.report == task.report
+                && failure.source.frame == task.frame
+                && failure.source.mount == task.mount
+                && failure
+                    .residual()
+                    .is_some_and(|residual| residual.claim_identity_is_exact(world, claim))
+            {
+                return false;
+            }
+        }
+        !cleanup_claim_has_exact_authority(world, claim)
+    }) {
         return Err(BackTargetDriverPhysicalIndeterminateReason::TargetRegistryIncomplete);
     }
     let target_boundaries = registry
@@ -12998,6 +13419,21 @@ pub(crate) fn freeze_back_target_driver_physical_partition_source(
     BackTargetDriverPhysicalPartitionSource,
     FrozenBackTargetDriverPhysicalIndeterminateEvidence,
 > {
+    freeze_back_target_driver_physical_partition_source_with_owner(
+        world, entry, driving, task, None,
+    )
+}
+
+fn freeze_back_target_driver_physical_partition_source_with_owner(
+    world: &World,
+    entry: &RouterEntry,
+    driving: &PendingBackTargetDriving,
+    task: &RootFrameTask,
+    physical: Option<&BackTargetDriverUnverifiedPhysicalOwner>,
+) -> Result<
+    BackTargetDriverPhysicalPartitionSource,
+    FrozenBackTargetDriverPhysicalIndeterminateEvidence,
+> {
     match entry.engine.validate_back_target_execution_pairing(
         BackTargetExecutionOwnerRef::Driving {
             history: &driving.history,
@@ -13021,12 +13457,12 @@ pub(crate) fn freeze_back_target_driver_physical_partition_source(
         frame: task.frame().clone(),
         mount: task.mount_target(),
     };
-    let frozen =
-        observe_back_target_driver_physical_partition(world, entry, task).map_err(|reason| {
-            FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+    let frozen = observe_back_target_driver_physical_partition(world, entry, task, physical)
+        .map_err(
+            |reason| FrozenBackTargetDriverPhysicalIndeterminateEvidence {
                 observation: BackTargetDriverPhysicalIndeterminateObservation::Freeze(reason),
-            }
-        })?;
+            },
+        )?;
     Ok(BackTargetDriverPhysicalPartitionSource { frozen })
 }
 
@@ -13091,6 +13527,60 @@ fn back_target_driver_residual_reportable(
         BackTargetDriverPhysicalIndeterminateReason,
     ),
 > {
+    #[cfg(feature = "bsn")]
+    if let Some(failure) = branch.native_failure() {
+        let exact_source = failure.source.report == source.task.report
+            && failure.source.frame == source.task.frame
+            && failure.source.mount == source.task.mount;
+        let claims = normalize_back_target_driver_claims(failure.claims().cloned().collect());
+        let no_other_targets = branch.frames().is_empty()
+            && branch.child_slots().is_empty()
+            && branch.mount_residuals().is_empty()
+            && branch.detached_frames().is_empty()
+            && branch.rejected_child_slots().is_empty()
+            && branch.mount_new_allowance().is_none();
+        if !exact_source
+            || !no_other_targets
+            || failure.residual().is_none()
+            || failure.validate_settled(world).is_err()
+            || claims.as_ref().map_or(true, |claims| {
+                claims != &source.target_claims
+                    || claims
+                        .iter()
+                        .any(|claim| source.protected.contains(&claim.entity()))
+            })
+        {
+            return Err((
+                branch,
+                BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+            ));
+        }
+        let manifest = world
+            .get_resource::<RouteEntityRegistry>()
+            .and_then(|registry| {
+                FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &branch).ok()
+            });
+        let Some(manifest) =
+            manifest.filter(|manifest| manifest.len() == 0 && manifest.preflight(world))
+        else {
+            return Err((
+                branch,
+                BackTargetDriverPhysicalIndeterminateReason::ResidualTopologyIncomplete,
+            ));
+        };
+        let target_claims = match claims {
+            Ok(claims) => claims,
+            Err(_) => unreachable!("native target claims were checked before moving their owner"),
+        };
+        return Ok(BackTargetDriverResidualPhysicalOwner {
+            branch,
+            proof: FrozenBackTargetDriverPhysicalPartitionProof {
+                source: source.clone(),
+                manifest,
+                target_claims,
+            },
+        });
+    }
     if branch.frames().len() != 1
         || !branch.child_slots().is_empty()
         || !branch.mount_residuals().is_empty()
@@ -13201,22 +13691,26 @@ fn classify_back_target_driver_frozen_physical(
     frozen: &BackTargetDriverPhysicalPartitionProjection,
     owner: BackTargetDriverUnverifiedPhysicalOwner,
 ) -> BackTargetDriverPhysicalClassification {
-    let observed =
-        match observe_back_target_driver_physical_partition(world, entry, frozen.task.clone()) {
-            Ok(observed) => observed,
-            Err(reason) => {
-                return back_target_driver_indeterminate(
-                    owner,
-                    FrozenBackTargetDriverPhysicalIndeterminateEvidence {
-                        observation: BackTargetDriverPhysicalIndeterminateObservation::Refreeze {
-                            expected: frozen.clone(),
-                            observed: None,
-                            reason,
-                        },
+    let observed = match observe_back_target_driver_physical_partition(
+        world,
+        entry,
+        frozen.task.clone(),
+        Some(&owner),
+    ) {
+        Ok(observed) => observed,
+        Err(reason) => {
+            return back_target_driver_indeterminate(
+                owner,
+                FrozenBackTargetDriverPhysicalIndeterminateEvidence {
+                    observation: BackTargetDriverPhysicalIndeterminateObservation::Refreeze {
+                        expected: frozen.clone(),
+                        observed: None,
+                        reason,
                     },
-                );
-            }
-        };
+                },
+            );
+        }
+    };
     if observed != *frozen {
         return back_target_driver_indeterminate(
             owner,
@@ -13268,7 +13762,7 @@ fn classify_back_target_driver_frozen_physical(
             BackTargetDriverPhysicalClassification::Reportable(
                 BackTargetDriverReportablePhysicalOwner::ProvenZero(
                     BackTargetDriverZeroPhysicalOwner {
-                        pending,
+                        physical: BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
                         proof: FrozenBackTargetDriverZeroPhysicalProof {
                             source: frozen.clone(),
                         },
@@ -13281,6 +13775,31 @@ fn classify_back_target_driver_frozen_physical(
             BackTargetDriverPhysicalIndeterminateReason::PendingPhysicalResidual,
         ),
         BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => {
+            #[cfg(feature = "bsn")]
+            if let Some(failure) = branch.native_failure()
+                && failure.residual().is_none()
+                && failure.source.report == frozen.task.report
+                && failure.source.frame == frozen.task.frame
+                && failure.source.mount == frozen.task.mount
+                && branch.frames().is_empty()
+                && branch.child_slots().is_empty()
+                && branch.mount_residuals().is_empty()
+                && branch.detached_frames().is_empty()
+                && branch.rejected_child_slots().is_empty()
+                && branch.mount_new_allowance().is_none()
+                && frozen.target_claims.is_empty()
+            {
+                return BackTargetDriverPhysicalClassification::Reportable(
+                    BackTargetDriverReportablePhysicalOwner::ProvenZero(
+                        BackTargetDriverZeroPhysicalOwner {
+                            physical: BackTargetDriverUnverifiedPhysicalOwner::Residual(branch),
+                            proof: FrozenBackTargetDriverZeroPhysicalProof {
+                                source: frozen.clone(),
+                            },
+                        },
+                    ),
+                );
+            }
             match back_target_driver_residual_reportable(world, frozen, branch) {
                 Ok(owner) => BackTargetDriverPhysicalClassification::Reportable(
                     BackTargetDriverReportablePhysicalOwner::Residual(owner),
@@ -13405,7 +13924,12 @@ fn consume_back_target_driver_reported(
                 drop(owner.proof);
                 entry.pending_failed_branch = Some(PendingFailedBranch {
                     terminal: PendingFailedBranchTerminal::Request(request),
-                    branch: failed_prepared_branch(owner.pending, None),
+                    branch: match owner.physical {
+                        BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                            failed_prepared_branch(pending, None)
+                        }
+                        BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => branch,
+                    },
                 });
             }
             BackTargetDriverReportablePhysicalOwner::Residual(owner) => {
@@ -13503,7 +14027,7 @@ pub(crate) fn drive_back_target_driver_failure(world: &mut World, entry: &mut Ro
         continuation,
         task,
         kind,
-        message,
+        &message,
         report_mode,
     ) {
         BackTargetDriverFailureReportOutcome::Reported(outcome) => outcome,
@@ -13830,8 +14354,9 @@ fn back_target_driver_staging_mismatch(
     physical: BackTargetDriverUnverifiedPhysicalOwner,
     task: RootFrameTask,
     kind: ViewFailureKind,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> PendingBackTargetDriverStagingMismatch {
+    let message = message.into();
     PendingBackTargetDriverStagingMismatch {
         previous,
         physical,
@@ -13902,8 +14427,9 @@ fn route_back_target_frame_failure(
     physical: BackTargetDriverUnverifiedPhysicalOwner,
     task: RootFrameTask,
     kind: ViewFailureKind,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> RouteBackTargetFrameFailureOutcome {
+    let message = message.into();
     let current_root_back_task = entry.engine.is_current_root_back_frame_task(&task);
     let Some(stage) = entry.pending_back_target_execution.take() else {
         return if current_root_back_task {
@@ -13971,31 +14497,35 @@ fn route_back_target_frame_failure(
         BackTargetExecutionPairingOutcome::Matched => {}
     }
 
-    let source =
-        match freeze_back_target_driver_physical_partition_source(world, entry, &driving, &task) {
-            Ok(source) => source,
-            Err(evidence) => {
-                entry.pending_back_target_execution =
-                    Some(PendingBackTargetExecution::ResumeBlocked(
-                        PendingBackTargetResumeBlocked::DriverFailure(
-                            PendingBackTargetDriverFailure::PhysicalIndeterminate(
-                                PendingBackTargetDriverPhysicalIndeterminate {
-                                    driving,
-                                    task,
-                                    physical: BackTargetDriverPhysicalIndeterminateOwner {
-                                        original: physical,
-                                        evidence,
-                                    },
-                                    kind,
-                                    message,
-                                },
-                            ),
-                        ),
-                    ));
-                drive_back_target_driver_failure(world, entry);
-                return RouteBackTargetFrameFailureOutcome::Handled;
-            }
-        };
+    let source = match freeze_back_target_driver_physical_partition_source_with_owner(
+        world,
+        entry,
+        &driving,
+        &task,
+        Some(&physical),
+    ) {
+        Ok(source) => source,
+        Err(evidence) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::DriverFailure(
+                    PendingBackTargetDriverFailure::PhysicalIndeterminate(
+                        PendingBackTargetDriverPhysicalIndeterminate {
+                            driving,
+                            task,
+                            physical: BackTargetDriverPhysicalIndeterminateOwner {
+                                original: physical,
+                                evidence,
+                            },
+                            kind,
+                            message,
+                        },
+                    ),
+                ),
+            ));
+            drive_back_target_driver_failure(world, entry);
+            return RouteBackTargetFrameFailureOutcome::Handled;
+        }
+    };
     let failure = match classify_back_target_driver_physical(world, entry, &source, physical) {
         BackTargetDriverPhysicalClassification::Reportable(physical) => {
             PendingBackTargetDriverFailure::AwaitingReport(PendingBackTargetDriverAwaitingReport {
@@ -14067,6 +14597,14 @@ fn drive_back_target_applied_classification(world: &mut World, entry: &mut Route
         unreachable!("the observed active classification owner remains whole");
     };
     match classify_back_target(world, entry, owner) {
+        #[cfg(feature = "bsn")]
+        ReconciliationPreparationOutcome::Matched(
+            ReconciliationPreparationDecision::NativeCleanupRetry { owner, evidence: _ },
+        ) => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::Classifying(
+                PendingBackTargetClassification::Active(owner),
+            ));
+        }
         ReconciliationPreparationOutcome::Matched(ReconciliationPreparationDecision::Ready(
             owner,
         )) => {
@@ -14557,6 +15095,34 @@ fn drive_back_target_authority_protocol(world: &mut World, entry: &mut RouterEnt
     }
 
     match begin_authority_settlement(world, entry, active, pending, None) {
+        #[cfg(feature = "bsn")]
+        AuthoritySettlementBeginOutcome::NativeCleanupContradiction {
+            active,
+            pending,
+            error,
+        } => {
+            match fail_closed_normal_owner_protocol(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::NativeCleanup(error),
+            ) {
+                Ok(()) => {
+                    drop(history);
+                    drop(continuation);
+                }
+                Err((active, pending)) => store_back_target_authority_protocol(
+                    entry,
+                    active,
+                    pending,
+                    history,
+                    continuation,
+                    evidence,
+                    source,
+                ),
+            }
+        }
         AuthoritySettlementBeginOutcome::TriggerContradiction {
             active,
             pending,
@@ -15075,9 +15641,9 @@ fn publish_ready_back_target(
     };
 
     let splice = &owner.physical.classified.splice;
-    let gate_before = splice.current_interactive_entities();
-    let gate_after = splice.resulting_interactive_entities();
+    let gate_before = splice.current_live_interactive_entities(world);
     let (targets, isolate_count) = splice.presentation_mutation_targets();
+    let gate_after = splice.resulting_live_interactive_entities(world, &targets);
     let transitions = splice.lifecycle_transitions();
     let registry_changes = transitions
         .iter()
@@ -15114,6 +15680,12 @@ fn publish_ready_back_target(
         None
     };
 
+    #[cfg(feature = "bsn")]
+    let native_focus = crate::native_focus::prepare_publication(
+        world,
+        owner.physical.classified.splice.entering().frames(),
+        &gate_after,
+    );
     let frozen_is_exact = (|| {
         let registry = world.get_resource::<RouteEntityRegistry>()?;
         let ready = &owner;
@@ -15172,6 +15744,8 @@ fn publish_ready_back_target(
         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
         let focus_plan =
             prepare_focus_mutation(input_focus, route_focus, &ready.physical.focus_leaving);
+        #[cfg(feature = "bsn")]
+        let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
         let claim_rebind = splice.prepare_claim_rebind(&resulting_claims)?;
         let presentation_plan = presentation.seal_commit(isolate_count)?;
         let BackTargetReadyAcceptanceOwner {
@@ -15321,7 +15895,8 @@ fn publish_ready_back_target(
                     splice.apply_root_rebase(rebase);
                 }
                 let outcome = splice.apply();
-                let (active, leaving) = outcome.into_active_and_leaving();
+                let (mut active, leaving) = outcome.into_active_and_leaving();
+                active.consume_native_focus_owners();
                 let next_active = (!active.frames().is_empty()).then_some(active);
                 let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
                     cleanup,
@@ -15400,6 +15975,8 @@ enum PendingPublicationWork {
 }
 
 pub(crate) fn commit_presentation_system(world: &mut World) {
+    #[cfg(feature = "bsn")]
+    let _ = crate::native_focus::observe(world, &[]);
     let handles = world
         .resource::<RouterNavigation>()
         .entries
@@ -15673,6 +16250,23 @@ fn settle_prepublication_authority_loss(
         begin_authority_settlement(world, entry, active, pending, None)
     };
     match outcome {
+        #[cfg(feature = "bsn")]
+        AuthoritySettlementBeginOutcome::NativeCleanupContradiction {
+            active,
+            pending,
+            error,
+        } => {
+            if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                world,
+                entry,
+                active,
+                pending,
+                AuthorityProtocolResidualKind::NativeCleanup(error),
+            ) {
+                entry.active = had_active.then_some(active);
+                entry.pending_commit = Some(pending);
+            }
+        }
         AuthoritySettlementBeginOutcome::TriggerContradiction {
             active,
             pending,
@@ -15776,7 +16370,7 @@ fn publish_normal_work(
             ),
         }
     };
-    let (splice, mut focus_leaving) = match preflight {
+    let (mut splice, mut focus_leaving) = match preflight {
         ReconciliationPreflightOutcome::Ready {
             splice,
             focus_leaving,
@@ -15839,7 +16433,7 @@ fn publish_normal_work(
                                 terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
                                     task,
                                     failure: ViewFailureKind::Apply,
-                                    message: "frame final preflight rejected",
+                                    message: "frame final preflight rejected".into(),
                                 },
                                 branch: failed_prepared_branch(pending, None),
                             };
@@ -15865,6 +16459,34 @@ fn publish_normal_work(
             return;
         }
     };
+    #[cfg(feature = "bsn")]
+    if let Err(error) = splice.prepare_native_cleanup(world) {
+        world.resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == handle)
+                    .unwrap();
+                let (active, entering, _) = splice.reject().into_parts();
+                pending.branch = entering;
+                if error.is_retryable() {
+                    entry.active = had_active.then_some(active);
+                    entry.pending_commit = Some(pending);
+                } else if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                    world,
+                    entry,
+                    active,
+                    pending,
+                    AuthorityProtocolResidualKind::NativeCleanup(error),
+                ) {
+                    entry.active = had_active.then_some(active);
+                    entry.pending_commit = Some(pending);
+                }
+            },
+        );
+        return;
+    }
     let retained_empty_focus = observed_descendant_closure(
         world,
         splice
@@ -15877,9 +16499,9 @@ fn publish_normal_work(
     focus_leaving.sort_by_key(|entity| entity.to_bits());
     focus_leaving.dedup();
     let logical_roots = logical_cleanup_roots(splice.leaving());
-    let gate_before = splice.current_interactive_entities();
-    let gate_after = splice.resulting_interactive_entities();
+    let gate_before = splice.current_live_interactive_entities(world);
     let (targets, isolate_count) = splice.presentation_mutation_targets();
+    let gate_after = splice.resulting_live_interactive_entities(world, &targets);
     let transitions = splice.lifecycle_transitions();
     let leaving_count = splice.leaving().obligation_count();
     let registry_changes = transitions
@@ -15931,6 +16553,9 @@ fn publish_normal_work(
 
         Some(frozen_manifest)
     })();
+    #[cfg(feature = "bsn")]
+    let native_focus =
+        crate::native_focus::prepare_publication(world, splice.entering().frames(), &gate_after);
     let mut splice_owner = Some(splice);
     let mut cleanup_reserve_contradiction = None;
     let mut commit_authority_contradiction = None;
@@ -15985,6 +16610,8 @@ fn publish_normal_work(
 
         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
+        #[cfg(feature = "bsn")]
+        let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
         let claim_rebind = splice_owner
             .as_ref()?
             .prepare_claim_rebind(&resulting_claims)?;
@@ -16057,7 +16684,8 @@ fn publish_normal_work(
             splice.apply_root_rebase(rebase);
         }
         let outcome = splice.apply();
-        let (active, leaving) = outcome.into_active_and_leaving();
+        let (mut active, leaving) = outcome.into_active_and_leaving();
+        active.consume_native_focus_owners();
         let next_active = (!active.frames().is_empty()).then_some(active);
         let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
             cleanup_ledger,
@@ -16150,15 +16778,15 @@ use authority_isolation::{
 use authority_isolation::{
     AuthorityIsolationContradiction, AuthorityIsolationPreparation,
     AuthoritySettlementBeginOutcome, PreparedAuthorityIsolation, begin_authority_settlement,
-    begin_initial_fallback_authority_settlement, fail_closed_cleanup_settlement_permanent,
-    fail_closed_failed_authority_protocol, fail_closed_failed_manifest_protocol,
-    fail_closed_failed_owner_protocol, fail_closed_failed_owner_protocol_prepared,
-    fail_closed_failure_cleanup_completion_protocol, fail_closed_normal_authority_protocol,
-    fail_closed_normal_authority_protocol_prepared, fail_closed_normal_owner_protocol,
-    fail_closed_projectionless_owner_protocol, prepare_authority_isolation_targets,
-    prepare_failed_branch_authority_isolation, prepare_failed_manifest_protocol_isolation,
-    prepare_normal_authority_isolation, prepare_post_commit_input_isolation,
-    prepare_target_preparation_permanent_isolation,
+    begin_initial_fallback_authority_settlement, begin_unstarted_fallback_host_loss,
+    fail_closed_cleanup_settlement_permanent, fail_closed_failed_authority_protocol,
+    fail_closed_failed_manifest_protocol, fail_closed_failed_owner_protocol,
+    fail_closed_failed_owner_protocol_prepared, fail_closed_failure_cleanup_completion_protocol,
+    fail_closed_normal_authority_protocol, fail_closed_normal_authority_protocol_prepared,
+    fail_closed_normal_owner_protocol, fail_closed_projectionless_owner_protocol,
+    prepare_authority_isolation_targets, prepare_failed_branch_authority_isolation,
+    prepare_failed_manifest_protocol_isolation, prepare_normal_authority_isolation,
+    prepare_post_commit_input_isolation, prepare_target_preparation_permanent_isolation,
 };
 
 enum ProjectionlessFallbackPreflight {
@@ -16604,8 +17232,9 @@ fn projectionless_fallback_preflight(
 fn reject_projectionless_fallback_pending(
     entry: &mut RouterEntry,
     mut pending: PendingCommit,
-    message: &'static str,
+    message: impl Into<String>,
 ) {
+    let message = message.into();
     let task = pending
         .final_task
         .take()
@@ -16765,12 +17394,36 @@ fn prepare_projectionless_branch(
     } else {
         (None, Vec::new())
     };
+    #[cfg(feature = "bsn")]
+    if let Some(active) = entry.active.as_mut()
+        && let Err(error) = active.prepare_native_cleanup(world)
+    {
+        if error.is_retryable() {
+            return Err(pending);
+        }
+        let active = entry
+            .active
+            .take()
+            .expect("the leaving native owner is retained");
+        return match fail_closed_normal_owner_protocol(
+            world,
+            entry,
+            active,
+            pending,
+            AuthorityProtocolResidualKind::NativeCleanup(error),
+        ) {
+            Ok(()) => Ok(()),
+            Err((active, pending)) => {
+                entry.active = Some(active);
+                Err(pending)
+            }
+        };
+    }
     let gate_before = entry
         .active
         .as_ref()
-        .map(RealizedBranch::interactive_entities)
+        .map(|branch| branch.live_interactive_entities(world))
         .unwrap_or_default();
-    let gate_after = pending.branch.as_realized().interactive_entities();
     let mut targets = match entry
         .active
         .as_ref()
@@ -16798,6 +17451,12 @@ fn prepare_projectionless_branch(
             .as_realized()
             .entering_mutation_targets(EntityLifecycle::PreparedInert, EntityLifecycle::Active),
     );
+    let gate_after: Vec<_> = pending
+        .branch
+        .frames()
+        .iter()
+        .flat_map(|frame| frame.content_input_facts(world, &targets).1)
+        .collect();
     let mut transitions = entry
         .active
         .as_ref()
@@ -17187,6 +17846,9 @@ fn publish_projectionless_work(
         (frozen == expected_manifest).then_some(())
     })()
     .is_some();
+    #[cfg(feature = "bsn")]
+    let native_focus =
+        crate::native_focus::prepare_publication(world, pending.branch.frames(), &gate_after);
     let pointer_targets = world
         .get_resource_mut::<RouterInputGate>()
         .and_then(|gate| prepare_input_gate_mutation(gate, &gate_before, gate_after.clone()))
@@ -17216,6 +17878,8 @@ fn publish_projectionless_work(
         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
+        #[cfg(feature = "bsn")]
+        let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
         let presentation_plan = presentation.seal_commit(isolate_count)?;
         let root_rebase = match entry.active.as_ref() {
             Some(leaving) => Some(pending.branch.as_realized().prepare_root_rebase(leaving)?),
@@ -17293,6 +17957,7 @@ fn publish_projectionless_work(
         if let Some(rebase) = root_rebase {
             entering.apply_root_rebase(rebase);
         }
+        entering.consume_native_focus_owners();
         let next_active = Some(entering);
         let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
             cleanup_ledger,
@@ -17507,7 +18172,11 @@ fn exact_failed_source_obligation<'a>(
                     candidate.frame() == frame
                         && candidate.shell() == *removed_child
                         && candidate.mount_binding().slot() == *mount_slot
-                        && physical_parent == expected.entity()
+                        && physical_parent == drift.expected.physical_entity()
+                        && candidate
+                            .mount_binding()
+                            .outlet_binding()
+                            .is_some_and(|binding| drift.expected.matches_outlet_binding(binding))
                         && physical_claim == Some(expected)
                 });
             let candidate = matches.next()?;
@@ -17535,7 +18204,10 @@ fn exact_failed_source_obligation<'a>(
                     && candidate.slot_id() == *slot
                     && candidate.slot() == *removed_child
                     && candidate.anchor_claim() == expected
-                    && candidate.anchor() == expected.entity()
+                    && candidate.anchor() == drift.expected.physical_entity()
+                    && drift
+                        .expected
+                        .matches_outlet_binding(candidate.anchor_binding())
             });
             let candidate = matches.next()?;
             if matches.next().is_some() {
@@ -17553,7 +18225,10 @@ fn exact_failed_source_obligation<'a>(
                 candidate.parent() == parent
                     && candidate.outlet() == outlet
                     && candidate.entity() == *removed_child
-                    && candidate.anchor() == expected.entity()
+                    && candidate.anchor() == drift.expected.physical_entity()
+                    && drift
+                        .expected
+                        .matches_outlet_binding(candidate.anchor_binding())
                     && candidate.anchor_claim() == expected
                     && matches!(
                         candidate.claim().owner(),
@@ -17585,7 +18260,10 @@ fn exact_failed_source_obligation<'a>(
             let mut matches = failed.rejected_child_slots().iter().filter(|rejected| {
                 let candidate = rejected.slot();
                 candidate.slot() == *removed_child
-                    && rejected.canonical_anchor() == Some(expected.entity())
+                    && rejected.canonical_anchor() == Some(drift.expected.physical_entity())
+                    && rejected
+                        .canonical_anchor_binding()
+                        .is_some_and(|binding| drift.expected.matches_outlet_binding(binding))
                     && rejected.canonical_anchor_claim() == Some(expected)
                     && matches!(
                         candidate.slot_claim().owner(),
@@ -17611,6 +18289,18 @@ fn realized_branch_owns_exact_boundary(
     branch: &RealizedBranch,
     drift: &FailedBoundaryDrift,
 ) -> bool {
+    if let crate::cleanup::FailedBoundaryExpectation::OutletBinding { parent, binding } =
+        &drift.expected
+    {
+        return branch.frames().iter().any(|frame| {
+            frame.frame() == parent
+                && frame.claims().any(|claim| claim == binding.source_claim())
+                && frame
+                    .outlets()
+                    .iter()
+                    .any(|outlet| outlet.anchor_binding() == binding)
+        });
+    }
     let claim = drift.expected.exact_claim();
     match claim.owner() {
         RegistryOwner::Committed(EntityOwner::ChildSlot {
@@ -17659,6 +18349,22 @@ fn failed_branch_owns_exact_boundary(
     failed: &FailedPreparedBranch,
     drift: &FailedBoundaryDrift,
 ) -> bool {
+    if let crate::cleanup::FailedBoundaryExpectation::OutletBinding { parent, binding } =
+        &drift.expected
+    {
+        return failed
+            .frames()
+            .iter()
+            .chain(failed.detached_frames())
+            .any(|frame| {
+                frame.frame() == parent
+                    && frame.claims().any(|claim| claim == binding.source_claim())
+                    && frame
+                        .outlets()
+                        .iter()
+                        .any(|outlet| outlet.anchor_binding() == binding)
+            });
+    }
     let claim = drift.expected.exact_claim();
     match claim.owner() {
         RegistryOwner::Committed(EntityOwner::FrameOutput {
@@ -17805,6 +18511,7 @@ fn classify_failed_boundary(
 }
 
 fn classify_failed_manifest(
+    world: &World,
     manifest: FrozenCleanupManifest,
     failed: PendingFailedBranch,
     active: Option<&RealizedBranch>,
@@ -17836,12 +18543,21 @@ fn classify_failed_manifest(
     }) {
         return FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest };
     }
-    if dispositions.iter().any(|disposition| {
-        matches!(
-            disposition.0,
-            FailedBoundaryDisposition::CurrentAuthorityLoss(_)
-        )
-    }) {
+    // Physical mount claims can remain exact after the application removes its
+    // host registration. Classify that authority source before consuming the
+    // original failed task into ordinary recovery/fallback.
+    let host_lost = host.is_some_and(|host| {
+        precommit_authority_cause(world, host) == PreCommitAuthorityCause::HostLost
+            && !current_host_binding_is_exact(world, host)
+    });
+    if host_lost
+        || dispositions.iter().any(|disposition| {
+            matches!(
+                disposition.0,
+                FailedBoundaryDisposition::CurrentAuthorityLoss(_)
+            )
+        })
+    {
         let bindings = dispositions
             .into_iter()
             .map(|(disposition, pending)| match disposition {
@@ -17898,6 +18614,11 @@ enum FailedAuthoritySettlementBeginOutcome {
     LedgerContradiction {
         failed: PendingFailedBranch,
         kind: CleanupLedgerReserveErrorKind,
+    },
+    #[cfg(feature = "bsn")]
+    NativeCleanupContradiction {
+        failed: PendingFailedBranch,
+        error: crate::presentation::native_frame::NativeCleanupPreparationError,
     },
 }
 
@@ -17984,6 +18705,16 @@ fn begin_failed_authority_settlement(
         };
     };
     let cause = precommit_authority_cause(world, host);
+    #[cfg(feature = "bsn")]
+    if let Some(active) = entry.active.as_mut()
+        && let Err(error) = active.prepare_native_cleanup(world)
+    {
+        return if error.is_retryable() {
+            FailedAuthoritySettlementBeginOutcome::Retryable(failed)
+        } else {
+            FailedAuthoritySettlementBeginOutcome::NativeCleanupContradiction { failed, error }
+        };
+    }
     let frozen = {
         let registry = world.resource::<RouteEntityRegistry>();
         match manifest.finalize_failed_authority_settlement(
@@ -18991,7 +19722,7 @@ fn prepare_target_preparation_permanent_current_isolation(
         .filter(|claim| claim.lifecycle() == EntityLifecycle::Leaving)
         .cloned()
         .ok_or_else(target_preparation_permanent_physical_error)?;
-    let current_interactive = splice.current_interactive_entities();
+    let current_interactive = splice.current_live_interactive_entities(world);
     let mut isolation = match prepare_target_preparation_permanent_isolation(
         world,
         validation
@@ -21921,563 +22652,589 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
                 if drive_back_no_target_zero_completion(entry) {
                     continue;
                 }
-                if let Some(inert) = entry.failure_cleanup_completion.take() {
-                    if let Err(inert) =
-                        fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
-                    {
-                        entry.failure_cleanup_completion = Some(inert);
-                    }
-                    continue;
-                }
-                if entry.pending_back_target_execution.is_some() {
-                    continue;
-                }
-                if entry.failure_cleanup_permanent.is_some() {
-                    continue;
-                }
-                if entry.cleanup_settlement_permanent_inert.is_some() {
-                    continue;
-                }
-                if let Some(mut failed) = entry.pending_failed_branch.take() {
-                    if entry.cleanup_ledger.is_some() {
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
-                    }
-                    let terminal_is_current = match &failed.terminal {
-                        PendingFailedBranchTerminal::Task { task, .. }
-                        | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => {
-                            entry.engine.inspect_report_identity(task).is_ok()
-                        }
-                        PendingFailedBranchTerminal::RegistrationBegin(error) => {
-                            error.validate_rejection(&entry.engine).is_ok()
-                        }
-                        PendingFailedBranchTerminal::Request(_)
-                        | PendingFailedBranchTerminal::BackTargetPendingRejected { .. } => true,
-                    };
-                    if !terminal_is_current {
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
-                    }
-                    let retained_prepared_prefix = failed.retained_prepared_prefix().to_vec();
-                    if !failed
-                        .branch
-                        .retain_prepared_prefix(&retained_prepared_prefix)
-                    {
-                        if let Err(failed) = fail_closed_failed_manifest_protocol(
-                            world,
-                            entry,
-                            failed,
-                            FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
-                        ) {
-                            entry.pending_failed_branch = Some(failed);
-                        }
-                        continue;
-                    }
-                    let manifest = {
-                        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
-                            entry.pending_failed_branch = Some(failed);
-                            continue;
-                        };
-                        FrozenCleanupManifest::from_failed_prepared_branch(
-                            world,
-                            registry,
-                            &failed.branch,
-                        )
-                    };
-                    let manifest = match manifest {
-                        Ok(manifest) => manifest,
-                        Err(FailedManifestBuildError::InvalidTopology(kind)) => {
-                            if let Err(failed) =
-                                fail_closed_failed_manifest_protocol(world, entry, failed, kind)
-                            {
-                                entry.pending_failed_branch = Some(failed);
-                            }
-                            continue;
-                        }
-                        Err(FailedManifestBuildError::MountParentFreeze(_typed_error)) => {
-                            if let Err(failed) = fail_closed_failed_manifest_protocol(
-                                world,
-                                entry,
-                                failed,
-                                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
-                            ) {
-                                entry.pending_failed_branch = Some(failed);
-                            }
-                            continue;
-                        }
-                        Err(FailedManifestBuildError::RetryableCapacity) => {
-                            entry.pending_failed_branch = Some(failed);
-                            continue;
-                        }
-                    };
-                    let (failed, manifest) = match classify_failed_manifest(
-                        manifest,
-                        failed,
-                        entry.active.as_ref(),
-                        entry.host.as_ref(),
-                    ) {
-                        FailedManifestDisposition::Ready { failed, manifest } => {
-                            (failed, manifest)
-                        }
-                        FailedManifestDisposition::CurrentAuthorityLoss {
-                            failed,
-                            manifest,
-                            bindings,
-                        } => {
-                            match begin_failed_authority_settlement(
-                                world, entry, failed, manifest, bindings,
-                            ) {
-                                FailedAuthoritySettlementBeginOutcome::Begun => {}
-                                FailedAuthoritySettlementBeginOutcome::Retryable(failed) => {
-                                    entry.pending_failed_branch = Some(failed);
-                                }
-                                FailedAuthoritySettlementBeginOutcome::TriggerContradiction {
-                                    failed,
-                                    kind,
-                                } => {
-                                    if let Err(failed) = fail_closed_failed_owner_protocol(
-                                        world,
-                                        entry,
-                                        failed,
-                                        AuthorityProtocolResidualKind::AuthorityTrigger(kind),
-                                    ) {
-                                        entry.pending_failed_branch = Some(failed);
-                                    }
-                                }
-                                FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
-                                    failed,
-                                    kind,
-                                } => {
-                                    if let Err(failed) = fail_closed_failed_authority_protocol(
-                                        world, entry, failed, kind,
-                                    ) {
-                                        entry.pending_failed_branch = Some(failed);
-                                    }
-                                }
-                                FailedAuthoritySettlementBeginOutcome::IsolationContradiction {
-                                    failed,
-                                    contradiction,
-                                    isolation,
-                                } => {
-                                    if let Err(failed) =
-                                        fail_closed_failed_owner_protocol_prepared(
-                                            world,
-                                            entry,
-                                            failed,
-                                            AuthorityProtocolResidualKind::AuthorityIsolation(
-                                                contradiction.clone(),
-                                            ),
-                                            isolation,
-                                            Some(contradiction),
-                                        )
-                                    {
-                                        entry.pending_failed_branch = Some(failed);
-                                    }
-                                }
-                                FailedAuthoritySettlementBeginOutcome::LedgerContradiction {
-                                    failed,
-                                    kind,
-                                } => {
-                                    if let Err(failed) = fail_closed_failed_owner_protocol(
-                                        world,
-                                        entry,
-                                        failed,
-                                        AuthorityProtocolResidualKind::CleanupLedger(kind),
-                                    ) {
-                                        entry.pending_failed_branch = Some(failed);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        FailedManifestDisposition::AmbiguousInvalidTopology {
-                            failed,
-                            manifest,
-                        } => {
-                            let _bounded_contradiction_evidence = manifest;
-                            if let Err(failed) = fail_closed_failed_manifest_protocol(
-                                world,
-                                entry,
-                                failed,
-                                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
-                            ) {
-                                entry.pending_failed_branch = Some(failed);
-                            }
-                            continue;
-                        }
-                    };
-                    let preflight_before_isolation = manifest.preflight(world);
-                    if !preflight_before_isolation {
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
-                    }
-                    let isolated = isolate_failed_prepared_branch(
-                        world,
-                        &failed.branch,
-                        &manifest,
-                        entry.active.as_ref(),
-                    );
-                    if !isolated {
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
-                    }
-                    let preflight_after_isolation = manifest.preflight(world);
-                    if !preflight_after_isolation {
-                        entry.pending_failed_branch = Some(failed);
-                        continue;
-                    }
-                    let partition = {
-                        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
-                            entry.pending_failed_branch = Some(failed);
-                            continue;
-                        };
-                        let Some(host) = entry.host.as_ref() else {
-                            if let Err(failed) = fail_closed_failed_manifest_protocol(
-                                world,
-                                entry,
-                                failed,
-                                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
-                            ) {
-                                entry.pending_failed_branch = Some(failed);
-                            }
-                            continue;
-                        };
-                        manifest.freeze_failure_cleanup_partition_retaining(
-                            world,
-                            registry,
-                            entry.active.as_ref(),
-                            failed
-                                .branch
-                                .retained_prepared_prefix()
-                                .map(PreparedBranch::as_realized),
-                            host,
-                        )
-                    };
-                    let Some(partition) = partition else {
-                        if let Err(failed) = fail_closed_failed_manifest_protocol(
-                            world,
-                            entry,
-                            failed,
-                            FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
-                        ) {
-                            entry.pending_failed_branch = Some(failed);
-                        }
-                        continue;
-                    };
-                    let manifest_digest = manifest.digest();
-                    let obligation_count = manifest.len();
-                    let reserved = match CleanupLedger::reserve(manifest) {
-                        Ok(reserved) => reserved.bind_failure_cleanup_partition(partition),
-                        Err(error) => match error.kind() {
-                            CleanupLedgerReserveErrorKind::RetryableCapacity => {
-                                entry.pending_failed_branch = Some(failed);
-                                continue;
-                            }
-                            kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
-                            | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
-                                let _returned_manifest = error.into_manifest();
-                                if let Err(failed) = fail_closed_failed_owner_protocol(
-                                    world,
-                                    entry,
-                                    failed,
-                                    AuthorityProtocolResidualKind::CleanupLedger(kind),
-                                ) {
-                                    entry.pending_failed_branch = Some(failed);
-                                }
-                                continue;
-                            }
-                        },
-                    };
-                    let PendingFailedBranch { terminal, branch } = failed;
-                    let (request, preflight_evidence) = match terminal {
-                        PendingFailedBranchTerminal::Task {
-                            task,
-                            failure,
-                            message,
-                        } => {
-                            match entry.engine.report_failed(task, failure, message) {
-                                Ok(Some(request)) => (request, None),
-                                Ok(None) if obligation_count == 0 => continue,
-                                Ok(None) | Err(_) => {
-                                    unreachable!(
-                                        "an exact failed branch with physical obligations must issue cleanup"
-                                    )
-                                }
-                            }
-                        }
-                        PendingFailedBranchTerminal::TaskWithPhysicalResidual {
-                            task,
-                            failure,
-                            message,
-                        } => (
-                            entry
-                                .engine
-                                .report_failed_with_physical_residual(task, failure, message)
-                                .expect(
-                                    "an exact isolated physical residual retains its report task",
-                                ),
-                            None,
-                        ),
-                        PendingFailedBranchTerminal::Request(request) => (request, None),
-                        PendingFailedBranchTerminal::BackTargetPendingRejected {
-                            request,
-                            evidence,
-                        } => (request, Some(evidence)),
-                        PendingFailedBranchTerminal::RegistrationBegin(error) => {
-                            match error.reject(&mut entry.engine) {
-                                Ok(request) => (request, None),
-                                Err(error) => {
-                                    entry.pending_failed_branch = Some(PendingFailedBranch {
-                                        terminal: PendingFailedBranchTerminal::RegistrationBegin(
-                                            error,
-                                        ),
-                                        branch,
-                                    });
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-                    let observed_manifest_digest =
-                        freeze_failure_cleanup_observed_physical_manifest_digest(
-                            world,
-                            request.request(),
-                            manifest_digest,
-                        );
-                    let observed = CleanupManifest::new(
-                        request.logical_roots().to_vec(),
-                        observed_manifest_digest,
-                        obligation_count,
-                    );
-                    let physical = FailureCleanupPhysicalPayload {
-                        branch,
-                        reserved,
-                        preflight: preflight_evidence,
-                        #[cfg(test)]
-                        witness: issue_failure_cleanup_physical_witness(world, request.request()),
-                    };
-                    let physical = entry
-                        .engine
-                        .bind_failure_cleanup_physical(&request, observed, physical);
-                    let mut logical_roots = request.logical_roots().to_vec();
-                    inject_failure_cleanup_permanent_logical_root_contradiction(
-                        world,
-                        request.request(),
-                        &mut logical_roots,
-                        manifest_digest,
-                    );
-                    match entry.engine.prepare_failure_cleanup_with_physical(
-                        request,
-                        CleanupManifest::new(
-                            logical_roots,
-                            manifest_digest,
-                            obligation_count,
-                        ),
-                        physical,
-                    ) {
-                        FailureCleanupPhysicalPrepareOutcome::Prepared(prepared) => {
-                            let (batch, physical) = prepared.into_parts();
-                            entry.cleanup_ledger = Some(physical.into_ledger(batch));
-                        }
-                        FailureCleanupPhysicalPrepareOutcome::Mismatch(mismatch) => {
-                            entry.failure_cleanup_permanent = Some(
-                                FailureCleanupPermanentStableInertOwner::PrepareMismatch(mismatch),
-                            );
-                            continue;
-                        }
-                        FailureCleanupPhysicalPrepareOutcome::Permanent(permanent) => {
-                            record_failure_cleanup_permanent_prepare(
-                                world,
-                                permanent.request(),
-                            );
-                            install_failure_cleanup_permanent(world, entry, permanent);
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(test)]
-                inject_failure_cleanup_prewrite_drift(world, entry);
-                let Some(mut ledger) = entry.cleanup_ledger.take() else {
-                    continue;
-                };
-                if ledger.cleanup_settlement_permanent_evidence().is_some() {
-                    if let Err(ledger) =
-                        fail_closed_cleanup_settlement_permanent(world, entry, ledger)
-                    {
-                        entry.cleanup_ledger = Some(ledger);
-                    }
-                    continue;
-                }
-                if !entry.observe_cleanup_receipts(&mut ledger) {
-                    entry.cleanup_ledger = Some(ledger);
-                    continue;
-                }
-                if !ledger.is_settled() {
-                    let Some(attempt) = ledger.attempt(world) else {
-                        entry.cleanup_ledger = Some(ledger);
-                        continue;
-                    };
-                    let settled = if ledger.is_failed_prepared() {
-                        let source = FailureCleanupSourceProjection::observe_with_prepared(
-                            entry.host.as_ref(),
-                            entry.active.as_ref(),
-                            ledger
-                                .failed_prepared_branch()
-                                .and_then(FailedPreparedBranch::retained_prepared_prefix)
-                                .map(PreparedBranch::as_realized),
-                        );
-                        ledger.settle_failure_cleanup(world, attempt, &source)
-                    } else {
-                        ledger.settle(world, attempt)
-                    };
-                    if !entry.observe_cleanup_receipts(&mut ledger) {
-                        entry.cleanup_ledger = Some(ledger);
-                        continue;
-                    }
-                    if !settled {
-                        if ledger.cleanup_settlement_permanent_evidence().is_some() {
-                            if let Err(ledger) =
-                                fail_closed_cleanup_settlement_permanent(world, entry, ledger)
-                            {
-                                entry.cleanup_ledger = Some(ledger);
-                            }
-                        } else {
-                            entry.cleanup_ledger = Some(ledger);
-                        }
-                        continue;
-                    }
-                }
-                let completion = ledger
-                    .pending_completion()
-                    .expect("successful settlement has a completion");
-                if ledger.is_authority_settlement() {
-                    match entry.engine.complete_authority_cleanup(completion, || {
-                        drop(
-                            ledger
-                                .take_authority_settlement_owner()
-                                .expect("authority publication retains its composed owner"),
-                        );
-                    }) {
-                        Ok(()) => {}
-                        Err(_) => entry.cleanup_ledger = Some(ledger),
-                    }
-                    continue;
-                }
-                if ledger.is_failed_prepared() {
-                    if entry.pending_commit.is_some() {
-                        entry.cleanup_ledger = Some(ledger);
-                        continue;
-                    }
-                    #[cfg(test)]
-                    if entry.failure_cleanup_completion_preparation_drift_armed {
-                        entry.failure_cleanup_completion_preparation_drift_armed = false;
-                        entry
-                            .engine
-                            .drift_failure_cleanup_completion_receiver_for_test();
-                    }
-                    let owner = match entry
-                        .engine
-                        .prepare_failure_cleanup_completion(completion)
-                    {
-                        Ok(owner) => owner,
-                        Err(error) => {
-                            let inert = FailureCleanupCompletionInertOwner {
-                                owner: None,
-                                ledger,
-                                mismatch: FailureCleanupCompletionMismatchView::Preparation(
-                                    error.into_mismatch(),
-                                ),
-                            };
-                            if let Err(inert) =
-                                fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
-                            {
-                                entry.failure_cleanup_completion = Some(inert);
-                            }
-                            continue;
-                        }
-                    };
-                    #[cfg(test)]
-                    if entry.failure_cleanup_completion_receiver_drift_armed {
-                        entry.failure_cleanup_completion_receiver_drift_armed = false;
-                        entry
-                            .engine
-                            .drift_failure_cleanup_completion_receiver_for_test();
-                    }
-                    let mut retained_prepared_prefix = None;
-                    match entry
-                        .engine
-                        .complete_prepared_failure_cleanup_with_ledger(
-                            owner,
-                            ledger,
-                            |mut ledger| {
-                                retained_prepared_prefix = ledger
-                                    .take_failed_prepared_owner()
-                                    .expect("failure continuation retains its physical owner")
-                                    .into_retained_prepared_prefix();
-                            },
-                        )
-                    {
-                        Ok(FailureCleanupCompletionDisposition::RetainedPreparedPrefixBound) => {
-                            let branch = retained_prepared_prefix.expect(
-                                "a bound retained-prefix continuation keeps its physical owner",
-                            );
-                            entry.pending_commit = Some(PendingCommit {
-                                ticket: None,
-                                final_task: None,
-                                branch,
-                            });
-                            bind_post_cleanup_back_resolution(entry);
-                        }
-                        Ok(FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup) => {
-                            let branch = retained_prepared_prefix.expect(
-                                "a retained-prefix cleanup continuation keeps its physical owner",
-                            );
-                            let Some(EngineAction::FailureCleanup(request)) = entry.engine.action()
-                            else {
-                                unreachable!(
-                                    "a typed retained-prefix cleanup disposition owns its cleanup request"
-                                )
-                            };
-                            entry.pending_failed_branch = Some(PendingFailedBranch {
-                                terminal: PendingFailedBranchTerminal::Request(request),
-                                branch: FailedPreparedBranch::new(branch),
-                            });
-                            bind_post_cleanup_back_resolution(entry);
-                        }
-                        Ok(FailureCleanupCompletionDisposition::Settled) => {
-                            assert!(
-                                retained_prepared_prefix.is_none(),
-                                "a settled continuation cannot return a retained physical prefix",
-                            );
-                            bind_post_cleanup_back_resolution(entry);
-                        }
-                        Err(error) => {
-                            let (owner, ledger, mismatch) = error.into_parts();
-                            let inert = FailureCleanupCompletionInertOwner {
-                                owner: Some(owner),
-                                ledger,
-                                mismatch: FailureCleanupCompletionMismatchView::Completion(
-                                    mismatch,
-                                ),
-                            };
-                            if let Err(inert) =
-                                fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
-                            {
-                                entry.failure_cleanup_completion = Some(inert);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                match entry.engine.complete_cleanup(completion) {
-                    Ok(()) | Err(IntegrationError::Duplicate) => {
-                        bind_post_cleanup_back_resolution(entry);
-                    }
-                    Err(_) => entry.cleanup_ledger = Some(ledger),
-                }
+                settle_branch_cleanup(world, entry);
             }
         },
     );
+}
+
+// Keep the ordinary failure/ledger stack separate from the specialized drivers.
+// Each entry still executes one branch in the same original ordering.
+fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
+    if let Some(inert) = entry.failure_cleanup_completion.take() {
+        if let Err(inert) = fail_closed_failure_cleanup_completion_protocol(world, entry, inert) {
+            entry.failure_cleanup_completion = Some(inert);
+        }
+        return;
+    }
+    if entry.pending_back_target_execution.is_some() {
+        return;
+    }
+    if entry.failure_cleanup_permanent.is_some() {
+        return;
+    }
+    if entry.cleanup_settlement_permanent_inert.is_some() {
+        return;
+    }
+    if let Some(mut failed) = entry.pending_failed_branch.take() {
+        if entry.cleanup_ledger.is_some() {
+            entry.pending_failed_branch = Some(failed);
+            return;
+        }
+        let terminal_is_current = match &failed.terminal {
+            PendingFailedBranchTerminal::Task { task, .. }
+            | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => {
+                entry.engine.inspect_report_identity(task).is_ok()
+            }
+            PendingFailedBranchTerminal::RegistrationBegin(error) => {
+                error.validate_rejection(&entry.engine).is_ok()
+            }
+            PendingFailedBranchTerminal::Request(_)
+            | PendingFailedBranchTerminal::BackTargetPendingRejected { .. } => true,
+        };
+        if !terminal_is_current {
+            entry.pending_failed_branch = Some(failed);
+            return;
+        }
+        let retained_prepared_prefix = failed.retained_prepared_prefix().to_vec();
+        if !failed
+            .branch
+            .retain_prepared_prefix(&retained_prepared_prefix)
+        {
+            if let Err(failed) = fail_closed_failed_manifest_protocol(
+                world,
+                entry,
+                failed,
+                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+            ) {
+                entry.pending_failed_branch = Some(failed);
+            }
+            return;
+        }
+        let manifest = {
+            #[cfg(feature = "bsn")]
+            if let Err(error) = failed.branch.prepare_native_cleanup(world) {
+                if error.is_retryable() {
+                    entry.pending_failed_branch = Some(failed);
+                } else if let Err(failed) = fail_closed_failed_owner_protocol(
+                    world,
+                    entry,
+                    failed,
+                    AuthorityProtocolResidualKind::NativeCleanup(error),
+                ) {
+                    entry.pending_failed_branch = Some(failed);
+                }
+                return;
+            }
+            let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+                entry.pending_failed_branch = Some(failed);
+                return;
+            };
+            FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &failed.branch)
+        };
+        let manifest = match manifest {
+            Ok(manifest) => manifest,
+            Err(FailedManifestBuildError::InvalidTopology(kind)) => {
+                if let Err(failed) =
+                    fail_closed_failed_manifest_protocol(world, entry, failed, kind)
+                {
+                    entry.pending_failed_branch = Some(failed);
+                }
+                return;
+            }
+            Err(FailedManifestBuildError::MountParentFreeze(_typed_error)) => {
+                if let Err(failed) = fail_closed_failed_manifest_protocol(
+                    world,
+                    entry,
+                    failed,
+                    FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                ) {
+                    entry.pending_failed_branch = Some(failed);
+                }
+                return;
+            }
+            Err(FailedManifestBuildError::RetryableCapacity) => {
+                entry.pending_failed_branch = Some(failed);
+                return;
+            }
+        };
+        let (failed, manifest) = match classify_failed_manifest(
+            world,
+            manifest,
+            failed,
+            entry.active.as_ref(),
+            entry.host.as_ref(),
+        ) {
+            FailedManifestDisposition::Ready { failed, manifest } => (failed, manifest),
+            FailedManifestDisposition::CurrentAuthorityLoss {
+                failed,
+                manifest,
+                bindings,
+            } => {
+                match begin_failed_authority_settlement(world, entry, failed, manifest, bindings) {
+                    #[cfg(feature = "bsn")]
+                    FailedAuthoritySettlementBeginOutcome::NativeCleanupContradiction {
+                        failed,
+                        error,
+                    } => {
+                        if let Err(failed) = fail_closed_failed_owner_protocol(
+                            world,
+                            entry,
+                            failed,
+                            AuthorityProtocolResidualKind::NativeCleanup(error),
+                        ) {
+                            entry.pending_failed_branch = Some(failed);
+                        }
+                    }
+                    FailedAuthoritySettlementBeginOutcome::Begun => {}
+                    FailedAuthoritySettlementBeginOutcome::Retryable(failed) => {
+                        entry.pending_failed_branch = Some(failed);
+                    }
+                    FailedAuthoritySettlementBeginOutcome::TriggerContradiction {
+                        failed,
+                        kind,
+                    } => {
+                        if let Err(failed) = fail_closed_failed_owner_protocol(
+                            world,
+                            entry,
+                            failed,
+                            AuthorityProtocolResidualKind::AuthorityTrigger(kind),
+                        ) {
+                            entry.pending_failed_branch = Some(failed);
+                        }
+                    }
+                    FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                        failed,
+                        kind,
+                    } => {
+                        if let Err(failed) =
+                            fail_closed_failed_authority_protocol(world, entry, failed, kind)
+                        {
+                            entry.pending_failed_branch = Some(failed);
+                        }
+                    }
+                    FailedAuthoritySettlementBeginOutcome::IsolationContradiction {
+                        failed,
+                        contradiction,
+                        isolation,
+                    } => {
+                        if let Err(failed) = fail_closed_failed_owner_protocol_prepared(
+                            world,
+                            entry,
+                            failed,
+                            AuthorityProtocolResidualKind::AuthorityIsolation(
+                                contradiction.clone(),
+                            ),
+                            isolation,
+                            Some(contradiction),
+                        ) {
+                            entry.pending_failed_branch = Some(failed);
+                        }
+                    }
+                    FailedAuthoritySettlementBeginOutcome::LedgerContradiction { failed, kind } => {
+                        if let Err(failed) = fail_closed_failed_owner_protocol(
+                            world,
+                            entry,
+                            failed,
+                            AuthorityProtocolResidualKind::CleanupLedger(kind),
+                        ) {
+                            entry.pending_failed_branch = Some(failed);
+                        }
+                    }
+                }
+                return;
+            }
+            FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest } => {
+                let _bounded_contradiction_evidence = manifest;
+                if let Err(failed) = fail_closed_failed_manifest_protocol(
+                    world,
+                    entry,
+                    failed,
+                    FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                ) {
+                    entry.pending_failed_branch = Some(failed);
+                }
+                return;
+            }
+        };
+        let preflight_before_isolation = manifest.preflight(world);
+        if !preflight_before_isolation {
+            entry.pending_failed_branch = Some(failed);
+            return;
+        }
+        let isolated =
+            isolate_failed_prepared_branch(world, &failed.branch, &manifest, entry.active.as_ref());
+        if !isolated {
+            entry.pending_failed_branch = Some(failed);
+            return;
+        }
+        let preflight_after_isolation = manifest.preflight(world);
+        if !preflight_after_isolation {
+            entry.pending_failed_branch = Some(failed);
+            return;
+        }
+        let partition = {
+            let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+                entry.pending_failed_branch = Some(failed);
+                return;
+            };
+            let Some(host) = entry.host.as_ref() else {
+                if let Err(failed) = fail_closed_failed_manifest_protocol(
+                    world,
+                    entry,
+                    failed,
+                    FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+                ) {
+                    entry.pending_failed_branch = Some(failed);
+                }
+                return;
+            };
+            manifest.freeze_failure_cleanup_partition_retaining(
+                world,
+                registry,
+                entry.active.as_ref(),
+                failed
+                    .branch
+                    .retained_prepared_prefix()
+                    .map(PreparedBranch::as_realized),
+                host,
+            )
+        };
+        let Some(partition) = partition else {
+            if let Err(failed) = fail_closed_failed_manifest_protocol(
+                world,
+                entry,
+                failed,
+                FailedPreparedTopologyError::AmbiguousBoundaryOwnership,
+            ) {
+                entry.pending_failed_branch = Some(failed);
+            }
+            return;
+        };
+        let manifest_digest = manifest.digest();
+        let obligation_count = manifest.len();
+        let reserved = match CleanupLedger::reserve(manifest) {
+            Ok(reserved) => reserved.bind_failure_cleanup_partition(partition),
+            Err(error) => match error.kind() {
+                CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                    entry.pending_failed_branch = Some(failed);
+                    return;
+                }
+                kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                    let _returned_manifest = error.into_manifest();
+                    if let Err(failed) = fail_closed_failed_owner_protocol(
+                        world,
+                        entry,
+                        failed,
+                        AuthorityProtocolResidualKind::CleanupLedger(kind),
+                    ) {
+                        entry.pending_failed_branch = Some(failed);
+                    }
+                    return;
+                }
+            },
+        };
+        #[cfg(feature = "bsn")]
+        if let Err(error) = prepare_native_failure_transfer(
+            world,
+            &mut entry.native_residuals,
+            failed.branch.native_failure(),
+        ) {
+            match error {
+                NativeFailureTransferError::Capacity => entry.pending_failed_branch = Some(failed),
+                NativeFailureTransferError::Isolation(reason) => {
+                    if let Err(failed) = fail_closed_failed_owner_protocol(
+                        world,
+                        entry,
+                        failed,
+                        AuthorityProtocolResidualKind::NativeCreation(reason),
+                    ) {
+                        entry.pending_failed_branch = Some(failed);
+                    }
+                }
+            }
+            return;
+        }
+        let PendingFailedBranch {
+            terminal,
+            mut branch,
+        } = failed;
+        let (request, preflight_evidence) = match terminal {
+            PendingFailedBranchTerminal::Task {
+                task,
+                failure,
+                message,
+            } => match entry.engine.report_failed(task, failure, message) {
+                Ok(Some(request)) => (request, None),
+                Ok(None) if obligation_count == 0 => {
+                    #[cfg(feature = "bsn")]
+                    complete_native_failure_transfer(
+                        &mut entry.native_residuals,
+                        branch.take_native_failure(),
+                    );
+                    return;
+                }
+                Ok(None) | Err(_) => {
+                    unreachable!(
+                        "an exact failed branch with physical obligations must issue cleanup"
+                    )
+                }
+            },
+            PendingFailedBranchTerminal::TaskWithPhysicalResidual {
+                task,
+                failure,
+                message,
+            } => (
+                entry
+                    .engine
+                    .report_failed_with_physical_residual(task, failure, message)
+                    .expect("an exact isolated physical residual retains its report task"),
+                None,
+            ),
+            PendingFailedBranchTerminal::Request(request) => (request, None),
+            PendingFailedBranchTerminal::BackTargetPendingRejected { request, evidence } => {
+                (request, Some(evidence))
+            }
+            PendingFailedBranchTerminal::RegistrationBegin(error) => {
+                match error.reject(&mut entry.engine) {
+                    Ok(request) => (request, None),
+                    Err(error) => {
+                        entry.pending_failed_branch = Some(PendingFailedBranch {
+                            terminal: PendingFailedBranchTerminal::RegistrationBegin(error),
+                            branch,
+                        });
+                        return;
+                    }
+                }
+            }
+        };
+        let observed_manifest_digest = freeze_failure_cleanup_observed_physical_manifest_digest(
+            world,
+            request.request(),
+            manifest_digest,
+        );
+        let observed = CleanupManifest::new(
+            request.logical_roots().to_vec(),
+            observed_manifest_digest,
+            obligation_count,
+        );
+        let physical = FailureCleanupPhysicalPayload {
+            branch,
+            reserved,
+            preflight: preflight_evidence,
+            #[cfg(test)]
+            witness: issue_failure_cleanup_physical_witness(world, request.request()),
+        };
+        let physical = entry
+            .engine
+            .bind_failure_cleanup_physical(&request, observed, physical);
+        let mut logical_roots = request.logical_roots().to_vec();
+        inject_failure_cleanup_permanent_logical_root_contradiction(
+            world,
+            request.request(),
+            &mut logical_roots,
+            manifest_digest,
+        );
+        match entry.engine.prepare_failure_cleanup_with_physical(
+            request,
+            CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
+            physical,
+        ) {
+            FailureCleanupPhysicalPrepareOutcome::Prepared(prepared) => {
+                let (batch, physical) = prepared.into_parts();
+                entry.cleanup_ledger = Some(physical.into_ledger(batch));
+            }
+            FailureCleanupPhysicalPrepareOutcome::Mismatch(mismatch) => {
+                entry.failure_cleanup_permanent = Some(
+                    FailureCleanupPermanentStableInertOwner::PrepareMismatch(mismatch),
+                );
+                return;
+            }
+            FailureCleanupPhysicalPrepareOutcome::Permanent(permanent) => {
+                record_failure_cleanup_permanent_prepare(world, permanent.request());
+                install_failure_cleanup_permanent(world, entry, permanent);
+                return;
+            }
+        }
+    }
+    #[cfg(test)]
+    inject_failure_cleanup_prewrite_drift(world, entry);
+    let Some(mut ledger) = entry.cleanup_ledger.take() else {
+        return;
+    };
+    if ledger.cleanup_settlement_permanent_evidence().is_some() {
+        if let Err(ledger) = fail_closed_cleanup_settlement_permanent(world, entry, ledger) {
+            entry.cleanup_ledger = Some(ledger);
+        }
+        return;
+    }
+    if !entry.observe_cleanup_receipts(&mut ledger) {
+        entry.cleanup_ledger = Some(ledger);
+        return;
+    }
+    if !ledger.is_settled() {
+        let Some(attempt) = ledger.attempt(world) else {
+            entry.cleanup_ledger = Some(ledger);
+            return;
+        };
+        let settled = if ledger.is_failed_prepared() {
+            let source = FailureCleanupSourceProjection::observe_with_prepared(
+                entry.host.as_ref(),
+                entry.active.as_ref(),
+                ledger
+                    .failed_prepared_branch()
+                    .and_then(FailedPreparedBranch::retained_prepared_prefix)
+                    .map(PreparedBranch::as_realized),
+            );
+            ledger.settle_failure_cleanup(world, attempt, &source)
+        } else {
+            ledger.settle(world, attempt)
+        };
+        if !entry.observe_cleanup_receipts(&mut ledger) {
+            entry.cleanup_ledger = Some(ledger);
+            return;
+        }
+        if !settled {
+            if ledger.cleanup_settlement_permanent_evidence().is_some() {
+                if let Err(ledger) = fail_closed_cleanup_settlement_permanent(world, entry, ledger)
+                {
+                    entry.cleanup_ledger = Some(ledger);
+                }
+            } else {
+                entry.cleanup_ledger = Some(ledger);
+            }
+            return;
+        }
+    }
+    let completion = ledger
+        .pending_completion()
+        .expect("successful settlement has a completion");
+    #[cfg(feature = "bsn")]
+    let Some(mut ledger) = prepare_native_completed_ledger_transfer(world, entry, ledger) else {
+        return;
+    };
+    if ledger.is_authority_settlement() {
+        #[cfg(feature = "bsn")]
+        let native_residuals = &mut entry.native_residuals;
+        match entry.engine.complete_authority_cleanup(completion, || {
+            let mut owner = ledger
+                .take_authority_settlement_owner()
+                .expect("authority publication retains its composed owner");
+            #[cfg(feature = "bsn")]
+            complete_native_failure_transfer(native_residuals, owner.take_native_failure());
+        }) {
+            Ok(()) => {}
+            Err(_) => entry.cleanup_ledger = Some(ledger),
+        }
+        return;
+    }
+    if ledger.is_failed_prepared() {
+        if entry.pending_commit.is_some() {
+            entry.cleanup_ledger = Some(ledger);
+            return;
+        }
+        #[cfg(test)]
+        if entry.failure_cleanup_completion_preparation_drift_armed {
+            entry.failure_cleanup_completion_preparation_drift_armed = false;
+            entry
+                .engine
+                .drift_failure_cleanup_completion_receiver_for_test();
+        }
+        let owner = match entry.engine.prepare_failure_cleanup_completion(completion) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let inert = FailureCleanupCompletionInertOwner {
+                    owner: None,
+                    ledger,
+                    mismatch: FailureCleanupCompletionMismatchView::Preparation(
+                        error.into_mismatch(),
+                    ),
+                };
+                if let Err(inert) =
+                    fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
+                {
+                    entry.failure_cleanup_completion = Some(inert);
+                }
+                return;
+            }
+        };
+        #[cfg(test)]
+        if entry.failure_cleanup_completion_receiver_drift_armed {
+            entry.failure_cleanup_completion_receiver_drift_armed = false;
+            entry
+                .engine
+                .drift_failure_cleanup_completion_receiver_for_test();
+        }
+        let mut retained_prepared_prefix = None;
+        #[cfg(feature = "bsn")]
+        let native_residuals = &mut entry.native_residuals;
+        match entry.engine.complete_prepared_failure_cleanup_with_ledger(
+            owner,
+            ledger,
+            |mut ledger| {
+                let completed = ledger
+                    .take_failed_prepared_owner()
+                    .expect("failure continuation retains its physical owner")
+                    .into_completed();
+                retained_prepared_prefix = completed.retained_prepared_prefix;
+                #[cfg(feature = "bsn")]
+                complete_native_failure_transfer(native_residuals, completed.native_failure);
+            },
+        ) {
+            Ok(FailureCleanupCompletionDisposition::RetainedPreparedPrefixBound) => {
+                let branch = retained_prepared_prefix
+                    .expect("a bound retained-prefix continuation keeps its physical owner");
+                entry.pending_commit = Some(PendingCommit {
+                    ticket: None,
+                    final_task: None,
+                    branch,
+                });
+                bind_post_cleanup_back_resolution(entry);
+            }
+            Ok(FailureCleanupCompletionDisposition::RetainedPreparedPrefixCleanup) => {
+                let branch = retained_prepared_prefix
+                    .expect("a retained-prefix cleanup continuation keeps its physical owner");
+                let Some(EngineAction::FailureCleanup(request)) = entry.engine.action() else {
+                    unreachable!(
+                        "a typed retained-prefix cleanup disposition owns its cleanup request"
+                    )
+                };
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal: PendingFailedBranchTerminal::Request(request),
+                    branch: FailedPreparedBranch::new(branch),
+                });
+                bind_post_cleanup_back_resolution(entry);
+            }
+            Ok(FailureCleanupCompletionDisposition::Settled) => {
+                assert!(
+                    retained_prepared_prefix.is_none(),
+                    "a settled continuation cannot return a retained physical prefix",
+                );
+                bind_post_cleanup_back_resolution(entry);
+            }
+            Err(error) => {
+                let (owner, ledger, mismatch) = error.into_parts();
+                let inert = FailureCleanupCompletionInertOwner {
+                    owner: Some(owner),
+                    ledger,
+                    mismatch: FailureCleanupCompletionMismatchView::Completion(mismatch),
+                };
+                if let Err(inert) =
+                    fail_closed_failure_cleanup_completion_protocol(world, entry, inert)
+                {
+                    entry.failure_cleanup_completion = Some(inert);
+                }
+            }
+        }
+        return;
+    }
+    match entry.engine.complete_cleanup(completion) {
+        Ok(()) | Err(IntegrationError::Duplicate) => {
+            bind_post_cleanup_back_resolution(entry);
+        }
+        Err(_) => entry.cleanup_ledger = Some(ledger),
+    }
 }
 
 pub(crate) fn publish_snapshots_system(world: &mut World) {

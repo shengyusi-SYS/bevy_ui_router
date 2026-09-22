@@ -39,6 +39,7 @@ impl Consumer {
             .as_nanos();
         let directory = base.join(format!("{}-{stamp}-{name}", std::process::id()));
         let path = Value::String(facade.to_str().expect("UTF-8 workspace path").to_owned());
+        let bsn = features.contains(&"bsn");
         let features = Value::Array(
             features
                 .iter()
@@ -50,6 +51,13 @@ impl Consumer {
         );
         if ecs {
             for dependency in ["bevy_app", "bevy_ecs", "bevy_ui"] {
+                manifest.push_str(&format!(
+                    "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
+                ));
+            }
+        }
+        if bsn {
+            for dependency in ["bevy_asset", "bevy_scene"] {
                 manifest.push_str(&format!(
                     "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
                 ));
@@ -227,14 +235,21 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             include_str!("consumers/ecs.rs"),
             false,
         ),
-        // Feature wiring only until phase C supplies the production BSN consumer.
         (
-            "bsn-wiring",
+            "bsn-native-lf",
             false,
             &["bsn"][..],
             true,
-            include_str!("consumers/ecs.rs"),
+            include_str!("consumers/bsn.rs"),
             false,
+        ),
+        (
+            "bsn-native-crlf",
+            false,
+            &["bsn"][..],
+            true,
+            include_str!("consumers/bsn.rs"),
+            true,
         ),
     ] {
         Consumer::new(name, defaults, features, ecs, source, crlf).run(!ecs);

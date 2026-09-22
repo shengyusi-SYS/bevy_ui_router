@@ -5,8 +5,6 @@
 //! application code can write it, and returns either an adopted containment
 //! snapshot or exact residual evidence.
 
-#![allow(dead_code)] // Wired into navigation by the next Phase C checkpoint.
-
 use std::{any::type_name, collections::HashSet};
 
 use bevy_asset::UntypedHandle;
@@ -23,7 +21,7 @@ use bevy_scene::{ApplySceneError, ResolvedScene, ResolvedSceneRoot};
 use bevy_ui::{Display, Node, Val};
 use bevy_ui_router_core::frame::RouteFrameVersion;
 
-use super::{FrameContentTarget, FrameLifecycle, FrameShell};
+use super::{FrameContentTarget, FrameLifecycle, FrameShell, RealizationError};
 use crate::{
     bsn::PreparedBsnScene,
     components::{RouteOwnershipSeal, RouterInputBarrier},
@@ -65,16 +63,54 @@ impl NativeSceneAdoption {
     pub(crate) fn into_dependencies(self) -> Vec<UntypedHandle> {
         self.dependencies
     }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        RouteFrameVersion,
+        ExactRegistryClaim,
+        ExactRegistryClaim,
+        Vec<UntypedHandle>,
+    ) {
+        (self.frame, self.shell, self.root, self.dependencies)
+    }
 }
+
+/// Distinguishes Scene-authored roots from the data driver's closed manifests.
+#[derive(bevy_ecs::component::Component)]
+pub(crate) struct NativeContentRoot;
+
+#[derive(bevy_ecs::component::Component)]
+pub(crate) struct NativeFrameShell;
 
 #[derive(Debug)]
 pub(crate) struct NativeSceneCreationFailure {
     error: NativeSceneCreationError,
     settlement: NativeSceneSettlement,
     dependencies: Vec<UntypedHandle>,
+    focus_error: Option<crate::native_focus::NativeFocusError>,
 }
 
 impl NativeSceneCreationFailure {
+    pub(crate) fn focus_entities(&self) -> Vec<Entity> {
+        self.settlement
+            .removed
+            .iter()
+            .map(|allocation| allocation.claim.entity())
+            .chain(
+                self.settlement
+                    .residual
+                    .iter()
+                    .flat_map(|residual| residual.claims().map(ExactRegistryClaim::entity)),
+            )
+            .collect()
+    }
+    pub(crate) fn focus_error(&self) -> Option<crate::native_focus::NativeFocusError> {
+        self.focus_error
+    }
+    pub(crate) fn set_focus_error(&mut self, error: crate::native_focus::NativeFocusError) {
+        self.focus_error = Some(error);
+    }
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -88,11 +124,29 @@ impl NativeSceneCreationFailure {
 
 #[derive(Debug)]
 pub(crate) enum NativeSceneCreationError {
+    Mount(RealizationError),
     Capacity,
     Registry(RegistryWriteError),
     PrivateIdentityDrift,
     Apply(ApplySceneError),
     Adoption(NativeSceneAdoptionError),
+}
+
+impl std::fmt::Display for NativeSceneCreationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mount(error) => write!(formatter, "BSN mount validation failed: {error:?}"),
+            Self::Apply(error) => write!(formatter, "BSN scene apply failed: {error}"),
+            Self::Capacity => formatter.write_str("BSN creation capacity unavailable"),
+            Self::Registry(error) => {
+                write!(formatter, "BSN allocation registration failed: {error:?}")
+            }
+            Self::PrivateIdentityDrift => {
+                formatter.write_str("BSN creation identity changed during application")
+            }
+            Self::Adoption(error) => write!(formatter, "BSN content adoption failed: {error:?}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +165,9 @@ pub(crate) struct NativeSceneSettlement {
 }
 
 impl NativeSceneSettlement {
+    pub(crate) fn into_residual(self) -> Option<NativeSceneResidual> {
+        self.residual
+    }
     pub(crate) fn removed(&self) -> &[SettledNativeSceneAllocation] {
         &self.removed
     }
@@ -140,6 +197,67 @@ pub(crate) struct NativeSceneResidual {
 }
 
 impl NativeSceneResidual {
+    pub(crate) fn claims(&self) -> impl Iterator<Item = &ExactRegistryClaim> {
+        self.allocations.iter().map(|allocation| &allocation.claim)
+    }
+
+    /// Re-observe the original allocations; a historical disposition is not a
+    /// proof that a later continuation may release their physical owner.
+    pub(crate) fn validate_inert(&self, world: &World) -> Result<(), NativeSceneIsolationFailure> {
+        let NativeSceneResidualIsolation::InertUnderShell { shell } = self.isolation else {
+            return Err(match self.isolation {
+                NativeSceneResidualIsolation::Unisolated(reason) => reason,
+                _ => unreachable!(),
+            });
+        };
+        if !shell_is_inert(world, shell) {
+            return Err(NativeSceneIsolationFailure::ShellNotInert);
+        }
+        for allocation in &self.allocations {
+            if !allocation.residual_identity_is_exact(world)
+                || current_parent(world, allocation.claim.entity()) != allocation.actual_parent
+            {
+                return Err(NativeSceneIsolationFailure::AllocationAuthorityDrift);
+            }
+            let mut current = allocation.claim.entity();
+            let mut seen = HashSet::new();
+            while current != shell {
+                if !seen.insert(current) {
+                    return Err(NativeSceneIsolationFailure::RelationshipCycle);
+                }
+                let Some(parent) = current_parent(world, current) else {
+                    return Err(NativeSceneIsolationFailure::RelationshipDrift);
+                };
+                if !current_children(world, parent).contains(&current)
+                    || (!self
+                        .allocations
+                        .iter()
+                        .any(|allocation| allocation.claim.entity() == parent)
+                        && !self.protected_entities.contains(&parent))
+                {
+                    return Err(NativeSceneIsolationFailure::RelationshipDrift);
+                }
+                current = parent;
+            }
+        }
+        if !self.allocations.iter().any(|allocation| {
+            allocation.claim.entity() == shell
+                && allocation.role == NativeSceneAllocationRole::Shell
+        }) {
+            return Err(NativeSceneIsolationFailure::AllocationAuthorityDrift);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claim_identity_is_exact(
+        &self,
+        world: &World,
+        claim: &ExactRegistryClaim,
+    ) -> bool {
+        self.allocations.iter().any(|allocation| {
+            &allocation.claim == claim && allocation.residual_identity_is_exact(world)
+        })
+    }
     pub(crate) const fn isolation(&self) -> NativeSceneResidualIsolation {
         self.isolation
     }
@@ -161,6 +279,7 @@ pub(crate) enum NativeSceneResidualIsolation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeSceneIsolationFailure {
+    Focus(crate::native_focus::NativeFocusError),
     Capacity,
     AllocationAuthorityDrift,
     ProtectedClosureDrift,
@@ -177,6 +296,20 @@ pub(crate) struct NativeSceneResidualAllocation {
     actual_parent: Option<Entity>,
     observed_manifest: Option<ComponentManifest>,
     temporary_markers_released: bool,
+}
+
+impl NativeSceneResidualAllocation {
+    fn residual_identity_is_exact(&self, world: &World) -> bool {
+        let Some(manifest) = self.observed_manifest.as_ref() else {
+            return false;
+        };
+        allocation_identity_fields_are_exact(
+            world,
+            self.role,
+            &self.claim,
+            self.temporary_markers_released,
+        ) && ComponentManifest::from_world(world, self.claim.entity()).as_ref() == Some(manifest)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,12 +614,13 @@ pub(crate) fn create_native_scene(
     })
 }
 
-fn failure_without_allocations(
+pub(super) fn failure_without_allocations(
     error: NativeSceneCreationError,
     dependencies: Vec<UntypedHandle>,
 ) -> NativeSceneCreationFailure {
     NativeSceneCreationFailure {
         error,
+        focus_error: None,
         settlement: NativeSceneSettlement {
             removed: Vec::new(),
             residual: None,
@@ -503,6 +637,7 @@ fn fail_and_settle(
 ) -> NativeSceneCreationFailure {
     NativeSceneCreationFailure {
         error,
+        focus_error: None,
         settlement: settle_failed_native_scene(world, allocations),
         dependencies,
     }
@@ -523,6 +658,7 @@ fn install_private_identity(
                 world.entity_mut(allocation.entity()).insert((
                     common,
                     FrameShell(frame.clone()),
+                    NativeFrameShell,
                     Node {
                         display: Display::None,
                         width: Val::Percent(100.0),
@@ -535,9 +671,11 @@ fn install_private_identity(
                 ));
             }
             NativeSceneAllocationRole::Declaration(0) => {
-                world
-                    .entity_mut(allocation.entity())
-                    .insert((common, FrameContentTarget(frame.clone())));
+                world.entity_mut(allocation.entity()).insert((
+                    common,
+                    FrameContentTarget(frame.clone()),
+                    NativeContentRoot,
+                ));
             }
             NativeSceneAllocationRole::Declaration(_) => {
                 world.entity_mut(allocation.entity()).insert(common);
@@ -550,38 +688,50 @@ fn allocation_has_exact_private_identity(
     world: &World,
     allocation: &NativeSceneAllocation,
 ) -> bool {
+    allocation_identity_fields_are_exact(
+        world,
+        allocation.role,
+        &allocation.claim,
+        allocation.temporary_markers_released,
+    )
+}
+
+fn allocation_identity_fields_are_exact(
+    world: &World,
+    role: NativeSceneAllocationRole,
+    claim: &ExactRegistryClaim,
+    temporary_markers_released: bool,
+) -> bool {
     let record_is_exact = world
         .resource::<RouteEntityRegistry>()
-        .record(allocation.entity())
-        .is_some_and(|record| record.claim() == allocation.claim);
-    let markers_match = if allocation.temporary_markers_released {
-        matches!(allocation.role, NativeSceneAllocationRole::Declaration(index) if index > 0)
-            && world
-                .get::<RouteOwnershipSeal>(allocation.entity())
-                .is_none()
-            && world.get::<FrameLifecycle>(allocation.entity()).is_none()
+        .record(claim.entity())
+        .is_some_and(|record| record.claim() == *claim);
+    let markers_match = if temporary_markers_released {
+        matches!(role, NativeSceneAllocationRole::Declaration(index) if index > 0)
+            && world.get::<RouteOwnershipSeal>(claim.entity()).is_none()
+            && world.get::<FrameLifecycle>(claim.entity()).is_none()
     } else {
-        world.get::<RouteOwnershipSeal>(allocation.entity())
-            == Some(&RouteOwnershipSeal::new(allocation.claim.seal()))
-            && world.get::<FrameLifecycle>(allocation.entity())
+        world.get::<RouteOwnershipSeal>(claim.entity())
+            == Some(&RouteOwnershipSeal::new(claim.seal()))
+            && world.get::<FrameLifecycle>(claim.entity())
                 == Some(&FrameLifecycle(EntityLifecycle::PreparedInert))
     };
     if !record_is_exact || !markers_match {
         return false;
     }
-    match allocation.role {
+    match role {
         NativeSceneAllocationRole::Shell => {
-            matches!(allocation.claim.owner(), RegistryOwner::Committed(EntityOwner::FrameShell(frame))
-                if world.get::<FrameShell>(allocation.entity()) == Some(&FrameShell(frame.clone())))
-                && shell_is_inert(world, allocation.entity())
+            matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameShell(frame))
+                if world.get::<FrameShell>(claim.entity()) == Some(&FrameShell(frame.clone())))
+                && shell_is_inert(world, claim.entity())
         }
         NativeSceneAllocationRole::Declaration(0) => {
-            matches!(allocation.claim.owner(), RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame))
-                if world.get::<FrameContentTarget>(allocation.entity())
+            matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame))
+                if world.get::<FrameContentTarget>(claim.entity())
                     == Some(&FrameContentTarget(frame.clone())))
         }
         NativeSceneAllocationRole::Declaration(index) => matches!(
-            allocation.claim.owner(),
+            claim.owner(),
             RegistryOwner::Committed(EntityOwner::FrameOutput { local_index, .. })
                 if *local_index == index
         ),
@@ -1410,21 +1560,21 @@ fn components_match_except_relationship(
     let Some(children) = world.components().component_id::<Children>() else {
         return false;
     };
-    let actual = entity_ref.archetype().components();
+    let actual =
+        ComponentManifest::observed_component_ids(world, entity_ref.archetype().components());
     let expected_count = expected
         .component_ids()
         .iter()
         .filter(|component| **component != child_of && **component != children)
         .count();
     actual
-        .iter()
-        .filter(|component| **component != child_of && **component != children)
+        .clone()
+        .filter(|component| *component != child_of && *component != children)
         .count()
         == expected_count
         && actual
-            .iter()
-            .filter(|component| **component != child_of && **component != children)
-            .all(|component| expected.component_ids().contains(component))
+            .filter(|component| *component != child_of && *component != children)
+            .all(|component| expected.component_ids().contains(&component))
 }
 
 fn protected_entities_match(

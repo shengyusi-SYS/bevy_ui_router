@@ -1,10 +1,4 @@
-//! Native Scene preparation for the phase C executor migration.
-//!
-//! This module deliberately does not register a navigation driver yet. Its
-//! prepared graph must be coupled to exact allocation obligations, current
-//! containment, input isolation and cleanup before native publication is enabled.
-
-#![allow(dead_code)] // Phase C: consumed by the forthcoming native realization path.
+//! Fresh native Scene registration and one-shot preparation for the shared executor.
 
 use std::{
     collections::HashSet,
@@ -19,6 +13,41 @@ use bevy_ecs::{hierarchy::ChildOf, template::SceneEntityReference, world::World}
 use bevy_scene::{CachedSceneError, ResolveSceneError, ResolvedSceneRoot, Scene, ScenePatch};
 use bevy_ui_router_bsn::{BsnBuildError, BsnSceneFactory};
 use bevy_ui_router_core::view_input::RouteViewInput;
+
+/// Register fresh synchronous native Scenes in the Router's shared driver namespace.
+pub trait AppBsnExt {
+    fn register_bsn_view<F, S>(
+        &mut self,
+        key: bevy_ui_router_view::ViewDriverKey,
+        factory: F,
+    ) -> Result<bevy_ui_router_view::ViewDriverKey, crate::ViewDriverRegistrationError>
+    where
+        F: FnMut(&RouteViewInput) -> Result<S, BsnBuildError> + Send + Sync + 'static,
+        S: Scene;
+}
+
+impl AppBsnExt for bevy_app::App {
+    fn register_bsn_view<F, S>(
+        &mut self,
+        key: bevy_ui_router_view::ViewDriverKey,
+        mut factory: F,
+    ) -> Result<bevy_ui_router_view::ViewDriverKey, crate::ViewDriverRegistrationError>
+    where
+        F: FnMut(&RouteViewInput) -> Result<S, BsnBuildError> + Send + Sync + 'static,
+        S: Scene,
+    {
+        crate::plugin::install_foundations(self);
+        crate::native_focus::install(self);
+        self.world_mut()
+            .resource_mut::<crate::app_ext::ViewDriverStore>()
+            .register_native(
+                key,
+                Box::new(move |input| {
+                    factory(input).map(|scene| Box::new(scene) as Box<dyn Scene>)
+                }),
+            )
+    }
+}
 
 static NEXT_SCENE_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
@@ -57,6 +86,7 @@ impl From<BsnPreparationError> for BsnPreparationFailure {
 
 #[derive(Debug)]
 pub(crate) enum BsnPreparationError {
+    Focus(crate::native_focus::NativeFocusError),
     MissingSceneRuntime,
     Build(BsnBuildError),
     Resolve(ResolveSceneError),
@@ -69,6 +99,7 @@ pub(crate) enum BsnPreparationError {
 impl std::fmt::Display for BsnPreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Focus(error) => write!(formatter, "BSN focus source rejected: {error:?}"),
             Self::MissingSceneRuntime => formatter.write_str(
                 "BSN requires AssetServer and Assets<ScenePatch> in the application World",
             ),

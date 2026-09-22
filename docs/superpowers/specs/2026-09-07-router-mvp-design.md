@@ -181,6 +181,10 @@ Scene 成功返回不代表 active。pending shell 采用 `Node.display = Displa
 
 本 MVP 不承诺直接安装原生 `TabNavigationPlugin`/`InputDispatchPlugin` 就自动遵守 Router gate。推荐 keyboard/gamepad 路径显式消费 gate；Scene apply 引发的 `AutoFocus` 需要同时验证非活动目标、原有效 focus 与延后 FocusGained/Lost 派发，不能仅调用 `clear()` 就声称隔离完成。若示例采用原生 Tab/dispatch，必须同时接入并验证相应目标过滤，不能把 gate 自测当成原生插件通过。
 
+创建期对 pending 内容的显式 `InputFocus::set`（包括 `AutoFocus`）仅形成候选意图，不授予输入权限。按真实操作先后只保留最后一个未被覆盖的候选，在其原 owner 成功发布且目标仍属于该次可获焦 active 内容时，于同次 publication 中生效。应用或用户后发的合法 `set`/`clear` 优先，包括同值 set 和已为空时 clear；后发 pending 候选也替代前一个。候选失败、stale、被取消或目标失效时丢弃，不复活更早的候选，不重放整个 pending 焦点历史。没有显式意图时，Router 不擅自选择首控件或恢复历史焦点。
+
+原未派发队列、合法 app/其它 active 目标的操作和原 cause 保持；不能通过全量快照回滚抹掉它们，也不能向从未 active 的 pending/failed 目标派发延后的焦点事件。跨帧等待须能识别官方队列 drain 前的后续操作，不能仅以最终焦点相等证明候选未被覆盖。候选与输入准备在发布前完成验证和分配，原位提交后仍由官方 processor 正常派发；不在 Ready 后补设焦点。这一选择保留 Bevy 的显式设焦意图并尊重后续选择，不引入 DOM 单 autofocus、模态 focus trap 或全局焦点管理需求。
+
 ## 8. 失败、恢复与清理
 
 BSN build error、官方 `ResolveSceneError`、`ApplySceneError`、依赖未就绪和 mount error 保留来源；未就绪在 immediate MVP 中失败，不暗中变成 queued/无限 retry。stale 结果丢弃并收敛自己的 pending 状态，不把当前请求伪造成成功或失败。
@@ -250,7 +254,7 @@ request snapshot 提供请求自身 requested/matched/status 和可分类 failur
 
 选择 **官方 resolve + 已登记声明图分配 + 私有 shell wrapper + attempt allocation obligations**，不预挂整棵树、不替换官方 relationship callbacks、不复制模板执行器：
 
-1. 使用 `ScenePatch::load/resolve` 消费本次 owned Scene，保留 dependency handles 到 apply/settlement 完成；不重复 resolve，不克隆模板。取出本次未共享的 `ResolvedSceneRoot`。
+1. 使用 `ScenePatch::load/resolve` 消费本次 owned Scene，保留 dependency handles 到 apply/settlement 完成；不重复 resolve，不克隆模板。取出本次未共享的 `ResolvedSceneRoot`。该依赖集合属于执行尝试的数据寿命，不承诺为已完成结算的 inert residual 持续保活到实体销毁；已应用组件中的强 `Handle` 按 Bevy 自身规则保活资产。未完成的 apply/settlement 仍须由真实 owner 保留原依赖。
 2. 通过公开的 `get_or_insert_related_resolved_scenes::<ChildOf>()` 读取直接声明图；在 World 分配前检查不支持的 cached inclusion、引用重复/跨声明节点歧义和容量。root/child 的全部原命名引用仍属于原内容 Entity，匿名节点补本次内部唯一引用。
 3. ECS 预分配并先登记 root/children 的 exact owner 与创建义务，不提前模拟其 `ChildOf` 写入；官方 executor 仍在模板成功后按原顺序写关系。分配记录不是根据 World 差集推导的 owner。
 4. 新建私有 wrapper `ResolvedSceneRoot`，只含一个引用映射 seed template 和 `ChildOf[原 resolved root]`，应用到本次新建的 inert `FrameShell`。wrapper 不携带原 root 的命名引用；seed 将完整引用表绑定到已登记内容 Entity。随后官方执行原 Scene，原 root 复用 `FrameContentTarget`，无需增加物理层数。不能把 wrapper 应用到 preserved/active shell。

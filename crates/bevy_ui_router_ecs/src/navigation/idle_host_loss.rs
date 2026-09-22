@@ -345,6 +345,16 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     {
         return false;
     }
+    #[cfg(feature = "bsn")]
+    if let Some(active) = entry.active.as_mut()
+        && let Err(error) = active.prepare_native_cleanup(world)
+        && error.is_retryable()
+    {
+        return true;
+    }
+    // A permanent native preparation contradiction remains with its real frame
+    // owner. The existing authority-loss partition classifies that residual;
+    // it must not remint claims or retry the contradictory closure.
     let registry = world.resource::<RouteEntityRegistry>();
     let Ok(frozen) = FrozenCleanupManifest::from_idle_host_authority(
         world,

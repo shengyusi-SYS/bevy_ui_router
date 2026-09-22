@@ -2615,7 +2615,13 @@ fn run_updates_until_succeeded(app: &mut App, request: NavigationRequestId) {
             return;
         }
     }
-    panic!("scheduled navigation request did not succeed within eight updates");
+    panic!(
+        "scheduled navigation request did not succeed within eight updates: {:?}",
+        app.world().resource::<RouterSnapshots>().request(
+            app.world().resource::<RouterNavigation>().entries[0].handle,
+            request
+        )
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3272,6 +3278,7 @@ fn ambiguous_boundary_owner_is_fail_closed_once_with_exact_owner_retained() {
             }]);
             let FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest } =
                 classify_failed_manifest(
+                    world,
                     manifest,
                     failed,
                     entry.active.as_ref(),
@@ -4295,6 +4302,7 @@ fn failed_authority_begin_rejection_restores_owner_and_fresh_trigger_can_publish
                 manifest,
                 bindings,
             } = classify_failed_manifest(
+                world,
                 manifest,
                 failed,
                 entry.active.as_ref(),
@@ -4389,6 +4397,7 @@ fn failed_authority_begin_rejection_restores_owner_and_fresh_trigger_can_publish
                 manifest,
                 bindings,
             } = classify_failed_manifest(
+                world,
                 manifest,
                 failed,
                 entry.active.as_ref(),
@@ -7016,6 +7025,7 @@ fn failed_settle_revalidates_active_descendants_before_releasing_focus() {
             )
             .expect("formal settle fixture must freeze for classification");
             match classify_failed_manifest(
+                world,
                 manifest,
                 failed,
                 entry.active.as_ref(),
@@ -8144,6 +8154,8 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         pending_commit: None,
         pending_frame_drive: None,
         pending_stale_output_cleanup: None,
+        #[cfg(feature = "bsn")]
+        native_residuals: Vec::new(),
         #[cfg(test)]
         delayed_driver_report_replay: None,
         pending_mount_frame_task: None,
@@ -9593,7 +9605,7 @@ fn expected_back_no_target_authority_graph_evidence(
                     parent: slot.parent().clone(),
                     outlet: slot.outlet().clone(),
                     slot_id: slot.slot_id(),
-                    anchor_claim: slot.anchor_claim().clone(),
+                    anchor_binding: slot.anchor_binding().clone(),
                     expected_support_relationships,
                 },
             }
@@ -10858,7 +10870,7 @@ fn back_no_target_slot_drift_preserves_exact_observed_binding_evidence() {
                         parent: slot.parent().clone(),
                         outlet: slot.outlet().clone(),
                         slot_id: slot.slot_id(),
-                        anchor_claim: slot.anchor_claim().clone(),
+                        anchor_binding: slot.anchor_binding().clone(),
                         expected_support_relationships,
                     },
                 },
@@ -11159,7 +11171,7 @@ fn back_no_target_authority_graph_requires_slot_registry_manifest_within_physica
                 parent: slot.parent().clone(),
                 outlet: slot.outlet().clone(),
                 slot_id: slot.slot_id(),
-                anchor_claim: slot.anchor_claim().clone(),
+                anchor_binding: slot.anchor_binding().clone(),
                 expected_support_relationships,
             },
         };
@@ -11259,7 +11271,7 @@ fn back_no_target_authority_graph_requires_slot_registry_manifest_within_physica
                 .outlet(&expected.binding.outlet)
                 .is_some_and(|outlet| {
                     outlet.anchor() == slot.anchor()
-                        && outlet.anchor_claim() == &expected.binding.anchor_claim
+                        && outlet.anchor_claim() == expected.binding.anchor_binding.source_claim()
                 })
         );
         assert!(
@@ -11277,7 +11289,7 @@ fn back_no_target_authority_graph_requires_slot_registry_manifest_within_physica
         assert!(cleanup_claim_has_exact_authority(world, &expected.claim));
         assert!(cleanup_claim_has_exact_authority(
             world,
-            &expected.binding.anchor_claim
+            expected.binding.anchor_binding.source_claim()
         ));
         let observed = observe_back_no_target_authority_graph_slot(world, registry, active, slot);
         assert_eq!(observed.slot.registry_claim, Some(expected.claim.clone()));
@@ -13103,7 +13115,7 @@ fn observe_back_target_driver_failure_stage(
         let _whole_mismatch = (
             &owner.task,
             owner.kind,
-            owner.message,
+            &owner.message,
             owner.evidence.observed,
             &owner.evidence.pairing,
         );
@@ -13158,7 +13170,7 @@ fn observe_back_target_driver_failure_stage(
                 &owner.task,
                 &owner.physical.evidence,
                 owner.kind,
-                owner.message,
+                &owner.message,
             );
             let unverified = match &owner.physical.original {
                 BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
@@ -13179,7 +13191,7 @@ fn observe_back_target_driver_failure_stage(
                 &owner.task,
                 &owner.source,
                 owner.kind,
-                owner.message,
+                &owner.message,
             );
             let unverified = match &owner.physical {
                 BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
@@ -13201,7 +13213,7 @@ fn observe_back_target_driver_failure_stage(
                 &owner.driving.continuation,
                 &owner.task,
                 owner.kind,
-                owner.message,
+                &owner.message,
                 &owner.mismatch,
             );
             let unverified = match &owner.physical {
@@ -15405,7 +15417,10 @@ impl ClassifierPermanentSourceProjection {
             .collect::<Vec<_>>();
         allowed_write_targets.sort_by_key(|entity| entity.to_bits());
         allowed_write_targets.dedup();
-        let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) = permanent;
+        let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) = permanent
+        else {
+            panic!("expected physical preparation contradiction")
+        };
         Self {
             history: history.clone(),
             preserved: splice.preserved().claims().cloned().collect(),
@@ -17935,7 +17950,10 @@ fn stage_real_back_target_ready_plan_permanent(
         owner
     };
     let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) =
-        &ready_plan_owner.evidence;
+        &ready_plan_owner.evidence
+    else {
+        panic!("expected physical preparation contradiction")
+    };
     assert_eq!(
         (
             evidence.source(),
@@ -32883,7 +32901,7 @@ fn back_no_target_registered_frame_and_child_extras_preserve_authority_evidence(
             parent: retained.parent().clone(),
             outlet: retained.outlet().clone(),
             slot_id: retained.slot_id(),
-            anchor_claim: retained.anchor_claim().clone(),
+            anchor_binding: retained.anchor_binding().clone(),
             expected_support_relationships: retained.expected_anchor_children().to_vec(),
         };
         assert!(
@@ -34185,7 +34203,7 @@ fn prepare_exact_child_physical_residual_failure(
                 terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
                     task,
                     failure: ViewFailureKind::Apply,
-                    message: "test retains an unreported physical task target",
+                    message: "test retains an unreported physical task target".into(),
                 },
                 branch: failed_prepared_branch(pending, None),
             });
@@ -34748,6 +34766,7 @@ fn stale_current_host_parent_settles_without_mutating_app_relationships() {
             )
             .unwrap();
             match classify_failed_manifest(
+                world,
                 manifest,
                 failed,
                 entry.active.as_ref(),

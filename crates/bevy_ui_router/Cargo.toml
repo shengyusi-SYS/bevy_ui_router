@@ -25,6 +25,7 @@ bevy_asset = { version = "0.19.1", default-features = false }
 bevy_camera = { version = "0.19.1", default-features = false }
 bevy_ecs = { version = "0.19.1", default-features = false }
 bevy_input_focus = { version = "0.19.1", default-features = false }
+bevy_internal = { version = "0.19.1", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
 bevy_picking = { version = "0.19.1", default-features = false }
 bevy_scene = { version = "0.19.1", default-features = false }
 bevy_ui = { version = "0.19.1", default-features = false }
@@ -48,6 +49,16 @@ required-features = ["ecs"]
 [[test]]
 name = "bsn_facade_features"
 path = "tests/bsn_facade_features.rs"
+required-features = ["bsn"]
+
+[[test]]
+name = "bsn_native_input"
+path = "tests/bsn_native_input.rs"
+required-features = ["bsn"]
+
+[[test]]
+name = "bsn_native_focus"
+path = "tests/bsn_native_focus.rs"
 required-features = ["bsn"]
 
 [[test]]

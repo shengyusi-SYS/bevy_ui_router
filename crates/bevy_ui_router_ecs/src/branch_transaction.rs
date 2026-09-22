@@ -395,7 +395,7 @@ pub(crate) struct SealedReconciliationSlotRole {
     outlet: RouteSlotKey,
     slot: RouteSlotId,
     anchor: bevy_ecs::prelude::Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: crate::presentation::OutletBinding,
     kind: ReconciliationSlotRoleKind,
     next: Option<EntityLifecycle>,
     entering_use: ReconciliationSlotEnteringUse,
@@ -410,7 +410,7 @@ pub(crate) struct SealedMountNewStagingAllowance {
     entity: bevy_ecs::prelude::Entity,
     claim: ExactRegistryClaim,
     anchor: bevy_ecs::prelude::Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: crate::presentation::OutletBinding,
     expected_anchor_children: Vec<bevy_ecs::prelude::Entity>,
 }
 
@@ -423,7 +423,7 @@ impl SealedMountNewStagingAllowance {
         entity: bevy_ecs::prelude::Entity,
         claim: ExactRegistryClaim,
         anchor: bevy_ecs::prelude::Entity,
-        anchor_claim: ExactRegistryClaim,
+        anchor_binding: crate::presentation::OutletBinding,
         expected_anchor_children: Vec<bevy_ecs::prelude::Entity>,
     ) -> Option<Self> {
         let allowance = Self {
@@ -434,7 +434,7 @@ impl SealedMountNewStagingAllowance {
             entity,
             claim,
             anchor,
-            anchor_claim,
+            anchor_binding,
             expected_anchor_children,
         };
         allowance
@@ -445,7 +445,7 @@ impl SealedMountNewStagingAllowance {
                 allowance.entity,
                 &allowance.claim,
                 allowance.anchor,
-                &allowance.anchor_claim,
+                &allowance.anchor_binding,
             )
             .then_some(allowance)
     }
@@ -475,7 +475,11 @@ impl SealedMountNewStagingAllowance {
     }
 
     pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
-        &self.anchor_claim
+        self.anchor_binding.source_claim()
+    }
+
+    pub(crate) const fn anchor_binding(&self) -> &crate::presentation::OutletBinding {
+        &self.anchor_binding
     }
 
     pub(crate) fn expected_anchor_children(&self) -> &[bevy_ecs::prelude::Entity] {
@@ -494,7 +498,7 @@ impl SealedMountNewStagingAllowance {
         entity: bevy_ecs::prelude::Entity,
         claim: &ExactRegistryClaim,
         anchor: bevy_ecs::prelude::Entity,
-        anchor_claim: &ExactRegistryClaim,
+        anchor_binding: &crate::presentation::OutletBinding,
     ) -> bool {
         self.parent == *parent
             && self.outlet == *outlet
@@ -502,7 +506,7 @@ impl SealedMountNewStagingAllowance {
             && self.entity == entity
             && self.claim == *claim
             && self.anchor == anchor
-            && self.anchor_claim == *anchor_claim
+            && self.anchor_binding == *anchor_binding
             && claim.lifecycle() == EntityLifecycle::PreparedInert
             && matches!(
                 claim.owner(),
@@ -523,7 +527,7 @@ impl SealedMountNewStagingAllowance {
             || self.parent != *residual.parent()
             || self.outlet != *residual.outlet()
             || self.anchor != residual.anchor()
-            || self.anchor_claim != *residual.anchor_claim()
+            || self.anchor_binding != *residual.anchor_binding()
             || !slot_claim_matches_mount_new(
                 residual.claim(),
                 &self.parent,
@@ -547,7 +551,7 @@ impl SealedMountNewStagingAllowance {
         entity: bevy_ecs::prelude::Entity,
         claim: ExactRegistryClaim,
         anchor: bevy_ecs::prelude::Entity,
-        anchor_claim: ExactRegistryClaim,
+        anchor_binding: crate::presentation::OutletBinding,
         expected_anchor_children: Vec<bevy_ecs::prelude::Entity>,
     ) -> Self {
         Self {
@@ -558,7 +562,7 @@ impl SealedMountNewStagingAllowance {
             entity,
             claim,
             anchor,
-            anchor_claim,
+            anchor_binding,
             expected_anchor_children,
         }
     }
@@ -627,7 +631,11 @@ impl SealedReconciliationSlotRole {
     }
 
     pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
-        &self.anchor_claim
+        self.anchor_binding.source_claim()
+    }
+
+    pub(crate) const fn anchor_binding(&self) -> &crate::presentation::OutletBinding {
+        &self.anchor_binding
     }
 
     pub(crate) const fn kind(&self) -> ReconciliationSlotRoleKind {
@@ -643,7 +651,7 @@ impl SealedReconciliationSlotRole {
             && self.outlet == *slot.outlet()
             && self.slot == slot.slot_id()
             && self.anchor == slot.anchor()
-            && self.anchor_claim == *slot.anchor_claim()
+            && self.anchor_binding == *slot.anchor_binding()
     }
 }
 
@@ -751,6 +759,13 @@ impl ReconciliationSpliceOutcome {
 }
 
 impl SealedReconciliationSplice {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn prepare_native_cleanup(
+        &mut self,
+        world: &mut bevy_ecs::world::World,
+    ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
+        self.leaving.prepare_native_cleanup(world)
+    }
     pub(crate) const fn preserved(&self) -> &RealizedBranch {
         &self.preserved
     }
@@ -972,6 +987,30 @@ impl SealedReconciliationSplice {
             .collect()
     }
 
+    pub(crate) fn current_live_interactive_entities(
+        &self,
+        world: &bevy_ecs::world::World,
+    ) -> Vec<bevy_ecs::prelude::Entity> {
+        self.preserved
+            .live_interactive_entities(world)
+            .into_iter()
+            .chain(self.leaving.live_interactive_entities(world))
+            .collect()
+    }
+
+    pub(crate) fn resulting_live_interactive_entities(
+        &self,
+        world: &bevy_ecs::world::World,
+        next: &[FrameMutationTarget],
+    ) -> Vec<bevy_ecs::prelude::Entity> {
+        self.preserved
+            .frames()
+            .iter()
+            .chain(self.entering.frames())
+            .flat_map(|frame| frame.content_input_facts(world, next).1)
+            .collect()
+    }
+
     pub(crate) fn resulting_interactive_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
         self.preserved
             .interactive_entities()
@@ -1140,9 +1179,9 @@ impl SealedReconciliationSplice {
         apply_reconciliation_claim_rebind(&mut self.preserved, preserved_frames, &all_claims);
         apply_reconciliation_claim_rebind(&mut self.entering, entering_frames, &all_claims);
         apply_reconciliation_claim_rebind(&mut self.leaving, leaving_frames, &all_claims);
-        for (role, (claim, anchor_claim)) in self.slot_roles.iter_mut().zip(slot_roles) {
+        for (role, (claim, anchor_binding)) in self.slot_roles.iter_mut().zip(slot_roles) {
             role.claim = claim;
-            role.anchor_claim = anchor_claim;
+            *role.anchor_binding.source_claim_mut() = anchor_binding;
         }
     }
 
@@ -1411,7 +1450,7 @@ fn sealed_slot_role(
         outlet: slot.outlet().clone(),
         slot: slot.slot_id(),
         anchor: slot.anchor(),
-        anchor_claim: slot.anchor_claim().clone(),
+        anchor_binding: slot.anchor_binding().clone(),
         kind,
         next,
         entering_use,
@@ -1984,7 +2023,7 @@ pub(crate) struct PreparedRootRebase {
 pub(crate) struct RejectedChildSlot {
     slot: MountedChildSlot,
     canonical_anchor: Option<bevy_ecs::prelude::Entity>,
-    canonical_anchor_claim: Option<crate::registry::ExactRegistryClaim>,
+    canonical_anchor_binding: Option<crate::presentation::OutletBinding>,
     canonical_anchor_children: Option<Vec<bevy_ecs::prelude::Entity>>,
 }
 
@@ -1997,10 +2036,14 @@ impl RejectedChildSlot {
         self.canonical_anchor
     }
 
-    pub(crate) const fn canonical_anchor_claim(
-        &self,
-    ) -> Option<&crate::registry::ExactRegistryClaim> {
-        self.canonical_anchor_claim.as_ref()
+    pub(crate) fn canonical_anchor_claim(&self) -> Option<&crate::registry::ExactRegistryClaim> {
+        self.canonical_anchor_binding
+            .as_ref()
+            .map(crate::presentation::OutletBinding::source_claim)
+    }
+
+    pub(crate) fn canonical_anchor_binding(&self) -> Option<&crate::presentation::OutletBinding> {
+        self.canonical_anchor_binding.as_ref()
     }
 
     pub(crate) fn canonical_anchor_children(&self) -> Option<&[bevy_ecs::prelude::Entity]> {
@@ -2009,6 +2052,21 @@ impl RejectedChildSlot {
 }
 
 impl RealizedBranch {
+    pub(crate) fn consume_native_focus_owners(&mut self) {
+        for frame in &mut self.frames {
+            frame.consume_native_focus_owner();
+        }
+    }
+    #[cfg(feature = "bsn")]
+    pub(crate) fn prepare_native_cleanup(
+        &mut self,
+        world: &mut bevy_ecs::world::World,
+    ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
+        for frame in &mut self.frames {
+            crate::presentation::native_frame::prepare_content_cleanup(world, frame)?;
+        }
+        Ok(())
+    }
     pub(crate) const fn empty() -> Self {
         Self {
             frames: Vec::new(),
@@ -2130,7 +2188,7 @@ impl RealizedBranch {
                 parent.outlet(slot.outlet()).map(|outlet| {
                     (
                         outlet.anchor(),
-                        outlet.anchor_claim().clone(),
+                        outlet.anchor_binding().clone(),
                         parent.expected_owned_children(outlet.anchor()),
                     )
                 })
@@ -2147,7 +2205,7 @@ impl RealizedBranch {
             return Err(RejectedChildSlot {
                 slot,
                 canonical_anchor: canonical.as_ref().map(|(anchor, _, _)| *anchor),
-                canonical_anchor_claim: canonical.as_ref().map(|(_, claim, _)| claim.clone()),
+                canonical_anchor_binding: canonical.as_ref().map(|(_, claim, _)| claim.clone()),
                 canonical_anchor_children: canonical.map(|(_, _, children)| children),
             });
         }
@@ -2159,7 +2217,7 @@ impl RealizedBranch {
             return Err(RejectedChildSlot {
                 slot,
                 canonical_anchor: None,
-                canonical_anchor_claim: None,
+                canonical_anchor_binding: None,
                 canonical_anchor_children: None,
             });
         };
@@ -2176,7 +2234,7 @@ impl RealizedBranch {
             return Err(RejectedChildSlot {
                 slot,
                 canonical_anchor: canonical.as_ref().map(|(anchor, _, _)| *anchor),
-                canonical_anchor_claim: canonical.as_ref().map(|(_, claim, _)| claim.clone()),
+                canonical_anchor_binding: canonical.as_ref().map(|(_, claim, _)| claim.clone()),
                 canonical_anchor_children: canonical.map(|(_, _, children)| children),
             });
         }
@@ -2191,24 +2249,24 @@ impl RealizedBranch {
     ) -> Result<(), RejectedChildSlot> {
         let canonical: Option<(
             bevy_ecs::prelude::Entity,
-            ExactRegistryClaim,
+            crate::presentation::OutletBinding,
             Vec<bevy_ecs::prelude::Entity>,
         )> = preserved_parent.outlet(slot.outlet()).map(|outlet| {
             (
                 outlet.anchor(),
-                outlet.anchor_claim().clone(),
+                outlet.anchor_binding().clone(),
                 preserved_parent.expected_owned_children(outlet.anchor()),
             )
         });
         let reject = |slot,
                       canonical: &Option<(
             bevy_ecs::prelude::Entity,
-            ExactRegistryClaim,
+            crate::presentation::OutletBinding,
             Vec<bevy_ecs::prelude::Entity>,
         )>| RejectedChildSlot {
             slot,
             canonical_anchor: canonical.as_ref().map(|(anchor, _, _)| *anchor),
-            canonical_anchor_claim: canonical.as_ref().map(|(_, claim, _)| claim.clone()),
+            canonical_anchor_binding: canonical.as_ref().map(|(_, claim, _)| claim.clone()),
             canonical_anchor_children: canonical.as_ref().map(|(_, _, children)| children.clone()),
         };
         if self.child_slots.iter().any(|current| {
@@ -2271,6 +2329,16 @@ impl RealizedBranch {
         self.frames
             .iter()
             .flat_map(RealizedFrame::interactive_entities)
+            .collect()
+    }
+
+    pub(crate) fn live_interactive_entities(
+        &self,
+        world: &bevy_ecs::world::World,
+    ) -> Vec<bevy_ecs::prelude::Entity> {
+        self.frames
+            .iter()
+            .flat_map(|frame| frame.live_interactive_entities(world))
             .collect()
     }
 
@@ -2569,6 +2637,13 @@ pub(crate) struct PreparedBranch {
 }
 
 impl PreparedBranch {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn prepare_native_cleanup(
+        &mut self,
+        world: &mut bevy_ecs::world::World,
+    ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
+        self.realized.prepare_native_cleanup(world)
+    }
     pub(crate) const fn empty() -> Self {
         Self {
             realized: RealizedBranch::empty(),
@@ -2670,6 +2745,8 @@ impl PendingCommit {
 }
 
 pub(crate) struct FailedPreparedBranch {
+    #[cfg(feature = "bsn")]
+    native_failure: Option<Box<crate::presentation::native_failure::NativeFailureOwner>>,
     realized: RealizedBranch,
     retained_prepared_prefix: Option<PreparedBranch>,
     mount_residuals: Vec<ChildSlotResidual>,
@@ -2679,8 +2756,43 @@ pub(crate) struct FailedPreparedBranch {
 }
 
 impl FailedPreparedBranch {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn with_native_failure(
+        mut self,
+        failure: crate::presentation::native_failure::NativeFailureOwner,
+    ) -> Self {
+        self.native_failure = Some(Box::new(failure));
+        self
+    }
+
+    #[cfg(feature = "bsn")]
+    pub(crate) fn native_failure(
+        &self,
+    ) -> Option<&crate::presentation::native_failure::NativeFailureOwner> {
+        self.native_failure.as_deref()
+    }
+
+    #[cfg(feature = "bsn")]
+    pub(crate) fn take_native_failure(
+        &mut self,
+    ) -> Option<crate::presentation::native_failure::NativeFailureOwner> {
+        self.native_failure.take().map(|owner| *owner)
+    }
+    #[cfg(feature = "bsn")]
+    pub(crate) fn prepare_native_cleanup(
+        &mut self,
+        world: &mut bevy_ecs::world::World,
+    ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
+        self.realized.prepare_native_cleanup(world)?;
+        for frame in &mut self.detached_frames {
+            crate::presentation::native_frame::prepare_content_cleanup(world, frame)?;
+        }
+        Ok(())
+    }
     pub(crate) fn new(branch: PreparedBranch) -> Self {
         Self {
+            #[cfg(feature = "bsn")]
+            native_failure: None,
             realized: branch.into_realized(),
             retained_prepared_prefix: None,
             mount_residuals: Vec::new(),
@@ -2692,6 +2804,8 @@ impl FailedPreparedBranch {
 
     pub(crate) fn with_mount_residual(branch: PreparedBranch, residual: ChildSlotResidual) -> Self {
         Self {
+            #[cfg(feature = "bsn")]
+            native_failure: None,
             realized: branch.into_realized(),
             retained_prepared_prefix: None,
             mount_residuals: vec![residual],
@@ -2703,6 +2817,8 @@ impl FailedPreparedBranch {
 
     pub(crate) fn with_detached_frame(branch: PreparedBranch, frame: RealizedFrame) -> Self {
         Self {
+            #[cfg(feature = "bsn")]
+            native_failure: None,
             realized: branch.into_realized(),
             retained_prepared_prefix: None,
             mount_residuals: Vec::new(),
@@ -2717,6 +2833,8 @@ impl FailedPreparedBranch {
         slot: RejectedChildSlot,
     ) -> Self {
         Self {
+            #[cfg(feature = "bsn")]
+            native_failure: None,
             realized: branch.into_realized(),
             retained_prepared_prefix: None,
             mount_residuals: Vec::new(),
@@ -4203,7 +4321,7 @@ mod tests {
             slot.slot(),
             slot.slot_claim().clone(),
             slot.anchor(),
-            slot.anchor_claim().clone(),
+            slot.anchor_binding().clone(),
             slot.expected_anchor_children().to_vec(),
         );
 
@@ -4214,7 +4332,7 @@ mod tests {
             slot.slot(),
             slot.slot_claim(),
             slot.anchor(),
-            slot.anchor_claim(),
+            slot.anchor_binding(),
         ));
         assert!(!allowance.matches_binding(
             branch.frames()[1].frame(),
@@ -4223,7 +4341,7 @@ mod tests {
             slot.slot(),
             slot.slot_claim(),
             slot.anchor(),
-            slot.anchor_claim(),
+            slot.anchor_binding(),
         ));
         assert!(!allowance.matches_binding(
             slot.parent(),
@@ -4232,7 +4350,7 @@ mod tests {
             slot.slot(),
             slot.slot_claim(),
             slot.anchor(),
-            slot.anchor_claim(),
+            slot.anchor_binding(),
         ));
     }
 
@@ -4265,7 +4383,7 @@ mod tests {
             slot.slot(),
             slot.slot_claim().clone(),
             slot.anchor(),
-            slot.anchor_claim().clone(),
+            slot.anchor_binding().clone(),
             slot.expected_anchor_children().to_vec(),
         );
 

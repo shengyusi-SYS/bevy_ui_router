@@ -271,6 +271,21 @@ pub(crate) struct ComponentManifest {
 }
 
 impl ComponentManifest {
+    /// Structural component presence excludes only Bevy 0.19.1's transient
+    /// clipping result. The official UI system adds/removes CalculatedClip as
+    /// authored display/overflow changes; it is not ownership or role evidence.
+    /// Keep this iterator allocation-free for resident publication consumers.
+    pub(crate) fn observed_component_ids<'a>(
+        world: &World,
+        components: &'a [ComponentId],
+    ) -> impl Iterator<Item = ComponentId> + Clone + 'a {
+        let clip = world.components().component_id::<bevy_ui::CalculatedClip>();
+        components
+            .iter()
+            .copied()
+            .filter(move |id| Some(*id) != clip)
+    }
+
     pub(crate) fn new(ids: impl IntoIterator<Item = ComponentId>) -> Self {
         note_component_manifest_materialization();
         let mut component_ids = ids.into_iter().collect::<Vec<_>>();
@@ -299,10 +314,12 @@ impl ComponentManifest {
     }
 
     pub(crate) fn from_world(world: &World, entity: Entity) -> Option<Self> {
-        world
-            .get_entity(entity)
-            .ok()
-            .map(|entity| Self::new(entity.archetype().components().iter().copied()))
+        world.get_entity(entity).ok().map(|entity| {
+            Self::new(Self::observed_component_ids(
+                world,
+                entity.archetype().components(),
+            ))
+        })
     }
 
     pub(crate) fn try_from_world(world: &World, entity: Entity) -> Result<Option<Self>, ()> {
@@ -314,7 +331,7 @@ impl ComponentManifest {
         component_ids
             .try_reserve_exact(components.len())
             .map_err(|_| ())?;
-        component_ids.extend(components.iter().copied());
+        component_ids.extend(Self::observed_component_ids(world, components));
         component_ids.sort_unstable();
         component_ids.dedup();
         Ok(Some(Self { component_ids }))
@@ -341,11 +358,9 @@ impl ComponentManifest {
         let Ok(entity) = world.get_entity(entity) else {
             return false;
         };
-        let actual = entity.archetype().components();
-        actual.len() == self.component_ids.len()
-            && actual
-                .iter()
-                .all(|component| self.component_ids.contains(component))
+        let mut actual = Self::observed_component_ids(world, entity.archetype().components());
+        actual.clone().count() == self.component_ids.len()
+            && actual.all(|component| self.component_ids.contains(&component))
     }
 }
 
@@ -1628,15 +1643,7 @@ fn frozen_manifest_matches_archetype_no_alloc(
     entity: Entity,
     frozen: &ComponentManifest,
 ) -> bool {
-    let Ok(entity) = world.get_entity(entity) else {
-        return false;
-    };
-    let archetype = entity.archetype();
-    archetype.components().len() == frozen.component_ids().len()
-        && frozen
-            .component_ids()
-            .iter()
-            .all(|expected| archetype.components().contains(expected))
+    frozen.matches_without_materialization(world, entity)
 }
 
 pub(crate) struct PreparedExactRegistryRetirement {
@@ -2715,6 +2722,60 @@ pub(crate) mod tests {
         assert!(manifest.matches(&world, entity));
         world.entity_mut(entity).remove::<B>();
         assert!(!manifest.matches(&world, entity));
+    }
+
+    #[test]
+    fn structural_manifest_ignores_only_official_transient_clipping_presence() {
+        let mut world = World::new();
+        let entity = world.spawn((bevy_ui::Node::default(), A)).id();
+        let expected = ComponentManifest::from_world(&world, entity).unwrap();
+        for clipped in [true, false, true] {
+            if clipped {
+                world.entity_mut(entity).insert(bevy_ui::CalculatedClip {
+                    clip: Default::default(),
+                });
+            } else {
+                world.entity_mut(entity).remove::<bevy_ui::CalculatedClip>();
+            }
+            assert_eq!(
+                ComponentManifest::from_world(&world, entity).as_ref(),
+                Some(&expected)
+            );
+            assert_eq!(
+                ComponentManifest::try_from_world(&world, entity)
+                    .unwrap()
+                    .as_ref(),
+                Some(&expected)
+            );
+            assert!(expected.matches(&world, entity));
+            {
+                take_authority_postmutation_manifest_materializations_for_test();
+                let _mutation = begin_authority_publication_mutation_for_test();
+                assert!(expected.matches_without_materialization(&world, entity));
+                assert!(frozen_manifest_matches_archetype_no_alloc(
+                    &world, entity, &expected
+                ));
+                assert_eq!(
+                    take_authority_postmutation_manifest_materializations_for_test(),
+                    0
+                );
+            }
+            assert_eq!(
+                world.get::<bevy_ui::CalculatedClip>(entity).is_some(),
+                clipped
+            );
+        }
+        world.entity_mut(entity).insert(B);
+        assert!(!expected.matches(&world, entity));
+        assert!(!expected.matches_without_materialization(&world, entity));
+        world.entity_mut(entity).remove::<B>();
+        world.entity_mut(entity).insert(bevy_ui::OverrideClip);
+        assert!(!expected.matches_without_materialization(&world, entity));
+        world.entity_mut(entity).remove::<bevy_ui::OverrideClip>();
+        world
+            .entity_mut(entity)
+            .remove::<bevy_camera::visibility::Visibility>();
+        assert!(!expected.matches_without_materialization(&world, entity));
     }
 
     #[test]

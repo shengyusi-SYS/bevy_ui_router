@@ -1416,15 +1416,15 @@ impl FrozenProvisionalStagingPartition {
         slot_target: Option<Entity>,
     ) -> Result<Self, HostCandidateCapacityEvidence> {
         let children_component = world.components().component_id::<Children>();
+        let candidate_entity = world
+            .get_entity(candidate.host)
+            .map_err(|_| staging_capacity_evidence(world, candidate, 0))?;
         let candidate_host_non_children_manifest = ComponentManifest::try_new(
-            world
-                .get_entity(candidate.host)
-                .map_err(|_| staging_capacity_evidence(world, candidate, 0))?
-                .archetype()
-                .components()
-                .iter()
-                .copied()
-                .filter(|component| Some(*component) != children_component),
+            ComponentManifest::observed_component_ids(
+                world,
+                candidate_entity.archetype().components(),
+            )
+            .filter(|component| Some(*component) != children_component),
         )
         .map_err(|_| staging_capacity_evidence(world, candidate, world.iter_entities().count()))?;
         let protected_count = world
@@ -1606,21 +1606,31 @@ impl FrozenProvisionalStagingPartition {
         let Some(host_entity) = world.get_entity(self.candidate_host).ok() else {
             return false;
         };
-        let host_manifest_matches = host_entity.archetype().components().len()
+        let host_components =
+            ComponentManifest::observed_component_ids(world, host_entity.archetype().components());
+        let host_manifest_matches = host_components.clone().count()
             == self
                 .candidate_host_non_children_manifest
                 .component_ids()
                 .len()
                 .saturating_add(usize::from(children_component.is_some_and(|children| {
-                    host_entity.archetype().components().contains(&children)
+                    host_components
+                        .clone()
+                        .any(|component| component == children)
                 })))
             && self
                 .candidate_host_non_children_manifest
                 .component_ids()
                 .iter()
-                .all(|expected| host_entity.archetype().components().contains(expected))
+                .all(|expected| {
+                    host_components
+                        .clone()
+                        .any(|component| component == *expected)
+                })
             && children_component.is_none_or(|children| {
-                host_entity.archetype().components().contains(&children)
+                host_components
+                    .clone()
+                    .any(|component| component == children)
                     == world.get::<Children>(self.candidate_host).is_some()
             });
         let expected_children = self
@@ -1678,7 +1688,10 @@ impl FrozenProvisionalStagingPartition {
                     slot_target
                         .is_none_or(|slot| !is_descendant_or_self_no_alloc(world, slot, *entity))
                 });
-            let observed_components = observed_entity.archetype().components();
+            let observed_components = ComponentManifest::observed_component_ids(
+                world,
+                observed_entity.archetype().components(),
+            );
             let expected_components = expected
                 .manifest
                 .component_ids()
@@ -1686,10 +1699,10 @@ impl FrozenProvisionalStagingPartition {
                 .copied()
                 .filter(|component| Some(*component) != children_component);
             let observed_non_children_count = observed_components
-                .iter()
+                .clone()
                 .filter(|component| {
-                    Some(**component) != children_component
-                        && !reinserted_resources.contains(&(expected.entity, **component))
+                    Some(*component) != children_component
+                        && !reinserted_resources.contains(&(expected.entity, *component))
                 })
                 .count();
             let expected_non_children_count = expected
@@ -1699,9 +1712,11 @@ impl FrozenProvisionalStagingPartition {
                 .filter(|component| Some(**component) != children_component)
                 .count();
             if observed_non_children_count != expected_non_children_count
-                || !expected_components
-                    .clone()
-                    .all(|component| observed_components.contains(&component))
+                || !expected_components.clone().all(|component| {
+                    observed_components
+                        .clone()
+                        .any(|actual| actual == component)
+                })
                 || observed_entity.get::<ChildOf>().map(ChildOf::parent) != expected.parent
                 || !observed_children.eq(expected_children)
             {
@@ -2732,15 +2747,7 @@ fn manifest_matches_world_no_alloc(
     entity: Entity,
     manifest: &ComponentManifest,
 ) -> bool {
-    let Ok(entity) = world.get_entity(entity) else {
-        return false;
-    };
-    let observed = entity.archetype().components();
-    observed.len() == manifest.component_ids().len()
-        && manifest
-            .component_ids()
-            .iter()
-            .all(|component| observed.contains(component))
+    manifest.matches_without_materialization(world, entity)
 }
 
 pub(crate) fn validated_host_candidate_is_current(

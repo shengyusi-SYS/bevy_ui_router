@@ -39,6 +39,10 @@ use crate::{
 };
 
 #[cfg(feature = "bsn")]
+pub(crate) mod native_failure;
+#[cfg(feature = "bsn")]
+pub(crate) mod native_frame;
+#[cfg(feature = "bsn")]
 pub(crate) mod native_scene;
 
 #[cfg(test)]
@@ -51,6 +55,117 @@ use crate::registry::{
 use crate::components::{
     ChildSlotAuthorityProbe, ChildSlotBarrierProbe, ChildSlotNodeProbe, ChildSlotRelationshipProbe,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OutletBinding {
+    RegisteredOutput(ExactRegistryClaim),
+    #[cfg(feature = "bsn")]
+    NativeContent {
+        anchor: Entity,
+        root: ExactRegistryClaim,
+    },
+}
+
+impl OutletBinding {
+    pub(crate) fn anchor(&self) -> Entity {
+        match self {
+            Self::RegisteredOutput(claim) => claim.entity(),
+            #[cfg(feature = "bsn")]
+            Self::NativeContent { anchor, .. } => *anchor,
+        }
+    }
+
+    pub(crate) const fn source_claim(&self) -> &ExactRegistryClaim {
+        match self {
+            Self::RegisteredOutput(claim) => claim,
+            #[cfg(feature = "bsn")]
+            Self::NativeContent { root, .. } => root,
+        }
+    }
+
+    pub(crate) fn source_claim_mut(&mut self) -> &mut ExactRegistryClaim {
+        match self {
+            Self::RegisteredOutput(claim) => claim,
+            #[cfg(feature = "bsn")]
+            Self::NativeContent { root, .. } => root,
+        }
+    }
+
+    pub(crate) fn is_native(&self) -> bool {
+        match self {
+            Self::RegisteredOutput(_) => false,
+            #[cfg(feature = "bsn")]
+            Self::NativeContent { .. } => true,
+        }
+    }
+
+    pub(crate) fn opaque_digest_part(&self) -> u64 {
+        self.source_claim().opaque_digest_part()
+            ^ self.anchor().to_bits().rotate_left(17)
+            ^ if self.is_native() {
+                0x4e4154495645414e
+            } else {
+                0x4f5554505554414e
+            }
+    }
+
+    /// The binding names a physical anchor and an independently exact authority source.
+    /// Native authored components and siblings remain open between operations.
+    pub(crate) fn is_current(
+        &self,
+        world: &World,
+        parent: &RouteFrameVersion,
+        require_outlet: bool,
+    ) -> bool {
+        self.is_current_with_manifest_policy(world, parent, require_outlet, false)
+    }
+
+    pub(crate) fn is_current_with_manifest_policy(
+        &self,
+        world: &World,
+        parent: &RouteFrameVersion,
+        require_outlet: bool,
+        allow_additions: bool,
+    ) -> bool {
+        match self {
+            Self::RegisteredOutput(claim) => world.get_resource::<RouteEntityRegistry>()
+                .and_then(|registry| registry.record(claim.entity()))
+                .is_some_and(|record| record.claim() == *claim
+                    && matches!(record.owner(), RegistryOwner::Committed(EntityOwner::FrameOutput { frame, .. }) if frame == parent)
+                    && (if allow_additions { manifest_contains_expected(world, claim.entity(), record.manifest()) } else { record.manifest().matches(world, claim.entity()) })
+                    && world.get::<RouteOwnershipSeal>(claim.entity()) == Some(&RouteOwnershipSeal::new(claim.seal()))),
+            #[cfg(feature = "bsn")]
+            Self::NativeContent { anchor, root } => world.get_resource::<RouteEntityRegistry>()
+                .and_then(|registry| registry.record(root.entity()))
+                .is_some_and(|record| record.claim() == *root)
+                && native_frame::collect_content(world, parent, root.entity()).is_ok_and(|content| content.contains(anchor)
+                    && (!require_outlet || content.iter().filter(|entity| world.get::<bevy_ui_router_bsn::DefaultOutlet>(**entity).is_some()).count() == 1))
+                && (!require_outlet || world.get::<Node>(*anchor).is_some()
+                    && world.get::<bevy_ui_router_bsn::DefaultOutlet>(*anchor).is_some()),
+        }
+    }
+
+    pub(crate) fn physical_claim(&self) -> Option<&ExactRegistryClaim> {
+        (self.anchor() == self.source_claim().entity()).then_some(self.source_claim())
+    }
+
+    pub(crate) fn children_are_current(
+        &self,
+        world: &World,
+        slot: Entity,
+        legacy_expected: &[Entity],
+    ) -> bool {
+        let children = world
+            .get::<Children>(self.anchor())
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if self.is_native() {
+            children.iter().filter(|entity| **entity == slot).count() == 1
+        } else {
+            children == legacy_expected
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrameMountBinding {
@@ -68,7 +183,7 @@ enum FrameMountBindingKind {
         parent: RouteFrameVersion,
         outlet: bevy_ui_router_core::slot::RouteSlotKey,
         anchor: Entity,
-        anchor_claim: ExactRegistryClaim,
+        anchor_binding: OutletBinding,
         expected_anchor_children: Vec<Entity>,
         staging_lifecycle: EntityLifecycle,
         allowed_existing_shells: Vec<ExactRegistryClaim>,
@@ -92,7 +207,7 @@ impl FrameMountBinding {
                 parent: mounted.parent().clone(),
                 outlet: mounted.outlet().clone(),
                 anchor: mounted.anchor(),
-                anchor_claim: mounted.anchor_claim().clone(),
+                anchor_binding: mounted.anchor_binding().clone(),
                 expected_anchor_children: mounted.expected_anchor_children().to_vec(),
                 staging_lifecycle: EntityLifecycle::PreparedInert,
                 allowed_existing_shells: Vec::new(),
@@ -111,7 +226,7 @@ impl FrameMountBinding {
                 parent: mounted.parent().clone(),
                 outlet: mounted.outlet().clone(),
                 anchor: mounted.anchor(),
-                anchor_claim: mounted.anchor_claim().clone(),
+                anchor_binding: mounted.anchor_binding().clone(),
                 expected_anchor_children: mounted.expected_anchor_children().to_vec(),
                 staging_lifecycle: mount.expected_slot_lifecycle(),
                 allowed_existing_shells: mount.allowed_existing_shells().to_vec(),
@@ -132,9 +247,16 @@ impl FrameMountBinding {
             FrameMountBindingKind::HostTop { host } => (*host, None),
             FrameMountBindingKind::ChildOutlet {
                 anchor,
-                anchor_claim,
+                anchor_binding,
                 ..
-            } => (*anchor, Some(anchor_claim)),
+            } => (*anchor, Some(anchor_binding.source_claim())),
+        }
+    }
+
+    pub(crate) fn outlet_binding(&self) -> Option<&OutletBinding> {
+        match &self.kind {
+            FrameMountBindingKind::HostTop { .. } => None,
+            FrameMountBindingKind::ChildOutlet { anchor_binding, .. } => Some(anchor_binding),
         }
     }
 
@@ -156,14 +278,14 @@ impl FrameMountBinding {
                     parent,
                     outlet,
                     anchor,
-                    anchor_claim,
+                    anchor_binding,
                     expected_anchor_children,
                     ..
                 } if parent == mounted.parent()
                     && outlet == mounted.outlet()
                     && *anchor == mounted.anchor()
-                    && anchor_claim == mounted.anchor_claim()
-                    && expected_anchor_children == mounted.expected_anchor_children()
+                    && anchor_binding == mounted.anchor_binding()
+                    && (anchor_binding.is_native() || expected_anchor_children == mounted.expected_anchor_children())
             )
     }
 
@@ -181,7 +303,7 @@ impl FrameMountBinding {
                     parent: left_parent,
                     outlet: left_outlet,
                     anchor: left_anchor,
-                    anchor_claim: left_anchor_claim,
+                    anchor_binding: left_anchor_claim,
                     expected_anchor_children: left_children,
                     ..
                 },
@@ -189,7 +311,7 @@ impl FrameMountBinding {
                     parent: right_parent,
                     outlet: right_outlet,
                     anchor: right_anchor,
-                    anchor_claim: right_anchor_claim,
+                    anchor_binding: right_anchor_claim,
                     expected_anchor_children: right_children,
                     ..
                 },
@@ -198,7 +320,7 @@ impl FrameMountBinding {
                     && left_outlet == right_outlet
                     && left_anchor == right_anchor
                     && left_anchor_claim == right_anchor_claim
-                    && left_children == right_children
+                    && (left_anchor_claim.is_native() || left_children == right_children)
             }
             _ => false,
         }
@@ -237,14 +359,14 @@ impl FrameMountBinding {
                 expected_current,
                 expected_next,
             ),
-            FrameMountBindingKind::ChildOutlet { anchor_claim, .. } => {
+            FrameMountBindingKind::ChildOutlet { anchor_binding, .. } => {
                 required_claim_alias_can_rebind(
                     &self.slot_claim,
                     claims,
                     expected_current,
                     expected_next,
                 ) && required_claim_alias_can_rebind(
-                    anchor_claim,
+                    anchor_binding.source_claim(),
                     claims,
                     expected_current,
                     expected_next,
@@ -256,12 +378,12 @@ impl FrameMountBinding {
     fn apply_internal_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
         apply_claim_alias_rebind(&mut self.slot_claim, claims);
         if let FrameMountBindingKind::ChildOutlet {
-            anchor_claim,
+            anchor_binding,
             allowed_existing_shells,
             ..
         } = &mut self.kind
         {
-            apply_claim_alias_rebind(anchor_claim, claims);
+            apply_claim_alias_rebind(anchor_binding.source_claim_mut(), claims);
             for claim in allowed_existing_shells {
                 apply_claim_alias_rebind(claim, claims);
             }
@@ -393,7 +515,7 @@ pub(crate) struct RealizedOutlet {
     parent: RouteFrameVersion,
     key: bevy_ui_router_core::slot::RouteSlotKey,
     anchor: Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: OutletBinding,
 }
 
 impl RealizedOutlet {
@@ -410,7 +532,11 @@ impl RealizedOutlet {
     }
 
     pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
-        &self.anchor_claim
+        self.anchor_binding.source_claim()
+    }
+
+    pub(crate) const fn anchor_binding(&self) -> &OutletBinding {
+        &self.anchor_binding
     }
 
     fn claim_can_rebind(
@@ -419,11 +545,16 @@ impl RealizedOutlet {
         expected_current: EntityLifecycle,
         expected_next: EntityLifecycle,
     ) -> bool {
-        required_claim_alias_can_rebind(&self.anchor_claim, claims, expected_current, expected_next)
+        required_claim_alias_can_rebind(
+            self.anchor_binding.source_claim(),
+            claims,
+            expected_current,
+            expected_next,
+        )
     }
 
     fn apply_claim_rebind(&mut self, claims: &[ExactRegistryClaim]) {
-        apply_claim_alias_rebind(&mut self.anchor_claim, claims);
+        apply_claim_alias_rebind(self.anchor_binding.source_claim_mut(), claims);
     }
 }
 
@@ -438,6 +569,8 @@ pub(crate) struct RealizedFrame {
     entities: Vec<RealizedEntity>,
     outlets: Vec<RealizedOutlet>,
     prewrite_complete: bool,
+    #[cfg(feature = "bsn")]
+    native: Option<native_frame::NativeFrameContent>,
 }
 
 pub(crate) struct PreparedFrameMountRebase {
@@ -494,6 +627,8 @@ pub(crate) struct FrameMutationTarget {
 #[derive(Clone, Copy)]
 enum PresentationTargetKind {
     Frame,
+    NativeShell,
+    NativeContent,
     ChildSlot,
 }
 
@@ -505,14 +640,19 @@ enum PreparedLifecycleMutation<'w> {
 struct PreparedEntityMutation<'w> {
     #[cfg(test)]
     entity: Entity,
-    visibility: Mut<'w, Visibility>,
-    pickable: Mut<'w, Pickable>,
-    barrier: Mut<'w, RouterInputBarrier>,
+    visual: Option<PreparedVisualMutation<'w>>,
+    shell_node: Option<Mut<'w, Node>>,
     lifecycle: PreparedLifecycleMutation<'w>,
     current: EntityLifecycle,
     next: EntityLifecycle,
     active_after: bool,
     interactive: bool,
+}
+
+struct PreparedVisualMutation<'w> {
+    visibility: Mut<'w, Visibility>,
+    pickable: Mut<'w, Pickable>,
+    barrier: Mut<'w, RouterInputBarrier>,
 }
 
 pub(crate) struct PreparedPresentationMutation<'w> {
@@ -593,31 +733,38 @@ impl PreparedLifecycleMutation<'_> {
 
 impl PreparedEntityMutation<'_> {
     fn apply_final(&mut self) {
-        *self.visibility = if self.active_after {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
+        self.apply_base_activation();
         self.apply_capabilities();
-        self.lifecycle.apply(self.next);
     }
 
     fn apply_base_activation(&mut self) {
-        *self.visibility = if self.active_after {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
+        if let Some(visual) = &mut self.visual {
+            *visual.visibility = if self.active_after {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+        }
+        if let Some(node) = &mut self.shell_node {
+            node.display = if self.active_after {
+                bevy_ui::Display::Flex
+            } else {
+                bevy_ui::Display::None
+            };
+        }
         self.lifecycle.apply(self.next);
     }
 
     fn apply_capabilities(&mut self) {
-        *self.pickable = if self.active_after && self.interactive {
+        let Some(visual) = &mut self.visual else {
+            return;
+        };
+        *visual.pickable = if self.active_after && self.interactive {
             ACTIVE_PICKABLE
         } else {
             Pickable::IGNORE
         };
-        *self.barrier = if self.active_after && self.interactive {
+        *visual.barrier = if self.active_after && self.interactive {
             RouterInputBarrier::allow_all()
         } else {
             RouterInputBarrier::deny_all()
@@ -626,43 +773,46 @@ impl PreparedEntityMutation<'_> {
 
     #[cfg(test)]
     fn is_prepared_inert(&self) -> bool {
-        *self.visibility == Visibility::Hidden
-            && *self.pickable == Pickable::IGNORE
-            && self.barrier.denies_all()
-            && self.lifecycle.matches(self.current)
+        self.visual.as_ref().is_none_or(|visual| {
+            *visual.visibility == Visibility::Hidden
+                && *visual.pickable == Pickable::IGNORE
+                && visual.barrier.denies_all()
+        }) && self.lifecycle.matches(self.current)
     }
 
     #[cfg(test)]
     fn is_base_active(&self) -> bool {
-        *self.visibility
-            == if self.active_after {
-                Visibility::Visible
-            } else {
-                Visibility::Hidden
-            }
-            && self.lifecycle.matches(self.next)
+        self.visual.as_ref().is_none_or(|visual| {
+            *visual.visibility
+                == if self.active_after {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                }
+        }) && self.lifecycle.matches(self.next)
     }
 
     #[cfg(test)]
     fn is_final(&self) -> bool {
-        *self.visibility
-            == if self.active_after {
-                Visibility::Visible
-            } else {
-                Visibility::Hidden
-            }
-            && *self.pickable
-                == if self.active_after && self.interactive {
-                    ACTIVE_PICKABLE
+        self.visual.as_ref().is_none_or(|visual| {
+            *visual.visibility
+                == if self.active_after {
+                    Visibility::Visible
                 } else {
-                    Pickable::IGNORE
+                    Visibility::Hidden
                 }
-            && if self.active_after && self.interactive {
-                self.barrier.allows_all()
-            } else {
-                self.barrier.denies_all()
-            }
-            && self.lifecycle.matches(self.next)
+                && *visual.pickable
+                    == if self.active_after && self.interactive {
+                        ACTIVE_PICKABLE
+                    } else {
+                        Pickable::IGNORE
+                    }
+                && if self.active_after && self.interactive {
+                    visual.barrier.allows_all()
+                } else {
+                    visual.barrier.denies_all()
+                }
+        }) && self.lifecycle.matches(self.next)
     }
 }
 
@@ -791,6 +941,56 @@ pub(crate) fn child_slot_mutation_target(
 }
 
 impl RealizedFrame {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn native_focus_owner(&self) -> Option<&crate::native_focus::NativeFocusOwner> {
+        self.native.as_ref()?.focus_owner.as_ref()
+    }
+
+    pub(crate) fn consume_native_focus_owner(&mut self) {
+        #[cfg(feature = "bsn")]
+        if let Some(native) = self.native.as_mut() {
+            native.focus_owner.take();
+        }
+    }
+    pub(crate) fn native_root(&self) -> Option<Entity> {
+        #[cfg(feature = "bsn")]
+        {
+            self.native.as_ref().map(|native| native.root)
+        }
+        #[cfg(not(feature = "bsn"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn live_interactive_entities(&self, world: &World) -> Vec<Entity> {
+        self.content_input_facts(world, &[]).1
+    }
+
+    /// Current managed content and its eligible subset. A visual ancestor is
+    /// observed without extending this frame's content/ownership boundary.
+    pub(crate) fn content_input_facts(
+        &self,
+        world: &World,
+        next: &[FrameMutationTarget],
+    ) -> (Vec<Entity>, Vec<Entity>) {
+        #[cfg(feature = "bsn")]
+        if let Some(root) = self.native_root() {
+            let managed =
+                native_frame::collect_content(world, self.frame(), root).unwrap_or_default();
+            let eligible = managed
+                .iter()
+                .copied()
+                .filter(|entity| {
+                    world.get::<Node>(*entity).is_some()
+                        && native_frame::authored_target_is_visible(world, *entity, next)
+                })
+                .collect();
+            return (managed, eligible);
+        }
+        let _ = (world, next);
+        (Vec::new(), self.interactive_entities())
+    }
     pub(crate) const fn frame(&self) -> &RouteFrameVersion {
         &self.frame
     }
@@ -996,7 +1196,15 @@ impl RealizedFrame {
                 next,
                 active_after,
                 interactive: entity.role == RealizedRole::SolidRect,
-                kind: PresentationTargetKind::Frame,
+                kind: if self.native_root().is_some() {
+                    if entity.entity == self.shell {
+                        PresentationTargetKind::NativeShell
+                    } else {
+                        PresentationTargetKind::NativeContent
+                    }
+                } else {
+                    PresentationTargetKind::Frame
+                },
             })
             .collect()
     }
@@ -1102,6 +1310,8 @@ fn apply_claim_alias_rebind(current: &mut ExactRegistryClaim, claims: &[ExactReg
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RealizationError {
+    #[cfg(feature = "bsn")]
+    NativeFocus(crate::native_focus::NativeFocusError),
     MissingTopSlot,
     InvalidTopSlot,
     InvalidMount,
@@ -1425,7 +1635,7 @@ fn realize_frame_with_binding_deferred(
                 .iter()
                 .find_map(|(index, entity)| (*index == outlet.local_index()).then_some(*entity))
                 .expect("accepted outlet local index must map to a realized output");
-            let anchor_claim = realized
+            let anchor_binding = realized
                 .iter()
                 .find(|entity| entity.entity == anchor)
                 .expect("realized outlet anchor must retain its exact claim")
@@ -1435,7 +1645,7 @@ fn realize_frame_with_binding_deferred(
                 parent: frame.clone(),
                 key: outlet.key().clone(),
                 anchor,
-                anchor_claim,
+                anchor_binding: OutletBinding::RegisteredOutput(anchor_binding),
             }
         })
         .collect();
@@ -1449,6 +1659,8 @@ fn realize_frame_with_binding_deferred(
         entities: realized,
         outlets,
         prewrite_complete: true,
+        #[cfg(feature = "bsn")]
+        native: None,
     };
     clear_frame_focus(world, &result);
     let children = world.register_component::<Children>();
@@ -1532,6 +1744,8 @@ fn partial_realized_frame(
         entities,
         outlets: Vec::new(),
         prewrite_complete: false,
+        #[cfg(feature = "bsn")]
+        native: None,
     }
 }
 
@@ -1564,7 +1778,7 @@ fn validate_mount_binding_allowing_additions(
             parent,
             outlet,
             anchor,
-            anchor_claim,
+            anchor_binding,
             expected_anchor_children,
             staging_lifecycle,
             ..
@@ -1586,7 +1800,7 @@ fn validate_mount_binding_allowing_additions(
                 parent,
                 outlet,
                 *anchor,
-                anchor_claim,
+                anchor_binding,
                 expected_anchor_children,
                 frame,
                 allowed_manifest_additions,
@@ -1619,7 +1833,7 @@ fn validate_committed_mount_binding(
             parent,
             outlet,
             anchor,
-            anchor_claim,
+            anchor_binding,
             expected_anchor_children,
             ..
         } => validate_child_mount_slot(
@@ -1630,7 +1844,7 @@ fn validate_committed_mount_binding(
             parent,
             outlet,
             *anchor,
-            anchor_claim,
+            anchor_binding,
             expected_anchor_children,
             frame,
             &[],
@@ -1651,7 +1865,7 @@ fn validate_child_mount_slot(
     parent: &RouteFrameVersion,
     outlet: &bevy_ui_router_core::slot::RouteSlotKey,
     anchor: Entity,
-    anchor_claim: &ExactRegistryClaim,
+    anchor_binding: &OutletBinding,
     expected_anchor_children: &[Entity],
     frame: &RouteFrameVersion,
     allowed_manifest_additions: &[ComponentId],
@@ -1666,9 +1880,6 @@ fn validate_child_mount_slot(
     let Some(slot_record) = registry.record(slot_entity) else {
         return Err(RealizationError::InvalidMount);
     };
-    let Some(anchor_record) = registry.record(anchor) else {
-        return Err(RealizationError::InvalidMount);
-    };
     let owner_is_exact = matches!(
         slot_record.owner(),
         RegistryOwner::Committed(EntityOwner::ChildSlot {
@@ -1676,13 +1887,6 @@ fn validate_child_mount_slot(
             outlet: owner_outlet,
             slot,
         }) if owner_parent == parent && owner_outlet == outlet && *slot == frame.slot()
-    );
-    let anchor_owner_is_exact = matches!(
-        anchor_record.owner(),
-        RegistryOwner::Committed(EntityOwner::FrameOutput {
-            frame: owner_frame,
-            ..
-        }) if owner_frame == parent
     );
     let expected_node = Node {
         width: Val::Percent(100.0),
@@ -1721,20 +1925,14 @@ fn validate_child_mount_slot(
                     && authority.slot() == frame.slot()
             })
         || world.get::<ChildOf>(slot_entity).map(ChildOf::parent) != Some(anchor)
-        || anchor_record.claim() != *anchor_claim
-        || !anchor_owner_is_exact
-        || !(if allow_arbitrary_manifest_additions {
-            manifest_contains_expected(world, anchor, anchor_record.manifest())
-        } else {
-            anchor_record.manifest().matches(world, anchor)
-        })
-        || world.get::<RouteOwnershipSeal>(anchor)
-            != Some(&RouteOwnershipSeal::new(anchor_record.seal()))
-        || world
-            .get::<Children>(anchor)
-            .map(|children| children.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default()
-            != expected_anchor_children
+        || anchor_binding.anchor() != anchor
+        || !anchor_binding.is_current_with_manifest_policy(
+            world,
+            parent,
+            true,
+            allow_arbitrary_manifest_additions,
+        )
+        || !anchor_binding.children_are_current(world, slot_entity, expected_anchor_children)
         || !validated_host_candidate_is_current(world, host_candidate)
     {
         return Err(RealizationError::InvalidMount);
@@ -2259,6 +2457,10 @@ fn validate_realized_frame_allowing_child_slots(
     existing_mount: Option<&RealizedFrame>,
     observed_leaving_shells: &[ExactRegistryClaim],
 ) -> bool {
+    #[cfg(feature = "bsn")]
+    if frame.native_focus_owner().is_some() && !crate::native_focus::source_is_valid(world) {
+        return false;
+    }
     let sealed_existing_mount = existing_mount.is_some_and(|existing| {
         frame
             .sealed_reconciliation_entering_shell_for(existing)
@@ -2298,6 +2500,10 @@ fn validate_realized_frame_allowing_child_slots(
     let focus_present = frame_focus_is_in_subtree(world, frame);
     if !mount_valid || !mount_children_valid || focus_present {
         return false;
+    }
+    #[cfg(feature = "bsn")]
+    if frame.native_root().is_some() {
+        return native_frame::validate_native_values(world, frame, EntityLifecycle::PreparedInert);
     }
     frame.entities.iter().all(|realized| {
         let Some(record) = world
@@ -2396,10 +2602,10 @@ fn prepare_presentation_access<'w>(
         Option<&FrameLifecycle>,
         Option<&ChildSlotLifecycle>,
     )>();
-    if targets
-        .iter()
-        .any(|target| presentation_eligibility.get(world, target.entity).is_err())
-    {
+    if targets.iter().any(|target| {
+        !matches!(target.kind, PresentationTargetKind::NativeContent)
+            && presentation_eligibility.get(world, target.entity).is_err()
+    }) {
         return None;
     }
     let pointer_targets = pointer_targets.iter().copied().collect::<HashSet<_>>();
@@ -2417,9 +2623,12 @@ fn prepare_presentation_access<'w>(
             &mut Visibility,
             Option<&mut Pickable>,
             &mut RouterInputBarrier,
+        )>,
+        (
             Option<&mut FrameLifecycle>,
             Option<&mut ChildSlotLifecycle>,
-        )>,
+            Option<&mut Node>,
+        ),
         Option<&mut PickingInteraction>,
         Option<&mut HoverMap>,
         Option<&mut PreviousHoverMap>,
@@ -2438,8 +2647,16 @@ fn prepare_presentation_access<'w>(
     let mut pointer_resources = PointerStateResources::default();
     let (mut navigation, mut registry, mut gate, mut input_focus, mut route_focus) =
         (None, None, None, None, None);
-    for (entity, presentation, interaction, hover, previous_hover, state, resources) in
-        query.iter_mut(world)
+    for (
+        entity,
+        presentation,
+        (frame_lifecycle, slot_lifecycle, node),
+        interaction,
+        hover,
+        previous_hover,
+        state,
+        resources,
+    ) in query.iter_mut(world)
     {
         let (nav, reg, input_gate, focus, route) = resources;
         if publication {
@@ -2481,7 +2698,29 @@ fn prepare_presentation_access<'w>(
         else {
             continue;
         };
-        let (visibility, pickable, barrier, frame_lifecycle, slot_lifecycle) = presentation?;
+        if matches!(target.kind, PresentationTargetKind::NativeContent) {
+            let lifecycle = frame_lifecycle?;
+            if lifecycle.0 != target.current || slot_lifecycle.is_some() || found[index] {
+                return None;
+            }
+            found[index] = true;
+            entities.push((
+                index,
+                PreparedEntityMutation {
+                    #[cfg(test)]
+                    entity,
+                    visual: None,
+                    shell_node: None,
+                    lifecycle: PreparedLifecycleMutation::Frame(lifecycle),
+                    current: target.current,
+                    next: target.next,
+                    active_after: target.active_after,
+                    interactive: false,
+                },
+            ));
+            continue;
+        }
+        let (visibility, pickable, barrier) = presentation?;
         let expected_pickable = if target.current == EntityLifecycle::Active && target.interactive {
             ACTIVE_PICKABLE
         } else {
@@ -2492,18 +2731,21 @@ fn prepare_presentation_access<'w>(
         };
         let pickable_valid = *pickable == expected_pickable;
         let lifecycle = match target.kind {
-            PresentationTargetKind::Frame => match (frame_lifecycle, slot_lifecycle) {
-                (Some(lifecycle), None) if lifecycle.0 == target.current => {
-                    PreparedLifecycleMutation::Frame(lifecycle)
+            PresentationTargetKind::Frame | PresentationTargetKind::NativeShell => {
+                match (frame_lifecycle, slot_lifecycle) {
+                    (Some(lifecycle), None) if lifecycle.0 == target.current => {
+                        PreparedLifecycleMutation::Frame(lifecycle)
+                    }
+                    _ => return None,
                 }
-                _ => return None,
-            },
+            }
             PresentationTargetKind::ChildSlot => match (frame_lifecycle, slot_lifecycle) {
                 (None, Some(lifecycle)) if child_slot_lifecycle(target.current) == *lifecycle => {
                     PreparedLifecycleMutation::ChildSlot(lifecycle)
                 }
                 _ => return None,
             },
+            PresentationTargetKind::NativeContent => unreachable!(),
         };
         if found[index]
             || !pickable_valid
@@ -2527,9 +2769,16 @@ fn prepare_presentation_access<'w>(
             PreparedEntityMutation {
                 #[cfg(test)]
                 entity,
-                visibility,
-                pickable,
-                barrier,
+                visual: Some(PreparedVisualMutation {
+                    visibility,
+                    pickable,
+                    barrier,
+                }),
+                shell_node: if matches!(target.kind, PresentationTargetKind::NativeShell) {
+                    Some(node?)
+                } else {
+                    None
+                },
                 lifecycle,
                 current: target.current,
                 next: target.next,
@@ -2643,6 +2892,10 @@ pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> boo
 }
 
 pub(crate) fn validate_active_frame_local_values(world: &World, frame: &RealizedFrame) -> bool {
+    #[cfg(feature = "bsn")]
+    if frame.native_root().is_some() {
+        return native_frame::validate_native_values(world, frame, EntityLifecycle::Active);
+    }
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return false;
     };
@@ -2760,6 +3013,15 @@ fn classify_committed_frame(
         // Continue with the role-sensitive closure checks below.
     } else {
         return CommittedFramePreflight::Invalid;
+    }
+
+    #[cfg(feature = "bsn")]
+    if frame.native_root().is_some() {
+        return if native_frame::validate_native_values(world, frame, EntityLifecycle::Active) {
+            CommittedFramePreflight::Ready
+        } else {
+            CommittedFramePreflight::Invalid
+        };
     }
 
     let mut quarantine_on_leave = false;
@@ -2896,6 +3158,15 @@ pub(crate) fn isolate_frame_for_settlement_guarded(
     requires_exact_isolation: &impl Fn(&ExactRegistryClaim) -> bool,
     protected_partition_is_exact: &impl Fn(&World) -> bool,
 ) -> bool {
+    #[cfg(feature = "bsn")]
+    if frame.native_root().is_some() {
+        return native_frame::isolate_native_frame(
+            world,
+            frame,
+            requires_exact_isolation,
+            protected_partition_is_exact,
+        );
+    }
     if !protected_partition_is_exact(world)
         || !frame
             .entities
@@ -3013,6 +3284,23 @@ pub(crate) fn frame_is_isolated_for_settlement(
     frame: &RealizedFrame,
     requires_exact_isolation: &impl Fn(&ExactRegistryClaim) -> bool,
 ) -> bool {
+    #[cfg(feature = "bsn")]
+    if frame.native_root().is_some() {
+        return frame
+            .entities
+            .iter()
+            .filter(|entity| requires_exact_isolation(&entity.claim))
+            .all(|entity| {
+                frame_claim_is_current(world, entity)
+                    && if entity.entity == frame.shell() {
+                        world
+                            .get::<Node>(entity.entity)
+                            .is_some_and(|node| node.display == bevy_ui::Display::None)
+                    } else {
+                        native_frame::content_scope_is_inert(world, entity.entity)
+                    }
+            });
+    }
     frame
         .entities
         .iter()
@@ -4871,7 +5159,7 @@ pub(crate) mod tests {
                 parent: parent.clone(),
                 outlet: outlet.clone(),
                 anchor: first_slot,
-                anchor_claim: first_claim,
+                anchor_binding: OutletBinding::RegisteredOutput(first_claim),
                 expected_anchor_children: Vec::new(),
                 staging_lifecycle: EntityLifecycle::PreparedInert,
                 allowed_existing_shells: Vec::new(),
@@ -4904,7 +5192,7 @@ pub(crate) mod tests {
             content.accept(),
         )
         .unwrap();
-        let current_anchor = frame.outlets[0].anchor_claim.clone();
+        let current_anchor = frame.outlets[0].anchor_claim().clone();
         let anchor_manifest = world
             .resource::<RouteEntityRegistry>()
             .record(current_anchor.entity())
@@ -4922,7 +5210,7 @@ pub(crate) mod tests {
                 current_anchor.lifecycle(),
             )
             .unwrap();
-        frame.outlets[0].anchor_claim = foreign_registry
+        *frame.outlets[0].anchor_binding.source_claim_mut() = foreign_registry
             .record(current_anchor.entity())
             .unwrap()
             .claim();
@@ -4967,7 +5255,7 @@ pub(crate) mod tests {
             content.accept(),
         )
         .unwrap();
-        let current_anchor = frame.outlets[0].anchor_claim.clone();
+        let current_anchor = frame.outlets[0].anchor_claim().clone();
         let foreign_entity = world.spawn_empty().id();
         let anchor_manifest = world
             .resource::<RouteEntityRegistry>()
@@ -4986,7 +5274,8 @@ pub(crate) mod tests {
                 current_anchor.lifecycle(),
             )
             .unwrap();
-        frame.outlets[0].anchor_claim = foreign_registry.record(foreign_entity).unwrap().claim();
+        *frame.outlets[0].anchor_binding.source_claim_mut() =
+            foreign_registry.record(foreign_entity).unwrap().claim();
 
         let transitions = frame.lifecycle_transitions(EntityLifecycle::Active);
         let resulting = world

@@ -27,7 +27,7 @@ use crate::{
         ChildSlotNodeProbe, ChildSlotRelationshipProbe, RouteOwnershipSeal, RouterInputBarrier,
     },
     input::RouteFocusState,
-    presentation::{RealizedFrame, RealizedOutlet},
+    presentation::{OutletBinding, RealizedFrame, RealizedOutlet},
     registry::{
         ComponentManifest, EntityLifecycle, ExactRegistryClaim, ProvisionalOwner, RegistryOwner,
         RouteEntityRegistry,
@@ -56,7 +56,7 @@ pub(crate) struct ProvisionalChildSlot {
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
     anchor: Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: OutletBinding,
     prior_anchor_children: Vec<Entity>,
 }
 
@@ -80,7 +80,7 @@ pub(crate) struct MountReceipt {
     slot_claim: ExactRegistryClaim,
     slot_manifest: ComponentManifest,
     anchor: Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: OutletBinding,
     anchor_manifest: ComponentManifest,
     expected_anchor_children: Vec<Entity>,
     digest: u64,
@@ -144,7 +144,7 @@ pub(crate) struct MountedChildSlot {
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
     anchor: Entity,
-    anchor_claim: ExactRegistryClaim,
+    anchor_binding: OutletBinding,
     expected_anchor_children: Vec<Entity>,
     slot_id: RouteSlotId,
 }
@@ -175,11 +175,23 @@ impl MountedChildSlot {
     }
 
     pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
-        &self.anchor_claim
+        self.anchor_binding.source_claim()
+    }
+
+    pub(crate) const fn anchor_binding(&self) -> &OutletBinding {
+        &self.anchor_binding
     }
 
     pub(crate) fn expected_anchor_children(&self) -> &[Entity] {
         &self.expected_anchor_children
+    }
+
+    pub(crate) fn current_anchor_children(&self, world: &World) -> Vec<Entity> {
+        if self.anchor_binding.is_native() {
+            children_of(world, self.anchor)
+        } else {
+            self.expected_anchor_children.clone()
+        }
     }
 
     #[cfg(test)]
@@ -190,7 +202,7 @@ impl MountedChildSlot {
             parent: self.parent.clone(),
             outlet: self.outlet.clone(),
             anchor: self.anchor,
-            anchor_claim: self.anchor_claim.clone(),
+            anchor_binding: self.anchor_binding.clone(),
             expected_anchor_children: self.expected_anchor_children.clone(),
             slot_id: self.slot_id,
         }
@@ -234,7 +246,7 @@ impl MountedChildSlot {
     ) -> bool {
         self.claim_alias_can_rebind(&self.slot_claim, claims, expected_current, expected_next)
             && self.claim_alias_can_rebind(
-                &self.anchor_claim,
+                self.anchor_binding.source_claim(),
                 claims,
                 expected_current,
                 expected_next,
@@ -250,9 +262,9 @@ impl MountedChildSlot {
         }
         if let Some(next) = claims
             .iter()
-            .find(|claim| claim.entity() == self.anchor_claim.entity())
+            .find(|claim| claim.entity() == self.anchor_binding.source_claim().entity())
         {
-            self.anchor_claim = next.clone();
+            *self.anchor_binding.source_claim_mut() = next.clone();
         }
     }
 
@@ -330,7 +342,11 @@ impl ChildSlotResidual {
     }
 
     pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
-        &self.provisional.anchor_claim
+        self.provisional.anchor_binding.source_claim()
+    }
+
+    pub(crate) const fn anchor_binding(&self) -> &OutletBinding {
+        &self.provisional.anchor_binding
     }
 
     pub(crate) const fn authorized_manifest(&self) -> &ComponentManifest {
@@ -356,7 +372,7 @@ impl ChildSlotResidual {
                 parent: mounted.parent.clone(),
                 outlet: mounted.outlet.clone(),
                 anchor,
-                anchor_claim,
+                anchor_binding: OutletBinding::RegisteredOutput(anchor_claim),
                 prior_anchor_children: world
                     .get::<Children>(anchor)
                     .map(|children| children.iter().copied().collect())
@@ -509,7 +525,7 @@ pub(crate) fn stage_child_slot(
         parent: parent.frame().clone(),
         outlet: outlet_key.clone(),
         anchor: outlet.anchor(),
-        anchor_claim: outlet.anchor_claim().clone(),
+        anchor_binding: outlet.anchor_binding().clone(),
         prior_anchor_children: prior_anchor_children.clone(),
     };
     if !validate_stage_registry(world, &provisional, &initial_manifest)
@@ -635,11 +651,8 @@ pub(crate) fn stage_child_slot(
         .expect("validated child slot record must exist")
         .manifest()
         .clone();
-    let anchor_manifest = registry
-        .record(provisional.anchor)
-        .expect("validated outlet anchor record must exist")
-        .manifest()
-        .clone();
+    let anchor_manifest = ComponentManifest::from_world(world, provisional.anchor)
+        .expect("validated physical outlet anchor must exist");
     let digest = mount_receipt_digest(
         &provisional,
         grant.slot(),
@@ -652,7 +665,7 @@ pub(crate) fn stage_child_slot(
         slot_claim: provisional.slot_claim.clone(),
         slot_manifest,
         anchor: provisional.anchor,
-        anchor_claim: provisional.anchor_claim.clone(),
+        anchor_binding: provisional.anchor_binding.clone(),
         anchor_manifest,
         expected_anchor_children,
         digest,
@@ -743,7 +756,7 @@ pub(crate) fn confirm_child_slot(
         parent: provisional.parent.clone(),
         outlet: provisional.outlet.clone(),
         anchor: provisional.anchor,
-        anchor_claim: provisional.anchor_claim.clone(),
+        anchor_binding: provisional.anchor_binding.clone(),
         expected_anchor_children: receipt.expected_anchor_children.clone(),
         slot_id,
     };
@@ -771,7 +784,7 @@ fn receipt_matches_provisional(
         && receipt.slot_claim == slot.slot_claim
         && receipt.slot_manifest.matches(world, slot.slot)
         && receipt.anchor == slot.anchor
-        && receipt.anchor_claim == slot.anchor_claim
+        && receipt.anchor_binding == slot.anchor_binding
         && receipt.anchor_manifest.matches(world, slot.anchor)
         && children_of(world, slot.anchor) == receipt.expected_anchor_children
         && receipt.digest
@@ -806,14 +819,12 @@ fn receipt_matches_provisional(
                     && record.manifest() == &receipt.slot_manifest
                     && record.manifest().matches(world, slot.slot)
             })
-        && world
-            .resource::<RouteEntityRegistry>()
-            .record(slot.anchor)
-            .is_some_and(|record| {
-                record.claim() == slot.anchor_claim
-                    && record.manifest() == &receipt.anchor_manifest
-                    && record.manifest().matches(world, slot.anchor)
-            })
+        && slot.anchor_binding.is_current(world, &slot.parent, true)
+        && physical_anchor_manifest_is_current(
+            world,
+            &slot.anchor_binding,
+            &receipt.anchor_manifest,
+        )
 }
 
 fn validate_registered_slot(
@@ -860,16 +871,12 @@ fn validate_registered_slot(
             })
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
         && children_of(world, slot.anchor) == receipt.expected_anchor_children
-        && world
-            .resource::<RouteEntityRegistry>()
-            .record(slot.anchor)
-            .is_some_and(|record| {
-                record.claim() == slot.anchor_claim
-                    && record.manifest() == &receipt.anchor_manifest
-                    && record.manifest().matches(world, slot.anchor)
-                    && world.get::<RouteOwnershipSeal>(slot.anchor)
-                        == Some(&RouteOwnershipSeal::new(record.seal()))
-            })
+        && slot.anchor_binding.is_current(world, &slot.parent, true)
+        && physical_anchor_manifest_is_current(
+            world,
+            &slot.anchor_binding,
+            &receipt.anchor_manifest,
+        )
         && !focus_is_in_slot(world, slot.slot)
 }
 
@@ -944,9 +951,6 @@ fn validate_mounted_child_slot_with_policy(
     let Some(record) = registry.record(slot.slot) else {
         return false;
     };
-    let Some(anchor_record) = registry.record(slot.anchor) else {
-        return false;
-    };
     let (component_lifecycle, visibility) = match lifecycle {
         EntityLifecycle::PreparedInert => (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden),
         EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
@@ -962,15 +966,12 @@ fn validate_mounted_child_slot_with_policy(
                 outlet: slot.outlet.clone(),
                 slot: slot.slot_id,
             })
-        && anchor_record.claim() == slot.anchor_claim
-        && manifest_matches_policy(
+        && slot.anchor_binding.is_current_with_manifest_policy(
             world,
-            slot.anchor,
-            anchor_record.manifest(),
+            &slot.parent,
+            true,
             allow_foreign_additions,
         )
-        && world.get::<RouteOwnershipSeal>(slot.anchor)
-            == Some(&RouteOwnershipSeal::new(anchor_record.seal()))
         && world.get::<Visibility>(slot.slot) == Some(&visibility)
         && world.get::<Pickable>(slot.slot) == Some(&Pickable::IGNORE)
         && world
@@ -987,7 +988,11 @@ fn validate_mounted_child_slot_with_policy(
                     && authority.slot() == slot.slot_id
             })
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
-        && children_of(world, slot.anchor) == slot.expected_anchor_children
+        && slot.anchor_binding.children_are_current(
+            world,
+            slot.slot,
+            &slot.expected_anchor_children,
+        )
         && (lifecycle == EntityLifecycle::Active
             || !require_focus_outside
             || !focus_is_in_slot(world, slot.slot))
@@ -1165,7 +1170,7 @@ fn confirmation_failure(
 
 fn mounted_registration_digest(slot: &MountedChildSlot, receipt: &MountReceipt) -> u64 {
     let mut digest = slot.slot_claim.opaque_digest_part().rotate_left(17)
-        ^ slot.anchor_claim.opaque_digest_part().rotate_left(37)
+        ^ slot.anchor_binding.opaque_digest_part().rotate_left(37)
         ^ slot.slot_id.raw().rotate_left(53)
         ^ slot.slot.to_bits()
         ^ slot.anchor.to_bits().rotate_left(29);
@@ -1233,13 +1238,20 @@ fn advance_relationship_batch(
     let Some(old_slot) = current_exact_manifest(world, slot) else {
         return false;
     };
-    let Some(old_anchor) = world
-        .resource::<RouteEntityRegistry>()
-        .record(slot.anchor)
-        .filter(|record| record.claim() == slot.anchor_claim)
-        .map(|record| record.manifest().clone())
-    else {
+    let Some(old_anchor) = ComponentManifest::from_world(world, slot.anchor) else {
         return false;
+    };
+    let registered_anchor = if let Some(claim) = slot.anchor_binding.physical_claim() {
+        let Some(record) = world
+            .resource::<RouteEntityRegistry>()
+            .record(slot.anchor)
+            .filter(|record| record.claim() == *claim)
+        else {
+            return false;
+        };
+        Some((claim.clone(), record.manifest().clone()))
+    } else {
+        None
     };
     if !old_slot.matches(world, slot.slot)
         || !old_anchor.matches(world, slot.anchor)
@@ -1291,23 +1303,19 @@ fn advance_relationship_batch(
         || children_of(world, slot.anchor) != expected_children
         || world.get::<ChildOf>(slot.slot).map(ChildOf::parent) != Some(slot.anchor)
         || !validate_stage_registry(world, slot, &old_slot)
-        || !world
-            .resource::<RouteEntityRegistry>()
-            .record(slot.anchor)
-            .is_some_and(|record| {
-                record.claim() == slot.anchor_claim && record.manifest() == &old_anchor
-            })
+        // The exact physical delta above authorizes the newly inserted Children.
+        // Its registry manifest is exchanged below, so this intermediate check
+        // must validate the original source without requiring that exchange early.
+        || !slot.anchor_binding.is_current_with_manifest_policy(world, &slot.parent, true, true)
+        || registered_anchor.as_ref().is_some_and(|(claim, manifest)| !world.resource::<RouteEntityRegistry>().record(slot.anchor)
+            .is_some_and(|record| record.claim() == *claim && record.manifest() == manifest))
     {
         return false;
     }
-    let exchanges = [
-        (slot.slot_claim.clone(), old_slot, expected_slot.clone()),
-        (
-            slot.anchor_claim.clone(),
-            old_anchor,
-            expected_anchor.clone(),
-        ),
-    ];
+    let mut exchanges = vec![(slot.slot_claim.clone(), old_slot, expected_slot.clone())];
+    if let Some((claim, manifest)) = registered_anchor {
+        exchanges.push((claim, manifest, expected_anchor.clone()));
+    }
     if !world
         .resource_mut::<RouteEntityRegistry>()
         .compare_exchange_manifests_exact(&exchanges)
@@ -1316,14 +1324,7 @@ fn advance_relationship_batch(
     }
     validate_stage_registry(world, slot, &expected_slot)
         && expected_slot.matches(world, slot.slot)
-        && world
-            .resource::<RouteEntityRegistry>()
-            .record(slot.anchor)
-            .is_some_and(|record| {
-                record.claim() == slot.anchor_claim
-                    && record.manifest() == &expected_anchor
-                    && expected_anchor.matches(world, slot.anchor)
-            })
+        && physical_anchor_manifest_is_current(world, &slot.anchor_binding, &expected_anchor)
         && children_of(world, slot.anchor) == expected_children
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
 }
@@ -1396,40 +1397,28 @@ fn validate_stage_registry(
 }
 
 fn validate_outlet_anchor(world: &World, outlet: &RealizedOutlet) -> bool {
-    world
-        .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(outlet.anchor()))
-        .is_some_and(|record| {
-            record.claim() == *outlet.anchor_claim()
-                && matches!(
-                    record.owner(),
-                    RegistryOwner::Committed(crate::registry::EntityOwner::FrameOutput {
-                        frame,
-                        ..
-                    }) if frame == outlet.parent()
-                )
-                && record.manifest().matches(world, outlet.anchor())
-                && world.get::<RouteOwnershipSeal>(outlet.anchor())
-                    == Some(&RouteOwnershipSeal::new(record.seal()))
-        })
+    outlet.anchor_binding().anchor() == outlet.anchor()
+        && outlet
+            .anchor_binding()
+            .is_current(world, outlet.parent(), true)
 }
 
 fn validate_outlet_claim(world: &World, slot: &ProvisionalChildSlot) -> bool {
-    world
-        .resource::<RouteEntityRegistry>()
-        .record(slot.anchor)
-        .is_some_and(|record| {
-            record.claim() == slot.anchor_claim
-                && matches!(
-                    record.owner(),
-                    RegistryOwner::Committed(crate::registry::EntityOwner::FrameOutput {
-                        frame,
-                        ..
-                    }) if frame == &slot.parent
-                )
-                && record.manifest().matches(world, slot.anchor)
-                && world.get::<RouteOwnershipSeal>(slot.anchor)
-                    == Some(&RouteOwnershipSeal::new(record.seal()))
+    slot.anchor_binding.anchor() == slot.anchor
+        && slot.anchor_binding.is_current(world, &slot.parent, true)
+}
+
+fn physical_anchor_manifest_is_current(
+    world: &World,
+    binding: &OutletBinding,
+    manifest: &ComponentManifest,
+) -> bool {
+    manifest.matches(world, binding.anchor())
+        && binding.physical_claim().is_none_or(|claim| {
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(binding.anchor())
+                .is_some_and(|record| record.claim() == *claim && record.manifest() == manifest)
         })
 }
 
@@ -1590,7 +1579,7 @@ fn mount_receipt_digest(
     expected_anchor_children: &[Entity],
 ) -> u64 {
     let mut digest = slot.slot_claim.opaque_digest_part().rotate_left(7)
-        ^ slot.anchor_claim.opaque_digest_part().rotate_left(23)
+        ^ slot.anchor_binding.opaque_digest_part().rotate_left(23)
         ^ slot_id.raw().rotate_left(41)
         ^ slot.parent.router().raw()
         ^ slot.parent.host().raw().rotate_left(13)
@@ -1741,7 +1730,7 @@ pub(crate) mod tests {
             .outlet(&RouteSlotKey::default())
             .expect("default outlet exists")
             .anchor();
-        let (anchor_claim, old_manifest) = {
+        let (anchor_binding, old_manifest) = {
             let record = world
                 .resource::<RouteEntityRegistry>()
                 .record(anchor)
@@ -1754,7 +1743,7 @@ pub(crate) mod tests {
         assert!(
             world
                 .resource_mut::<RouteEntityRegistry>()
-                .compare_exchange_manifest_exact(&anchor_claim, &old_manifest, actual_manifest,)
+                .compare_exchange_manifest_exact(&anchor_binding, &old_manifest, actual_manifest,)
         );
         let foreign = world.spawn_empty().id();
         world.insert_resource(AnchorOrderDrift { anchor, foreign });
@@ -2857,7 +2846,8 @@ pub(crate) mod tests {
                 EntityLifecycle::PreparedInert,
             )
             .unwrap();
-        mounted.anchor_claim = foreign_registry.record(foreign_entity).unwrap().claim();
+        *mounted.anchor_binding.source_claim_mut() =
+            foreign_registry.record(foreign_entity).unwrap().claim();
         let slot_before = mounted.slot_claim().clone();
         let anchor_before = mounted.anchor_claim().clone();
 

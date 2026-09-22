@@ -2148,7 +2148,7 @@ fn detailed_mount_parent_error_preserves_unsupported_owner_fact() {
         })
         .unwrap()
         .clone();
-    let mut candidate = mounted_anchor_parent_candidate(mounted).unwrap();
+    let mut candidate = mounted_anchor_parent_candidate(app.world(), mounted).unwrap();
     candidate.claim = shell_claim.clone();
 
     let error = freeze_external_mount_parents_detailed(
@@ -2187,7 +2187,7 @@ fn detailed_mount_parent_errors_preserve_each_physical_predicate() {
             )
             .unwrap(),
         ];
-        let mut first = mounted_anchor_parent_candidate(mounted).unwrap();
+        let mut first = mounted_anchor_parent_candidate(app.world(), mounted).unwrap();
         let mut second = None;
         match case {
             0 => {
@@ -2195,7 +2195,7 @@ fn detailed_mount_parent_errors_preserve_each_physical_predicate() {
                 first.children_before = vec![foreign];
             }
             1 => {
-                let mut conflict = mounted_anchor_parent_candidate(mounted).unwrap();
+                let mut conflict = mounted_anchor_parent_candidate(app.world(), mounted).unwrap();
                 conflict.removed_child = app.world_mut().spawn_empty().id();
                 conflict.removed_child_was_attached = false;
                 second = Some(conflict);
@@ -2306,7 +2306,7 @@ pub(crate) fn external_frame_output_value_and_manifest_drift_is_zero_write_and_r
             app.world(),
             app.world().resource::<RouteEntityRegistry>(),
             &obligations,
-            [mounted_anchor_parent_candidate(mounted).unwrap()],
+            [mounted_anchor_parent_candidate(app.world(), mounted).unwrap()],
         )
         .unwrap();
         assert_eq!(mount_parents[0].claim.entity(), anchor);
@@ -2452,6 +2452,8 @@ fn quarantine_detachment_projection_accumulates_later_edges_without_rebaselining
         let child_manifest = empty_manifest();
         PreparedCleanupQuarantineMountParentDetachment {
             parent: CleanupMountParentSettlement {
+                physical: parent.entity(),
+                binding: CleanupParentBinding::Structural { upstream: None },
                 claim: parent.clone(),
                 manifest: parent_manifest.clone(),
                 physical_manifest: parent_manifest.clone(),
@@ -2490,8 +2492,8 @@ fn quarantine_detachment_projection_accumulates_later_edges_without_rebaselining
     assert!(accumulated.merge_conflict_kind(&second).is_none());
     accumulated.merge_prechecked(second);
     assert_eq!(accumulated.edges.len(), 2);
-    assert!(accumulated.contains_parent(&claims[0]));
-    assert!(accumulated.contains_parent(&claims[2]));
+    assert!(accumulated.contains_parent(&edge(claims[0].clone(), claims[1].clone()).parent));
+    assert!(accumulated.contains_parent(&edge(claims[2].clone(), claims[3].clone()).parent));
     assert_eq!(accumulated.targets_after.len(), 2);
     assert_eq!(accumulated.targets_after[0], original_first_target);
 }

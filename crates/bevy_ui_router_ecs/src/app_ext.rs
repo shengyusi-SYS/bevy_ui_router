@@ -142,6 +142,7 @@ pub enum RouterInstallErrorKind {
     UnknownRouteView,
     UnknownViewDriver,
     MissingFallbackView,
+    MissingSceneRuntime,
 }
 
 #[derive(Debug)]
@@ -167,6 +168,7 @@ impl std::fmt::Display for RouterInstallError {
             RouterInstallErrorKind::UnknownRouteView => "route view is not registered",
             RouterInstallErrorKind::UnknownViewDriver => "view driver is not registered",
             RouterInstallErrorKind::MissingFallbackView => "fallback view is not registered",
+            RouterInstallErrorKind::MissingSceneRuntime => "BSN requires AssetServer and Assets<ScenePatch>; install the Bevy asset and scene runtime before adding this router",
         })
     }
 }
@@ -205,7 +207,13 @@ impl std::error::Error for ViewDriverRegistrationError {}
 
 #[derive(Resource)]
 pub(crate) struct ViewDriverStore {
-    drivers: Vec<(ViewDriverKey, Box<dyn EcsViewDriver>)>,
+    drivers: Vec<(ViewDriverKey, ViewExecutor)>,
+}
+
+pub(crate) enum ViewExecutor {
+    Data(Box<dyn EcsViewDriver>),
+    #[cfg(feature = "bsn")]
+    Native(bevy_ui_router_bsn::BsnSceneFactory),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,7 +237,8 @@ impl ViewDriverStore {
             return Err(ViewDriverRegistrationError::duplicate_key());
         }
 
-        self.drivers.push((key.clone(), Box::new(driver)));
+        self.drivers
+            .push((key.clone(), ViewExecutor::Data(Box::new(driver))));
         Ok(key)
     }
 
@@ -239,7 +248,44 @@ impl ViewDriverStore {
     ) -> Option<&mut (dyn EcsViewDriver + 'static)> {
         self.drivers
             .iter_mut()
-            .find_map(|(stored, driver)| (stored == key).then_some(driver.as_mut()))
+            .find_map(|(stored, driver)| match driver {
+                ViewExecutor::Data(driver) if stored == key => Some(driver.as_mut()),
+                _ => None,
+            })
+    }
+
+    #[cfg(feature = "bsn")]
+    pub(crate) fn register_native(
+        &mut self,
+        key: ViewDriverKey,
+        factory: bevy_ui_router_bsn::BsnSceneFactory,
+    ) -> Result<ViewDriverKey, ViewDriverRegistrationError> {
+        if self.contains(&key) {
+            return Err(ViewDriverRegistrationError::duplicate_key());
+        }
+        self.drivers
+            .push((key.clone(), ViewExecutor::Native(factory)));
+        Ok(key)
+    }
+
+    #[cfg(feature = "bsn")]
+    pub(crate) fn native_mut(
+        &mut self,
+        key: &ViewDriverKey,
+    ) -> Option<&mut bevy_ui_router_bsn::BsnSceneFactory> {
+        self.drivers
+            .iter_mut()
+            .find_map(|(stored, executor)| match executor {
+                ViewExecutor::Native(factory) if stored == key => Some(factory),
+                _ => None,
+            })
+    }
+
+    #[cfg(feature = "bsn")]
+    fn is_native(&self, key: &ViewDriverKey) -> bool {
+        self.drivers
+            .iter()
+            .any(|(stored, executor)| stored == key && matches!(executor, ViewExecutor::Native(_)))
     }
 
     pub(crate) fn contains(&self, key: &ViewDriverKey) -> bool {
@@ -256,13 +302,13 @@ impl ViewDriverStore {
     pub(crate) fn take_for_test(
         &mut self,
         key: &ViewDriverKey,
-    ) -> Option<(ViewDriverKey, Box<dyn EcsViewDriver>)> {
+    ) -> Option<(ViewDriverKey, ViewExecutor)> {
         let position = self.drivers.iter().position(|(stored, _)| stored == key)?;
         Some(self.drivers.remove(position))
     }
 
     #[cfg(test)]
-    pub(crate) fn restore_for_test(&mut self, driver: (ViewDriverKey, Box<dyn EcsViewDriver>)) {
+    pub(crate) fn restore_for_test(&mut self, driver: (ViewDriverKey, ViewExecutor)) {
         assert!(
             !self.contains(&driver.0),
             "the removed driver key must remain absent until exact restoration"
@@ -306,6 +352,8 @@ impl AppRouterExt for App {
         let (routes, views, fallback) = config.into_parts();
         let drivers = self.world().resource::<ViewDriverStore>();
         let mut binding_error = None;
+        #[cfg(feature = "bsn")]
+        let mut uses_native = false;
         bevy_ui_router_core::integration::for_each_route_view_binding(
             &routes,
             |normal, boundary, error| {
@@ -326,6 +374,10 @@ impl AppRouterExt for App {
                     binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
                     return;
                 }
+                #[cfg(feature = "bsn")]
+                {
+                    uses_native |= drivers.is_native(normal_driver);
+                }
                 if boundary.is_some() {
                     let Some(error) = error else {
                         binding_error = Some(RouterInstallErrorKind::MissingErrorView);
@@ -340,6 +392,10 @@ impl AppRouterExt for App {
                     if !drivers.contains(error_driver) {
                         binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
                     }
+                    #[cfg(feature = "bsn")]
+                    {
+                        uses_native |= drivers.is_native(error_driver);
+                    }
                 }
             },
         );
@@ -351,6 +407,14 @@ impl AppRouterExt for App {
         if !drivers.contains(fallback_driver) {
             return Err(RouterInstallError::new(
                 RouterInstallErrorKind::UnknownViewDriver,
+            ));
+        }
+        #[cfg(feature = "bsn")]
+        if (uses_native || drivers.is_native(fallback_driver))
+            && !crate::bsn::scene_runtime_is_present(self.world())
+        {
+            return Err(RouterInstallError::new(
+                RouterInstallErrorKind::MissingSceneRuntime,
             ));
         }
         let handle = self

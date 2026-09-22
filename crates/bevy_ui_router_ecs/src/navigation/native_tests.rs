@@ -1,0 +1,939 @@
+use super::*;
+use crate::prelude::*;
+use bevy_app::{App, TaskPoolPlugin};
+use bevy_asset::AssetPlugin;
+use bevy_ecs::template::{Template, TemplateContext};
+use bevy_internal::reflect as bevy_reflect;
+use bevy_scene::{SceneFunction, ScenePlugin};
+use bevy_ui::{Node, Val};
+use bevy_ui_router_core::prelude::*;
+use bevy_ui_router_view::prelude::*;
+use std::sync::atomic::AtomicBool;
+
+#[derive(Resource, Default)]
+struct NativeFallbackCalls(Arc<std::sync::atomic::AtomicUsize>);
+
+#[derive(Default, bevy_internal::reflect::TypePath)]
+struct NativeDependencyLoader;
+
+impl bevy_asset::AssetLoader for NativeDependencyLoader {
+    type Asset = bevy_scene::ScenePatch;
+    type Settings = ();
+    type Error = std::io::Error;
+    async fn load(
+        &self,
+        _: &mut dyn bevy_asset::io::Reader,
+        _: &(),
+        _: &mut bevy_asset::LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        Ok(bevy_scene::ScenePatch {
+            scene: None,
+            dependencies: Vec::new(),
+            resolved: None,
+        })
+    }
+    fn extensions(&self) -> &[&str] {
+        &["native_dep"]
+    }
+}
+
+struct DependencyScene {
+    inner: Box<dyn bevy_scene::Scene>,
+    dependency: bool,
+}
+
+impl bevy_scene::Scene for DependencyScene {
+    fn resolve(
+        self,
+        context: &mut bevy_scene::ResolveContext,
+        scene: &mut bevy_scene::ResolvedScene,
+    ) -> Result<(), bevy_scene::ResolveSceneError> {
+        self.inner.resolve(context, scene)
+    }
+    fn register_dependencies(&self, dependencies: &mut bevy_scene::SceneDependencies) {
+        if self.dependency {
+            dependencies.register::<bevy_scene::ScenePatch>("native-test://held.native_dep".into());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct KeepProtectedThenFail(Entity);
+
+#[derive(Resource)]
+struct MakeFailureUnisolated;
+
+#[derive(Resource)]
+struct CleanFailure;
+
+impl Template for KeepProtectedThenFail {
+    type Output = ();
+    fn build_template(&self, context: &mut TemplateContext<'_, '_>) -> bevy_ecs::error::Result<()> {
+        let root = context.entity.id();
+        context.entity.insert(Node {
+            width: Val::Px(71.0),
+            ..Node::default()
+        });
+        context.entity.world_scope(|world| {
+            if !world.contains_resource::<CleanFailure>() {
+                world.entity_mut(self.0).insert(ChildOf(root));
+            }
+            if world.contains_resource::<MakeFailureUnisolated>() {
+                let shell = world
+                    .resource::<RouteEntityRegistry>()
+                    .records()
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.owner(),
+                            RegistryOwner::Committed(EntityOwner::FrameShell(_))
+                        ) && record.lifecycle() == EntityLifecycle::PreparedInert
+                    })
+                    .unwrap()
+                    .entity();
+                world.get_mut::<Node>(shell).unwrap().display = bevy_ui::Display::Flex;
+            }
+        });
+        Err("native retained apply source".into())
+    }
+    fn clone_template(&self) -> Self {
+        self.clone()
+    }
+}
+
+fn fixture(failing: bool) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
+    fixture_variant(failing, false)
+}
+
+fn fixture_variant(
+    failing: bool,
+    nested: bool,
+) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
+    fixture_with_dependency(failing, nested, false)
+}
+
+fn fixture_with_dependency(
+    failing: bool,
+    nested: bool,
+    dependency: bool,
+) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
+    let mut app = App::new();
+    if dependency {
+        use bevy_asset::{
+            AssetApp,
+            io::{
+                AssetSourceBuilder,
+                memory::{Dir, MemoryAssetReader},
+            },
+        };
+        let dir = Dir::default();
+        dir.insert_asset(std::path::Path::new("held.native_dep"), Vec::new());
+        app.register_asset_source(
+            "native-test",
+            AssetSourceBuilder::new(move || Box::new(MemoryAssetReader { root: dir.clone() })),
+        );
+    }
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+    ));
+    if dependency {
+        use bevy_asset::AssetApp;
+        app.register_asset_loader(NativeDependencyLoader);
+    }
+    let protected = app
+        .world_mut()
+        .spawn(Node {
+            width: Val::Px(91.0),
+            ..Node::default()
+        })
+        .id();
+    let failure = Arc::new(AtomicBool::new(failing));
+    let control = failure.clone();
+    let driver = app
+        .register_bsn_view(ViewDriverKey::new("retained").unwrap(), move |_| {
+            let failing = control.load(Ordering::Relaxed);
+            Ok(DependencyScene {
+                dependency,
+                inner: Box::new(SceneFunction(
+                    move |_, root: &mut bevy_scene::ResolvedScene| {
+                        root.push_template(Node {
+                            width: Val::Px(71.0),
+                            ..Node::default()
+                        });
+                        if failing {
+                            root.push_bundle_template(KeepProtectedThenFail(protected));
+                        }
+                    },
+                )),
+            })
+        })
+        .unwrap();
+    app.init_resource::<NativeFallbackCalls>();
+    let fallback_calls = app.world().resource::<NativeFallbackCalls>().0.clone();
+    let fallback_driver = app
+        .register_bsn_view(ViewDriverKey::new("fallback").unwrap(), move |_| {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(bevy_scene::bsn! { Node })
+        })
+        .unwrap();
+    let view = RouteViewKey::new("page").unwrap();
+    let fallback = RouteViewKey::new("fallback").unwrap();
+    let layout = RouteViewKey::new("layout").unwrap();
+    let layout_driver = app
+        .register_bsn_view(ViewDriverKey::new("layout").unwrap(), |_| {
+            Ok(bevy_scene::bsn! { Node bevy_ui_router_bsn::DefaultOutlet })
+        })
+        .unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(if nested { layout.clone() } else { view.clone() }),
+        )
+        .unwrap();
+    if nested {
+        routes
+            .route_with_options(
+                routes.root_id().unwrap(),
+                RoutePattern::path("child").unwrap(),
+                RouteNodeOptions::new().with_view(view.clone()),
+            )
+            .unwrap();
+    }
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view, RouteViewDescriptor::new(driver))
+        .unwrap();
+    views
+        .insert(layout, RouteViewDescriptor::new(layout_driver))
+        .unwrap();
+    views
+        .insert(fallback.clone(), RouteViewDescriptor::new(fallback_driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)))
+        .id();
+    app.update();
+    (app, router, host, protected, failure)
+}
+
+fn settle(app: &mut App) {
+    for _ in 0..20 {
+        app.update();
+    }
+}
+
+#[test]
+fn issued_native_fallback_host_loss_covers_original_active_and_readmits_without_factory() {
+    for (with_active, retry) in [(false, false), (true, false), (true, true)] {
+        let (mut app, router, host, protected, _) = fixture(false);
+        if with_active {
+            app.world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/"))
+                .unwrap();
+            settle(&mut app);
+            let root = app.world().resource::<RouterNavigation>().entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .frames()[0]
+                .native_root()
+                .unwrap();
+            app.world_mut().spawn((Node::default(), ChildOf(root)));
+            app.update();
+        }
+        let history = app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .history()
+            .clone();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/unmatched"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        // Move the genuinely issued, not-yet-executed fallback task into the
+        // production retry holder; no lifecycle classification is injected.
+        let identity = {
+            let entry = &mut app.world_mut().resource_mut::<RouterNavigation>().entries[0];
+            let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+                panic!("real fallback task expected");
+            };
+            assert_eq!(
+                task.frame().origin(),
+                &bevy_ui_router_core::frame::FrameOrigin::RouterFallback
+            );
+            let identity = task.report_identity();
+            let active = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+            retain_frame_task_after_authority_retry(
+                entry,
+                with_active,
+                active,
+                PendingCommit::new(),
+                task,
+                None,
+            );
+            identity
+        };
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>();
+        if retry {
+            app.insert_resource(
+                crate::presentation::native_frame::NativeCleanupCapacityLimit { after_claims: 0 },
+            );
+            app.update();
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(
+                entry
+                    .pending_frame_drive
+                    .as_ref()
+                    .unwrap()
+                    .task
+                    .report_identity()
+                    == identity
+            );
+            assert!(entry.active.is_some() && entry.host.is_some());
+            assert_eq!(
+                app.world()
+                    .resource::<NativeFallbackCalls>()
+                    .0
+                    .load(Ordering::Relaxed),
+                0
+            );
+            app.world_mut()
+                .remove_resource::<crate::presentation::native_frame::NativeCleanupCapacityLimit>();
+        }
+        settle(&mut app);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+        );
+        assert_eq!(entry.engine.history(), &history);
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+        assert!(
+            entry.active.is_none()
+                && entry.pending_frame_drive.is_none()
+                && entry.authority_protocol_residual.is_none()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<NativeFallbackCalls>()
+                .0
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            app.world().get::<Node>(host).is_some() && app.world().get::<Node>(protected).is_some()
+        );
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        settle(&mut app);
+        let next = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("readmitted"))
+            .unwrap();
+        settle(&mut app);
+        assert!(
+            matches!(app.world().resource::<RouterSnapshots>().request(router, next), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+        );
+    }
+}
+
+#[test]
+fn authority_native_cleanup_retains_current_projection_after_capacity_retry() {
+    use crate::presentation::native_frame::{
+        NativeCleanupCapacityLimit, NativeCleanupPreparationError,
+    };
+    let (mut app, router, host, _, _) = fixture(false);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let root = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .frames()[0]
+        .native_root()
+        .unwrap();
+    app.world_mut().spawn((Node::default(), ChildOf(root)));
+    app.world_mut().spawn((Node::default(), ChildOf(root)));
+    app.update();
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/unmatched"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    let task_identity = {
+        let entry = &mut app.world_mut().resource_mut::<RouterNavigation>().entries[0];
+        let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+            panic!("actual fallback task");
+        };
+        let identity = task.report_identity();
+        let active = entry.active.take().unwrap();
+        retain_frame_task_after_authority_retry(
+            entry,
+            true,
+            active,
+            PendingCommit::new(),
+            task,
+            None,
+        );
+        identity
+    };
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    app.insert_resource(NativeCleanupCapacityLimit { after_claims: 1 });
+    app.update();
+    let claims = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            entry
+                .pending_frame_drive
+                .as_ref()
+                .unwrap()
+                .task
+                .report_identity()
+                == task_identity
+        );
+        let active = entry.active.as_ref().unwrap();
+        let claims = active.claims().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            claims.len(),
+            3,
+            "original shell/root plus actual partial content claim"
+        );
+        claims
+    };
+    app.world_mut()
+        .remove_resource::<NativeCleanupCapacityLimit>();
+    let added = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+    app.update();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let residual = entry
+        .authority_protocol_residual
+        .as_ref()
+        .expect("bounded original owner receiver");
+    let AuthorityProtocolResidualKind::NativeCleanup(NativeCleanupPreparationError::Projection {
+        root: observed_root,
+        expected,
+        observed,
+    }) = &residual.kind
+    else {
+        panic!("current typed error must not collapse to InvalidManifest or old Capacity");
+    };
+    assert_eq!(*observed_root, root);
+    assert!(
+        !expected
+            .iter()
+            .find(|(entity, _, _)| *entity == root)
+            .unwrap()
+            .2
+            .contains(&added)
+    );
+    assert!(
+        observed
+            .iter()
+            .find(|(entity, _, _)| *entity == root)
+            .unwrap()
+            .2
+            .contains(&added)
+    );
+    assert_eq!(
+        residual
+            .active
+            .as_ref()
+            .unwrap()
+            .claims()
+            .cloned()
+            .collect::<Vec<_>>(),
+        claims
+    );
+    assert!(entry.pending_frame_drive.is_none());
+    assert_eq!(
+        app.world()
+            .resource::<NativeFallbackCalls>()
+            .0
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn native_current_content_hiding_clears_route_focus_but_escape_returns_to_app() {
+    for escaped in [false, true] {
+        let (mut app, router, host, _, _) = fixture(false);
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        settle(&mut app);
+        let root = app.world().resource::<RouterNavigation>().entries[0]
+            .active
+            .as_ref()
+            .unwrap()
+            .frames()[0]
+            .native_root()
+            .unwrap();
+        let target = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+        app.update();
+        app.world_mut()
+            .resource_mut::<crate::input::RouteFocusState>()
+            .set_focused(Some(target));
+        app.world_mut()
+            .resource_mut::<bevy_input_focus::InputFocus>()
+            .set(target, bevy_input_focus::FocusCause::Pressed);
+        if escaped {
+            app.world_mut().entity_mut(target).insert(ChildOf(host));
+        }
+        app.world_mut().get_mut::<Node>(target).unwrap().display = bevy_ui::Display::None;
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<crate::input::RouteFocusState>()
+                .focused(),
+            escaped.then_some(target)
+        );
+        assert_eq!(
+            app.world().resource::<bevy_input_focus::InputFocus>().get(),
+            escaped.then_some(target)
+        );
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_keyboard(target)
+        );
+    }
+}
+
+fn preload_native_dependency(app: &mut App) -> bevy_asset::Handle<bevy_scene::ScenePatch> {
+    let preload = app
+        .world()
+        .resource::<bevy_asset::AssetServer>()
+        .load::<bevy_scene::ScenePatch>("native-test://held.native_dep");
+    for _ in 0..1000 {
+        if app
+            .world()
+            .resource::<bevy_asset::AssetServer>()
+            .is_loaded(preload.id())
+        {
+            break;
+        }
+        app.update();
+        std::thread::yield_now();
+    }
+    assert!(
+        app.world()
+            .resource::<bevy_asset::AssetServer>()
+            .is_loaded(preload.id())
+    );
+    preload
+}
+
+fn assert_retained_failure(
+    app: &App,
+    router: RouterHandle,
+    request: NavigationRequestId,
+    host: Entity,
+    protected: Entity,
+) {
+    let result = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, request);
+    assert!(
+        matches!(result, RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Apply && failure.message().contains("native retained apply source"))),
+        "{result:?}"
+    );
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .active()
+            .kind(),
+        ActivePresentationKind::Error
+    );
+    assert!(app.world().get_entity(host).is_ok());
+    assert_eq!(
+        app.world().get::<Node>(protected).unwrap().width,
+        Val::Px(91.0)
+    );
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(entry.native_residuals.len(), 1);
+    assert!(
+        entry.native_residuals[0]
+            .residual
+            .validate_inert(app.world())
+            .is_ok()
+    );
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.authority_protocol_residual.is_none());
+}
+
+#[test]
+fn native_retained_root_failure_transfers_owner_then_allows_next_navigation() {
+    let (mut app, router, host, protected, failure) = fixture(true);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/").with_fragment("first"))
+        .unwrap();
+    settle(&mut app);
+    assert_retained_failure(&app, router, request, host, protected);
+    let failed_root = app.world().get::<ChildOf>(protected).unwrap().parent();
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(failed_root, bevy_input_focus::FocusCause::Navigated);
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), None);
+    let app_target = app.world_mut().spawn(Node::default()).id();
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(app_target, bevy_input_focus::FocusCause::Navigated);
+    app.update();
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(app_target));
+    failure.store(false, Ordering::Relaxed);
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/").with_fragment("next"))
+        .unwrap();
+    settle(&mut app);
+    assert!(
+        matches!(app.world().resource::<RouterSnapshots>().request(router, next), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+    );
+    assert!(app.world().get_entity(protected).is_ok());
+}
+
+#[test]
+fn native_retained_back_failure_consumes_history_pair_via_failure_cleanup() {
+    let (mut app, router, host, protected, failure) = fixture(false);
+    for fragment in ["a", "b"] {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment(fragment))
+            .unwrap();
+        settle(&mut app);
+    }
+    failure.store(true, Ordering::Relaxed);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .unwrap();
+    settle(&mut app);
+    assert_retained_failure(&app, router, request, host, protected);
+}
+
+#[test]
+fn native_retained_nested_failure_settles_real_prefix_and_terminal_residual() {
+    let (mut app, router, host, protected, _) = fixture_variant(true, true);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child"))
+        .unwrap();
+    settle(&mut app);
+    assert_retained_failure(&app, router, request, host, protected);
+    let nodes = app
+        .world_mut()
+        .query::<&Node>()
+        .iter(app.world())
+        .filter(|node| node.width == Val::Px(71.0))
+        .count();
+    assert_eq!(
+        nodes, 1,
+        "only the inert native residual keeps its authored root"
+    );
+}
+
+#[test]
+fn native_retained_retry_keeps_original_source_then_current_drift_fail_closes() {
+    let (mut app, router, host, protected, _) = fixture(true);
+    app.world_mut()
+        .insert_resource(NativeFailureTransferCapacity);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let (source, claims) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let failure = entry
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .native_failure()
+            .unwrap();
+        (
+            failure.source.clone(),
+            failure.claims().cloned().collect::<Vec<_>>(),
+        )
+    };
+    settle(&mut app);
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let failure = entry
+            .pending_failed_branch
+            .as_ref()
+            .unwrap()
+            .branch
+            .native_failure()
+            .unwrap();
+        assert!(failure.source == source);
+        assert_eq!(failure.claims().cloned().collect::<Vec<_>>(), claims);
+        assert!(entry.native_residuals.is_empty());
+    }
+    app.world_mut()
+        .remove_resource::<NativeFailureTransferCapacity>();
+    let root = claims
+        .iter()
+        .find(|claim| {
+            matches!(
+                claim.owner(),
+                RegistryOwner::Committed(EntityOwner::FrameContentTarget(_))
+            )
+        })
+        .unwrap()
+        .entity();
+    app.world_mut()
+        .entity_mut(root)
+        .remove::<RouteOwnershipSeal>();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let owner = entry.authority_protocol_residual.as_ref().unwrap();
+    let failure = owner
+        .failed
+        .as_ref()
+        .unwrap()
+        .branch
+        .native_failure()
+        .unwrap();
+    assert!(failure.source == source);
+    assert!(matches!(
+        owner.kind,
+        AuthorityProtocolResidualKind::NativeCreation(_)
+    ));
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.native_residuals.is_empty());
+    assert!(app.world().get_entity(host).is_ok());
+    assert!(app.world().get_entity(protected).is_ok());
+    assert!(
+        matches!(app.world().resource::<RouterSnapshots>().request(router, request), RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(_)))
+    );
+}
+
+#[test]
+fn native_retained_unisolated_back_fail_close_keeps_original_pair_and_error() {
+    let (mut app, router, host, protected, failure) = fixture(false);
+    for fragment in ["a", "b"] {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment(fragment))
+            .unwrap();
+        settle(&mut app);
+    }
+    failure.store(true, Ordering::Relaxed);
+    app.world_mut().insert_resource(MakeFailureUnisolated);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .unwrap();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let owner = entry.authority_protocol_residual.as_ref().unwrap();
+    assert!(matches!(
+        owner.kind,
+        AuthorityProtocolResidualKind::NativeCreation(
+            crate::presentation::native_scene::NativeSceneIsolationFailure::ShellNotInert
+        )
+    ));
+    assert!(matches!(
+        owner.back_target.as_deref(),
+        Some(PendingBackTargetExecution::Driving(_))
+    ));
+    assert!(
+        owner
+            .failed
+            .as_ref()
+            .unwrap()
+            .branch
+            .native_failure()
+            .unwrap()
+            .error
+            .to_string()
+            .contains("native retained apply source")
+    );
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.native_residuals.is_empty());
+    assert!(app.world().get_entity(host).is_ok());
+    assert!(app.world().get_entity(protected).is_ok());
+}
+
+#[test]
+fn native_retained_dependencies_live_until_real_failure_settlement_not_residual_destruction() {
+    let (mut app, router, host, protected, _) = fixture_with_dependency(true, false, true);
+    let preload = preload_native_dependency(&mut app);
+    let bevy_asset::Handle::Strong(strong) = &preload else {
+        panic!("loaded dependency is strong")
+    };
+    let lifetime = Arc::downgrade(strong);
+    app.world_mut()
+        .insert_resource(NativeFailureTransferCapacity);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    drop(preload);
+    settle(&mut app);
+    assert!(
+        lifetime.upgrade().is_some(),
+        "the unfinished original failure owns its real Scene dependency"
+    );
+    app.world_mut()
+        .remove_resource::<NativeFailureTransferCapacity>();
+    settle(&mut app);
+    assert_retained_failure(&app, router, request, host, protected);
+    assert!(
+        lifetime.upgrade().is_none(),
+        "terminal physical retention does not extend the data lease"
+    );
+}
+
+#[test]
+fn native_clean_back_failure_keeps_zero_physical_history_path() {
+    let (mut app, router, host, protected, failure) = fixture(false);
+    for fragment in ["a", "b"] {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment(fragment))
+            .unwrap();
+        settle(&mut app);
+    }
+    failure.store(true, Ordering::Relaxed);
+    app.world_mut().insert_resource(CleanFailure);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .unwrap();
+    settle(&mut app);
+    let result = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .request(router, request);
+    assert!(
+        matches!(result, RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Apply)),
+        "{result:?}"
+    );
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.native_residuals.is_empty());
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.authority_protocol_residual.is_none());
+    assert!(app.world().get_entity(host).is_ok());
+    assert!(app.world().get::<ChildOf>(protected).is_none());
+}
+
+#[test]
+fn native_success_dependencies_move_into_frame_and_release_after_cleanup() {
+    let (mut app, router, _, _, _) = fixture_with_dependency(false, false, true);
+    let preload = preload_native_dependency(&mut app);
+    let bevy_asset::Handle::Strong(strong) = &preload else {
+        panic!("loaded dependency is strong")
+    };
+    let lifetime = Arc::downgrade(strong);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    assert!(
+        matches!(app.world().resource::<RouterSnapshots>().request(router, request), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+    );
+    drop(preload);
+    settle(&mut app);
+    assert!(
+        lifetime.upgrade().is_some(),
+        "the adopted frame received the original dependency handles"
+    );
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(router, RouteLocation::new("/missing"))
+        .unwrap();
+    settle(&mut app);
+    assert!(
+        lifetime.upgrade().is_none(),
+        "the finished old frame cleanup releases its data holder"
+    );
+}
+
+#[test]
+fn native_idle_host_loss_post_marker_escape_is_bounded_and_returns_app_focus() {
+    use crate::presentation::native_frame::NativeCleanupContent;
+    use bevy_ecs::prelude::{Commands, Insert, On};
+    let (mut app, router, host, _, _) = fixture(false);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let root = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .frames()[0]
+        .native_root()
+        .unwrap();
+    let child = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+    let application = app.world_mut().spawn(Node::default()).id();
+    app.world_mut().add_observer(
+        move |event: On<Insert, NativeCleanupContent>, mut commands: Commands| {
+            if event.entity == child {
+                commands.queue(move |world: &mut World| {
+                    world.entity_mut(child).insert(ChildOf(application));
+                    world
+                        .resource_mut::<InputFocus>()
+                        .set(child, bevy_input_focus::FocusCause::Navigated);
+                });
+            }
+        },
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert!(
+        entry.host.is_none(),
+        "permanent native preflight cannot leave the lost host owner retrying forever"
+    );
+    assert!(entry.active.is_none());
+    assert!(entry.idle_host_terminal.is_some());
+    assert_eq!(
+        app.world().get::<ChildOf>(child).map(ChildOf::parent),
+        Some(application)
+    );
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(child));
+}

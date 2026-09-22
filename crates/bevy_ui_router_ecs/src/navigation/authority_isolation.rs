@@ -4,6 +4,7 @@ use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
     integration::{
+        BackTargetExecutionOwnerRef, BackTargetExecutionPairingOutcome, BackTargetPhysicalOwnerRef,
         BeginAuthoritySettlementErrorKind, CleanupManifest, FailedAuthorityTriggerError,
     },
     prelude::RouteFrameVersion,
@@ -30,8 +31,9 @@ use super::{
     AuthorityProtocolResidualKind, AuthorityProtocolResidualOwner,
     CleanupSettlementPermanentInertOwner, FailureCleanupCompletionInertOwner,
     FrozenPostCommitInputIsolation, FrozenTargetPreparationPermanentPhysicalManifest, HostBinding,
-    PendingFailedBranch, PostCommitInputIsolationFailure, PreparedPostCommitInputIsolation,
-    RetiredHostBinding, RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
+    PendingBackTargetExecution, PendingFailedBranch, PendingFailedBranchTerminal,
+    PostCommitInputIsolationFailure, PreparedPostCommitInputIsolation, RetiredHostBinding,
+    RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
     projectionless_fail_close_capacity_probe,
 };
 
@@ -42,6 +44,44 @@ mod tests {
         active_atomic_app, assert_pointer_target_preserved, assert_pointer_target_revoked,
         seed_pointer_history,
     };
+
+    #[test]
+    fn authority_focus_isolation_preserves_original_queue_and_cause() {
+        for guarded in [false, true] {
+            let (mut app, target) = active_atomic_app("authority-focus-queue");
+            let application_target = app.world_mut().spawn_empty().id();
+            let claims = app
+                .world()
+                .resource::<crate::navigation::RouterNavigation>()
+                .entries[0]
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut expected = app.world().resource::<InputFocus>().clone();
+            expected.set(application_target, bevy_input_focus::FocusCause::Pressed);
+            expected.set(target, bevy_input_focus::FocusCause::Navigated);
+            *app.world_mut().resource_mut::<InputFocus>() = expected.clone();
+            expected.clear();
+            let prepared =
+                prepare_authority_isolation_targets(app.world(), claims.iter(), [target], 0);
+            let AuthorityIsolationPreparation::Ready(prepared) = prepared else {
+                panic!("real active frame supplies exact isolation authority");
+            };
+            if guarded {
+                assert!(prepared.apply_guarded(app.world_mut(), &|_| true));
+            } else {
+                prepared.apply(app.world_mut());
+            }
+            assert_eq!(
+                app.world().resource::<InputFocus>(),
+                &expected,
+                "isolation must append a target-local clear, preserving the original queue and causes"
+            );
+        }
+    }
 
     #[test]
     fn authority_pointer_isolation_without_gate_requires_exact_owned_targets() {
@@ -81,6 +121,12 @@ mod tests {
 
 pub(super) enum AuthoritySettlementBeginOutcome {
     Begun,
+    #[cfg(feature = "bsn")]
+    NativeCleanupContradiction {
+        active: RealizedBranch,
+        pending: PendingCommit,
+        error: crate::presentation::native_frame::NativeCleanupPreparationError,
+    },
     RetryablePreparation {
         active: RealizedBranch,
         pending: PendingCommit,
@@ -121,7 +167,7 @@ pub(super) fn begin_authority_settlement(
         active,
         pending,
         logical_roots_override,
-        false,
+        AuthoritySettlementSource::Reconciliation,
     )
 }
 
@@ -136,17 +182,40 @@ pub(super) fn begin_initial_fallback_authority_settlement(
         RealizedBranch::empty(),
         pending,
         None,
-        true,
+        AuthoritySettlementSource::InitialFallbackTask,
     )
+}
+
+pub(super) fn begin_unstarted_fallback_host_loss(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    task: &bevy_ui_router_core::integration::RootFrameTask,
+) -> AuthoritySettlementBeginOutcome {
+    begin_authority_settlement_from_source(
+        world,
+        entry,
+        active,
+        pending,
+        None,
+        AuthoritySettlementSource::UnstartedFallbackTask(task),
+    )
+}
+
+enum AuthoritySettlementSource<'a> {
+    Reconciliation,
+    InitialFallbackTask,
+    UnstartedFallbackTask(&'a bevy_ui_router_core::integration::RootFrameTask),
 }
 
 fn begin_authority_settlement_from_source(
     world: &mut World,
     entry: &mut RouterEntry,
-    active: RealizedBranch,
-    pending: PendingCommit,
+    mut active: RealizedBranch,
+    mut pending: PendingCommit,
     logical_roots_override: Option<Vec<RouteFrameVersion>>,
-    initial_fallback_task: bool,
+    source: AuthoritySettlementSource<'_>,
 ) -> AuthoritySettlementBeginOutcome {
     let Some(host) = entry.host.as_ref() else {
         return AuthoritySettlementBeginOutcome::ProtocolContradiction {
@@ -156,6 +225,20 @@ fn begin_authority_settlement_from_source(
         };
     };
     let cause = precommit_authority_cause(world, host);
+    #[cfg(feature = "bsn")]
+    if let Err(error) = active
+        .prepare_native_cleanup(world)
+        .and_then(|_| pending.branch.prepare_native_cleanup(world))
+    {
+        if error.is_retryable() {
+            return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+        }
+        return AuthoritySettlementBeginOutcome::NativeCleanupContradiction {
+            active,
+            pending,
+            error,
+        };
+    }
     let frozen = {
         let registry = world.resource::<RouteEntityRegistry>();
         match FrozenCleanupManifest::from_authority_settlement(
@@ -243,24 +326,40 @@ fn begin_authority_settlement_from_source(
 
     // All physical preparation precedes minting the one-shot trigger. The
     // original task remains in pending until the retaining callback succeeds.
-    let trigger = if initial_fallback_task {
-        let result = pending
-            .final_task
-            .as_ref()
-            .ok_or(FailedAuthorityTriggerError::WrongPhase)
-            .and_then(|task| entry.engine.failed_authority_trigger_for_task(task));
-        match result {
-            Ok(trigger) => Some(trigger),
-            Err(kind) => {
-                return AuthoritySettlementBeginOutcome::TriggerContradiction {
-                    active,
-                    pending,
-                    kind,
-                };
+    let trigger = match source {
+        AuthoritySettlementSource::Reconciliation => None,
+        AuthoritySettlementSource::InitialFallbackTask
+        | AuthoritySettlementSource::UnstartedFallbackTask(_) => {
+            let result = match source {
+                AuthoritySettlementSource::InitialFallbackTask => pending
+                    .final_task
+                    .as_ref()
+                    .ok_or(FailedAuthorityTriggerError::WrongPhase)
+                    .and_then(|task| entry.engine.failed_authority_trigger_for_task(task)),
+                AuthoritySettlementSource::UnstartedFallbackTask(task) => {
+                    if entry.engine.active().kind()
+                        == bevy_ui_router_core::prelude::ActivePresentationKind::None
+                    {
+                        entry.engine.failed_authority_trigger_for_task(task)
+                    } else {
+                        entry
+                            .engine
+                            .host_loss_trigger_for_unstarted_fallback_with_active(task)
+                    }
+                }
+                AuthoritySettlementSource::Reconciliation => unreachable!(),
+            };
+            match result {
+                Ok(trigger) => Some(trigger),
+                Err(kind) => {
+                    return AuthoritySettlementBeginOutcome::TriggerContradiction {
+                        active,
+                        pending,
+                        kind,
+                    };
+                }
             }
         }
-    } else {
-        None
     };
     let HostBinding {
         version,
@@ -379,6 +478,7 @@ pub(super) struct PreparedAuthorityEntityIsolation {
     pub(super) pickable: bool,
     pub(super) insert_pickable: bool,
     pub(super) barrier: bool,
+    pub(super) native_shell_node: bool,
 }
 
 pub(super) struct PreparedAuthorityIsolation {
@@ -402,7 +502,7 @@ impl PreparedAuthorityIsolation {
             .is_some_and(|focused| self.focus.contains(&focused))
             && let Some(mut focus) = world.get_resource_mut::<InputFocus>()
         {
-            *focus = InputFocus::default();
+            focus.clear();
         }
         if world
             .get_resource::<RouteFocusState>()
@@ -413,6 +513,12 @@ impl PreparedAuthorityIsolation {
             focus.set_focused(None);
         }
         for entity in self.entities {
+            if entity.native_shell_node {
+                world
+                    .get_mut::<bevy_ui::Node>(entity.entity)
+                    .expect("prepared native shell retains Node")
+                    .display = bevy_ui::Display::None;
+            }
             if entity.visibility {
                 *world
                     .get_mut::<bevy_camera::visibility::Visibility>(entity.entity)
@@ -447,7 +553,7 @@ impl PreparedAuthorityIsolation {
             .is_some_and(|focused| self.focus.contains(&focused))
             && let Some(mut focus) = world.get_resource_mut::<InputFocus>()
         {
-            *focus = InputFocus::default();
+            focus.clear();
         }
         if world
             .get_resource::<RouteFocusState>()
@@ -461,6 +567,15 @@ impl PreparedAuthorityIsolation {
             return false;
         }
         for entity in self.entities {
+            if entity.native_shell_node {
+                world
+                    .get_mut::<bevy_ui::Node>(entity.entity)
+                    .expect("prepared native shell retains Node")
+                    .display = bevy_ui::Display::None;
+                if !guard(world) {
+                    return false;
+                }
+            }
             if entity.visibility {
                 *world
                     .get_mut::<Visibility>(entity.entity)
@@ -584,6 +699,10 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
     let mut known = Vec::new();
     let mut exact = Vec::new();
     for claim in stored_claims {
+        #[cfg(feature = "bsn")]
+        if crate::presentation::native_frame::is_escaped_cleanup_content(world, claim.entity()) {
+            continue;
+        }
         if !known.contains(&claim.entity()) && try_push(&mut known, claim.entity()).is_err() {
             return AuthorityIsolationPreparation::RetryableCapacity;
         }
@@ -605,6 +724,17 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
     let mut entities = Vec::new();
     let mut violations = Vec::new();
     for entity in exact.iter().copied() {
+        #[cfg(feature = "bsn")]
+        if crate::presentation::native_frame::is_native_content(world, entity) {
+            continue;
+        }
+        #[cfg(feature = "bsn")]
+        let native_shell_node = crate::presentation::native_frame::is_native_shell(world, entity)
+            && world
+                .get::<bevy_ui::Node>(entity)
+                .is_some_and(|node| node.display != bevy_ui::Display::None);
+        #[cfg(not(feature = "bsn"))]
+        let native_shell_node = false;
         let visibility = match world.get::<bevy_camera::visibility::Visibility>(entity) {
             Some(visibility) => *visibility != bevy_camera::visibility::Visibility::Hidden,
             None => {
@@ -659,7 +789,7 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
                 false
             }
         };
-        if (visibility || pickable || barrier)
+        if (visibility || pickable || barrier || native_shell_node)
             && try_push(
                 &mut entities,
                 PreparedAuthorityEntityIsolation {
@@ -668,6 +798,7 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
                     pickable,
                     insert_pickable: false,
                     barrier,
+                    native_shell_node,
                 },
             )
             .is_err()
@@ -735,7 +866,7 @@ pub(super) fn prepare_post_commit_input_isolation(
     original: &FrozenOriginalCleanupLedgerTransfer,
     authority: &PreparedPostCommitAuthorityLedger,
 ) -> Result<PreparedPostCommitInputIsolation, PostCommitInputIsolationFailure> {
-    let mut gate_targets = active.interactive_entities();
+    let mut gate_targets = active.live_interactive_entities(world);
     // Protected descendants participate in read-only partition validation, not
     // input revocation. Only the original owned cleanup obligations are targets.
     gate_targets.extend(original.immutable_entities().iter().copied());
@@ -890,6 +1021,7 @@ pub(super) fn prepare_target_preparation_permanent_isolation<'a>(
                 pickable: false,
                 insert_pickable: true,
                 barrier: false,
+                native_shell_node: false,
             },
         )
         .is_err()
@@ -915,9 +1047,9 @@ pub(super) fn prepare_normal_authority_isolation(
             .chain(active.claims())
             .chain(host.into_iter().map(|host| &host.top_slot_claim)),
         active
-            .interactive_entities()
+            .live_interactive_entities(world)
             .into_iter()
-            .chain(pending.as_realized().interactive_entities()),
+            .chain(pending.as_realized().live_interactive_entities(world)),
         capacity_probe,
     )
 }
@@ -962,18 +1094,74 @@ pub(super) fn prepare_failed_branch_authority_isolation(
         )
         .chain(active.into_iter().flat_map(RealizedBranch::claims))
         .chain(host.into_iter().map(|host| &host.top_slot_claim));
+    #[cfg(feature = "bsn")]
+    let stored_claims = stored_claims.chain(
+        branch
+            .native_failure()
+            .into_iter()
+            .flat_map(|failure| failure.claims())
+            .filter(|claim| {
+                matches!(
+                    claim.owner(),
+                    crate::registry::RegistryOwner::Committed(
+                        crate::registry::EntityOwner::FrameShell(_)
+                    )
+                )
+            }),
+    );
     let gate_targets = active
         .into_iter()
-        .flat_map(RealizedBranch::interactive_entities)
+        .flat_map(|branch| branch.live_interactive_entities(world))
         .chain(
             branch
                 .frames()
                 .iter()
                 .chain(branch.detached_frames())
-                .flat_map(RealizedFrame::interactive_entities),
+                .flat_map(|frame| frame.live_interactive_entities(world)),
         )
         .chain(host.into_iter().map(|host| host.top_slot));
-    prepare_authority_isolation_targets(world, stored_claims, gate_targets, 0)
+    #[cfg(feature = "bsn")]
+    let gate_targets = gate_targets.chain(
+        branch
+            .native_failure()
+            .into_iter()
+            .flat_map(|failure| failure.entities()),
+    );
+    let mut preparation =
+        prepare_authority_isolation_targets(world, stored_claims, gate_targets, 0);
+    #[cfg(feature = "bsn")]
+    if let Some(failure) = branch.native_failure() {
+        let isolation = match &mut preparation {
+            AuthorityIsolationPreparation::Ready(isolation) => Some(isolation),
+            AuthorityIsolationPreparation::PermanentContradiction { fail_closed, .. } => {
+                Some(fail_closed)
+            }
+            AuthorityIsolationPreparation::RetryableCapacity => None,
+        };
+        if let Some(isolation) = isolation {
+            let claims = failure
+                .claims()
+                .filter(|claim| {
+                    world
+                        .get_resource::<RouteEntityRegistry>()
+                        .and_then(|registry| registry.record(claim.entity()))
+                        .is_some_and(|record| record.claim() == **claim)
+                })
+                .collect::<Vec<_>>();
+            if isolation.focus.try_reserve(claims.len()).is_err()
+                || isolation.pointer_targets.try_reserve(claims.len()).is_err()
+            {
+                return AuthorityIsolationPreparation::RetryableCapacity;
+            }
+            for claim in claims {
+                isolation.focus.push(claim.entity());
+                isolation.pointer_targets.insert(claim.entity());
+            }
+            isolation.focus.sort_by_key(|entity| entity.to_bits());
+            isolation.focus.dedup();
+        }
+    }
+    preparation
 }
 
 pub(super) fn prepare_failed_manifest_protocol_isolation(
@@ -996,7 +1184,7 @@ pub(super) fn prepare_projectionless_authority_isolation(
             .as_realized()
             .claims()
             .chain(host.into_iter().map(|host| &host.top_slot_claim)),
-        pending.as_realized().interactive_entities(),
+        pending.as_realized().live_interactive_entities(world),
         0,
     )
 }
@@ -1004,26 +1192,44 @@ pub(super) fn prepare_projectionless_authority_isolation(
 pub(super) fn fail_closed_cleanup_settlement_permanent(
     world: &mut World,
     entry: &mut RouterEntry,
-    mut ledger: CleanupLedger,
+    ledger: CleanupLedger,
 ) -> Result<(), CleanupLedger> {
-    let preparation = prepare_authority_isolation_targets(
-        world,
-        ledger
-            .exact_claims()
-            .chain(entry.active.iter().flat_map(RealizedBranch::claims))
-            .chain(entry.host.iter().map(|host| &host.top_slot_claim)),
-        ledger
-            .exact_claims()
-            .map(ExactRegistryClaim::entity)
-            .chain(
-                entry
-                    .active
-                    .iter()
-                    .flat_map(RealizedBranch::interactive_entities),
-            )
-            .chain(entry.host.iter().map(|host| host.top_slot)),
-        0,
-    );
+    fail_closed_cleanup_ledger_protocol(world, entry, ledger, None)
+}
+
+pub(super) fn fail_closed_cleanup_ledger_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    mut ledger: CleanupLedger,
+    kind: Option<AuthorityProtocolResidualKind>,
+) -> Result<(), CleanupLedger> {
+    let preparation = if let Some(branch) = ledger.failure_owner_branch() {
+        prepare_failed_branch_authority_isolation(
+            world,
+            entry.active.as_ref(),
+            branch,
+            entry.host.as_ref(),
+        )
+    } else {
+        prepare_authority_isolation_targets(
+            world,
+            ledger
+                .exact_claims()
+                .chain(entry.active.iter().flat_map(RealizedBranch::claims))
+                .chain(entry.host.iter().map(|host| &host.top_slot_claim)),
+            ledger
+                .exact_claims()
+                .map(ExactRegistryClaim::entity)
+                .chain(
+                    entry
+                        .active
+                        .iter()
+                        .flat_map(|branch| branch.live_interactive_entities(world)),
+                )
+                .chain(entry.host.iter().map(|host| host.top_slot)),
+            0,
+        )
+    };
     let (isolation, isolation_contradiction) = match preparation {
         AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
         AuthorityIsolationPreparation::RetryableCapacity => return Err(ledger),
@@ -1032,8 +1238,12 @@ pub(super) fn fail_closed_cleanup_settlement_permanent(
             fail_closed,
         } => (fail_closed, Some(contradiction)),
     };
-    let Some(evidence) = ledger.take_cleanup_settlement_permanent_evidence() else {
-        return Err(ledger);
+    let kind = match kind {
+        Some(kind) => kind,
+        None => match ledger.take_cleanup_settlement_permanent_evidence() {
+            Some(evidence) => AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence),
+            None => return Err(ledger),
+        },
     };
     let active = entry.active.take();
     let (retired_host, lease) = match entry.host.take() {
@@ -1044,7 +1254,8 @@ pub(super) fn fail_closed_cleanup_settlement_permanent(
         None => (None, None),
     };
     let mut residual = Some(AuthorityProtocolResidualOwner {
-        kind: AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence),
+        back_target: None,
+        kind,
         isolation_contradiction,
         active,
         pending: None,
@@ -1082,7 +1293,10 @@ pub(super) fn fail_closed_cleanup_settlement_permanent(
             .expect("rejected cleanup permanent fail-close retains prepared isolation")
             .apply(world);
         let AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence) = owner.kind else {
-            unreachable!("cleanup permanent residual retains its typed evidence")
+            return Err(owner
+                .cleanup_settlement_ledger
+                .take()
+                .expect("a rejected native settlement transfer retains its entire ledger"));
         };
         entry.cleanup_settlement_permanent_inert = Some(CleanupSettlementPermanentInertOwner {
             evidence,
@@ -1194,6 +1408,7 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
         None => (None, None),
     };
     let mut residual = Some(AuthorityProtocolResidualOwner {
+        back_target: None,
         kind,
         isolation_contradiction,
         active,
@@ -1298,6 +1513,28 @@ pub(super) fn fail_closed_failed_owner_protocol_prepared(
     isolation: PreparedAuthorityIsolation,
     isolation_contradiction: Option<AuthorityIsolationContradiction>,
 ) -> Result<(), PendingFailedBranch> {
+    if let Some(stage) = entry.pending_back_target_execution.as_ref() {
+        let PendingBackTargetExecution::Driving(driving) = stage else {
+            return Err(failed);
+        };
+        let task = match &failed.terminal {
+            PendingFailedBranchTerminal::Task { task, .. }
+            | PendingFailedBranchTerminal::TaskWithPhysicalResidual { task, .. } => task,
+            _ => return Err(failed),
+        };
+        if !matches!(
+            entry.engine.validate_back_target_execution_pairing(
+                BackTargetExecutionOwnerRef::Driving {
+                    history: &driving.history,
+                    continuation: &driving.continuation
+                },
+                BackTargetPhysicalOwnerRef::FrameTask(task),
+            ),
+            BackTargetExecutionPairingOutcome::Matched
+        ) {
+            return Err(failed);
+        }
+    }
     let active = entry.active.take();
     let (retired_host, lease) = match entry.host.take() {
         Some(host) => {
@@ -1307,6 +1544,7 @@ pub(super) fn fail_closed_failed_owner_protocol_prepared(
         None => (None, None),
     };
     let mut residual = Some(AuthorityProtocolResidualOwner {
+        back_target: entry.pending_back_target_execution.take().map(Box::new),
         kind,
         isolation_contradiction,
         active,
@@ -1336,6 +1574,7 @@ pub(super) fn fail_closed_failed_owner_protocol_prepared(
             _ => unreachable!("authority fail-closed returns the exact optional host lease"),
         }
         entry.active = owner.active.take();
+        entry.pending_back_target_execution = owner.back_target.take().map(|owner| *owner);
         return Err(owner
             .failed
             .take()
@@ -1381,6 +1620,7 @@ pub(super) fn fail_closed_failure_cleanup_completion_protocol(
         None => (None, None),
     };
     let mut residual = Some(AuthorityProtocolResidualOwner {
+        back_target: None,
         kind: AuthorityProtocolResidualKind::FailureCleanupCompletion(mismatch),
         isolation_contradiction,
         active,

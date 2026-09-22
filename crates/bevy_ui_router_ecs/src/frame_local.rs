@@ -67,6 +67,41 @@ fn collect_frame_local_entities_with_policy(
         return Err(FrameLocalError::OwnershipDrift(root));
     }
 
+    #[cfg(feature = "bsn")]
+    if let Some(content_root) = world.get::<Children>(root).and_then(|children| {
+        children.iter().copied().find(|child| {
+            world
+                .get::<crate::presentation::native_scene::NativeContentRoot>(*child)
+                .is_some()
+        })
+    }) {
+        let content =
+            crate::presentation::native_frame::collect_content(world, frame, content_root)?;
+        let mut structure = vec![root, content_root];
+        for entity in content {
+            for child in world
+                .get::<Children>(entity)
+                .into_iter()
+                .flat_map(|children| children.iter().copied())
+            {
+                if let Some(record) = registry.record(child) {
+                    if !matches!(record.owner(), RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. }) if parent == frame)
+                        && !(matches!(record.owner(), RegistryOwner::Committed(EntityOwner::FrameOutput { frame: owner, .. }) if owner == frame)
+                            && world
+                                .get::<crate::presentation::native_frame::NativeCleanupContent>(
+                                    child,
+                                )
+                                .is_some())
+                    {
+                        return Err(FrameLocalError::OwnershipDrift(child));
+                    }
+                    structure.push(child);
+                }
+            }
+        }
+        return Ok(structure);
+    }
+
     let mut visited = HashSet::new();
     let mut pending = vec![root];
     let mut ordered = Vec::new();
@@ -123,6 +158,16 @@ fn manifest_is_acceptable(
     record: &RouteEntityRecord,
     policy: ManifestPolicy,
 ) -> bool {
+    #[cfg(feature = "bsn")]
+    if world
+        .get::<crate::presentation::native_scene::NativeContentRoot>(entity)
+        .is_some()
+    {
+        return matches!(
+            record.owner(),
+            RegistryOwner::Committed(EntityOwner::FrameContentTarget(_))
+        );
+    }
     match policy {
         ManifestPolicy::Strict => record.manifest().matches(world, entity),
         ManifestPolicy::Observed => {
@@ -648,9 +693,9 @@ fn validate_mount_new_staging_allowance(
     let record_is_exact = registry
         .record(allowance.entity())
         .is_some_and(|record| record.claim() == *allowance.claim());
-    let anchor_is_exact = registry
-        .record(allowance.anchor())
-        .is_some_and(|record| record.claim() == *allowance.anchor_claim());
+    let anchor_is_exact = allowance
+        .anchor_binding()
+        .is_current(world, allowance.parent(), true);
     record_is_exact
         && anchor_is_exact
         && allowance.matches_binding(
@@ -660,7 +705,7 @@ fn validate_mount_new_staging_allowance(
             allowance.entity(),
             allowance.claim(),
             allowance.anchor(),
-            allowance.anchor_claim(),
+            allowance.anchor_binding(),
         )
         && world.get::<RouteOwnershipSeal>(allowance.entity())
             == Some(&RouteOwnershipSeal::new(allowance.claim().seal()))
@@ -940,6 +985,12 @@ fn collect_frame_focus_unit(
             }
         }
         children.sort_by_key(|child| {
+            // Native cleanup adds transient claims without changing content.
+            // Keep its focus projection stable across that preparation.
+            #[cfg(feature = "bsn")]
+            if crate::presentation::native_frame::is_native_shell(world, root) {
+                return (1, (0, child.to_bits()));
+            }
             registry
                 .record(*child)
                 .map(|record| (0, record.seal().stable_identity()))

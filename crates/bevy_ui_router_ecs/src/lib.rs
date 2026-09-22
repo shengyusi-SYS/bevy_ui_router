@@ -15,6 +15,8 @@ mod host;
 mod input;
 mod lifecycle_preparation;
 mod mount;
+#[cfg(feature = "bsn")]
+mod native_focus;
 mod navigation;
 mod plugin;
 mod presentation;
@@ -29,6 +31,8 @@ pub use app_ext::{
     AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError,
     RouterInstallErrorKind, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
 };
+#[cfg(feature = "bsn")]
+pub use bsn::AppBsnExt;
 pub use content::{
     ContentColor, ContentEntity, ContentPrimitiveError, ContentPrimitiveErrorKind,
     ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind, FrameContentWriter, SolidRect,
@@ -40,6 +44,8 @@ pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet};
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
 
 pub mod prelude {
+    #[cfg(feature = "bsn")]
+    pub use crate::AppBsnExt;
     pub use crate::{
         AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentEntity, ContentPrimitiveError,
         ContentPrimitiveErrorKind, ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind,

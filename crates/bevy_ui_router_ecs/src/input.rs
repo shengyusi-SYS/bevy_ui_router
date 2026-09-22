@@ -79,13 +79,21 @@ impl RouterInputGate {
         self.revoked = revoked;
     }
 
-    fn retain_allowed(&mut self, allowed: &HashSet<Entity>) {
+    fn refresh_allowed(&mut self, allowed: &HashSet<Entity>, grants: &HashSet<Entity>) {
         for entity in self.allowed.iter().copied() {
             if !allowed.contains(&entity) && !self.revoked.contains(&entity) {
                 self.revoked.push(entity);
             }
         }
         self.allowed.retain(|entity| allowed.contains(entity));
+        self.allowed.extend(
+            grants
+                .iter()
+                .copied()
+                .filter(|entity| allowed.contains(entity)),
+        );
+        self.allowed.sort_by_key(|entity| entity.to_bits());
+        self.allowed.dedup();
         self.revoked.retain(|entity| !allowed.contains(entity));
     }
 }
@@ -265,6 +273,21 @@ pub(crate) struct PreparedFocusMutation<'w> {
 }
 
 impl PreparedFocusMutation<'_> {
+    #[cfg(feature = "bsn")]
+    pub(crate) fn with_native_publication(
+        mut self,
+        prepared: &crate::native_focus::PublicationFocus,
+    ) -> Option<Self> {
+        if !prepared.matches(&self.input) {
+            return None;
+        }
+        if let Some((target, cause)) = prepared.candidate {
+            self.next_input
+                .get_or_insert_with(|| self.input.clone())
+                .set(target, cause);
+        }
+        Some(self)
+    }
     pub(crate) fn apply(mut self) {
         if let Some(next_input) = self.next_input {
             *self.input = next_input;
@@ -356,10 +379,14 @@ fn try_prepare_pointer_revocations(
 }
 
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
-    let (allowed, invalid_claims) = {
+    #[cfg(feature = "bsn")]
+    crate::presentation::native_frame::release_escaped_cleanup_content(world);
+    let (allowed, grants, invalid_claims, ineligible_content) = {
         let navigation = world.resource::<crate::navigation::RouterNavigation>();
         let mut allowed = HashSet::new();
+        let mut grants = HashSet::new();
         let mut invalid_claims = Vec::new();
+        let mut ineligible_content = HashSet::new();
         for branch in navigation
             .entries
             .iter()
@@ -374,18 +401,51 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
             )
             .is_ok()
             {
-                allowed.extend(active.interactive_entities());
+                for frame in active.frames() {
+                    let (managed, eligible) = frame.content_input_facts(world, &[]);
+                    ineligible_content.extend(
+                        managed
+                            .into_iter()
+                            .filter(|entity| !eligible.contains(entity)),
+                    );
+                    allowed.extend(eligible.iter().copied());
+                    if frame.native_root().is_some() {
+                        grants.extend(eligible);
+                    }
+                }
             } else {
                 invalid_claims.push(active.claims().cloned().collect::<Vec<_>>());
             }
         }
-        (allowed, invalid_claims)
+        #[cfg(feature = "bsn")]
+        for entry in &navigation.entries {
+            let claims = entry
+                .native_terminal_shell_claims()
+                .cloned()
+                .collect::<Vec<_>>();
+            if !claims.is_empty() {
+                invalid_claims.push(claims);
+            }
+        }
+        (allowed, grants, invalid_claims, ineligible_content)
     };
-    let invalid_active = fail_closed_invalid_active_frames(world, invalid_claims);
+    let mut invalid_active = fail_closed_invalid_active_frames(world, invalid_claims);
+    invalid_active.extend(ineligible_content);
+    #[cfg(feature = "bsn")]
+    {
+        let native_residual_targets = world
+            .resource::<crate::navigation::RouterNavigation>()
+            .entries
+            .iter()
+            .flat_map(|entry| entry.native_terminal_input_targets(world))
+            .collect::<HashSet<_>>();
+        revoke_router_pointer_targets(world, &native_residual_targets);
+        invalid_active.extend(native_residual_targets);
+    }
     clear_inert_subtree_focus(world, &invalid_active);
     world
         .resource_mut::<RouterInputGate>()
-        .retain_allowed(&allowed);
+        .refresh_allowed(&allowed, &grants);
     // Lifecycle publication may have revoked a target after the preceding
     // picking pass. Clear its retained gesture state before the next backend
     // sample; the second scheduled pass also filters newly generated hits.
@@ -397,12 +457,16 @@ struct PreparedPhysicalIsolation<'w> {
         Option<Mut<'w, Visibility>>,
         Option<Mut<'w, Pickable>>,
         Option<Mut<'w, RouterInputBarrier>>,
+        Option<Mut<'w, bevy_ui::Node>>,
     )>,
 }
 
 impl PreparedPhysicalIsolation<'_> {
     fn apply(self) {
-        for (visibility, pickable, barrier) in self.entities {
+        for (visibility, pickable, barrier, shell_node) in self.entities {
+            if let Some(mut node) = shell_node {
+                node.display = bevy_ui::Display::None;
+            }
             if let Some(mut visibility) = visibility {
                 *visibility = Visibility::Hidden;
             }
@@ -451,18 +515,42 @@ fn prepare_physical_isolation<'w>(
     world: &'w mut World,
     targets: &HashSet<Entity>,
 ) -> PreparedPhysicalIsolation<'w> {
+    #[cfg(feature = "bsn")]
+    let native_content = targets
+        .iter()
+        .copied()
+        .filter(|entity| crate::presentation::native_frame::is_native_content(world, *entity))
+        .collect::<HashSet<_>>();
+    #[cfg(feature = "bsn")]
+    let native_shells = targets
+        .iter()
+        .copied()
+        .filter(|entity| crate::presentation::native_frame::is_native_shell(world, *entity))
+        .collect::<HashSet<_>>();
     let mut query = world.query::<(
         Entity,
         Option<&mut Visibility>,
         Option<&mut Pickable>,
         Option<&mut RouterInputBarrier>,
+        Option<&mut bevy_ui::Node>,
     )>();
     let mut entities = Vec::with_capacity(targets.len());
-    for (entity, visibility, pickable, barrier) in query.iter_mut(world) {
+    for (entity, visibility, pickable, barrier, node) in query.iter_mut(world) {
         if !targets.contains(&entity) {
             continue;
         }
-        entities.push((visibility, pickable, barrier));
+        #[cfg(feature = "bsn")]
+        if native_content.contains(&entity) {
+            continue;
+        }
+        #[cfg(feature = "bsn")]
+        let shell_node = native_shells.contains(&entity).then_some(node).flatten();
+        #[cfg(not(feature = "bsn"))]
+        let shell_node = {
+            let _ = node;
+            None
+        };
+        entities.push((visibility, pickable, barrier, shell_node));
     }
     PreparedPhysicalIsolation { entities }
 }
@@ -518,11 +606,19 @@ fn nearest_registry_boundary_is_inert(world: &World, focused: Entity) -> bool {
         if !visited.insert(current) {
             return true;
         }
-        if table.record(current).is_some() || table.unresolved_record(current).is_some() {
-            return inert_table_root_is_exact(world, current);
+        #[cfg(feature = "bsn")]
+        if crate::presentation::native_frame::is_escaped_cleanup_content(world, current) {
+            let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+                return false;
+            };
+            current = parent;
+            continue;
         }
         if let Some(record) = registry.record(current) {
             return record.lifecycle() != EntityLifecycle::Active;
+        }
+        if table.record(current).is_some() || table.unresolved_record(current).is_some() {
+            return inert_table_root_is_exact(world, current);
         }
         let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
             return false;
@@ -531,7 +627,7 @@ fn nearest_registry_boundary_is_inert(world: &World, focused: Entity) -> bool {
     }
 }
 
-fn inert_table_root_is_exact(world: &World, entity: Entity) -> bool {
+pub(crate) fn inert_table_root_is_exact(world: &World, entity: Entity) -> bool {
     let table = world.resource::<QuarantineLeaseTable>();
     let Some(record) = table
         .record(entity)
@@ -583,6 +679,13 @@ fn inert_table_root_is_exact(world: &World, entity: Entity) -> bool {
         }
         _ => false,
     };
+    #[cfg(feature = "bsn")]
+    if crate::presentation::native_frame::is_native_content(world, entity) {
+        return world.get::<RouteOwnershipSeal>(entity)
+            == Some(&RouteOwnershipSeal::new(claim.seal()))
+            && lifecycle_is_exact
+            && crate::presentation::native_frame::content_scope_is_inert(world, entity);
+    }
     world.get::<RouteOwnershipSeal>(entity) == Some(&RouteOwnershipSeal::new(claim.seal()))
         && lifecycle_is_exact
         && world.get::<Visibility>(entity) == Some(&Visibility::Hidden)
@@ -814,6 +917,14 @@ fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
     let mut current = target;
     let mut visited = HashSet::new();
     while visited.insert(current) {
+        #[cfg(feature = "bsn")]
+        if crate::presentation::native_frame::is_escaped_cleanup_content(world, current) {
+            let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+                return false;
+            };
+            current = parent;
+            continue;
+        }
         let claim = registry
             .record(current)
             .map(|record| record.claim())
