@@ -10,7 +10,7 @@
 
 - 对照统一 spec 归集已经存在的内部 default outlet、location/history、恢复、host/stale、输入/focus 与公共 snapshot 证据；不重做已完成的联动迁移，也不把单个检查点当成完整 MVP 验收。
 - 旧公开 writer/report 入口及专属延迟回放机制已退出，示例已作为独立 consumer 运行；完成私有替身最终边界核查，删除已被替代的重复事实，保留 renderer-neutral 独立验证；不新增 runtime 或通用事务框架。
-- 先运行确认最终审查中的具体正确性候选，成立时从来源模型作局部修正，不以测试全绿或扩大审查范围替代实际判断。
+- 最终审查的混合诊断保留、发布后原请求结果及 native 隔离预期已修正，经完整相关门禁、普通更新补证和冻结增量复审；下一步是有界 fixture 减法后的最终同版本验收，不再重复整体架构评估。
 - 通过推荐 facade 的独立 BSN consumer、示例、全量验证与独立交叉审查后集成 main；完成前不标记 MVP PASS。
 
 ## Post-MVP

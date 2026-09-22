@@ -13,7 +13,7 @@ use crate::ids::{
 };
 use crate::location::RouteLocation;
 use crate::presentation::{ActivePresentation, RouterNavigationState};
-use crate::request::NavigationRequestRecord;
+use crate::request::{NavigationRequestRecord, RequestStatus};
 use crate::trace::NavigationTraceEvent;
 
 use super::{
@@ -1191,6 +1191,7 @@ pub(super) struct CoreCompletedCleanupSourceProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CorePreparedPostCommitTerminalSourceProjection {
     pub(super) cause: PostCommitAuthorityCause,
+    pub(super) request_status: RequestStatus,
     pub(super) history_before: FrozenCommittedHistoryProjection,
     pub(super) recovering_record: NavigationTraceEvent,
     pub(super) aggregate_cleanup: NavigationTraceEvent,
@@ -1359,6 +1360,7 @@ pub(crate) enum PostCommitCompoundCompletionCoreOutcome<PhysicalTerminal> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PreparedPostCommitTerminalPlan {
     pub(super) cause: PostCommitAuthorityCause,
+    pub(super) request_status: RequestStatus,
     pub(super) history_before: FrozenCommittedHistoryProjection,
     pub(super) recovering_record: NavigationTraceEvent,
     pub(super) aggregate_cleanup: NavigationTraceEvent,
@@ -1382,6 +1384,7 @@ impl From<&PreparedPostCommitTerminalPlan> for CorePreparedPostCommitTerminalSou
     fn from(terminal: &PreparedPostCommitTerminalPlan) -> Self {
         Self {
             cause: terminal.cause,
+            request_status: terminal.request_status.clone(),
             history_before: terminal.history_before.clone(),
             recovering_record: terminal.recovering_record.clone(),
             aggregate_cleanup: terminal.aggregate_cleanup.clone(),

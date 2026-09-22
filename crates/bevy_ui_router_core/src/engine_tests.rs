@@ -10394,10 +10394,24 @@ fn prepared_post_commit_authority_fixture_for_cause(
     CorePreparedPostCommitAuthorityTransfer,
     CleanupBatchProjection,
 ) {
+    prepared_post_commit_authority_fixture_for_location(cause, RouteLocation::new("/"))
+}
+
+fn prepared_post_commit_authority_fixture_for_location(
+    cause: PostCommitAuthorityCause,
+    location: RouteLocation,
+) -> (
+    RouterEngine,
+    HostAdmissionIssuer,
+    NavigationRequestId,
+    CleanupBatchToken,
+    CorePreparedPostCommitAuthorityTransfer,
+    CleanupBatchProjection,
+) {
     let (mut engine, issuer, lease) = ready_engine_with_tree_and_authority(tree());
     engine.push(RouteLocation::new("/items/1")).unwrap();
     settle_current(&mut engine);
-    let request = engine.push(RouteLocation::new("/")).unwrap();
+    let request = engine.push(location).unwrap();
     let normal = publish_current(&mut engine);
     assert!(normal.obligation_count() > 0);
     let accepted = match engine.accept_post_commit_authority_transfer(&normal, cause) {
@@ -10434,6 +10448,188 @@ fn prepared_post_commit_authority_fixture() -> (
     CleanupBatchProjection,
 ) {
     prepared_post_commit_authority_fixture_for_cause(PostCommitAuthorityCause::HostEntityMissing)
+}
+
+#[test]
+fn published_fallback_post_commit_host_loss_preserves_original_failure() {
+    let (mut engine, mut issuer, request, normal, prepared, authority) =
+        prepared_post_commit_authority_fixture_for_location(
+            PostCommitAuthorityCause::HostEntityMissing,
+            RouteLocation::new("/unmatched"),
+        );
+    let AttemptKind::Fallback {
+        original_failure, ..
+    } = &engine.current.as_ref().unwrap().attempt
+    else {
+        panic!("real fallback publication")
+    };
+    let expected = RequestStatus::Failed(original_failure.clone());
+    let history = engine.history_snapshot();
+    assert_eq!(engine.active().kind(), ActivePresentationKind::Error);
+    let queued = engine.push(RouteLocation::new("/items/2")).unwrap();
+    let mut installed = None;
+    assert!(matches!(
+        engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            prepared,
+            (),
+            |(), _, plan| {
+                let prior_trace_start = plan.current_trace.len();
+                let (plan, physical) =
+                    bind_test_settlement_plan_with_authority(plan, prior_trace_start, Vec::new());
+                Ok::<_, ((), ())>((physical, plan))
+            },
+            |physical, batch| installed = Some((batch, physical)),
+        ),
+        PostCommitAuthorityBeginCoreOutcome::Begun
+    ));
+    let (batch, physical) = installed.unwrap();
+    let (batch, _) = record_exact_post_commit_settlement_trace(&mut engine, batch, &physical);
+    let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+    let PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) =
+        engine.prepare_post_commit_compound_completion(batch, inputs)
+    else {
+        panic!("exact completion prepares")
+    };
+    assert!(matches!(
+        engine.complete_post_commit_authority_compound(owner, |_| ()),
+        PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+    ));
+    assert_eq!(engine.history_snapshot(), history);
+    assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+    assert_eq!(
+        engine.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert!(engine.current.is_none() && engine.action.is_none());
+    assert!(
+        engine.pending_post_commit_terminal.is_none()
+            && engine.pending_post_commit_settlement_trace.is_none()
+    );
+    assert!(!engine.testing_history_capability_snapshot().has_owner());
+    assert!(
+        matches!(engine.request(queued).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+    );
+    assert_eq!(
+        engine
+            .request(request)
+            .unwrap()
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .count(),
+        1
+    );
+    assert_eq!(engine.request(request).unwrap().status(), &expected);
+}
+
+#[test]
+fn post_commit_diagnostic_prepare_and_refresh_retire_only_exact_report_events() {
+    let (mut engine, mut issuer, _request, normal, prepared, authority) =
+        prepared_post_commit_authority_fixture();
+    let mut sources = Vec::new();
+    for _ in 0..=ROUTER_DIAGNOSTIC_RETENTION {
+        let mut source = ready_engine();
+        source.push(RouteLocation::new("/items/1")).unwrap();
+        let EngineAction::FrameTask(task) = source.action().unwrap() else {
+            panic!("real foreign task")
+        };
+        sources.push((source, task));
+    }
+    for (_, task) in sources.iter().take(ROUTER_DIAGNOSTIC_RETENTION) {
+        assert_eq!(
+            engine.validate_view_report_identity(task.identity()),
+            Err(ReportError::Invalid)
+        );
+    }
+    let mut installed = None;
+    assert!(matches!(
+        engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            prepared,
+            (),
+            |(), _, plan| {
+                let prior_trace_start = plan.current_trace.len();
+                let (plan, physical) =
+                    bind_test_settlement_plan_with_authority(plan, prior_trace_start, Vec::new());
+                Ok::<_, ((), ())>((physical, plan))
+            },
+            |physical, batch| installed = Some((batch, physical)),
+        ),
+        PostCommitAuthorityBeginCoreOutcome::Begun
+    ));
+    let terminal = engine.pending_post_commit_terminal.as_ref().unwrap();
+    assert_eq!(
+        terminal.final_router_diagnostics.len(),
+        ROUTER_DIAGNOSTIC_RETENTION
+    );
+    assert!(
+        !terminal
+            .final_report_dispositions
+            .iter()
+            .any(|record| record.identity == *sources[0].1.identity())
+    );
+    assert!(
+        terminal
+            .final_report_dispositions
+            .iter()
+            .any(|record| record.identity == *sources[1].1.identity())
+    );
+    // A genuine rejected report arriving during compound settlement changes the
+    // live retained log; completion must refresh both events and their dedup.
+    assert_eq!(
+        engine.validate_view_report_identity(sources.last().unwrap().1.identity()),
+        Err(ReportError::Invalid)
+    );
+    let (batch, physical) = installed.unwrap();
+    let (batch, _) = record_exact_post_commit_settlement_trace(&mut engine, batch, &physical);
+    let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+    let PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) =
+        engine.prepare_post_commit_compound_completion(batch, inputs)
+    else {
+        panic!("exact completion prepares")
+    };
+    assert!(matches!(
+        engine.complete_post_commit_authority_compound(owner, |_| ()),
+        PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+    ));
+    assert_eq!(
+        engine.router_diagnostics().len(),
+        ROUTER_DIAGNOSTIC_RETENTION
+    );
+    for (_, task) in sources.iter().take(2) {
+        assert!(
+            !engine
+                .report_dispositions
+                .iter()
+                .any(|record| record.identity == *task.identity())
+        );
+    }
+    let before = engine.router_diagnostics().to_vec();
+    assert_eq!(
+        engine.validate_view_report_identity(sources.last().unwrap().1.identity()),
+        Err(ReportError::Invalid)
+    );
+    assert_eq!(engine.router_diagnostics(), before);
+    assert_eq!(
+        engine.validate_view_report_identity(sources[0].1.identity()),
+        Err(ReportError::Invalid)
+    );
+    assert_eq!(
+        engine.router_diagnostics.last().unwrap().request(),
+        Some(sources[0].1.identity().request())
+    );
+    assert!(engine.report_dispositions.iter().all(|record| {
+        match record.target {
+            DiagnosticTarget::Router(index) => {
+                engine.router_diagnostics.get(index).is_some_and(|event| {
+                    event.request() == Some(record.identity.request())
+                        && event.report_disposition() == Some(record.disposition)
+                })
+            }
+            DiagnosticTarget::Request(_) => true,
+        }
+    }));
 }
 
 fn settlement_key(namespace: u64, identity: u64) -> CorePostCommitSettlementKeyProjection {

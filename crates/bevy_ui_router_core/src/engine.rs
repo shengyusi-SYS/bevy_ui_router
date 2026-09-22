@@ -3022,6 +3022,17 @@ enum AttemptKind {
     },
 }
 
+impl AttemptKind {
+    fn published_request_status(&self) -> RequestStatus {
+        match self {
+            Self::Normal(_) => RequestStatus::Succeeded,
+            Self::Fallback {
+                original_failure, ..
+            } => RequestStatus::Failed(original_failure.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BoundErrorAttempt {
     binding: FrozenErrorViewBinding,
@@ -3399,7 +3410,29 @@ struct ReportDispositionRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DiagnosticTarget {
     Request(NavigationRequestId),
-    Router,
+    // Exact position in the retained Router event log, not an authority ID.
+    Router(usize),
+}
+
+fn append_router_diagnostic(
+    diagnostics: &mut Vec<DiagnosticEvent>,
+    report_dispositions: &mut Vec<ReportDispositionRecord>,
+    event: DiagnosticEvent,
+) -> usize {
+    if diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION {
+        diagnostics.remove(0);
+        report_dispositions.retain_mut(|record| match &mut record.target {
+            DiagnosticTarget::Router(0) => false,
+            DiagnosticTarget::Router(index) => {
+                *index -= 1;
+                true
+            }
+            DiagnosticTarget::Request(_) => true,
+        });
+    }
+    let index = diagnostics.len();
+    diagnostics.push(event);
+    index
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5991,6 +6024,12 @@ impl RouterEngine {
         current_top_slot: RouteSlotId,
     ) -> Result<PreparedPostCommitTerminalPlan, CorePostCommitTerminalPreparationFailure> {
         let request = normal.identity().request();
+        let request_status = self
+            .current
+            .as_ref()
+            .expect("post-commit preparation retains the published attempt")
+            .attempt
+            .published_request_status();
         let history_before = self.freeze_committed_history();
         let recovering_record =
             NavigationTraceEvent::request_phase_changed(NavigationPhase::Recovering);
@@ -6085,7 +6124,7 @@ impl RouterEngine {
                 CorePostCommitAuthorityContradiction::TraceMismatch,
             ));
         }
-        if record.transition(RequestStatus::Succeeded).is_err() {
+        if record.transition(request_status.clone()).is_err() {
             return Err(CorePostCommitTerminalPreparationFailure::Permanent(
                 CorePostCommitAuthorityContradiction::RequestOrQueueMismatch,
             ));
@@ -6111,13 +6150,13 @@ impl RouterEngine {
                 CorePostCommitCapacityKind::PreparedTerminal,
             ));
         }
-        if final_router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION {
-            final_router_diagnostics.remove(0);
-        }
-        final_router_diagnostics.push(diagnostic.clone());
-
         let mut final_issued_view_tasks = self.issued_view_tasks.clone();
         let mut final_report_dispositions = self.report_dispositions.clone();
+        append_router_diagnostic(
+            &mut final_router_diagnostics,
+            &mut final_report_dispositions,
+            diagnostic.clone(),
+        );
         let mut final_evicted_through = self.evicted_through;
         while final_records
             .iter()
@@ -6151,6 +6190,7 @@ impl RouterEngine {
         let retain_completed_current = final_records.iter().any(|record| record.id() == request);
         Ok(PreparedPostCommitTerminalPlan {
             cause,
+            request_status,
             history_before,
             recovering_record,
             aggregate_cleanup,
@@ -6178,6 +6218,7 @@ impl RouterEngine {
             aggregate_cleanup,
             diagnostic,
             request_terminal,
+            request_status,
             mut final_completed_cleanup,
             mut final_router_diagnostics,
         ) = {
@@ -6189,6 +6230,7 @@ impl RouterEngine {
                 terminal.aggregate_cleanup.clone(),
                 terminal.diagnostic.clone(),
                 terminal.request_terminal.clone(),
+                terminal.request_status.clone(),
                 std::mem::take(&mut terminal.final_completed_cleanup),
                 std::mem::take(&mut terminal.final_router_diagnostics),
             )
@@ -6210,7 +6252,7 @@ impl RouterEngine {
             .append_trace(aggregate_cleanup)
             .expect("the exact recovering trace remains open");
         record
-            .transition(RequestStatus::Succeeded)
+            .transition(request_status)
             .expect("the committed request remains nonterminal until compound settlement");
         record
             .push_diagnostic(diagnostic.clone())
@@ -6223,13 +6265,13 @@ impl RouterEngine {
         final_completed_cleanup.extend(self.completed_cleanup.iter().cloned());
         final_router_diagnostics.clear();
         final_router_diagnostics.extend(self.router_diagnostics.iter().cloned());
-        if final_router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION {
-            final_router_diagnostics.remove(0);
-        }
-        final_router_diagnostics.push(diagnostic);
-
         let mut final_issued_view_tasks = self.issued_view_tasks.clone();
         let mut final_report_dispositions = self.report_dispositions.clone();
+        append_router_diagnostic(
+            &mut final_router_diagnostics,
+            &mut final_report_dispositions,
+            diagnostic,
+        );
         let mut final_evicted_through = self.evicted_through;
         while final_records
             .iter()
@@ -13700,12 +13742,7 @@ impl RouterEngine {
             self.retain_terminal_records();
             return Ok(());
         }
-        let terminal_status = match &current.attempt {
-            AttemptKind::Normal(_) => RequestStatus::Succeeded,
-            AttemptKind::Fallback {
-                original_failure, ..
-            } => RequestStatus::Failed(original_failure.clone()),
-        };
+        let terminal_status = current.attempt.published_request_status();
         let record = self
             .record_mut(request)
             .expect("running record is retained");
@@ -15827,34 +15864,17 @@ impl RouterEngine {
         disposition: ReportDisposition,
         message: impl Into<String>,
     ) {
-        let target = if self.request(identity.request).is_some() {
-            DiagnosticTarget::Request(identity.request)
-        } else {
-            DiagnosticTarget::Router
-        };
+        let retained_request = self.request(identity.request).map(|record| record.id());
         if self.report_dispositions.iter().any(|record| {
             record.identity == *identity
                 && record.disposition == disposition
-                && record.target == target
+                && match record.target {
+                    DiagnosticTarget::Request(request) => retained_request == Some(request),
+                    DiagnosticTarget::Router(_) => retained_request.is_none(),
+                }
         }) {
             return;
         }
-        if target == DiagnosticTarget::Router
-            && self.router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION
-        {
-            self.router_diagnostics.remove(0);
-            let oldest = self
-                .report_dispositions
-                .iter()
-                .position(|record| record.target == DiagnosticTarget::Router)
-                .expect("router diagnostic and dedup records stay aligned");
-            self.report_dispositions.remove(oldest);
-        }
-        self.report_dispositions.push(ReportDispositionRecord {
-            identity: identity.clone(),
-            disposition,
-            target,
-        });
         let frame = RouteFrameVersion::new(
             identity.router_identity(),
             identity.host(),
@@ -15864,14 +15884,24 @@ impl RouterEngine {
             identity.generation(),
         );
         let event = DiagnosticEvent::reported(identity.request(), frame, disposition, message);
-        match target {
-            DiagnosticTarget::Request(request) => self
-                .record_mut(request)
+        let target = if let Some(request) = retained_request {
+            self.record_mut(request)
                 .expect("diagnostic target request is retained")
                 .push_diagnostic(event)
-                .expect("report disposition diagnostics are open"),
-            DiagnosticTarget::Router => self.router_diagnostics.push(event),
-        }
+                .expect("report disposition diagnostics are open");
+            DiagnosticTarget::Request(request)
+        } else {
+            DiagnosticTarget::Router(append_router_diagnostic(
+                &mut self.router_diagnostics,
+                &mut self.report_dispositions,
+                event,
+            ))
+        };
+        self.report_dispositions.push(ReportDispositionRecord {
+            identity: identity.clone(),
+            disposition,
+            target,
+        });
     }
 
     fn current_active_branch(&self) -> Option<&MatchedBranch> {

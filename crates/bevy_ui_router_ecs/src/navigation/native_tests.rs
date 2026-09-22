@@ -229,6 +229,342 @@ fn settle(app: &mut App) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum NativePublishedCase {
+    Normal,
+    Fallback,
+    BoundError,
+}
+
+fn assert_native_published_host_loss_keeps_result(case: NativePublishedCase) {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+    ));
+    let normal_driver = app
+        .register_bsn_view(ViewDriverKey::new("post-error-normal").unwrap(), |input| {
+            if input.location().path() == "/broken" {
+                return Err(bevy_ui_router_bsn::BsnBuildError::new(
+                    "original native build failure",
+                ));
+            }
+            Ok(bevy_scene::bsn! { Node bevy_ui_router_bsn::DefaultOutlet })
+        })
+        .unwrap();
+    let original = Arc::new(std::sync::Mutex::new(None));
+    let observed = original.clone();
+    let error_driver = app
+        .register_bsn_view(
+            ViewDriverKey::new("post-error-view").unwrap(),
+            move |input| {
+                *observed.lock().unwrap() = input.failure().cloned();
+                Ok(bevy_scene::bsn! { Node })
+            },
+        )
+        .unwrap();
+    let normal = RouteViewKey::new("post-error-normal").unwrap();
+    let error = RouteViewKey::new("post-error-view").unwrap();
+    let mut options = RouteNodeOptions::new().with_view(normal.clone());
+    if matches!(case, NativePublishedCase::BoundError) {
+        options = options.with_error_view(
+            ErrorBoundaryKey::named("post-error-boundary").unwrap(),
+            error.clone(),
+        );
+    }
+    let mut routes = RouteTree::builder()
+        .root_with_options(RoutePattern::path("/").unwrap(), options)
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("broken").unwrap(),
+            RouteNodeOptions::new().with_view(normal.clone()),
+        )
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(normal, RouteViewDescriptor::new(normal_driver))
+        .unwrap();
+    views
+        .insert(error.clone(), RouteViewDescriptor::new(error_driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, error))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)))
+        .id();
+    app.update();
+    let first = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let history = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(first).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        entry.engine.history().clone()
+    };
+    let location = match case {
+        NativePublishedCase::Normal => RouteLocation::new("/").with_fragment("next"),
+        NativePublishedCase::Fallback => RouteLocation::new("/unmatched"),
+        NativePublishedCase::BoundError => RouteLocation::new("/broken"),
+    };
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, location)
+        .unwrap();
+    // Exercise the private production stages so the actual post-publication,
+    // pre-cleanup window remains observable even when one update settles it.
+    for _ in 0..8 {
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        if app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .status()
+            == &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        {
+            break;
+        }
+        settle_cleanup_system(app.world_mut());
+    }
+    let committed_history = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.active().kind(),
+            if matches!(case, NativePublishedCase::Normal) {
+                ActivePresentationKind::Route
+            } else {
+                ActivePresentationKind::Error
+            }
+        );
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        );
+        if matches!(case, NativePublishedCase::Normal) {
+            assert_eq!(entry.engine.history().len(), history.len() + 1);
+        } else {
+            assert_eq!(entry.engine.history(), &history);
+        }
+        assert!(entry.cleanup_ledger.is_some());
+        entry.engine.history().clone()
+    };
+    let expected = if matches!(case, NativePublishedCase::Normal) {
+        assert!(original.lock().unwrap().is_none());
+        RequestStatus::Succeeded
+    } else {
+        let original = original
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the native error factory receives the original failure");
+        assert_eq!(
+            original.kind(),
+            if matches!(case, NativePublishedCase::BoundError) {
+                NavigationFailureKind::Build
+            } else {
+                NavigationFailureKind::Match
+            }
+        );
+        RequestStatus::Failed(original)
+    };
+    let queued = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    for _ in 0..8 {
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        if !matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ) {
+            break;
+        }
+    }
+    let assert_terminal = |app: &App| {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.engine.history(), &committed_history);
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+        );
+        assert!(
+            entry.active.is_none()
+                && entry.host.is_none()
+                && entry.cleanup_ledger.is_none()
+                && entry.post_commit_compound.is_none()
+                && entry.pending_frame_drive.is_none()
+                && entry.pending_failed_branch.is_none()
+        );
+        assert!(entry.engine.snapshot().running_request().is_none());
+        let queued_status = entry.engine.request(queued).unwrap().status().clone();
+        assert!(
+            matches!(&queued_status, RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+        );
+        let record = entry.engine.request(request).unwrap();
+        assert_eq!(
+            record
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+        assert_eq!(
+            record
+                .diagnostics()
+                .iter()
+                .filter(|event| event.kind() == DiagnosticEventKind::PostCommitCleanupAnomaly)
+                .count(),
+            1
+        );
+        assert!(app.world().get::<Node>(host).is_some());
+        assert_eq!(record.status(), &expected);
+        (
+            record.trace().to_vec(),
+            record.diagnostics().to_vec(),
+            queued_status,
+            entry.engine.snapshot(),
+        )
+    };
+    let settled = assert_terminal(&app);
+    app.update();
+    assert_eq!(assert_terminal(&app), settled);
+
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    let RequestLookup::Found(published_request) = snapshots.request(router, request) else {
+        panic!("the completed request must remain publicly observable");
+    };
+    assert_eq!(published_request.status(), &expected);
+    assert_eq!(published_request.trace(), settled.0);
+    assert_eq!(published_request.diagnostics(), settled.1);
+    let RequestLookup::Found(published_queued) = snapshots.request(router, queued) else {
+        panic!("the queued HostLost result must remain publicly observable");
+    };
+    assert_eq!(published_queued.status(), &settled.2);
+    let published_router = snapshots.get(router).unwrap();
+    assert_eq!(published_router.history(), settled.3.history());
+    assert_eq!(published_router.active(), settled.3.active());
+    assert_eq!(published_router.availability(), settled.3.availability());
+    assert_eq!(published_router.diagnostics(), settled.3.diagnostics());
+    assert!(published_router.running_request().is_none());
+    assert!(published_router.pending_phase().is_none());
+    assert!(!published_router.cleanup().foreground_pending());
+}
+
+#[test]
+fn native_published_normal_post_commit_host_loss_keeps_success() {
+    assert_native_published_host_loss_keeps_result(NativePublishedCase::Normal);
+}
+
+#[test]
+fn native_published_fallback_post_commit_host_loss_keeps_original_failure() {
+    assert_native_published_host_loss_keeps_result(NativePublishedCase::Fallback);
+}
+
+#[test]
+fn native_published_bound_error_post_commit_host_loss_keeps_original_failure() {
+    assert_native_published_host_loss_keeps_result(NativePublishedCase::BoundError);
+}
+
+#[test]
+fn native_post_commit_isolation_keeps_authored_values_and_rejects_content_drift() {
+    for drift in [false, true] {
+        let (mut app, router, host, _, _) = fixture(false);
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        settle(&mut app);
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/").with_fragment("next"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>();
+        app.world_mut()
+            .resource_scope(|world, mut navigation: Mut<RouterNavigation>| {
+                let entry = &mut navigation.entries[0];
+                let active = entry.active.as_ref().unwrap();
+                let host = entry.host.as_ref().unwrap();
+                let root = active.frames()[0].native_root().unwrap();
+                let authored = *world.get::<Visibility>(root).unwrap();
+                assert_eq!(authored, Visibility::Inherited);
+                let original = entry.cleanup_ledger.as_mut().unwrap();
+                let original_freeze = original
+                    .freeze_for_post_commit_transfer(world)
+                    .ok()
+                    .unwrap();
+                let mut authority = PreparedPostCommitAuthorityLedger::freeze_and_reserve(
+                    world,
+                    active,
+                    host,
+                    &original_freeze,
+                )
+                .ok()
+                .unwrap();
+                let edge = FrozenRetiredHostEdge::freeze(world, host).unwrap();
+                let isolation = prepare_post_commit_input_isolation(
+                    world,
+                    active,
+                    &original_freeze,
+                    &authority,
+                )
+                .ok()
+                .unwrap();
+                let removed = original_freeze
+                    .removed_entities_for_authority_refreeze(world, original, None)
+                    .unwrap();
+                assert!(
+                    isolation
+                        .apply_guarded(world, &|world| {
+                            original_freeze.refreeze(world, original, None)
+                                && authority
+                                    .partition()
+                                    .refreeze_allowing_input_isolation(world, &removed)
+                                && edge.host_projection_is_current(world, false)
+                        })
+                        .is_ok()
+                );
+                assert_eq!(
+                    world.get::<Visibility>(root),
+                    Some(&authored),
+                    "authorized isolation only writes the shell"
+                );
+                if drift {
+                    *world.get_mut::<Visibility>(root).unwrap() = Visibility::Hidden;
+                }
+                assert_eq!(
+                    authority.commit_input_isolation(world, &original_freeze, original),
+                    !drift,
+                    "the production refreeze must preserve exact Scene content values"
+                );
+            });
+    }
+}
+
 #[test]
 fn native_outlet_loss_after_scene_preparation_keeps_exact_current_task_source() {
     let (mut app, router, _, _, _) = fixture_variant(false, true);

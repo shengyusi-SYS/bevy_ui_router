@@ -9566,6 +9566,174 @@ mod tests {
         (engine, lease)
     }
 
+    fn settle_idle_host_and_readmit(
+        engine: &mut RouterEngine,
+        lease: HostLease,
+        revision: u64,
+    ) -> HostLease {
+        let history = engine.history().clone();
+        let running = engine.snapshot().running_request();
+        let mut owner = None;
+        assert!(
+            engine
+                .begin_idle_host_loss(
+                    lease,
+                    &CleanupManifest::new(Vec::new(), revision, 1),
+                    |value| owner = Some(value)
+                )
+                .is_ok()
+        );
+        assert!(
+            engine
+                .complete_idle_host_loss(
+                    owner.unwrap(),
+                    IdleHostLossPhysicalFacts {
+                        manifest_digest: revision,
+                        obligation_count: 1,
+                        disposition: IdleHostLossPhysicalDisposition::Settled {
+                            completion_digest: revision + 1,
+                            settled_count: 1
+                        },
+                    },
+                    |_| ()
+                )
+                .is_ok()
+        );
+        assert_eq!(engine.history(), &history);
+        assert_eq!(engine.snapshot().running_request(), running);
+        let HostAdmissionSourcePermitOutcome::Ineligible { source, .. } =
+            engine.issue_host_admission_source_permit()
+        else {
+            panic!("settled loss waits for a changed observation")
+        };
+        let observation = HostAdmissionUnavailableEvidenceProjection::host_lost(
+            &source,
+            Some(revision),
+            revision,
+            revision + 1,
+        );
+        let HostAdmissionUnavailableCauseBindOutcome::Bound(cause) =
+            engine.bind_host_admission_unavailable_cause(source, &observation, ())
+        else {
+            panic!("changed candidate binds to the lost source")
+        };
+        assert!(matches!(
+            engine.complete_observed_host_admission_unavailable(cause, || {}),
+            HostAdmissionUnavailableObservedOutcome::Published(_)
+        ));
+        let HostAdmissionSourcePermitOutcome::Issued(permit) =
+            engine.issue_host_admission_source_permit()
+        else {
+            panic!("changed source permits admission")
+        };
+        let token = engine
+            .request_source_bound_host_admission(permit)
+            .ok()
+            .unwrap();
+        let grant = engine
+            .grant_source_bound_host_admission(token)
+            .ok()
+            .unwrap();
+        engine
+            .record_source_bound_top_slot_registered(&grant)
+            .ok()
+            .unwrap();
+        let HostConfirmationPreparationOutcome::Prepared(prepared) =
+            engine.prepare_host_confirmation(bind_granted_host_admission_source(grant, ()))
+        else {
+            panic!("exact admission prepares")
+        };
+        let HostAdmissionConfirmationCoreOutcome::Ready {
+            installed: lease, ..
+        } = engine.confirm_host_admission_with_binding(prepared, |(), lease| lease)
+        else {
+            panic!("exact admission installs one lease")
+        };
+        lease
+    }
+
+    fn foreign_report_task() -> (RouterEngine, RootFrameTask) {
+        let mut engine = confirmed_nested_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("real normal task")
+        };
+        (engine, task)
+    }
+
+    #[test]
+    fn router_report_rejection_after_full_idle_diagnostics_returns_error() {
+        let (mut engine, mut lease) = confirmed_nested_engine_with_lease();
+        for revision in 1..=64 {
+            lease = settle_idle_host_and_readmit(&mut engine, lease, revision as u64);
+        }
+        let (source, task) = foreign_report_task();
+        let source_before = source.snapshot();
+        let receiver_before = engine.snapshot();
+        assert_eq!(
+            engine.validate_report_identity(&task),
+            Err(IntegrationError::Invalid)
+        );
+        assert_eq!(source.snapshot(), source_before);
+        assert_eq!(engine.snapshot().history(), receiver_before.history());
+        assert!(engine.idle_host_loss_eligible());
+        assert_eq!(engine.router_diagnostics().len(), 64);
+        // The rejected report has no authority to consume the current lease.
+        settle_idle_host_and_readmit(&mut engine, lease, 100);
+    }
+
+    #[test]
+    fn mixed_router_diagnostics_keep_exact_report_dedup_until_its_event_is_evicted() {
+        let (mut engine, mut lease) = confirmed_nested_engine_with_lease();
+        for revision in 1..64 {
+            lease = settle_idle_host_and_readmit(&mut engine, lease, revision as u64);
+        }
+        let (_source_a, task_a) = foreign_report_task();
+        let (_source_b, task_b) = foreign_report_task();
+        assert_eq!(
+            engine.validate_report_identity(&task_a),
+            Err(IntegrationError::Invalid)
+        );
+        assert_eq!(
+            engine.validate_report_identity(&task_b),
+            Err(IntegrationError::Invalid)
+        );
+        let retained = engine.router_diagnostics().to_vec();
+        assert_eq!(
+            engine.validate_report_identity(&task_a),
+            Err(IntegrationError::Invalid)
+        );
+        assert_eq!(
+            engine.router_diagnostics(),
+            retained,
+            "evicting an idle event must retain both report dedup records"
+        );
+        for revision in 100..164 {
+            lease = settle_idle_host_and_readmit(&mut engine, lease, revision as u64);
+        }
+        assert!(
+            engine
+                .router_diagnostics()
+                .iter()
+                .all(|event| event.report_disposition().is_none())
+        );
+        assert_eq!(
+            engine.validate_report_identity(&task_a),
+            Err(IntegrationError::Invalid)
+        );
+        assert_eq!(
+            engine
+                .router_diagnostics()
+                .iter()
+                .filter(|event| event.report_disposition().is_some())
+                .count(),
+            1,
+            "evicted reports can emit again"
+        );
+        assert_eq!(engine.router_diagnostics().len(), 64);
+    }
+
     #[test]
     fn initial_fallback_task_host_loss_preserves_roots_history_and_terminal_semantics() {
         for include_target in [false, true] {

@@ -32,7 +32,7 @@ BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory �
 
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
-facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。独立 workspace 的真实 BSN consumer 已运行嵌套/history/错误恢复与 LF/CRLF 对照；旧 session 专属公开拒绝行随 API 删除，身份、handle、navigation/publication 权限拒绝仍保留。ECS-only consumer 只证明插件资源、安装拒绝和普通更新行为，不再声称外部独立 renderer；无 BSN 的渲染/lifecycle 独立性由 ECS 私有真实管线测试验证。完整公开消费验收与示例仍按 plan 推进，不以此单个 consumer 代替全部验收。
+facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。独立 workspace 的真实 BSN consumer 已运行嵌套/history/错误恢复与 LF/CRLF 对照；旧 session 专属公开拒绝行随 API 删除，身份、handle、navigation/publication 权限拒绝仍保留。ECS-only consumer 只证明插件资源、安装拒绝和普通更新行为，不再声称外部独立 renderer；无 BSN 的渲染/lifecycle 独立性由 ECS 私有真实管线测试验证。推荐示例现也由独立 consumer 直接运行，完整 MVP 验收继续按 plan 推进，不以单个 consumer 代替全部验收。
 
 `a153520` 在同一独立 BSN consumer 内验证普通应用系统于 `Update` 的公开 `PublishSnapshots` 标签之后读取本轮完整 snapshots；实际 native 输入授权作为独立发布证据，防止延后一轮的旧快照靠 polling 通过。此 test-only 检查点没有新增 runtime 或公开 API。
 
@@ -74,4 +74,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 推荐 quick start 与普通内部 outlet 示例已交付，并把原文件作为独立 workspace consumer 编译运行。嵌套示例经真实 UI 布局验证 Push/Replace/Back、history 和 layout/toolbar/slot 保持；它是有限 headless 示例，不是窗口、GPU 或真实设备验收。
 
-私有替身最终边界核查、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。Core 最终独立审查有两个正确性候选待运行确认，尚未标为通过。已退出的公开 Data 入口与延迟回放机制、已通过的 native public journeys、公共观察边界和示例不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。
+最终审查复现的三处接收端缺陷已修正并通过增量复审：混合 Router 诊断与去重共同维护 exact 保留关系；post-commit terminal 冻结原 attempt 结果；native 隔离预期只更新实际写入角色，严格保留 authored 内容观察。完整 Core/ECS/facade/workspace 验证通过，正常/fallback/bound-error 的普通更新后公开快照与单次终态也通过。当前仅余有界私有 fixture 清理、最终同版本验收与 main 集成；不重复开发已有导航/输入/示例，不以本检查点代替完整 MVP。Windows 原生验证保持 NOT_RUN。

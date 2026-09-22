@@ -148,10 +148,11 @@ impl RouterEngine {
             admission_source,
         });
         self.pending_idle_host_loss = Some(receiver);
-        if self.router_diagnostics.len() == ROUTER_DIAGNOSTIC_RETENTION {
-            self.router_diagnostics.remove(0);
-        }
-        self.router_diagnostics.push(diagnostic);
+        append_router_diagnostic(
+            &mut self.router_diagnostics,
+            &mut self.report_dispositions,
+            diagnostic,
+        );
         self.state = recovering;
         Ok(())
     }

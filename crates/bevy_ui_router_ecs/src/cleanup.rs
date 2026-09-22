@@ -13237,6 +13237,12 @@ impl PreparedPostCommitAuthorityLedger {
             return false;
         }
         for expected in &mut self.partition.target_observed {
+            #[cfg(feature = "bsn")]
+            if crate::presentation::native_frame::is_native_content(world, expected.entity) {
+                // Isolation writes the Router shell, preserving Scene-authored
+                // content values and their exact frozen observation.
+                continue;
+            }
             if expected.visibility.is_some() {
                 expected.visibility = Some(Visibility::Hidden);
             }
