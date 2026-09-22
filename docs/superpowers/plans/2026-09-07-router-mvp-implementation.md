@@ -43,7 +43,13 @@
 - r1 审查后的收口以局部重构和减法为主：集中当前内容归属与输入/focus 资格的只读事实，让 Refresh、publication preparation 和定点清焦消费一致语义，删除同一边界的重复遍历/判定；不以统一资格替代各自的 ownership 或 mutation proof。区分官方 Visibility 覆盖、Display::None 祖先和精确授权的 staging next 值。当前 typed cleanup 证据沿既有 owner/receiver 传递，不另设错误历史。旧静态输出入口、无消费者的过渡 helper 和含糊命名随等价行为替代后退出，不无限保留双模型，也不以改名或分文件冒充重构完成。
 - 真实 hidden-outlet 回归还暴露共享 manifest 将官方 `CalculatedClip` 的正常增删当成结构失效。统一现有 World 观测及无分配比较入口，仅排除此已证实的派生缓存；保留所有 identity、relationship 和 authored 组件检查，不给每条导航路径叠加豁免，也不扩成通用 computed-component 框架。
 
-本次联动收口后，剩余约三个主要交付单元：native nested/history/recovery 及公共观察边界组合验收、公开 consumer/示例与旧机制退出、最终验证审查集成。第一项为中到大工作量，后两项为中等；已有嵌套/consumer 和运行证据可复用，并非从零开始。单元不等于小补丁、固定提交次数或工时承诺；阶段 checklist 仍按完整验收勾选，不因一组测试通过就整阶段打勾。
+本次联动收口后，剩余约三个主要交付单元，整体仍为中到大工作量，并非只剩文档收尾。独立验收盘点与旧机制调用者盘点经交叉复核，后续按以下顺序收口：
+
+1. **native 公共验收**：复用已有嵌套、输入/focus 与 host 证据，集中补 factory input/等价与 search/fragment 更新、排队及失败 Back、boundary/build/resolve 恢复和公开 snapshot 调度边界。优先改造、合并现有 public journey fixture；逐项处置旧测试的真实行为责任，不机械复制全部旧用例，不另保留一套永久平行验收框架。
+2. **示例与旧机制退出**：完成推荐 quick start/普通内部 outlet 示例，撤下旧公开 writer/report 注册及兼容 consumer；按实际依赖收窄私有非 BSN 替身，成组退出仅服务旧回放的状态、投影和静态 helper。旧公开入口退出与私有执行器瘦身可分提交；不以删除所有 ContentPlan 代码为先决条件，也不以“私有 fixture”名义保留整套第二生产入口。先迁移外部测试，再决定 test-only 边界，保持真实 no-BSN 行为验证。
+3. **最终集成**：完成 spec 验收证据、Core/ECS/public 独立与交叉审查、全量验证和 main 集成。已闭合路径不重新开发；新增生产问题须有真实可达证据，才安排局部修正。
+
+这些单元不等于固定提交次数或工时承诺。复杂度的主要待减部分是双内容模型和测试回放协议，不是 Core/View 分层或实际 native ownership；创建/cleanup 的真实 FrameOutput role、执行依赖保活、原 failure owner 与残留责任按调用者保留。阶段 checklist 仍按完整验收勾选，不因局部通过整阶段打勾，也不将尚未勾选误报为功能从未实现。
 
 ### 1.1 候选行为 retention map
 
@@ -255,6 +261,10 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 阶段 C native 联动检查点（2026-09-22，本记录所在提交；Core 前置为 `e7445a2`）：公开 factory 与真实 FrameTask 接通，原 adoption/失败产物沿既有 owner 和 Back/cleanup/terminal 接收端移动。physical anchor 与 authority source 分开，普通 authored 内容按 current containment；输入/focus 共享当前资格但保留原 source-frame 归属证明。官方 clipping 缓存采用统一观测，不再产生散落挂载豁免。真实 AutoFocus 时序、动态隐藏、移入 preserved 内容、HostLost/重接纳与当前 typed cleanup 证据均有生产路径回归。两位独立审查者完成交叉及增量复核，无本检查点剩余 finding。
 
 最终冻结版本的 workspace all-target/all-feature check、完整 workspace test、workspace doctest、facade core/default/ecs/bsn checks、fmt/diff 均以 `--locked --offline`（适用命令）运行并 exit 0；包括 424 Core、663 ECS、19 focus、13 input、35 public journeys、独立 LF/CRLF consumer 与 28 Core doctests。完整 ECS no-BSN 为 624+1 PASS；最后的 BSN-only source-membership 修正未改其共享源码。既有 warnings 保留，Windows NOT_RUN。下一步按现有 spec 核对剩余组合和公共观察边界，推进示例/旧入口退出；不得以本记录代替最终 MVP/main 验收。
+
+公开 snapshot 观察边界检查点（2026-09-22，本记录所在提交）：在原独立 BSN consumer 中添加普通 `Update` 应用系统，仅按公开 `PublishSnapshots` 标签排序，逐次要求新观察并对照本轮更新后的完整 request/router snapshot。将同一时刻的真实 native Entity 与输入授权作为独立发布证据，避免延后一轮的旧快照仍靠 polling 通过；既有嵌套 Push/Replace/Back、实际 Apply 失败、Error presentation 和 history 保持都经此边界观察。无生产代码或公开 API 修改。
+
+实现与独立范围审查通过；主代理再次执行 `cargo test -p bevy_ui_router --test facade_consumers --locked --offline`（含独立 LF/CRLF BSN）、workspace fmt、consumer 显式 rustfmt check 和 diff check，均 exit 0。本次 test-only 改动不重复宣称全量 workspace runtime 验收，已有 warnings 和 Windows NOT_RUN 保留。阶段 C 最后一项的同更新观察部分已闭合，build/resolve 公开恢复组合仍随下一 native public journey 迁移完成，故不将整项提前勾选。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 
