@@ -605,12 +605,37 @@ enum FailedAuthoritySettlementTerminal {
         current_roots: Vec<RouteFrameVersion>,
         target_and_current_roots: Option<Vec<RouteFrameVersion>>,
     },
+    ProjectionlessFallbackWithActive(Box<ProjectionlessFallbackAuthoritySource>),
     FailureCleanup(FailureCleanupReceiverProjection),
     RegistrationBegin {
         identity: FrameTaskIdentity,
         permit: MountRegistrationPermit,
         logical_roots: Vec<RouteFrameVersion>,
     },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ProjectionlessFallbackAuthoritySource {
+    identity: FrameTaskIdentity,
+    current: FailureCleanupZeroTerminalCurrentProjection,
+    host: HostVersion,
+    top_slot: RouteSlotId,
+    active: ActivePresentation,
+    active_branch: Option<FailureCleanupZeroTerminalBranchProjection>,
+    active_child_slots: Vec<LogicalChildSlotBinding>,
+    logical_roots: Vec<RouteFrameVersion>,
+}
+
+impl std::fmt::Debug for ProjectionlessFallbackAuthoritySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectionlessFallbackAuthoritySource")
+            .field("identity", &self.identity)
+            .field("host", &self.host)
+            .field("active", &self.active)
+            .field("logical_roots", &self.logical_roots)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -633,6 +658,7 @@ impl FailedAuthoritySettlementTrigger {
 
 enum FailedAuthoritySettlementTerminalRef<'a> {
     Task(&'a FrameTaskIdentity),
+    ProjectionlessFallbackWithActive(&'a FrameTaskIdentity),
     FailureCleanup(&'a FailureCleanupRequest),
     FailureCleanupProjection(&'a FailureCleanupReceiverProjection),
     RegistrationBegin(&'a MountRegistrationPermit),
@@ -645,6 +671,7 @@ struct FailedAuthoritySettlementSource {
 
 enum FailedAuthoritySettlementLogicalRoots {
     Exact(Vec<RouteFrameVersion>),
+    ProjectionlessFallbackWithActive(Vec<RouteFrameVersion>),
     Task {
         current: Vec<RouteFrameVersion>,
         target_and_current: Option<Vec<RouteFrameVersion>>,
@@ -657,7 +684,8 @@ impl FailedAuthoritySettlementSource {
         seal: &CleanupManifestSeal,
     ) -> Option<(FrameTaskIdentity, Vec<RouteFrameVersion>)> {
         let selected = match self.logical_roots {
-            FailedAuthoritySettlementLogicalRoots::Exact(roots) => {
+            FailedAuthoritySettlementLogicalRoots::Exact(roots)
+            | FailedAuthoritySettlementLogicalRoots::ProjectionlessFallbackWithActive(roots) => {
                 (roots.as_slice() == seal.logical_roots()).then_some(roots)
             }
             FailedAuthoritySettlementLogicalRoots::Task {
@@ -6733,6 +6761,15 @@ impl RouterEngine {
         self.mint_failed_authority_trigger(FailedAuthoritySettlementTerminalRef::Task(identity))
     }
 
+    pub(crate) fn host_loss_trigger_for_unstarted_fallback_with_active(
+        &mut self,
+        identity: &FrameTaskIdentity,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.mint_failed_authority_trigger(
+            FailedAuthoritySettlementTerminalRef::ProjectionlessFallbackWithActive(identity),
+        )
+    }
+
     pub(crate) fn failed_authority_trigger_for_cleanup(
         &mut self,
         request: &FailureCleanupRequest,
@@ -6785,6 +6822,60 @@ impl RouterEngine {
             return Err(FailedAuthorityTriggerError::WrongPhase);
         }
         match terminal {
+            FailedAuthoritySettlementTerminalRef::ProjectionlessFallbackWithActive(identity) => {
+                if identity.router_identity() != self.router {
+                    return Err(FailedAuthorityTriggerError::Foreign);
+                }
+                if current.identity != *identity {
+                    return Err(FailedAuthorityTriggerError::Stale);
+                }
+                let host = self.state.host().expect("host checked above");
+                if identity.host != host.host()
+                    || identity.host_epoch != host.epoch()
+                    || Some(identity.slot) != self.state.top_slot()
+                {
+                    return Err(FailedAuthorityTriggerError::Stale);
+                }
+                if current.stage != WorkStage::Applying
+                    || self.action.is_some()
+                    || current.reconciliation.is_some()
+                    || !current.applied_frames.is_empty()
+                    || !matches!(
+                        current.attempt,
+                        AttemptKind::Fallback {
+                            bound_error: None,
+                            ..
+                        }
+                    )
+                    || self.state.active().kind() == ActivePresentationKind::None
+                {
+                    return Err(FailedAuthorityTriggerError::WrongPhase);
+                }
+                Ok(
+                    FailedAuthoritySettlementTerminal::ProjectionlessFallbackWithActive(Box::new(
+                        ProjectionlessFallbackAuthoritySource {
+                            identity: identity.clone(),
+                            current: FailureCleanupZeroTerminalCurrentProjection::from(current),
+                            host: host.clone(),
+                            top_slot: self.state.top_slot().expect("top slot checked above"),
+                            active: self.state.active().clone(),
+                            active_branch: self
+                                .active_branch
+                                .as_ref()
+                                .map(failure_cleanup_zero_terminal_branch_projection),
+                            active_child_slots: self.active_child_slots.clone(),
+                            logical_roots: self
+                                .state
+                                .active()
+                                .frames()
+                                .iter()
+                                .rev()
+                                .cloned()
+                                .collect(),
+                        },
+                    )),
+                )
+            }
             FailedAuthoritySettlementTerminalRef::Task(identity) => {
                 if identity.router_identity() != self.router {
                     return Err(FailedAuthorityTriggerError::Foreign);
@@ -6927,6 +7018,11 @@ impl RouterEngine {
         }
         self.live_failed_authority_trigger_revision = None;
         let terminal_ref = match &trigger.terminal {
+            FailedAuthoritySettlementTerminal::ProjectionlessFallbackWithActive(source) => {
+                FailedAuthoritySettlementTerminalRef::ProjectionlessFallbackWithActive(
+                    &source.identity,
+                )
+            }
             FailedAuthoritySettlementTerminal::Task { identity, .. } => {
                 FailedAuthoritySettlementTerminalRef::Task(identity)
             }
@@ -6953,6 +7049,12 @@ impl RouterEngine {
             return Err(BeginAuthoritySettlementErrorKind::Stale);
         }
         let (identity, logical_roots) = match trigger.terminal {
+            FailedAuthoritySettlementTerminal::ProjectionlessFallbackWithActive(source) => (
+                source.identity,
+                FailedAuthoritySettlementLogicalRoots::ProjectionlessFallbackWithActive(
+                    source.logical_roots,
+                ),
+            ),
             FailedAuthoritySettlementTerminal::Task {
                 identity,
                 current_roots,
@@ -7029,7 +7131,16 @@ impl RouterEngine {
                 }
             ) && self.state.active().kind()
                 == ActivePresentationKind::None;
-            (current.reconciliation.is_some() || initial_fallback_task)
+            // This separate, consumed source refroze the complete committed
+            // presentation and bindings. The older Task-only source remains
+            // incapable of covering active roots.
+            let fallback_with_active = failed.as_ref().is_some_and(|source| {
+                matches!(
+                    source.logical_roots,
+                    FailedAuthoritySettlementLogicalRoots::ProjectionlessFallbackWithActive(_)
+                )
+            }) && cause == PreCommitAuthorityCause::HostLost;
+            (current.reconciliation.is_some() || initial_fallback_task || fallback_with_active)
                 && current.retired_host.is_none()
         }) && self.action.is_none()
             && self.current_reconciliation_matches_active();

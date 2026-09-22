@@ -7086,6 +7086,19 @@ impl RouterEngine {
             .map_err(map_failed_authority_trigger_error)
     }
 
+    /// Covers an unstarted, unbound fallback and the exact committed active
+    /// presentation. Only a HostLost settlement may consume this source.
+    #[doc(hidden)]
+    pub fn host_loss_trigger_for_unstarted_fallback_with_active(
+        &mut self,
+        task: &FrameTask,
+    ) -> Result<FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError> {
+        self.inner
+            .host_loss_trigger_for_unstarted_fallback_with_active(task.inner.identity())
+            .map(|inner| FailedAuthoritySettlementTrigger { inner })
+            .map_err(map_failed_authority_trigger_error)
+    }
+
     #[doc(hidden)]
     pub fn failed_authority_trigger_for_cleanup(
         &mut self,
@@ -8076,7 +8089,7 @@ impl RouterEngine {
         &mut self,
         task: RootFrameTask,
         kind: ViewFailureKind,
-        message: &'static str,
+        message: impl Into<String>,
     ) -> Result<Option<FailureCleanupRequest>, IntegrationError> {
         let kind = match kind {
             ViewFailureKind::Build => NavigationFailureKind::Build,
@@ -8097,7 +8110,7 @@ impl RouterEngine {
         &mut self,
         task: RootFrameTask,
         kind: ViewFailureKind,
-        message: &'static str,
+        message: impl Into<String>,
     ) -> Result<FailureCleanupRequest, IntegrationError> {
         let kind = match kind {
             ViewFailureKind::Build => NavigationFailureKind::Build,
@@ -8428,7 +8441,7 @@ impl RouterEngine {
         capacity: LifecycleContinuationCapacity,
         task: RootFrameTask,
         kind: ViewFailureKind,
-        message: &'static str,
+        message: impl Into<String>,
         mode: BackTargetDriverFailureReportMode,
     ) -> BackTargetDriverFailureReportOutcome {
         let failure_kind = match kind {
@@ -9762,6 +9775,97 @@ mod tests {
                     FailureCleanupPrepareOutcome::Prepared(_)
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn projectionless_fallback_active_source_requires_complete_roots_and_host_loss() {
+        for rejection in ["omitted-active", "unstarted-target", "wrong-cause"] {
+            let (mut engine, grant) = ready_engine();
+            engine.record_top_slot_registered(&grant).unwrap();
+            let lease = engine.confirm_host(grant);
+            settle_push(&mut engine, RouteLocation::new("/"));
+            let history = engine.history().clone();
+            let roots = engine
+                .active()
+                .frames()
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>();
+            let request = engine.push(RouteLocation::new("/unmatched")).unwrap();
+            engine.collect();
+            let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+                panic!("actual fallback task");
+            };
+            let trigger = engine
+                .host_loss_trigger_for_unstarted_fallback_with_active(&task)
+                .unwrap();
+            let replay = trigger.testing_duplicate();
+            let snapshot = engine.snapshot();
+            let (invalid_roots, cause, expected) = match rejection {
+                "omitted-active" => (
+                    Vec::new(),
+                    PreCommitAuthorityCause::HostLost,
+                    BeginAuthoritySettlementErrorKind::InvalidManifest,
+                ),
+                "unstarted-target" => (
+                    vec![task.frame().clone()],
+                    PreCommitAuthorityCause::HostLost,
+                    BeginAuthoritySettlementErrorKind::InvalidManifest,
+                ),
+                _ => (
+                    roots.clone(),
+                    PreCommitAuthorityCause::AuthorityLost,
+                    BeginAuthoritySettlementErrorKind::WrongPhase,
+                ),
+            };
+            let error = engine
+                .begin_failed_authority_settlement_for_cause_retaining(
+                    lease,
+                    trigger,
+                    cause,
+                    CleanupManifest::new(invalid_roots, 0xFAA1, 1),
+                    |_| panic!("invalid source cannot publish"),
+                )
+                .err()
+                .expect("invalid source rejected");
+            assert_eq!(error.kind(), expected);
+            assert_eq!(engine.snapshot(), snapshot);
+            assert!(engine.inspect_report_identity(&task).is_ok());
+            let error = engine
+                .begin_failed_authority_settlement_for_cause_retaining(
+                    error.into_owner(),
+                    replay,
+                    PreCommitAuthorityCause::HostLost,
+                    CleanupManifest::new(roots.clone(), 0xFAA2, 1),
+                    |_| panic!("burned source cannot replay"),
+                )
+                .err()
+                .expect("replay rejected");
+            assert_eq!(error.kind(), BeginAuthoritySettlementErrorKind::Stale);
+            let trigger = engine
+                .host_loss_trigger_for_unstarted_fallback_with_active(&task)
+                .unwrap();
+            let cleanup = engine
+                .begin_failed_authority_settlement_for_cause_retaining(
+                    error.into_owner(),
+                    trigger,
+                    PreCommitAuthorityCause::HostLost,
+                    CleanupManifest::new(roots, 0xFAA3, 1),
+                    |_| {},
+                )
+                .unwrap();
+            engine
+                .complete_authority_cleanup(cleanup.complete(0xFAA4, 1), || {})
+                .unwrap();
+            assert_eq!(engine.history(), &history);
+            assert_eq!(engine.active().kind(), ActivePresentationKind::None);
+            assert!(
+                matches!(engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost)
+            );
+            assert!(engine.action().is_none() && engine.snapshot().running_request().is_none());
+            assert!(engine.inspect_report_identity(&task).is_err());
         }
     }
 

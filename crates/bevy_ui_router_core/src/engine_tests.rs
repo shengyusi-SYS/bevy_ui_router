@@ -63,6 +63,62 @@ use crate::view_key::RouteViewKey;
 const NONZERO_OBLIGATION_COUNT: usize = 3;
 
 #[test]
+fn projectionless_fallback_active_source_refreezes_current_active_branch_and_bindings() {
+    for drift in [
+        "active",
+        "branch",
+        "bindings",
+        "old-epoch",
+        "current-location",
+    ] {
+        let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let lease_identity = lease.retirement_projection();
+        let roots = engine
+            .active()
+            .frames()
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        engine.push(RouteLocation::new("/unmatched")).unwrap();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("real unbound fallback task");
+        };
+        let trigger = engine
+            .host_loss_trigger_for_unstarted_fallback_with_active(task.identity())
+            .unwrap();
+        match drift {
+            "active" => engine.testing_set_active_generation(RouteGeneration::testing_max()),
+            "branch" => engine.active_branch = None,
+            "bindings" => {
+                assert!(!engine.active_child_slots.is_empty());
+                engine.active_child_slots.clear();
+            }
+            "old-epoch" => engine.current.as_mut().unwrap().identity.host_epoch += 1,
+            _ => engine.current.as_mut().unwrap().location = RouteLocation::new("/changed-source"),
+        }
+        let state = engine.state.clone();
+        let error = engine
+            .begin_failed_authority_settlement_for_cause_retaining(
+                &mut issuer,
+                lease,
+                trigger,
+                PreCommitAuthorityCause::HostLost,
+                CleanupManifestSeal::new(roots, manifest_digest(0xFAB1), 2),
+                |_, _| panic!("drifted source must not install physical ownership"),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), BeginAuthoritySettlementErrorKind::Stale);
+        assert_eq!(error.into_owner().retirement_projection(), lease_identity);
+        assert_eq!(engine.state, state);
+        assert!(issuer.has_current());
+        assert!(engine.live_failed_authority_trigger_revision.is_none());
+    }
+}
+
+#[test]
 fn idle_host_loss_core_rejects_foreign_queued_and_invalid_manifest_without_consuming_lease() {
     use super::idle_host_loss::IdleHostLossErrorKind;
     let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
