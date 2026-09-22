@@ -4,11 +4,11 @@
 
 ## Now
 
-- 候选精简、独立迁移基线及 idle host-loss 已完成。官方 native BSN 联动、失败 owner 交接与输入/focus 已通过独立及交叉审查、真实反例修正和冻结验证；转入剩余组合验收与旧机制退出，不扩大产品范围。
+- 候选精简、独立迁移基线及 idle host-loss 已完成。官方 native BSN 联动、输入/focus、公共同更新 snapshot 观察和迁移后的真实导航/恢复 journeys 已通过对应审查与验证；当前重心转向示例及旧机制退出，不扩大产品范围。
 
 ## Next
 
-- 对照统一 spec 收口剩余真实 BSN 组合与公共 snapshot 观察边界；复用已有内部 default outlet、history、恢复和 host/stale 证据，不重做已完成的联动迁移。
+- 对照统一 spec 归集已经存在的内部 default outlet、location/history、恢复、host/stale、输入/focus 与公共 snapshot 证据；不重做已完成的联动迁移，也不把单个检查点当成完整 MVP 验收。
 - 完成示例和旧内容模型/API 退出，删除已被替代的过渡入口与重复事实，保留 renderer-neutral 独立验证；不新增 runtime 或通用事务框架。
 - 通过推荐 facade 的独立 BSN consumer、示例、全量验证与独立交叉审查后集成 main；完成前不标记 MVP PASS。
 

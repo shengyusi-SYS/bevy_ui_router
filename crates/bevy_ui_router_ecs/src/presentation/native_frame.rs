@@ -787,6 +787,15 @@ fn prepare_content_cleanup_inner(
     let Some(root) = frame.native_root() else {
         return Ok(());
     };
+    if world.get_entity(root).is_err() {
+        // An absent content boundary has no current descendants to acquire.
+        // Keep every original/partially prepared obligation and its evidence:
+        // the authority cleanup ledger must still classify absent structures
+        // and any surviving claims. Escaped ordinary content is surrendered by
+        // the same exact bookkeeping release used after preparation failure.
+        release_escaped_cleanup_content(world);
+        return Ok(());
+    }
     let content = collect_content(world, frame.frame(), root)
         .map_err(NativeCleanupPreparationError::Content)?;
     if frame.native.as_ref().unwrap().cleanup.is_none() {
@@ -1169,6 +1178,138 @@ mod tests {
             .unwrap();
         let frame = branch.into_single_frame().ok().flatten().unwrap();
         (app, host, frame)
+    }
+
+    #[test]
+    fn absent_native_root_cleanup_keeps_claims_without_physical_writes() {
+        for despawn_host in [false, true] {
+            let (mut app, host, mut frame) = active_native_frame();
+            let root = frame.native_root().unwrap();
+            let claims = frame.claims().cloned().collect::<Vec<_>>();
+            assert!(
+                app.world_mut()
+                    .despawn(if despawn_host { host } else { root })
+            );
+            let entities = app
+                .world()
+                .iter_entities()
+                .map(|entity| (entity.id(), entity.archetype().components().to_vec()))
+                .collect::<Vec<_>>();
+            app.world_mut().clear_trackers();
+            let last_run = app.world().last_change_tick();
+
+            prepare_content_cleanup(app.world_mut(), &mut frame).unwrap();
+
+            assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
+            assert!(frame.native.as_ref().unwrap().cleanup.is_none());
+            assert_eq!(
+                app.world()
+                    .iter_entities()
+                    .map(|entity| { (entity.id(), entity.archetype().components().to_vec()) })
+                    .collect::<Vec<_>>(),
+                entities
+            );
+            for (entity, components) in entities {
+                let entity = app.world().entity(entity);
+                for component in components {
+                    let ticks = entity.get_change_ticks_by_id(component).unwrap();
+                    assert!(!ticks.is_added(last_run, app.world().read_change_tick()));
+                    assert!(!ticks.is_changed(last_run, app.world().read_change_tick()));
+                }
+            }
+            for claim in claims {
+                assert_eq!(
+                    app.world()
+                        .resource::<RouteEntityRegistry>()
+                        .record(claim.entity())
+                        .unwrap()
+                        .claim(),
+                    claim
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_native_root_retains_partial_cleanup_and_releases_escaped_child() {
+        for despawn_host in [false, true] {
+            let (mut app, host, mut frame) = active_native_frame();
+            let root = frame.native_root().unwrap();
+            app.world_mut()
+                .insert_resource(NativeCleanupCapacityLimit { after_claims: 1 });
+            assert!(
+                prepare_content_cleanup(app.world_mut(), &mut frame)
+                    .unwrap_err()
+                    .is_retryable()
+            );
+            let claims = frame.claims().cloned().collect::<Vec<_>>();
+            let native = frame.native.as_ref().unwrap();
+            let closure = native.cleanup.as_ref().unwrap().closure.clone();
+            let next = native.cleanup.as_ref().unwrap().next;
+            let failure = format!("{:?}", native.cleanup_failure);
+            let focus = native
+                .focus_owner
+                .as_ref()
+                .map(|owner| owner.source.clone());
+            let escaped = claims[2].entity();
+            let authored = app.world().get::<Node>(escaped).unwrap().clone();
+            let application = app.world_mut().spawn(Node::default()).id();
+            app.world_mut()
+                .entity_mut(escaped)
+                .insert(ChildOf(application));
+            app.world_mut()
+                .despawn(if despawn_host { host } else { root });
+
+            prepare_content_cleanup(app.world_mut(), &mut frame).unwrap();
+
+            assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
+            let native = frame.native.as_ref().unwrap();
+            assert_eq!(native.cleanup.as_ref().unwrap().closure, closure);
+            assert_eq!(native.cleanup.as_ref().unwrap().next, next);
+            assert_eq!(format!("{:?}", native.cleanup_failure), failure);
+            assert_eq!(
+                native
+                    .focus_owner
+                    .as_ref()
+                    .map(|owner| owner.source.clone()),
+                focus
+            );
+            assert_eq!(app.world().get::<Node>(escaped), Some(&authored));
+            assert_eq!(
+                app.world().get::<ChildOf>(escaped).map(ChildOf::parent),
+                Some(application)
+            );
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(escaped)
+                    .is_none()
+            );
+            assert!(app.world().get::<RouteOwnershipSeal>(escaped).is_none());
+            assert!(is_escaped_cleanup_content(app.world(), escaped));
+            assert!(
+                frame
+                    .cleanup_members()
+                    .any(|(claim, _)| claim == &claims[2])
+            );
+        }
+    }
+
+    #[test]
+    fn live_native_root_seal_drift_remains_a_permanent_cleanup_failure() {
+        let (mut app, _, mut frame) = active_native_frame();
+        let root = frame.native_root().unwrap();
+        let claims = frame.claims().cloned().collect::<Vec<_>>();
+        app.world_mut()
+            .entity_mut(root)
+            .remove::<RouteOwnershipSeal>();
+        let error = prepare_content_cleanup(app.world_mut(), &mut frame).unwrap_err();
+        assert!(
+            matches!(error, NativeCleanupPreparationError::Content(crate::frame_local::FrameLocalError::OwnershipDrift(entity)) if entity == root)
+        );
+        assert!(!error.is_retryable());
+        assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
+        assert!(frame.native.as_ref().unwrap().cleanup_failure.is_some());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use super::*;
 use crate::prelude::*;
 use bevy_app::{App, TaskPoolPlugin};
 use bevy_asset::AssetPlugin;
+use bevy_ecs::prelude::Mut;
 use bevy_ecs::template::{Template, TemplateContext};
 use bevy_internal::reflect as bevy_reflect;
 use bevy_scene::{SceneFunction, ScenePlugin};
@@ -226,6 +227,182 @@ fn settle(app: &mut App) {
     for _ in 0..20 {
         app.update();
     }
+}
+
+#[test]
+fn native_outlet_loss_after_scene_preparation_keeps_exact_current_task_source() {
+    let (mut app, router, _, _, _) = fixture_variant(false, true);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child"))
+        .unwrap();
+    settle(&mut app);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(
+            router,
+            RouteLocation::new("/child").with_fragment("after-prepare"),
+        )
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    let (task, pending, anchor, history) = {
+        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let entry = &mut navigation.entries[0];
+        let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else {
+            panic!("real leaf task");
+        };
+        let pending = entry
+            .pending_commit
+            .take()
+            .unwrap_or_else(PendingCommit::new);
+        let slot = &entry.active.as_ref().unwrap().child_slots()[0];
+        assert!(slot.anchor_binding().is_native());
+        (task, pending, slot.anchor(), entry.engine.history().clone())
+    };
+    // Resolve a real ordinary Scene first, then change the actual bound marker
+    // before the production realization check. A pre-factory check alone cannot
+    // authorize this later mount or settle its failed owner.
+    let mut factory: bevy_ui_router_bsn::BsnSceneFactory =
+        Box::new(|_| Ok(Box::new(bevy_scene::bsn! { Node })));
+    let prepared = crate::bsn::prepare_bsn_view(app.world(), &mut factory, task.input()).unwrap();
+    app.world_mut()
+        .entity_mut(anchor)
+        .remove::<bevy_ui_router_bsn::DefaultOutlet>();
+    app.world_mut()
+        .resource_scope(|world, mut navigation: Mut<RouterNavigation>| {
+            let entry = &mut navigation.entries[0];
+            let host = entry.host.as_ref().unwrap();
+            let result = realize_native_task(
+                world,
+                &entry.engine,
+                host.candidate.clone(),
+                host.top_slot,
+                host.top_slot_claim.clone(),
+                Some(&pending.branch),
+                entry.active.as_ref(),
+                &task,
+                prepared,
+            );
+            let Err(crate::presentation::native_frame::NativeFrameFailure::Creation(failure)) =
+                result
+            else {
+                panic!("missing preserved binding fails before allocation");
+            };
+            let failure =
+                crate::presentation::native_failure::NativeFailureOwner::creation(&task, failure);
+            reject_native_task(world, entry, pending, task, ViewFailureKind::Apply, failure);
+            let mut failed = entry.pending_failed_branch.take().unwrap();
+            let slot =
+                exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref()).unwrap();
+            assert_eq!(slot.anchor(), anchor);
+            assert!(failed_branch_primary_claims(&failed.branch).is_empty());
+            let mut failure = failed.branch.take_native_failure().unwrap();
+            let source = failure.source.clone();
+            failure.source.frame = entry.active.as_ref().unwrap().frames()[0].frame().clone();
+            failed.branch = failed.branch.with_native_failure(failure);
+            assert!(
+                exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref()).is_none(),
+                "a different native failure identity cannot authorize current retirement"
+            );
+            let mut failure = failed.branch.take_native_failure().unwrap();
+            failure.source = source;
+            failed.branch = failed.branch.with_native_failure(failure);
+            let slot =
+                exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref()).unwrap();
+            let mut manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+                world,
+                world.resource::<RouteEntityRegistry>(),
+                &failed.branch,
+            )
+            .unwrap();
+            manifest
+                .observe_current_task_outlet(world, world.resource::<RouteEntityRegistry>(), slot)
+                .unwrap();
+            assert_eq!(
+                manifest.len(),
+                0,
+                "current slot was not forged into a failed obligation"
+            );
+            assert_eq!(manifest.boundary_drifts().len(), 1);
+            assert!(current_task_outlet_matches_drift(
+                slot,
+                &manifest.boundary_drifts()[0]
+            ));
+            let FailedManifestDisposition::CurrentAuthorityLoss { failed, .. } =
+                classify_failed_manifest(
+                    world,
+                    &entry.engine,
+                    manifest,
+                    failed,
+                    entry.active.as_ref(),
+                    entry.host.as_ref(),
+                )
+            else {
+                panic!("the exact current outlet is authority-loss evidence");
+            };
+            entry.pending_failed_branch = Some(failed);
+        });
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(
+        matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::AuthorityLost)
+    );
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+    assert!(entry.pending_failed_branch.is_none() && entry.cleanup_ledger.is_none());
+    assert!(entry.authority_protocol_residual.is_none());
+}
+
+#[test]
+fn native_allocated_child_retains_exact_external_outlet_evidence() {
+    let (mut app, router, _, _, _) = fixture_variant(false, true);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child"))
+        .unwrap();
+    settle(&mut app);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(
+            router,
+            RouteLocation::new("/child").with_fragment("allocated"),
+        )
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    app.world_mut().resource_scope(|world, mut navigation: Mut<RouterNavigation>| {
+        let entry = &mut navigation.entries[0];
+        let EngineAction::FrameTask(task) = entry.engine.action().unwrap() else { panic!("real leaf task"); };
+        let mut pending = entry.pending_commit.take().unwrap_or_else(PendingCommit::new);
+        let host = entry.host.as_ref().unwrap();
+        let mut factory: bevy_ui_router_bsn::BsnSceneFactory = Box::new(|_| Ok(Box::new(bevy_scene::bsn! { Node })));
+        let prepared = crate::bsn::prepare_bsn_view(world, &mut factory, task.input()).unwrap();
+        let frame = realize_native_task(world, &entry.engine, host.candidate.clone(), host.top_slot,
+            host.top_slot_claim.clone(), Some(&pending.branch), entry.active.as_ref(), &task, prepared)
+            .unwrap_or_else(|_| panic!("actual native child allocation succeeds"));
+        let shell = frame.shell();
+        let slot = frame.mount_binding().slot();
+        let anchor = frame.mount_binding().physical_parent().0;
+        assert!(pending.branch.push_frame(frame).is_ok());
+        // The allocated pending frame is a real cleanup obligation. Its mount
+        // remains external to pending, even when the native marker then disappears.
+        world.entity_mut(anchor).remove::<bevy_ui_router_bsn::DefaultOutlet>();
+        let failed = FailedPreparedBranch::new(pending.branch);
+        let manifest = FrozenCleanupManifest::from_failed_prepared_branch(world, world.resource::<RouteEntityRegistry>(), &failed).unwrap();
+        let drift = manifest.boundary_drifts().iter().find(|drift| matches!(
+            drift.source, FailedBoundarySource::FramePhysicalParent { mount_slot, removed_child, .. }
+                if mount_slot == slot && removed_child == shell
+        )).expect("allocated native child freezes its actual external outlet");
+        assert!(exact_failed_source_obligation(drift, &failed).is_some());
+        assert!(matches!(classify_failed_boundary(drift.clone(), &failed, entry.active.as_ref(), entry.host.as_ref()),
+            FailedBoundaryDisposition::CurrentAuthorityLoss(_)));
+        let mut wrong_source = drift.clone();
+        let FailedBoundarySource::FramePhysicalParent { mount_slot, .. } = &mut wrong_source.source else { unreachable!() };
+        *mount_slot = anchor;
+        assert!(matches!(classify_failed_boundary(wrong_source, &failed, entry.active.as_ref(), entry.host.as_ref()),
+            FailedBoundaryDisposition::AmbiguousInvalidTopology(_)),
+            "the native role alone does not authorize an unrelated physical source");
+    });
 }
 
 #[test]

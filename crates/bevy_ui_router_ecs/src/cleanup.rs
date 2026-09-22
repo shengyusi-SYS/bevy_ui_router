@@ -3236,6 +3236,34 @@ impl FrozenCleanupManifest {
         &self.boundary_drifts
     }
 
+    #[cfg(feature = "bsn")]
+    pub(crate) fn observe_current_task_outlet(
+        &mut self,
+        world: &World,
+        registry: &RouteEntityRegistry,
+        slot: &MountedChildSlot,
+    ) -> Result<(), FailedManifestBuildError> {
+        let source = FailedBoundarySource::MountedSlotAnchor {
+            parent: slot.parent().clone(),
+            outlet: slot.outlet().clone(),
+            slot: slot.slot_id(),
+            removed_child: slot.slot(),
+        };
+        if let Some(drift) = observe_failed_outlet_binding(
+            world,
+            registry,
+            source,
+            slot.parent(),
+            slot.anchor_binding(),
+        ) {
+            self.boundary_drifts
+                .try_reserve(1)
+                .map_err(|_| FailedManifestBuildError::RetryableCapacity)?;
+            self.boundary_drifts.push(drift);
+        }
+        Ok(())
+    }
+
     pub(crate) fn contains_exact_obligation(&self, claim: &ExactRegistryClaim) -> bool {
         self.obligations
             .iter()

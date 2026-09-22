@@ -39,7 +39,7 @@ path = "tests/default_facade_features.rs"
 [[test]]
 name = "public_navigation_journeys"
 path = "tests/public_navigation_journeys.rs"
-required-features = ["ecs"]
+required-features = ["bsn"]
 
 [[test]]
 name = "ecs_facade_features"

@@ -18449,6 +18449,22 @@ fn failed_branch_owns_exact_boundary(
 fn failed_boundary_source_accepts_owner(drift: &FailedBoundaryDrift) -> bool {
     use crate::registry::{EntityOwner, RegistryOwner};
 
+    if let crate::cleanup::FailedBoundaryExpectation::OutletBinding { parent, binding } =
+        &drift.expected
+    {
+        return binding.is_native()
+            && matches!(binding.source_claim().owner(), RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) if frame == parent)
+            && match &drift.source {
+                // The failed-source receiver separately checks this child's
+                // exact shell, mount slot, anchor and native binding.
+                FailedBoundarySource::FramePhysicalParent { .. } => true,
+                FailedBoundarySource::MountedSlotAnchor { parent: source, .. }
+                | FailedBoundarySource::ResidualAnchor { parent: source, .. }
+                | FailedBoundarySource::RejectedAnchor { parent: source, .. } => source == parent,
+                FailedBoundarySource::FrameMountSlot { .. } => false,
+            };
+    }
+
     match (&drift.source, drift.expected.exact_claim().owner()) {
         (
             FailedBoundarySource::FrameMountSlot { .. },
@@ -18510,13 +18526,105 @@ fn classify_failed_boundary(
     }
 }
 
+/// A native task may fail before allocating any output, while its preserved
+/// mount still belongs to current. Bind this observation to the original task
+/// and Core projection; it must not manufacture a failed physical obligation.
+#[cfg(feature = "bsn")]
+fn exact_current_task_outlet<'a>(
+    engine: &RouterEngine,
+    failed: &PendingFailedBranch,
+    active: Option<&'a RealizedBranch>,
+) -> Option<&'a crate::mount::MountedChildSlot> {
+    use bevy_ui_router_core::integration::ReconciliationEnteringSlotKind;
+    let PendingFailedBranchTerminal::Task { task, .. } = &failed.terminal else {
+        return None;
+    };
+    let failure = failed.branch.native_failure()?;
+    if failure.source != crate::presentation::native_failure::NativeFailureSource::from_task(task)
+        || engine.inspect_report_identity(task).is_err()
+        || !failed_branch_primary_claims(&failed.branch).is_empty()
+    {
+        return None;
+    }
+    let FrameMountTarget::ChildOutlet { parent, outlet } = task.mount_target() else {
+        return None;
+    };
+    let projection = engine.reconciliation_projection_for_task(task).ok()?;
+    let projected_parent = projection
+        .preserved()
+        .find(|frame| frame.version() == &parent)?;
+    if !projection.entering().any(|frame| {
+        frame.frame() == task.frame().frame()
+            && frame.generation() == task.frame().generation()
+            && frame.origin() == task.frame().origin()
+            && frame.branch_index().checked_sub(1) == Some(projected_parent.branch_index())
+            && frame.slot() == ReconciliationEnteringSlotKind::Existing(task.frame().slot())
+    }) || !projection.child_slots().any(|role| {
+        role.binding().is_some_and(|binding| {
+            binding.parent_branch_index() == projected_parent.branch_index()
+                && binding.parent() == &parent
+                && binding.outlet() == &outlet
+                && binding.slot() == task.frame().slot()
+        })
+    }) {
+        return None;
+    }
+    let active = active?;
+    let mut parents = active
+        .frames()
+        .iter()
+        .filter(|frame| frame.frame() == &parent);
+    let parent_frame = parents.next()?;
+    if parents.next().is_some() {
+        return None;
+    }
+    let mut slots = active.child_slots().iter().filter(|slot| {
+        slot.parent() == &parent
+            && slot.outlet() == &outlet
+            && slot.slot_id() == task.frame().slot()
+    });
+    let slot = slots.next()?;
+    if slots.next().is_some()
+        || !slot.anchor_binding().is_native()
+        || !parent_frame
+            .claims()
+            .any(|claim| claim == slot.anchor_claim())
+        || parent_frame
+            .outlet(&outlet)
+            .is_none_or(|declared| declared.anchor_binding() != slot.anchor_binding())
+        || !matches!(slot.slot_claim().owner(), RegistryOwner::Committed(EntityOwner::ChildSlot { parent: owner, outlet: key, slot: identity })
+            if owner == &parent && key == &outlet && *identity == slot.slot_id())
+    {
+        return None;
+    }
+    Some(slot)
+}
+
+#[cfg(feature = "bsn")]
+fn current_task_outlet_matches_drift(
+    slot: &crate::mount::MountedChildSlot,
+    drift: &FailedBoundaryDrift,
+) -> bool {
+    matches!(&drift.source, FailedBoundarySource::MountedSlotAnchor { parent, outlet, slot: identity, removed_child }
+        if parent == slot.parent() && outlet == slot.outlet() && *identity == slot.slot_id() && *removed_child == slot.slot())
+        && drift.expected.physical_entity() == slot.anchor()
+        && drift.expected.exact_claim() == slot.anchor_claim()
+        && drift.expected.matches_outlet_binding(slot.anchor_binding())
+        && failed_boundary_source_accepts_owner(drift)
+}
+
 fn classify_failed_manifest(
     world: &World,
+    engine: &RouterEngine,
     manifest: FrozenCleanupManifest,
     failed: PendingFailedBranch,
     active: Option<&RealizedBranch>,
     host: Option<&HostBinding>,
 ) -> FailedManifestDisposition {
+    #[cfg(feature = "bsn")]
+    let current_task_outlet = exact_current_task_outlet(engine, &failed, active);
+    #[cfg(not(feature = "bsn"))]
+    let _ = engine;
     let dispositions = manifest
         .boundary_drifts()
         .iter()
@@ -18529,6 +18637,14 @@ fn classify_failed_manifest(
                         obligation: obligation.clone(),
                     }
                 });
+            #[cfg(feature = "bsn")]
+            if current_task_outlet
+                .is_some_and(|slot| current_task_outlet_matches_drift(slot, &drift))
+                && active.is_some_and(|active| realized_branch_owns_exact_boundary(active, &drift))
+                && !failed_branch_owns_exact_boundary(&failed.branch, &drift)
+            {
+                return (FailedBoundaryDisposition::CurrentAuthorityLoss(drift), None);
+            }
             (
                 classify_failed_boundary(drift, &failed.branch, active, host),
                 binding,
@@ -22731,6 +22847,15 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 return;
             };
             FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &failed.branch)
+                .and_then(|mut manifest| {
+                    #[cfg(feature = "bsn")]
+                    if let Some(slot) =
+                        exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref())
+                    {
+                        manifest.observe_current_task_outlet(world, registry, slot)?;
+                    }
+                    Ok(manifest)
+                })
         };
         let manifest = match manifest {
             Ok(manifest) => manifest,
@@ -22760,6 +22885,7 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
         };
         let (failed, manifest) = match classify_failed_manifest(
             world,
+            &entry.engine,
             manifest,
             failed,
             entry.active.as_ref(),

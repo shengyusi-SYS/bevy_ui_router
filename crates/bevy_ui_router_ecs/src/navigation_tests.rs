@@ -3279,6 +3279,7 @@ fn ambiguous_boundary_owner_is_fail_closed_once_with_exact_owner_retained() {
             let FailedManifestDisposition::AmbiguousInvalidTopology { failed, manifest } =
                 classify_failed_manifest(
                     world,
+                    &entry.engine,
                     manifest,
                     failed,
                     entry.active.as_ref(),
@@ -4303,6 +4304,7 @@ fn failed_authority_begin_rejection_restores_owner_and_fresh_trigger_can_publish
                 bindings,
             } = classify_failed_manifest(
                 world,
+                &entry.engine,
                 manifest,
                 failed,
                 entry.active.as_ref(),
@@ -4398,6 +4400,7 @@ fn failed_authority_begin_rejection_restores_owner_and_fresh_trigger_can_publish
                 bindings,
             } = classify_failed_manifest(
                 world,
+                &entry.engine,
                 manifest,
                 failed,
                 entry.active.as_ref(),
@@ -7026,6 +7029,7 @@ fn failed_settle_revalidates_active_descendants_before_releasing_focus() {
             .expect("formal settle fixture must freeze for classification");
             match classify_failed_manifest(
                 world,
+                &entry.engine,
                 manifest,
                 failed,
                 entry.active.as_ref(),
@@ -34767,6 +34771,7 @@ fn stale_current_host_parent_settles_without_mutating_app_relationships() {
             .unwrap();
             match classify_failed_manifest(
                 world,
+                &entry.engine,
                 manifest,
                 failed,
                 entry.active.as_ref(),

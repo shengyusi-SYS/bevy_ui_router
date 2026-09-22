@@ -1,6 +1,6 @@
 # Current Architecture
 
-**类型**：实现事实与差距。**更新时间**：2026-09-22。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简；idle host-loss 基线为 `8ce2b41`，Core 来源修正检查点为 `e7445a2`。native 联动已通过修正后的独立/交叉审查及冻结版本验证；这不是完整 MVP 验收。后台 reaper 与公开 audit/probe 已退出。
+**类型**：实现事实与差距。**更新时间**：2026-09-22。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简；idle host-loss 基线为 `8ce2b41`，Core 来源修正检查点为 `e7445a2`，native 联动为 `c203446`。联动已通过修正后的独立/交叉审查及冻结版本验证；这不是完整 MVP 验收。后台 reaper 与公开 audit/probe 已退出。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
@@ -12,19 +12,19 @@
 | --- | --- | --- |
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
-| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss | 剩余 native 组合验收及旧 data-only 入口退出 |
-| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | 完整公开消费验收与示例仍待完成 |
-| Facade | 导航、snapshots、旧 driver/journeys；真实独立 Core/View/ECS consumer | BSN consumer 已实现并执行；最终验收、普通嵌套示例及旧 API 退出仍未完成 |
+| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss | 旧 data-only 入口与仅供旧回放的内部机制退出 |
+| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | 完整 MVP 验收归集与示例仍待完成 |
+| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer | 旧 driver 公开面仍在；最终验收、普通嵌套示例及旧 API 退出未完成 |
 
 迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 API/迁移 executor 仍待退出，不能作为 native 的第二条 report/replay 链。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
 BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory 调用消费 fresh Scene，检查 runtime、cached inclusion 和重复引用，准备保持 ChildOf 顺序的声明图及 attempt 唯一匿名引用。成功与失败结果均携带 dependency handles，供实际 apply/settlement 保活；这不承诺为已结算的 inert residual 保活到实体销毁。已应用组件中的强 Handle 按 Bevy 自身规则保活。
 
-私有 `presentation::native_scene` 消费同一 prepared Scene：先批量预备 registry 容量和 seal，再登记 shell 与全部声明 Entity，之后才写私有组件；引用 seed 与 shell wrapper 交由官方 executor 执行。成功 adoption 检查实际关系与其它 live owner，逐次复验临时标记移除产生的变化，退役 descendant 创建期 claims，并返回最后的真实内容闭包快照；该快照不是永久 ownership 名单。失败时只删除有 exact 证明的叶节点，保留 protected closure，并在每次关系/删除写入后复验剩余目标与隔离 shell；合法声明/普通容器交错不再误判为关系环。无法证明隔离时返回明确 `Unisolated`，不能当成 inert 或 publication 成功。该私有单元的接受不等于导航已正确消费全部失败产物。
+私有 `presentation::native_scene` 消费同一 prepared Scene：先批量预备 registry 容量和 seal，再登记 shell 与全部声明 Entity，之后才写私有组件；引用 seed 与 shell wrapper 交由官方 executor 执行。成功 adoption 检查实际关系与其它 live owner，逐次复验临时标记移除产生的变化，退役 descendant 创建期 claims，并返回最后的真实内容闭包快照；该快照不是永久 ownership 名单。失败时只删除有 exact 证明的叶节点，保留 protected closure，并在每次关系/删除写入后复验剩余目标与隔离 shell；合法声明/普通容器交错不再误判为关系环。无法证明隔离时返回明确 `Unisolated`，不能当成 inert 或 publication 成功。导航消费这些失败产物的联动证据见下方已验证检查点。
 
 原生 pointer 的既有 hover/press/click/drag/祖先缓存与 `PickingInteraction` 已在三个正常 publication 入口及 authority isolation 的同一 exclusive 调用内撤销。正常发布通过 exact resource Entity 联合查询预借资源/组件，pointer tail 只做原位修改；历史目标或资源 Entity 被禁用也不会漏清，正常 presentation 的默认查询过滤不因此放宽。post-commit 的观察 partition 不再被全量用作撤权目标，protected/app 状态保持。`Refresh` 与 `generate_hovermap` 之后、`update_interactions`/`pointer_events` 之前的定点过滤继续防止非活动命中派发。native 内容、输入及 Scene AutoFocus 已通过下述联动检查点验证。
 
-三个成功发布路径（normal reconciliation、Back target、projectionless fallback）现已将 World preparation 及外层 `RouterNavigation` 资源 scope 的退出放到最终复验之前，再按 exact resource Entity 联合借用常驻 navigation/registry/gate/focus/pointer/presentation。原 active/cleanup owner 在 Core publication 前安装，发布后不再通过资源重新插入补装 owner。Back 最终复验比较完整 leaving 与 RetainEmpty focus 来源；来源漂移沿现有 pending rejection 同调用归还原 active，再由正常调度清理与 fallback，不让临时 owner 存放位置导致下一次 Refresh 误撤有效权限。仅 focus 值变化仍可发布，等价 gate 变化保持原顺序与 tick。此迁移不宣称其它 terminal、cleanup、no-target 或 snapshot 路径的资源边界全部闭合，也不替代 native current-containment 接线。
+三个成功发布路径（normal reconciliation、Back target、projectionless fallback）现已将 World preparation 及外层 `RouterNavigation` 资源 scope 的退出放到最终复验之前，再按 exact resource Entity 联合借用常驻 navigation/registry/gate/focus/pointer/presentation。原 active/cleanup owner 在 Core publication 前安装，发布后不再通过资源重新插入补装 owner。Back 最终复验比较完整 leaving 与 RetainEmpty focus 来源；来源漂移沿现有 pending rejection 同调用归还原 active，再由正常调度清理与 fallback，不让临时 owner 存放位置导致下一次 Refresh 误撤有效权限。仅 focus 值变化仍可发布，等价 gate 变化保持原顺序与 tick。native owner/current-containment 已接入这些路径；各类 terminal、cleanup、no-target 或 snapshot 的证据仍按实际路径区分，不由成功发布检查点统一外推。
 
 无 active 的初始 unbound RouterFallback 在发布前失去 host 时，Core 接纳原 failed Task source 进入现有 authority settlement，保持 `HostLost` 而非协议错误；有 active 的 fallback 不由此窄分支接纳。Core 保留其合法逻辑 roots 选择，ECS 提交实际 pending 的完整物理义务。无候选观察复用完整 permit outcome 处理，避免丢失 Issued owner；完全 idle 的 host-loss 则由后续独立检查点闭合，见下文。
 
@@ -33,6 +33,10 @@ BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory �
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
 facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。独立 workspace 的真实 BSN consumer 已运行嵌套/history/错误恢复与 LF/CRLF 对照，既有私有身份/authority/session 拒绝测试保留。完整公开消费验收与示例仍按 plan 推进，不以此单个 consumer 代替全部验收。
+
+`a153520` 在同一独立 BSN consumer 内验证普通应用系统于 `Update` 的公开 `PublishSnapshots` 标签之后读取本轮完整 snapshots；实际 native 输入授权作为独立发布证据，防止延后一轮的旧快照靠 polling 通过。此 test-only 检查点没有新增 runtime 或公开 API。
+
+原 public journey fixture 已整体改为真实 BSN factory/Scene，覆盖实际 build/resolve/部分 apply、内部 outlet、location 更新、history/Back、boundary/fallback/recovery 和 host 组合，未另建永久平行 suite。native 根被销毁后的 cleanup preparation 不再获取新内容 claims，但原义务仍由现有 ledger 结算；创建前拒绝时的 committed outlet 失效通过原 task/current binding 的 typed evidence 进入现有 authority settlement，避免空 failed manifest 掩盖永久失效。独立/交叉审查与冻结版本验证通过，未修改 Core 或新增公开协议。
 
 ## 已验证的 native 联动检查点
 
@@ -54,7 +58,7 @@ facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏�
 - boundary/error/fallback 与 host loss/re-registration；无 binding nested Push 失败 cleanup 后进入 `RouterFallback`，不恢复旧 Terminal 语义。
 - exact identity、线性 owner、publication-last、owned-only cleanup、stale 拒绝、非活动输入/focus 隔离和 app-owned host 保持。
 
-以上是已有行为与迁移保留项，不宣称当前旧输入实现已经满足全部 native BSN 输入情形。
+以上是已有行为与迁移保留项；整体 native 验收仍以统一 plan 的各项真实证据为准，不以单个联动检查点代替。
 
 **idle host-loss 已闭合**：所有请求终态后的 registration removal/host despawn 会主动处理，包括 Ready 无 active 的绑定；真实 retired grant 建立请求独立的 owner，旧请求/history 保持。重新接纳将原 grant/candidate/staged slot 交给唯一 pending holder，全部 staging/activation 与外层资源重插后再复验实际旧残留、候选和新 slot，以常驻资源借用完成确认；真实拒绝原因与物理清理证据分开保留。两个真实 hook 回归、17 项定向、冻结版本 workspace/feature 验证及独立/交叉复审通过；这是当时迁移 renderer 的完整基线，不能自动推广为全部 native 输入/cleanup 已验收。
 
@@ -68,4 +72,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-剩余 native root/nested/history/error 组合与公共观察边界验收、旧 renderer API 退出、完整 consumer/示例、MVP 最终验证审查及 main 集成仍需完成。本联动检查点通过不替代这些结果；Windows 原生验证保持 NOT_RUN。
+旧 renderer API 与仅供旧回放的内部机制退出、推荐 quick start/普通嵌套示例、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。已通过的 native public journeys 和公共观察边界不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。

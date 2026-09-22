@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A/B 已完成；idle host-loss 基线为 `8ce2b41`，Core native failure/HostLost 来源检查点为 `e7445a2`。阶段 C 的官方 BSN 联动切片已通过独立/交叉审查、反例修正与最终冻结验证：公开注册经真实 FrameTask 接入 adoption、current containment、mount、cleanup、失败/Back/terminal owner 和输入/focus。共享资格、动态隐藏、当前 cleanup 错误证据、官方 clipping 缓存及 pending focus 原 frame 归属问题均已闭合。该检查点不是阶段 C/D 全部验收：剩余 native 组合与公共观察边界、示例、旧 API 退出和最终集成仍开放。成功 focus 合同保持 spec §7.1，不重写产品范围或将 MVP 标为 PASS。
+**状态**：Active implementation plan。阶段 A/B 已完成；idle host-loss 基线为 `8ce2b41`，Core native failure/HostLost 来源检查点为 `e7445a2`。官方 BSN 联动切片 `c203446` 已通过独立/交叉审查、反例修正与最终冻结验证：公开注册经真实 FrameTask 接入 adoption、current containment、mount、cleanup、失败/Back/terminal owner 和输入/focus。共享资格、动态隐藏、当前 cleanup 错误证据、官方 clipping 缓存及 pending focus 原 frame 归属问题均已闭合；`a153520` 补齐公开 snapshot 的同更新观察，本次提交完成 native public journey 迁移及其暴露的两处失败接收修正。统一验收归集、示例、旧 API/回放机制退出和最终集成仍开放。成功 focus 合同保持 spec §7.1，不重写产品范围或将 MVP 标为 PASS。
 
 ## 全局约束
 
@@ -43,9 +43,9 @@
 - r1 审查后的收口以局部重构和减法为主：集中当前内容归属与输入/focus 资格的只读事实，让 Refresh、publication preparation 和定点清焦消费一致语义，删除同一边界的重复遍历/判定；不以统一资格替代各自的 ownership 或 mutation proof。区分官方 Visibility 覆盖、Display::None 祖先和精确授权的 staging next 值。当前 typed cleanup 证据沿既有 owner/receiver 传递，不另设错误历史。旧静态输出入口、无消费者的过渡 helper 和含糊命名随等价行为替代后退出，不无限保留双模型，也不以改名或分文件冒充重构完成。
 - 真实 hidden-outlet 回归还暴露共享 manifest 将官方 `CalculatedClip` 的正常增删当成结构失效。统一现有 World 观测及无分配比较入口，仅排除此已证实的派生缓存；保留所有 identity、relationship 和 authored 组件检查，不给每条导航路径叠加豁免，也不扩成通用 computed-component 框架。
 
-本次联动收口后，剩余约三个主要交付单元，整体仍为中到大工作量，并非只剩文档收尾。独立验收盘点与旧机制调用者盘点经交叉复核，后续按以下顺序收口：
+当前按以下三个主要交付单元组织，第一项已闭合；剩余两项仍为中等偏大的工作量，并非只剩文档收尾。独立验收盘点与旧机制调用者盘点经交叉复核，按以下顺序收口：
 
-1. **native 公共验收**：复用已有嵌套、输入/focus 与 host 证据，集中补 factory input/等价与 search/fragment 更新、排队及失败 Back、boundary/build/resolve 恢复和公开 snapshot 调度边界。优先改造、合并现有 public journey fixture；逐项处置旧测试的真实行为责任，不机械复制全部旧用例，不另保留一套永久平行验收框架。
+1. **native 公共验收（本轮交付已闭合）**：公开 snapshot 同更新观察由 `a153520` 闭合；原 public journey fixture 已整体迁到官方 BSN，补齐 factory input/等价与 search/fragment、排队及失败 Back、boundary/build/resolve 恢复和两处真实 host/outlet 缺口。旧 writer 专属测试责任由现有私测保留，不另建永久平行 suite。剩余工作是全 MVP 验收归集，不重新执行这轮迁移。
 2. **示例与旧机制退出**：完成推荐 quick start/普通内部 outlet 示例，撤下旧公开 writer/report 注册及兼容 consumer；按实际依赖收窄私有非 BSN 替身，成组退出仅服务旧回放的状态、投影和静态 helper。旧公开入口退出与私有执行器瘦身可分提交；不以删除所有 ContentPlan 代码为先决条件，也不以“私有 fixture”名义保留整套第二生产入口。先迁移外部测试，再决定 test-only 边界，保持真实 no-BSN 行为验证。
 3. **最终集成**：完成 spec 验收证据、Core/ECS/public 独立与交叉审查、全量验证和 main 集成。已闭合路径不重新开发；新增生产问题须有真实可达证据，才安排局部修正。
 
@@ -125,7 +125,7 @@
 
 **涉及文件**：BSN crate、新 `ecs/src/bsn.rs`、ECS/ facade Cargo 与 exports；`app_ext.rs`、`presentation.rs`、`frame_local.rs`、`input.rs`、`cleanup.rs`、`mount.rs`、`navigation.rs` 及对应 tests。
 
-- [ ] 先反转 BSN 的错误依赖，再添加 ECS optional `bsn` bridge 和 facade feature 联动。以真实 `Box<dyn Scene>` 单次消费编译，测试 factory 每个 effect 恰好调用一次、重复 key 拒绝与 normal/error/fallback 安装校验。
+- [x] 先反转 BSN 的错误依赖，再添加 ECS optional `bsn` bridge 和 facade feature 联动。以真实 `Box<dyn Scene>` 单次消费编译，测试 factory 每个 effect 恰好调用一次、重复 key 拒绝与 normal/error/fallback 安装校验。
 - [ ] 在含 BSN binding 的 Router 安装入口检查 `AssetServer`、`Assets<ScenePatch>`；在调用前再次检查 runtime 资源。缺失分别产生 `MissingSceneRuntime` 安装错误或有来源的运行 failure，不调用缺失资源会 panic 的官方入口。
 - [ ] 将现有 shell/content-target 改为 Router shell + Scene root，删除 authored 内容的封闭 component/构建输出清单假设。Router 结构 identity/seal 继续 exact 校验。按 spec 第 12 节使用官方 ScenePatch load/resolve，保活 dependency handles，预检直接 ChildOf 图及 cached/reference/capacity 边界，先登记 exact allocation obligations 再写组件；匿名引用使用本 attempt 唯一身份，不能复制探针固定编号。
 - [ ] 将只含引用 seed 与原 resolved root 的私有 wrapper 应用到本次新建 inert shell；原 root 的引用仍指向 content target，wrapper 自身不携带它们。原模板和关系由官方 executor 按顺序执行，诊断去除最外层私有 wrapper 错误。返回同一 exclusive 调用内完成 adoption 或失败隔离，覆盖尚未挂接的 root/children；验证成功后才交接到 current containment，不延后到普通调度。
@@ -135,7 +135,7 @@
 - [ ] `RouterInputGate` 每个输入边界从当前 active frame-local Children closure 导出；publication 同步撤销旧权限、安装新权限并释放目标 focus。动态 child 添加/移出、显式 `Visibility::Visible`/自定义 `Pickable`、保留 app focus 都有真实对照；不覆盖 authored presentation 值。
 - [ ] 以真实 `AutoFocus` 的 staging 成功/失败对照验证原有效 focus、当前非活动 focus 与延后的 FocusGained/Lost；明确推荐路径与原生 Tab/dispatch 的接线边界，不把完整原生 Tab 支持偷偷加入 MVP。普通 typed 方法没有队列过滤接口，但官方 Reflect 可安全读取实际队列；已验证的追加候选保留原队列、合法 clear/set 及 cause，无需整体回滚或提前派发事件。按 spec §7.1 接入成功意图，显式启用所需 feature，验证固定版本 schema、真实追加来源、目标分类和跨 drain 后续操作；接入官方处理边界时保持应用初始化、排序和事件派发时序。源码/来源不匹配不能伪装成已隔离，不新增构建期 focus 禁令或全历史重放。
 - [ ] 所有 allocation/query/claim/cleanup/input preparation 在 `Ready` 之前完成，publication tail 只执行已准备的不可失败原位 mutation；successful presentation/history 是最后语义步骤。检查范围包括外层资源 scope 的退出：官方 Bevy 0.19.1 的 `resource_scope` 会取出并重新插入 Resource component，不能把它当作无副作用借用。三个成功发布路径已迁往 exact resource Entity 联合借用；native owner/内容边界接入后仍须验证完整 preparation 与 publication，不能将此检查点推广为其它 terminal/cleanup/no-target/snapshot 路径全部闭合。失败留原 owner，stale 丢弃而不发布。
-- [ ] 建立真实 BSN root consumer 和 build/resolve/apply error 回归；由外部系统在 `RouterScheduleSet::PublishSnapshots` 后读取同帧 snapshot，补足目前仅编译 label 的边界验证。resolve/apply 故障使用官方 Scene/template 的实际失败，不制造假的 Router report。验证 host sentinel/关系、旧 active、history、pending cleanup、partial subtree、focus 和 request failure 来源。
+- [x] 建立真实 BSN root consumer 和 build/resolve/apply error 回归；外部系统在 `RouterScheduleSet::PublishSnapshots` 后读取同帧 snapshot。resolve/apply 故障使用官方 Scene/template 的实际失败，不制造假的 Router report。host sentinel/关系、旧 active、history、pending cleanup、真实 partial subtree、focus 和 request failure 来源已有实际验证。
 
 **已落实的发布迁移依赖**：无已提交 active 的 RouterFallback 在最终复验发现 host loss 时，原 Core authority settlement 因缺少 reconciliation 拒绝，错误进入协议 fail-close 而非 `HostLost`。独立评估及交叉复核后复用已消费的 failed Task source、原 HostLease 与 authority cleanup，仅为 unbound fallback 且 Core active kind 为 None 增加窄接纳分支；既有身份、Applying、action、retirement、lease 和 exact roots 校验继续复用，不伪造 reconciliation 或新增清理协议。Core 保留 Task source 的两种合法 roots 选择；当前已 realized 的 ECS caller 必须据真实 pending owner 提交包含 target 的完整 manifest，不能按物理数量反推逻辑 roots。拒绝返还原 task/lease；host loss 与 parent-only rejection 分别验证 `HostLost`、`RecoveryFailed`。完整 Core/ECS 和最高层 public/consumer 验收结果见执行记录；此窄修不代表有旧 active 的全部 projectionless host-loss、idle host loss 或其它 terminal/snapshot 资源边界已闭合。
 
@@ -153,12 +153,12 @@
 
 **涉及文件**：`bsn/src/outlet.rs`（若拆分）、ECS `mount.rs`、`presentation.rs`、`branch_transaction.rs`、`navigation.rs`、`cleanup.rs`、必要 Core 修复；facade public BSN journeys、`crates/bevy_ui_router/examples/bsn_nested.rs`（新增）、`README.md`。
 
-- [ ] 在本 frame content closure 内解析单 outlet，停止于 child slot；支持 root 与内部 Node anchor，leaf 无 outlet 合法。需要 child 时缺失/重复/非 Node/失效声明明确失败，不默认挑选、不 fallback 到 root。
+- [x] 在本 frame content closure 内解析单 outlet，停止于 child slot；支持 root 与内部 Node anchor，leaf 无 outlet 合法。需要 child 时缺失/重复/非 Node/失效声明明确失败，不默认挑选、不 fallback 到 root。
 - [x] 补齐已确认的 idle host-loss 缺口：所有请求终态后的 registration removal/host despawn 在普通 `App::update` 下主动失效，不依赖新请求或 cleanup-in-flight；包括 Ready 无 active 的已绑定 host。验证旧成功结果/history 不回滚、owned-only cleanup、输入/focus 撤权和重新注册。原 grant 的请求独立 settlement、成功 retained 责任、容量/public snapshot 与 staging/资源重插后的最终接纳复验已通过独立/交叉审查和全量验证；不代表尚未接线的 native Scene 已完成相同验收。
-- [ ] preserved parent 复验 exact anchor/slot/generation，child slot 独立于 marker；测试 layout、anchor、slot 和局部应用状态在 leaf 切换时保持。把 entering mount rejection 和 committed authority loss 分开，覆盖稀疏/保留 prefix，不能由 frame/slot 数量反推权限。
+- [x] preserved parent 复验 exact anchor/slot/generation，child slot 独立于 marker；测试 layout、anchor、slot 和局部应用状态在 leaf 切换时保持。把 entering mount rejection 和 committed authority loss 分开，覆盖稀疏/保留 prefix，不能由 frame/slot 数量反推权限。
 - [ ] 从 BSN factory 观察实际 route-local params、raw search、fragment、origin/failure。覆盖 index/pathless/静态/params/wildcard、同优先级不同 leaf 的 `MatchConflict`、参数变化的 suffix、search 整链重建、fragment-only deepest normal frame generation 推进、等价 location 的零物理 mutation。
-- [ ] 完成 push/replace/back 的成功、失败 back 和串行入队结果；区分 `NoBackEntry` 同步拒绝（无 request）和入队后的 `BackTargetUnavailable`。back 在执行时选择目标，失败不改 cursor，错误 presentation 不写成功 history。
-- [ ] 完成最近 boundary/error view、fallback、恢复自身失败、无 binding nested Push cleanup 后 RouterFallback；分别验证原 failure continuation 和实际 cleanup scope，不按 preserved active 或 obligation 数量选择分支。
+- [x] 完成 push/replace/back 的成功、失败 back 和串行入队结果；区分 `NoBackEntry` 同步拒绝（无 request）和入队后的 `BackTargetUnavailable`。back 在执行时选择目标，失败不改 cursor，错误 presentation 不写成功 history。
+- [x] 完成最近 boundary/error view、fallback、恢复自身失败、无 binding nested Push cleanup 后 RouterFallback；分别验证原 failure continuation 和实际 cleanup scope，不按 preserved active 或 obligation 数量选择分支。
 - [ ] 验证 publication 前后 host loss 的不同结果、同 Entity registration 移除重插、重复候选、旧 epoch/task stale、重新注册仅接受新命令。保留最小 RouterHandle scope 回归，不扩成 multi-router stress。
 - [ ] 将普通嵌套示例和短小 quick start 做成实际编译/运行消费者。运行环境明确安装 Asset/Scene/UI/picking/focus 所需插件，不能依赖本 workspace dev feature 偶然统一。
 
@@ -265,6 +265,10 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 公开 snapshot 观察边界检查点（2026-09-22，本记录所在提交）：在原独立 BSN consumer 中添加普通 `Update` 应用系统，仅按公开 `PublishSnapshots` 标签排序，逐次要求新观察并对照本轮更新后的完整 request/router snapshot。将同一时刻的真实 native Entity 与输入授权作为独立发布证据，避免延后一轮的旧快照仍靠 polling 通过；既有嵌套 Push/Replace/Back、实际 Apply 失败、Error presentation 和 history 保持都经此边界观察。无生产代码或公开 API 修改。
 
 实现与独立范围审查通过；主代理再次执行 `cargo test -p bevy_ui_router --test facade_consumers --locked --offline`（含独立 LF/CRLF BSN）、workspace fmt、consumer 显式 rustfmt check 和 diff check，均 exit 0。本次 test-only 改动不重复宣称全量 workspace runtime 验收，已有 warnings 和 Windows NOT_RUN 保留。阶段 C 最后一项的同更新观察部分已闭合，build/resolve 公开恢复组合仍随下一 native public journey 迁移完成，故不将整项提前勾选。
+
+native 公共旅程检查点（2026-09-22，本记录所在提交）：原 fixture 已迁往真实官方 BSN，覆盖 factory input/location 更新、内部 outlet/局部状态保持、history/Back、真实 build/resolve/部分 apply 与恢复、host loss/readmission。替换的是旧公开 writer 模型和固定物理计数断言，不是既有行为责任；专属 session/cycle 输入的必要私有回归保留。实际迁移发现并修正两处 native 接收缺口：缺失根不再触发新内容获取，但保留原 cleanup 义务；零分配失败仍保留与原 task/current outlet 绑定的 authority-loss 证据，复用现有 settlement。已分配 child 的同类 native 边界也经原 exact failed-source 接收器验证。Core 与公开 API 未改，RecoveryFailed 的两份来源由同一请求的公开 diagnostics 验证，不强加摘要字符串格式。
+
+两份独立审查及交叉复核无剩余问题。最终冻结源码的 public journeys 为 36 passed，完整 ECS 为 668 + 1，完整 facade（含 focus/input 与 LF/CRLF 独立 consumer）通过；workspace all-target/all-feature check、fmt 与 diff check 通过。主代理另行执行完整 workspace all-feature tests（含 424 Core、668 ECS、36 public journeys、28 Core doctests）及 ECS no-default-features（624 + 1），均 exit 0。现有 warnings 和 Windows NOT_RUN 保留。上述勾选只对应已有证据的交付项，其余已实现联动及 matcher/host 私有证据在最终 spec 验收归集时核对，不因尚未归集而重复开发；示例、旧公开入口/回放机制退出、最终审查和 main 集成仍开放。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 
