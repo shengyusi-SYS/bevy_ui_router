@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：Active implementation plan。阶段 A/B 已完成；idle host-loss 基线为 `8ce2b41`，Core native failure/HostLost 来源检查点为 `e7445a2`。官方 BSN 联动切片 `c203446` 已通过独立/交叉审查、反例修正与最终冻结验证：公开注册经真实 FrameTask 接入 adoption、current containment、mount、cleanup、失败/Back/terminal owner 和输入/focus。共享资格、动态隐藏、当前 cleanup 错误证据、官方 clipping 缓存及 pending focus 原 frame 归属问题均已闭合；`a153520` 补齐公开 snapshot 的同更新观察，`31f84c6` 完成 native public journey 迁移及两处失败接收修正。`0d8cb48` 撤下旧公开 writer/report 注册与导出；本次成组退出专属延迟回放机制，保留私有真实 no-BSN 测试管线。统一验收归集、示例、私有替身最终边界核查、最终集成仍开放。成功 focus 合同保持 spec §7.1，不重写产品范围或将 MVP 标为 PASS。
+**状态**：Active implementation plan。阶段 A/B 已完成；idle host-loss 基线为 `8ce2b41`，Core native failure/HostLost 来源检查点为 `e7445a2`。官方 BSN 联动切片 `c203446` 已通过独立/交叉审查、反例修正与最终冻结验证：公开注册经真实 FrameTask 接入 adoption、current containment、mount、cleanup、失败/Back/terminal owner 和输入/focus。共享资格、动态隐藏、当前 cleanup 错误证据、官方 clipping 缓存及 pending focus 原 frame 归属问题均已闭合；`a153520` 补齐公开 snapshot 的同更新观察，`31f84c6` 完成 native public journey 迁移及两处失败接收修正。`0d8cb48` 撤下旧公开 writer/report 注册与导出；`9f0563e` 成组退出专属延迟回放机制，保留私有真实 no-BSN 测试管线。推荐 quick start/普通内部 outlet 示例已通过独立消费、审查和 workspace 验证。统一验收归集、私有替身最终边界核查及最终集成仍开放；Core 最终审查的两个候选待运行确认，不提前宣称审查通过。成功 focus 合同保持 spec §7.1，不重写产品范围或将 MVP 标为 PASS。
 
 ## 全局约束
 
@@ -43,10 +43,10 @@
 - r1 审查后的收口以局部重构和减法为主：集中当前内容归属与输入/focus 资格的只读事实，让 Refresh、publication preparation 和定点清焦消费一致语义，删除同一边界的重复遍历/判定；不以统一资格替代各自的 ownership 或 mutation proof。区分官方 Visibility 覆盖、Display::None 祖先和精确授权的 staging next 值。当前 typed cleanup 证据沿既有 owner/receiver 传递，不另设错误历史。旧静态输出入口、无消费者的过渡 helper 和含糊命名随等价行为替代后退出，不无限保留双模型，也不以改名或分文件冒充重构完成。
 - 真实 hidden-outlet 回归还暴露共享 manifest 将官方 `CalculatedClip` 的正常增删当成结构失效。统一现有 World 观测及无分配比较入口，仅排除此已证实的派生缓存；保留所有 identity、relationship 和 authored 组件检查，不给每条导航路径叠加豁免，也不扩成通用 computed-component 框架。
 
-当前按以下三个主要交付单元组织，第一项已闭合；剩余两项仍为中等偏大的工作量，并非只剩文档收尾。独立验收盘点与旧机制调用者盘点经交叉复核，按以下顺序收口：
+当前按以下三个主要交付单元组织，第一项已闭合，第二项只余有界的私有测试设施清理；最后的正确性确认、审查和集成仍有实质工作，并非只剩文档收尾。按以下顺序收口：
 
 1. **native 公共验收（本轮交付已闭合）**：公开 snapshot 同更新观察由 `a153520` 闭合；原 public journey fixture 已整体迁到官方 BSN，补齐 factory input/等价与 search/fragment、排队及失败 Back、boundary/build/resolve 恢复和两处真实 host/outlet 缺口。旧 writer 专属测试责任由现有私测保留，不另建永久平行 suite。剩余工作是全 MVP 验收归集，不重新执行这轮迁移。
-2. **示例与旧机制退出**：旧公开 writer/report 注册与导出已撤下，外部迁移 consumer 已改为明确的 ECS-only 安装验证，Data 注册及变体仅在私有单元测试中编译；仅服务旧延迟回放的状态、投影、cleanup 包装和无用静态 helper 已成组退出。继续完成推荐 quick start/普通内部 outlet 示例，并按真实调用者完成私有替身最终边界核查。保留真实 no-BSN 管线，不以删除所有 ContentPlan 代码为先决条件，不重复开发已退出的机制。
+2. **示例与旧机制退出**：旧公开 writer/report 注册与导出已撤下，外部迁移 consumer 已改为明确的 ECS-only 安装验证，Data 注册及变体仅在私有单元测试中编译；仅服务旧延迟回放的状态、投影、cleanup 包装和无用静态 helper 已成组退出。推荐 quick start/普通内部 outlet 示例已交付，并作为独立 consumer 运行。仅按已核实的真实调用者和行为替代完成私有替身最终边界清理；保留真实 no-BSN 管线，不以删除所有 ContentPlan 代码为先决条件，不重复开发已退出的机制。
 3. **最终集成**：完成 spec 验收证据、Core/ECS/public 独立与交叉审查、全量验证和 main 集成。已闭合路径不重新开发；新增生产问题须有真实可达证据，才安排局部修正。
 
 这些单元不等于固定提交次数或工时承诺。已识别的多余复杂度是旧公开内容模型与专属测试回放协议，二者已退出；不据剩余符号数启动新一轮整体重构。Core/View 分层、创建/cleanup 的真实 FrameOutput role、执行依赖保活、原 failure owner 与残留责任按调用者保留。阶段 checklist 仍按完整验收勾选，不因局部通过整阶段打勾，也不将尚未勾选误报为功能从未实现。
@@ -160,7 +160,7 @@
 - [x] 完成 push/replace/back 的成功、失败 back 和串行入队结果；区分 `NoBackEntry` 同步拒绝（无 request）和入队后的 `BackTargetUnavailable`。back 在执行时选择目标，失败不改 cursor，错误 presentation 不写成功 history。
 - [x] 完成最近 boundary/error view、fallback、恢复自身失败、无 binding nested Push cleanup 后 RouterFallback；分别验证原 failure continuation 和实际 cleanup scope，不按 preserved active 或 obligation 数量选择分支。
 - [ ] 验证 publication 前后 host loss 的不同结果、同 Entity registration 移除重插、重复候选、旧 epoch/task stale、重新注册仅接受新命令。保留最小 RouterHandle scope 回归，不扩成 multi-router stress。
-- [ ] 将普通嵌套示例和短小 quick start 做成实际编译/运行消费者。运行环境明确安装 Asset/Scene/UI/picking/focus 所需插件，不能依赖本 workspace dev feature 偶然统一。
+- [x] 将普通嵌套示例和短小 quick start 做成实际编译/运行消费者。运行环境明确安装 Asset/Scene/UI/picking/focus 所需插件，不能依赖本 workspace dev feature 偶然统一。
 
 **验证**：真实 BSN public journeys、ECS focused + 完整 crate、受影响 Core/View tests。故障只能通过实际生产输入或私有 seam 改变 predicate 的事实输入；最高层 consumer 不依赖 owner crate、test-support、中间 schedule、audit/probe。
 
@@ -279,6 +279,10 @@ native 公共旅程检查点（2026-09-22，本记录所在提交）：原 fixtu
 阶段 E 专属回放退出（本记录所在提交）：在 `0d8cb48` 基线上，成组删除只由测试捕获入口驱动的旧输出 owner、延迟释放状态、全 store/snapshot 投影、调度和 cleanup 专属包装，并删除无消费者的静态 helper、四项形状断言和三项旧协议专属测试。共享 cleanup 中移除的回调在所有剩余调用者均为常真；真实 partition/refreeze、失败来源和原 owner 保留。stale 零写入、原 task 重试、同 host 重新接纳、旧残留隔离与 hook 后停止写入仍由生产路径回归覆盖。两位独立审查者完成双向交叉复核，无可行动 finding；主代理核实调用者、测试责任与最后 import-only 变更。
 
 本检查点完整 ECS all-features（661 + 1）、no-default（617 + 1）、完整 facade（85，含 36 native journeys、19 focus、13 input 和独立 LF/CRLF consumer）、workspace all-target/all-feature check 均 exit 0。主代理另行重跑 `cargo test --workspace --all-features --locked --offline`，含 Core 424、ECS 661 与 Core doctests 28，exit 0；workspace/独立 consumer 格式检查及 diff 检查通过，产品冻结哈希一致。既有 warnings 与 Windows 原生 NOT_RUN 不变。下一交付是推荐 quick start/普通内部 outlet 示例及最后 fixture 边界核查，随后归集完整验收、最终审查验证和 main 集成；本次不新增产品需求或通用事务框架。
+
+阶段 D 示例交付（2026-09-22，本记录所在提交）：新增 README、短小 BSN quick start 与普通内部 outlet 嵌套示例。后者以真实 UI 布局执行 Push overview → Push settings → Replace help → Back overview，验证 history、旧页面销毁及 layout/sidebar/toolbar/slot 的 exact Entity 和状态保持。现有独立 consumer harness 直接编译运行这两份源文件，显式配置官方依赖与插件，不复制第二份示例实现、不增加源码/Markdown 解析 gate。示例是有限 headless 程序，不承诺窗口/GPU、真实设备输入或自动 Tab/dispatch 集成。
+
+独立 spec/quality 审查无可行动 finding，主代理核对冻结文件与实际输出。两个示例运行、完整 facade（85，含独立 LF/CRLF consumer）、workspace all-target/all-feature check 均 exit 0；主代理另行执行完整 `cargo test --workspace --all-features --locked --offline`，含 Core 424、ECS 661、public journeys 36、Core doctests 28，exit 0。主代理 workspace fmt、consumer/示例显式 rustfmt、diff 与冻结哈希检查通过。既有 warnings 保留，最低 Rust 版本执行、Windows 原生及窗口/GPU 验证 NOT_RUN。下一步先确认最终 Core 审查的两个具体候选，再完成有界 fixture 清理、最终交叉审查与 main 集成；本提交不是 MVP 验收完成。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 

@@ -4,12 +4,13 @@
 
 ## Now
 
-- 候选精简、独立迁移基线及 idle host-loss 已完成。官方 native BSN 联动、输入/focus、公共同更新 snapshot 观察和迁移后的真实导航/恢复 journeys 已通过对应审查与验证；当前重心转向示例及旧机制退出，不扩大产品范围。
+- 候选精简、独立迁移基线及 idle host-loss 已完成。官方 native BSN 联动、输入/focus、公共同更新 snapshot 观察、真实导航/恢复 journeys 和推荐 BSN 示例已通过对应审查与验证；当前重心转向有界清理与最终审查，不扩大产品范围。
 
 ## Next
 
 - 对照统一 spec 归集已经存在的内部 default outlet、location/history、恢复、host/stale、输入/focus 与公共 snapshot 证据；不重做已完成的联动迁移，也不把单个检查点当成完整 MVP 验收。
-- 旧公开 writer/report 入口及专属延迟回放机制已退出；继续完成示例和私有替身最终边界核查，删除已被替代的重复事实，保留 renderer-neutral 独立验证；不新增 runtime 或通用事务框架。
+- 旧公开 writer/report 入口及专属延迟回放机制已退出，示例已作为独立 consumer 运行；完成私有替身最终边界核查，删除已被替代的重复事实，保留 renderer-neutral 独立验证；不新增 runtime 或通用事务框架。
+- 先运行确认最终审查中的具体正确性候选，成立时从来源模型作局部修正，不以测试全绿或扩大审查范围替代实际判断。
 - 通过推荐 facade 的独立 BSN consumer、示例、全量验证与独立交叉审查后集成 main；完成前不标记 MVP PASS。
 
 ## Post-MVP

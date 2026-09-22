@@ -13,8 +13,8 @@
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
 | ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss；旧 Data 注册仅在单元测试中编译，专属延迟回放机制已退出 | 最小私有替身的最终边界核查 |
-| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | 完整 MVP 验收归集与示例仍待完成 |
-| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer；旧 writer/report 导出及注册已撤下 | 最终验收、普通嵌套示例未完成 |
+| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | 完整 MVP 验收归集与最终审查 |
+| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer；推荐 quick start 与内部 outlet 示例；旧 writer/report 导出及注册已撤下 | 最终验收及 main 集成 |
 
 迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 writer/report 不再公开，Data executor 的注册和可构造变体只在单元测试中编译，由私有扩展驱动原 Core/ECS 管线。仅供测试捕获/延迟释放旧输出的 owner、投影、调度与 cleanup 包装已成组删除；真实 `pending_frame_drive` 重试、stale 接收、旧残留隔离和写后复验保留。剩余 ContentPlan 执行器服务 no-BSN 独立行为验证，不要求为符号归零而删除。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
@@ -72,4 +72,6 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-私有替身最终边界核查、推荐 quick start/普通嵌套示例、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。已退出的公开 Data 入口与延迟回放机制、已通过的 native public journeys 和公共观察边界不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。
+推荐 quick start 与普通内部 outlet 示例已交付，并把原文件作为独立 workspace consumer 编译运行。嵌套示例经真实 UI 布局验证 Push/Replace/Back、history 和 layout/toolbar/slot 保持；它是有限 headless 示例，不是窗口、GPU 或真实设备验收。
+
+私有替身最终边界核查、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。Core 最终独立审查有两个正确性候选待运行确认，尚未标为通过。已退出的公开 Data 入口与延迟回放机制、已通过的 native public journeys、公共观察边界和示例不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。

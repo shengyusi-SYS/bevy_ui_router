@@ -25,6 +25,7 @@ impl Consumer {
         ecs: bool,
         source: &str,
         crlf: bool,
+        native_ui: bool,
     ) -> Self {
         let facade = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let base = facade
@@ -62,6 +63,12 @@ impl Consumer {
                     "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
                 ));
             }
+        }
+        if native_ui {
+            manifest.push_str(
+                "bevy_input_focus = { version = '=0.19.1', default-features = false }\n\
+                 bevy_internal = { version = '=0.19.1', default-features = false, features = ['bevy_window', 'bevy_camera', 'bevy_ui', 'bevy_picking'] }\n",
+            );
         }
         assert!(manifest_violations(&toml::from_str(&manifest).unwrap()).is_empty());
         fs::create_dir_all(directory.join("src")).unwrap();
@@ -252,7 +259,20 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             true,
         ),
     ] {
-        Consumer::new(name, defaults, features, ecs, source, crlf).run(!ecs);
+        Consumer::new(name, defaults, features, ecs, source, crlf, false).run(!ecs);
+    }
+
+    // Compile and execute the actual recommended examples, outside the workspace
+    // dev-feature graph. Keep explicit dependencies aligned with the README.
+    for (name, source, native_ui) in [
+        (
+            "quick-start",
+            include_str!("../examples/bsn_quick_start.rs"),
+            false,
+        ),
+        ("nested", include_str!("../examples/bsn_nested.rs"), true),
+    ] {
+        Consumer::new(name, false, &["bsn"], true, source, false, native_ui).run(false);
     }
 
     // One rejection per consumer: another compiler error cannot mask a removed boundary.
@@ -288,6 +308,6 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             "publish",
         ),
     ] {
-        Consumer::new(name, false, &["ecs"], false, source, false).rejects(code, symbol);
+        Consumer::new(name, false, &["ecs"], false, source, false, false).rejects(code, symbol);
     }
 }
