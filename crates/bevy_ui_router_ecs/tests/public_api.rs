@@ -13,9 +13,6 @@ fn root_profile_exports_the_new_navigation_surface() {
     assert_public::<RouterSnapshots>();
     assert_public::<RouterInputGate>();
     assert_public::<NavigationRequestSnapshot>();
-    assert_public::<ContentColor>();
-    assert_public::<SolidRect>();
-    assert_public::<ViewBuildReport>();
 
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());

@@ -211,6 +211,7 @@ pub(crate) struct ViewDriverStore {
 }
 
 pub(crate) enum ViewExecutor {
+    #[cfg(test)]
     Data(Box<dyn EcsViewDriver>),
     #[cfg(feature = "bsn")]
     Native(bevy_ui_router_bsn::BsnSceneFactory),
@@ -228,6 +229,7 @@ impl ViewDriverStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn register<D: EcsViewDriver>(
         &mut self,
         driver: D,
@@ -244,12 +246,13 @@ impl ViewDriverStore {
 
     pub(crate) fn get_mut(
         &mut self,
-        key: &ViewDriverKey,
+        _key: &ViewDriverKey,
     ) -> Option<&mut (dyn EcsViewDriver + 'static)> {
         self.drivers
             .iter_mut()
-            .find_map(|(stored, driver)| match driver {
-                ViewExecutor::Data(driver) if stored == key => Some(driver.as_mut()),
+            .find_map(|(_stored, driver)| match driver {
+                #[cfg(test)]
+                ViewExecutor::Data(driver) if _stored == _key => Some(driver.as_mut()),
                 _ => None,
             })
     }
@@ -328,15 +331,21 @@ impl ViewDriverStore {
 }
 
 pub trait AppRouterExt {
+    fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError>;
+}
+
+/// The independent unit-test renderer supplies real build/physical facts to
+/// the normal Core/ECS pipeline without becoming a shipping registration API.
+#[cfg(test)]
+pub(crate) trait TestAppRouterExt {
     fn register_ui_view_driver<D: EcsViewDriver>(
         &mut self,
         driver: D,
     ) -> Result<ViewDriverKey, ViewDriverRegistrationError>;
-
-    fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError>;
 }
 
-impl AppRouterExt for App {
+#[cfg(test)]
+impl TestAppRouterExt for App {
     fn register_ui_view_driver<D: EcsViewDriver>(
         &mut self,
         driver: D,
@@ -346,7 +355,9 @@ impl AppRouterExt for App {
             .resource_mut::<ViewDriverStore>()
             .register(driver)
     }
+}
 
+impl AppRouterExt for App {
     fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError> {
         crate::plugin::install_foundations(self);
         let (routes, views, fallback) = config.into_parts();

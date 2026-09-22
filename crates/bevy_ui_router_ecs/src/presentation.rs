@@ -4083,7 +4083,9 @@ fn repair_missing_pickable_for_quarantine(
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        app_ext::{AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration},
+        app_ext::{
+            AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, TestAppRouterExt,
+        },
         content::{ContentColor, ContentPlan, FrameContentWriter, SolidRect},
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         host::{HostCandidateClassification, HostCandidateRevisionState, classify_host_candidate},

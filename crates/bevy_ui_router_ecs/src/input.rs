@@ -953,7 +953,7 @@ pub(crate) fn input_ready_system(_world: &mut World) {}
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
+        app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration, TestAppRouterExt},
         content::{ContentColor, FrameContentWriter, SolidRect},
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         navigation::{

@@ -16,11 +16,13 @@ use bevy_ui_router_core::prelude::{
 use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey};
 
 use crate::{
-    AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentWriteErrorKind, EcsViewDriver,
-    EcsViewReportSession, FrameContentWriter, RequestLookup, RouterConfig, RouterHandle,
-    RouterHostRegistration, RouterSnapshots, SolidRect, ViewBuildReport,
+    AppRouterExt, BevyUiRouterPlugin, RequestLookup, RouterConfig, RouterHandle,
+    RouterHostRegistration, RouterSnapshots,
+    app_ext::TestAppRouterExt,
     cleanup::CleanupAttempt,
     components::{ChildSlotLifecycle, RouterInputBarrier},
+    content::{ContentColor, ContentWriteErrorKind, FrameContentWriter, SolidRect},
+    driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
     input::RouterInputGate,
     navigation::{
         RouterNavigation, collect_navigation_system, commit_presentation_system,

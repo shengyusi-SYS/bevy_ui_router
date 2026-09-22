@@ -54,14 +54,11 @@ pub mod view {
 #[cfg(feature = "ecs")]
 pub mod ecs {
     pub use bevy_ui_router_ecs::{
-        AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentEntity, ContentPrimitiveError,
-        ContentPrimitiveErrorKind, ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind,
-        EcsViewDriver, EcsViewReportSession, FrameContentWriter, NavigationEnqueueError,
-        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouterConfig,
-        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
+        AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
+        NavigationRequestSnapshot, RequestLookup, RouterConfig, RouterHandle,
+        RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
         RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
-        RouterSnapshots, SolidRect, ViewBuildReport, ViewBuildReportKind,
-        ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        RouterSnapshots, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
 }
 
@@ -105,13 +102,10 @@ pub mod prelude {
 
     #[cfg(feature = "ecs")]
     pub use crate::ecs::{
-        AppRouterExt, BevyUiRouterPlugin, ContentColor, ContentEntity, ContentPrimitiveError,
-        ContentPrimitiveErrorKind, ContentPrimitiveKind, ContentWriteError, ContentWriteErrorKind,
-        EcsViewDriver, EcsViewReportSession, FrameContentWriter, NavigationEnqueueError,
-        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouterConfig,
-        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterSnapshot, RouterSnapshots, SolidRect,
-        ViewBuildReport, ViewBuildReportKind, ViewDriverRegistrationError,
+        AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
+        NavigationRequestSnapshot, RequestLookup, RouterConfig, RouterHandle,
+        RouterHostRegistration, RouterInputGate, RouterInstallError, RouterInstallErrorKind,
+        RouterNavigation, RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
         ViewDriverRegistrationErrorKind,
     };
 }

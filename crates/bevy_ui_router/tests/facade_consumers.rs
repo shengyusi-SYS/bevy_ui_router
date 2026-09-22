@@ -287,13 +287,6 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             "E0624",
             "publish",
         ),
-        // Temporary lifecycle API: remove this probe when the old session exits in phase C/E.
-        (
-            "session-double-consumption",
-            "use bevy_ui_router::prelude::EcsViewReportSession; fn probe(session: EcsViewReportSession<'_>) { let _ = session.applied(); let _ = session.applied(); } fn main() {}",
-            "E0382",
-            "session",
-        ),
     ] {
         Consumer::new(name, false, &["ecs"], false, source, false).rejects(code, symbol);
     }

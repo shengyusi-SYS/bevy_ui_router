@@ -2,7 +2,7 @@ use super::*;
 #[cfg(test)]
 use crate::cleanup::BackCapacityRetireError;
 use crate::{
-    app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration},
+    app_ext::{AppRouterExt, RouterConfig, RouterHostRegistration, TestAppRouterExt},
     cleanup::{
         AuthorityLostResidualPhysicalRestoreDrift, AuthorityLostResidualPostwriteDrift,
         AuthorityRemovalRegistryPostwriteDrift, AuthorityResidualPostwriteDrift,

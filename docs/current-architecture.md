@@ -12,11 +12,11 @@
 | --- | --- | --- |
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
-| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss | 旧 data-only 入口与仅供旧回放的内部机制退出 |
+| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss；旧 Data 注册仅在单元测试中编译 | 仅供旧回放的内部机制退出、私有替身收窄 |
 | BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | 完整 MVP 验收归集与示例仍待完成 |
-| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer | 旧 driver 公开面仍在；最终验收、普通嵌套示例及旧 API 退出未完成 |
+| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer；旧 writer/report 导出及注册已撤下 | 最终验收、普通嵌套示例未完成 |
 
-迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 API/迁移 executor 仍待退出，不能作为 native 的第二条 report/replay 链。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
+迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 writer/report 不再公开，Data executor 的注册和可构造变体只在单元测试中编译，由私有扩展驱动原 Core/ECS 管线；其内部执行协议与回放依赖尚待成组精简，不能把公开面退出当作全部旧实现已删除。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
 BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory 调用消费 fresh Scene，检查 runtime、cached inclusion 和重复引用，准备保持 ChildOf 顺序的声明图及 attempt 唯一匿名引用。成功与失败结果均携带 dependency handles，供实际 apply/settlement 保活；这不承诺为已结算的 inert residual 保活到实体销毁。已应用组件中的强 Handle 按 Bevy 自身规则保活。
 
@@ -32,7 +32,7 @@ BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory �
 
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
-facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。独立 workspace 的真实 BSN consumer 已运行嵌套/history/错误恢复与 LF/CRLF 对照，既有私有身份/authority/session 拒绝测试保留。完整公开消费验收与示例仍按 plan 推进，不以此单个 consumer 代替全部验收。
+facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue 和两项 AST API 清单也已退出，私有源码形状断言仍待阶段 E 合并。独立 workspace 的真实 BSN consumer 已运行嵌套/history/错误恢复与 LF/CRLF 对照；旧 session 专属公开拒绝行随 API 删除，身份、handle、navigation/publication 权限拒绝仍保留。ECS-only consumer 只证明插件资源、安装拒绝和普通更新行为，不再声称外部独立 renderer；无 BSN 的渲染/lifecycle 独立性由 ECS 私有真实管线测试验证。完整公开消费验收与示例仍按 plan 推进，不以此单个 consumer 代替全部验收。
 
 `a153520` 在同一独立 BSN consumer 内验证普通应用系统于 `Update` 的公开 `PublishSnapshots` 标签之后读取本轮完整 snapshots；实际 native 输入授权作为独立发布证据，防止延后一轮的旧快照靠 polling 通过。此 test-only 检查点没有新增 runtime 或公开 API。
 
@@ -72,4 +72,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 ## 尚未完成
 
-旧 renderer API 与仅供旧回放的内部机制退出、推荐 quick start/普通嵌套示例、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。已通过的 native public journeys 和公共观察边界不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。
+仅供旧回放的内部机制退出与私有替身收窄、推荐 quick start/普通嵌套示例、统一 spec 验收归集、MVP 最终验证审查及 main 集成仍需完成。已通过的 native public journeys 和公共观察边界不重复开发，也不替代完整 MVP 验收；Windows 原生验证保持 NOT_RUN。
