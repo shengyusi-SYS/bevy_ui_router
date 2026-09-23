@@ -1,20 +1,20 @@
 # Current Architecture
 
-**类型**：实现事实与差距。**更新时间**：2026-09-23。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简；idle host-loss 基线为 `8ce2b41`，Core 来源修正检查点为 `e7445a2`，native 联动为 `c203446`。独立/交叉审查、最终 fixture 差异审查及冻结版本完整验证均通过；待 main 集成和合并后 smoke，暂不称总体 MVP 已验收。后台 reaper 与公开 audit/probe 已退出。
+**类型**：实现事实与验证边界。**更新时间**：2026-09-23。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简；idle host-loss 基线为 `8ce2b41`，Core 来源修正检查点为 `e7445a2`，native 联动为 `c203446`。独立/交叉审查、最终 fixture 差异审查、冻结版本完整验证及本地 `main` 快进后的公开 smoke 均通过；MVP 已在本地 main 验收。后台 reaper 与公开 audit/probe 已退出。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
 ## 已接受基线
 
-`Cargo.lock` 已跟踪，直接 Bevy 依赖使用官方 crates.io `0.19.1`。依赖升级和历史验证不证明 BSN MVP 已交付。
+`Cargo.lock` 已跟踪，直接 Bevy 依赖使用官方 crates.io `0.19.1`。MVP 结论另由实际产品验收与本地集成支持。
 
-| 层 | 已接受实现 | 新 MVP 差距 |
+| 层 | 已接受实现 | MVP 结论 |
 | --- | --- | --- |
-| Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | 保留既有行为；仅按新证据修正，不整体重写 |
-| View | renderer-neutral key、registry、descriptor、effect/input 合同 | 清除旧公开 writer/report 耦合时保持独立性 |
-| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss；旧 Data 注册仅在单元测试中编译，专属延迟回放及冗余 fixture 已退出 | main 集成 |
-| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | main 集成 |
-| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer；推荐 quick start 与内部 outlet 示例；旧 writer/report 导出及注册已撤下 | main 集成与合并后 smoke |
+| Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | MVP 已验收 |
+| View | renderer-neutral key、registry、descriptor、effect/input 合同 | MVP 已验收 |
+| ECS | host/slot/frame binding、native 执行、staging、cleanup、输入/focus、physical authority 与 idle host-loss；旧 Data 注册仅在单元测试中编译，专属延迟回放及冗余 fixture 已退出 | MVP 已验收 |
+| BSN | owned `BsnSceneFactory`、`BsnBuildError`、`DefaultOutlet`、公开注册与真实导航；依赖已反转 | MVP 已验收 |
+| Facade | 导航、snapshots、真实 native public journeys；独立 Core/View/ECS/BSN consumer；推荐 quick start 与内部 outlet 示例；旧 writer/report 导出及注册已撤下 | MVP 已验收 |
 
 迁移前主链为 `EcsViewDriver → FrameContentWriter/ContentPlan → RealizedFrame`；现在公开 BSN 注册经真实 FrameTask 分派到 native Scene，原 adoption 直接进入 RealizedFrame。旧 writer/report 不再公开，Data executor 的注册和可构造变体只在单元测试中编译，由私有扩展驱动原 Core/ECS 管线。仅供测试捕获/延迟释放旧输出的 owner、投影、调度与 cleanup 包装已成组删除；真实 `pending_frame_drive` 重试、stale 接收、旧残留隔离和写后复验保留。剩余 ContentPlan 执行器服务 no-BSN 独立行为验证，不要求为符号归零而删除。调度仅公开 `RouterInputSet::{Refresh,Ready}` 与 `RouterScheduleSet::PublishSnapshots`，中间 lifecycle 调度为 crate 私有，必要故障 seam 只在私测中编译。
 
@@ -46,9 +46,9 @@ facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏�
 - 未 adopt 创建产物的 failure/Back/terminal ownership 交接已通过生产路径测试和独立审查。原错误、执行依赖、物理残留责任与前台 continuation 分开交接，不以假 frame 或第二 runtime 适配旧类型；当前 typed cleanup 观测与原 owner 一起保留，不被此前容量错误遮蔽。
 - 创建期 host registration 丢失不再误报普通 Apply failure；“fallback 已签发、仍有 active 时首次失去 host”使用明确 task/active 来源，复用既有 authority settlement 与重新接纳链。真实 HostLost/history/同 host 接纳、来源漂移及拒绝/重试已验证并审查。旧 Task-only 权限未扩大，没有把正常 HostLost 改成永久协议错误。
 
-当前重点是这些用户路径的完整消费结果，非重写 Core 或展开旧路径全面安全审计。统一 plan 的验收项仍须逐项满足。
+这些用户路径的完整消费结果已按统一 plan 验收；后续维护仍沿现有职责边界，不扩展为 Core 重写或全面安全审计。
 
-本轮按真实反例完成局部减法：Refresh 复用一次 current-content/eligible 观察；共享 manifest 观测只排除官方动态 `CalculatedClip`，现有无分配和关系差分消费者保持一致，未放宽各自关系/authority 规则。普通隐藏和重新显示不再误报挂载失效。两位原审查者完成独立及交叉复核、两次修正增量复审，本检查点无剩余可行动 finding。既有 warnings 保留；完整 MVP/Windows 验收仍是不同结论。
+本轮按真实反例完成局部减法：Refresh 复用一次 current-content/eligible 观察；共享 manifest 观测只排除官方动态 `CalculatedClip`，现有无分配和关系差分消费者保持一致，未放宽各自关系/authority 规则。普通隐藏和重新显示不再误报挂载失效。两位原审查者完成独立及交叉复核、两次修正增量复审，本检查点无剩余可行动 finding。既有 warnings 保留；Windows 原生验证未运行。
 
 ## 必须保留的行为
 
@@ -74,4 +74,4 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 推荐 quick start 与普通内部 outlet 示例已交付，并把原文件作为独立 workspace consumer 编译运行。嵌套示例经真实 UI 布局验证 Push/Replace/Back、history 和 layout/toolbar/slot 保持；它是有限 headless 示例，不是窗口、GPU 或真实设备验收。
 
-最终审查复现的三处接收端缺陷已修正并通过增量复审：混合 Router 诊断与去重共同维护 exact 保留关系；post-commit terminal 冻结原 attempt 结果；native 隔离预期只更新实际写入角色，严格保留 authored 内容观察。私有 fixture 减法的独立审查、完整 Core/ECS/facade/workspace 同版本验证及正常/fallback/bound-error 的普通更新后公开快照与单次终态均通过。当前仅余 main 集成和合并后 smoke。Windows 原生、最低 Rust 执行、GPU/窗口及真实硬件输入保持 NOT_RUN。
+最终审查复现的三处接收端缺陷已修正并通过增量复审：混合 Router 诊断与去重共同维护 exact 保留关系；post-commit terminal 冻结原 attempt 结果；native 隔离预期只更新实际写入角色，严格保留 authored 内容观察。私有 fixture 减法的独立审查、完整 Core/ECS/facade/workspace 同版本验证及正常/fallback/bound-error 的普通更新后公开快照与单次终态均通过。本地 main 快进到 `7a34fcc`，合并后公开旅程与独立 consumer smoke 通过。Windows 原生、最低 Rust 执行、GPU/窗口及真实硬件输入保持 NOT_RUN。

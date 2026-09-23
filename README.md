@@ -2,7 +2,7 @@
 
 面向 Bevy UI 的嵌套路由库：路由树、location/参数匹配、`push` / `replace` / `back`、内部 default outlet、错误恢复，以及请求/呈现/history 快照。Core 与 View 保持 renderer-neutral；推荐通过 facade 的 `bsn` feature 使用官方代码声明 Scene。
 
-当前是开发中的 MVP，尚未宣告完整验收或主分支集成完成。以下使用仓库本地依赖，不要求已发布的 crates.io 包。当前合同与进度以[文档索引](docs/README.md)、[统一 spec](docs/superpowers/specs/2026-09-07-router-mvp-design.md)和[实施 plan](docs/superpowers/plans/2026-09-07-router-mvp-implementation.md)为准。
+MVP 已在本地 `main` 完成集成和验收；以下使用仓库本地依赖，不要求已发布的 crates.io 包。合同与验证边界见[文档索引](docs/README.md)、[统一 spec](docs/superpowers/specs/2026-09-07-router-mvp-design.md)和[实施 plan](docs/superpowers/plans/2026-09-07-router-mvp-implementation.md)。Windows 原生、最低 Rust 版本、窗口/GPU 及真实设备输入尚未执行验证。
 
 ## 运行示例
 

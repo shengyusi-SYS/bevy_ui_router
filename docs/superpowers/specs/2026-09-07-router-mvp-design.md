@@ -2,7 +2,7 @@
 
 **日期**：2026-09-07
 
-**状态**：Active design。总体目标与范围已获用户确认，完整修订稿经两份独立审查和交叉复核，结论为可开始实施；第 12 节最小机制已有官方依赖探针证据。合同生效不代表产品实现或 MVP 已通过验证。
+**状态**：MVP accepted on local `main`（2026-09-23）。总体目标与范围已获用户确认；完整修订稿经独立审查和交叉复核，第 12 节最小机制有官方依赖探针证据。实际产品验收见第 10 节；未运行平台项目仍保持 NOT_RUN。
 
 **用途**：MVP 产品范围、架构、公共语义与验收结果的统一依据。实施顺序和当前事实分别由 implementation plan 与 current-architecture 记录。本文替代旧 Target、Matrix、Fixture、Allowlist、Golden、Journeys、Goals 的范围与重复规范地位；旧文件暂留供已有实现/测试迁移和历史追溯，不能反向扩张新 MVP。
 
@@ -221,7 +221,7 @@ request snapshot 提供请求自身 requested/matched/status 和可分类 failur
 
 ## 10. 验收与维护证据
 
-当前证据归集至最终私有 fixture 减法后的同一冻结源码。完整 Core/ECS/facade、workspace tests、独立 consumer/示例及静态检查通过；最终审查的三项接收端缺陷已修正并经独立增量复审，最后 test-only 普通更新补证另有定向通过证据。私有 fixture 减法经独立审查，完整门禁重跑通过；尚待 main 集成和合并后 smoke，不等于总体 MVP 已完成。命令及检查点结果归 [实施 plan](../plans/2026-09-07-router-mvp-implementation.md)，不维护第二套测试清单。
+最终私有 fixture 减法后的同一冻结源码通过完整 Core/ECS/facade、workspace tests、独立 consumer/示例及静态检查；三项接收端缺陷已修正并经独立增量复审，最后 test-only 普通更新补证另有定向通过证据。私有 fixture 减法经独立审查，完整门禁重跑通过。本地 `main` 快进集成到 `7a34fcc` 后，独立 facade consumer（含原样示例）和 36 项公开导航旅程再次通过。既定 Linux/headless MVP 验收完成；命令及检查点结果归 [实施 plan](../plans/2026-09-07-router-mvp-implementation.md)，不维护第二套测试清单。
 
 | 用户结果/边界 | 必需的独立证据 | 当前验证入口与结论 |
 | --- | --- | --- |
@@ -234,7 +234,7 @@ request snapshot 提供请求自身 requested/matched/status 和可分类 failur
 | 恢复与 host | boundary/fallback、真实 build/resolve/apply/mount error、恢复再失败、publication 前后 host loss、重新注册 | native public journeys、[BSN facade tests](../../../crates/bevy_ui_router/tests/bsn_facade_features.rs) 与 [ECS 私有精确窗口](../../../crates/bevy_ui_router_ecs/src/navigation/native_tests.rs) 通过；发布后的正常成功和原 Match/Build 失败均保留，HostLost 后一次普通更新仍稳定，原结果缺陷及 native 隔离预期已修正并复审 |
 | Owned-only 与 stale | host 值/关系保持，frame generation 和 task stale 拒绝，稀疏 prefix、owner 单次消费、post-write 局部漂移回归 | Core integration/engine、ECS navigation/registry/native_scene/native_frame 实际输入回归通过；Core/ECS 独立审查及修正增量复核完成，混合诊断去重与 native authored 值严格漂移拒绝有真实正反对照 |
 | 输入与焦点 | 原生 UI layout/picking 有真实正向命中；pending/leaving/failed/residual 拒绝，按下/拖拽跨离场后不再派发到旧目标；keyboard/gamepad gate、focus 释放、动态 child 刷新 | [native input](../../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[native focus](../../../crates/bevy_ui_router/tests/bsn_native_focus.rs)、BSN facade 动态 child 与 ECS gate 回归通过；真实正向命中、历史手势、应用目标保持和官方 focus 顺序已由 ECS/public 独立视角复核 |
-| 跨层收敛 | 受影响 crate 与最高层 public journeys、feature 组合、workspace fmt/check/test/doctest；独立 Core/ECS/public 审查及交叉复核 | 三视角独立与交叉审查、三项缺陷修正增量复审及最终 fixture 差异独立审查已完成；冻结源码的 workspace fmt/check/test/doctest、facade 四组合及 BSN 测试全部 exit 0，含 Core 428、ECS 660、public journeys 36、独立 LF/CRLF consumer 和 Core doctests 28；待 main 集成与 smoke，**总体未验收** |
+| 跨层收敛 | 受影响 crate 与最高层 public journeys、feature 组合、workspace fmt/check/test/doctest；独立 Core/ECS/public 审查及交叉复核 | 三视角独立与交叉审查、三项缺陷修正增量复审及最终 fixture 差异独立审查已完成；冻结源码的 workspace fmt/check/test/doctest、facade 四组合及 BSN 测试全部 exit 0，含 Core 428、ECS 660、public journeys 36、独立 LF/CRLF consumer 和 Core doctests 28；本地 main 快进合并与公开旅程/独立 consumer smoke 均通过，**MVP PASS（限定已运行环境）** |
 
 Windows 原生、最低 Rust 版本执行、GPU/窗口及真实硬件输入为 NOT_RUN；Linux LF/CRLF、headless 布局和原生输入系统测试不替代这些证据。此处不以已有基线的绿色结果覆盖后来复现的缺陷。
 

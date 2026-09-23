@@ -4,11 +4,11 @@
 
 ## Now
 
-- 官方 native BSN、输入/focus、公开导航/恢复与推荐示例已完成。旧公开机制和冗余私有 fixture 已按真实调用者清理，Core/ECS/public 独立及交叉审查、冻结源码全量验证通过；当前仅待 main 集成与合并后 smoke。
+- 官方 native BSN、输入/focus、公开导航/恢复与推荐示例已完成。旧公开机制和冗余私有 fixture 已按真实调用者清理，Core/ECS/public 独立及交叉审查、冻结源码全量验证通过；本地 main 已快进集成，合并后 smoke 通过。
 
 ## Next
 
-- 将已通过验收的候选快进合入 main，合并后运行公开旅程、独立 BSN consumer 和示例 smoke，记录集成提交及剩余平台验证边界。
+- 按实际使用反馈维护已验收的 MVP；Windows 原生、最低 Rust 版本及窗口/GPU/真实设备输入仍需在有相应环境时单独验证。远端发布另行决定。
 
 ## Post-MVP
 

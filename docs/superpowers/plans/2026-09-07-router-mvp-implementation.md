@@ -10,7 +10,7 @@
 
 **Spec:** [统一 MVP design spec](../specs/2026-09-07-router-mvp-design.md)。实现者同时读取 spec 和本计划；产品合同归 spec，本文件只拥有迁移顺序与证据。
 
-**状态**：阶段 A–D 及阶段 E 的代码、审查和最终同版本验证已完成；仅待集成 main 与合并后 smoke。官方 BSN、native 导航/恢复、输入/focus、同更新 snapshots 与推荐示例均已实现并验证。最终审查确认的三处接收端缺陷已修正并复审，私有 fixture 减法也已独立复审。集成前不标记总体 MVP PASS。成功 focus 合同保持 spec §7.1；较早检查点和取舍见第 7 节。
+**状态**：MVP 已在本地 `main` 完成集成与既定验收（2026-09-23）。阶段 A–E 的代码、审查、最终同版本验证和合并后 smoke 均完成。官方 BSN、native 导航/恢复、输入/focus、同更新 snapshots 与推荐示例已实现并验证；三处接收端缺陷和最终私有 fixture 减法已分别复审。成功 focus 合同保持 spec §7.1；较早检查点和取舍见第 7 节。
 
 ## 全局约束
 
@@ -40,11 +40,11 @@
 - 审查单元覆盖完整用户路径和最后有副作用的边界，包含同调用与下一普通更新；循环内运行定向验证，交付冻结后运行受影响完整 crate/最高层 gate，修复采用增量复审。独立/交叉意见须核对真实路径；不以评估文档数、测试数或局部绿色推算产品完成度。
 - 核心范围和已确认的 AutoFocus 策略不重定。当前仅在真实修复触及的职责内消除重复知识，不整体替换 Core/RouterEntry，不增加后台回收、公开审计或未来 renderer。最终以同一冻结版本的完整验证、Core/ECS/public 独立与交叉审查、spec 结果及 main smoke 收口。
 
-本轮按以下三个主要交付单元组织，前两项与最后一项的审查、全量验证已闭合；目前只余 main 集成及合并后 smoke：
+本轮按以下三个主要交付单元组织，全部已闭合：
 
-1. **native 公共验收（本轮交付已闭合）**：公开 snapshot 同更新观察由 `a153520` 闭合；原 public journey fixture 已整体迁到官方 BSN，补齐 factory input/等价与 search/fragment、排队及失败 Back、boundary/build/resolve 恢复和两处真实 host/outlet 缺口。旧 writer 专属测试责任由现有私测保留，不另建永久平行 suite。剩余工作是全 MVP 验收归集，不重新执行这轮迁移。
+1. **native 公共验收（本轮交付已闭合）**：公开 snapshot 同更新观察由 `a153520` 闭合；原 public journey fixture 已整体迁到官方 BSN，补齐 factory input/等价与 search/fragment、排队及失败 Back、boundary/build/resolve 恢复和两处真实 host/outlet 缺口。旧 writer 专属测试责任由现有私测保留，不另建永久平行 suite；全 MVP 验收已在第 10 节归集。
 2. **示例与旧机制退出**：旧公开 writer/report 注册与导出已撤下，外部迁移 consumer 已改为明确的 ECS-only 安装验证，Data 注册及变体仅在私有单元测试中编译；仅服务旧延迟回放的状态、投影、cleanup 包装和无用静态 helper 已成组退出。推荐 quick start/普通内部 outlet 示例已交付，并作为独立 consumer 运行。私有替身按已核实的真实调用者和行为替代完成最终边界清理；真实 no-BSN 管线仍在，不以删除所有 ContentPlan 代码为先决条件。
-3. **最终集成**：spec 验收证据、Core/ECS/public 独立与交叉审查、全量验证已完成；待 main 集成和合并后 smoke。已闭合路径不重新开发；新增生产问题须有真实可达证据，才安排局部修正。
+3. **最终集成**：spec 验收证据、Core/ECS/public 独立与交叉审查、全量验证、main 快进合并和合并后 smoke 已完成。后续新增生产问题须有真实可达证据，才安排局部修正。
 
 这些单元不等于固定提交次数或工时承诺。已识别的多余复杂度是旧公开内容模型与专属测试回放协议，二者已退出；不据剩余符号数启动新一轮整体重构。Core/View 分层、创建/cleanup 的真实 FrameOutput role、执行依赖保活、原 failure owner 与残留责任按调用者保留。阶段 checklist 仍按完整验收勾选，不因局部通过整阶段打勾，也不将尚未勾选误报为功能从未实现。
 
@@ -188,7 +188,7 @@ cargo test -p bevy_ui_router --features bsn --test bsn_facade_features --locked
 
 - [x] 独立 workspace facade BSN consumer 在自身 lock 上核对官方解析图与 feature 前置，运行真实 root/nested/error；应用只依赖 facade 与实际需要的官方 Bevy crates。LF/CRLF 对照已运行；Windows 原生验证保持 NOT_RUN。
 - [x] 安排 Core、ECS、public/consumer 三视角独立审查；复杂关键问题用两个代理自由交叉评价。主代理核实证据并修正，重跑受影响最高层 gate；最终 fixture 差异另经独立审查。
-- [ ] 仅在 spec 验收结果、独立审查与全量验证齐全后记录 MVP completion；检查 main 当前状态与 worktree 后按 finishing-branch 流程集成。合并后重跑必要 smoke，记录具体集成 commit；未完成集成不能把总体 goal 标为 complete。
+- [x] 仅在 spec 验收结果、独立审查与全量验证齐全后记录 MVP completion；已检查 main 和唯一 worktree，快进集成到 `7a34fcc`，合并后公开旅程 36 项及独立 facade consumer（含示例）再次通过。
 
 **提交纪律**：仅精确 `git add <files>`，提交前检查 `git diff --cached --name-status` 和 staged diff；不包含他人文件。需要远端 push/PR 或扩大动作范围时按当前用户授权判断，不因“MVP 完成”自动发布包。
 
@@ -286,6 +286,8 @@ native 公共旅程检查点（2026-09-22，本记录所在提交）：原 fixtu
 Core/ECS/public 三视角独立审查及交叉已完成，修正经 Core/ECS 冻结增量复审通过；下一普通更新的补证也已复审。生产冻结版本完整 Core（428 单测及 integration/28 doctests）、ECS all-features（665 + 1）/no-default（617 + 1）、完整 facade（含 36 native journeys、19 focus、13 input、独立 LF/CRLF consumer 与示例）、workspace all-target/all-feature check 均 exit 0；主代理完整 workspace all-features test exit 0。最后仅扩展原测试尾部，实施者及主代理定向三项均通过，fmt/diff 与冻结哈希核对通过，不冒称再次运行全部 suite。按独立证据归集核对，阶段 C/D 剩余项现已勾选；阶段 E 的有界 fixture 清理、最终同版本门禁及 main 集成仍开放。既有 warnings 与 Windows/最低 Rust/GPU/硬件 NOT_RUN 保留。
 
 最终私有 fixture 减法（2026-09-23）：在 `e35a832` 上按真实调用者和测试责任删除六文件中的无用 helper、writer-only despawn、纯源码形状检查，共 9 行新增、1035 行删除；真实未知 handle、三个故障的写前阻断、terminal owner、registry seal/claim 与写后漂移回归保留。独立 spec/quality 差异审查无 finding。实施者完整 ECS all-features（660 + 1）/no-default（612 + 1）、facade（85）及 workspace check 均 exit 0。主代理按六文件冻结哈希重跑最终同版本门禁：workspace fmt、显式 consumer/示例格式、all-target/all-feature check、workspace all-feature tests（Core 428、ECS 660、public journeys 36、Core compile-fail 12、独立 LF/CRLF consumer、Core doctests 28）、独立 doctests、facade 四 feature 组合与 BSN feature test、diff check 全部 exit 0。首次全量运行因临时构建空间耗尽而失败，环境恢复后同一源码完整重跑通过；失败未被记作产品通过。现有 warnings 仍在，Windows 原生、最低 Rust 执行、GPU/窗口及真实硬件输入 NOT_RUN。下一步为 main 集成和合并后 smoke。
+
+本地集成（2026-09-23）：最终私有 fixture 减法与验收记录提交为 `7a34fcc`。检查当前分支工作区干净、`main=c67aa318`、merge-base 相同且只有一个 checkout 后，执行 `git switch main` 与 `git merge --ff-only sys/structural-governance`，本地 main 快进到 `7a34fcc`。合并后 `cargo test -p bevy_ui_router --all-features --test public_navigation_journeys --test facade_consumers --locked --offline` exit 0，36 项公开旅程和独立 facade consumer（含原样 quick start、嵌套示例及 LF/CRLF 对照）均通过。验收范围为已运行的 Linux/headless 环境；现有 warnings 保留，Windows 原生、最低 Rust 执行、GPU/窗口及真实硬件输入 NOT_RUN。未执行远端 push 或包发布。
 
 每个阶段结束只补充：交付 commit、实际命令与结果、审查结论/未决项、下一依赖；临时构建路径、完整日志和细碎排查过程不固化成长期经验。阶段内私有文件布局和检查点可调整，影响公共语义、范围或信任边界才需要重新确认。
 
