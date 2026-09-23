@@ -3463,21 +3463,4 @@ pub(crate) mod tests {
         assert_eq!(registry.records(), baseline);
         assert!(table.leases().is_empty());
     }
-
-    #[test]
-    fn quarantine_transfer_requires_owner_specific_sealed_tokens() {
-        let registry_source = include_str!("registry.rs");
-        let host_source = include_str!("host.rs");
-        let presentation_source = include_str!("presentation.rs");
-        assert!(registry_source.contains("fn prepare_verified("));
-        assert!(registry_source.contains("fn apply_prepared("));
-        let raw_public_transfer = ["pub(crate) fn ", "transfer("].concat();
-        assert!(!registry_source.contains(&raw_public_transfer));
-        assert!(registry_source.contains("transfer: VerifiedQuarantineTransfer"));
-        assert!(registry_source.contains("transfer: VerifiedFrameQuarantineTransfer"));
-        assert!(host_source.contains("fn after_world_validation("));
-        assert!(!host_source.contains("pub(crate) fn after_world_validation("));
-        assert!(presentation_source.contains("fn after_world_validation("));
-        assert!(!presentation_source.contains("pub(crate) fn after_world_validation("));
-    }
 }

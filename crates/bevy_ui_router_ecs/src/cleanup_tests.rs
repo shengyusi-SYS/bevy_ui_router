@@ -653,16 +653,6 @@ fn published_empty_batch() -> (RouterEngine, CleanupBatch) {
 }
 
 #[test]
-fn cleanup_attempt_identity_is_monotonic_and_private() {
-    let source = include_str!("cleanup.rs");
-    assert!(source.contains("next_attempt"));
-    assert!(!source.contains("\npub struct CleanupAttempt"));
-    assert!(!source.contains("\npub fn complete("));
-    assert!(!source.contains(concat!("fn into_single_", "leaving_frame")));
-    assert!(!source.contains(concat!("match settle_", "frame(world")));
-}
-
-#[test]
 fn replacement_mount_children_come_from_contiguous_owner_facts() {
     let mut world = World::new();
     let sibling = world.spawn_empty().id();

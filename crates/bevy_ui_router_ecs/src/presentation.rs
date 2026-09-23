@@ -2808,85 +2808,6 @@ fn prepare_presentation_access<'w>(
     ))
 }
 
-pub(crate) fn prepare_cleanup_quarantine_mutation<'w>(
-    world: &'w mut World,
-    claims: &[ExactRegistryClaim],
-) -> Option<PreparedPresentationMutation<'w>> {
-    let mut targets = Vec::with_capacity(claims.len());
-    for claim in claims {
-        let kind = match claim.owner() {
-            RegistryOwner::Committed(
-                EntityOwner::FrameShell(_)
-                | EntityOwner::FrameContentTarget(_)
-                | EntityOwner::FrameOutput { .. },
-            ) => PresentationTargetKind::Frame,
-            RegistryOwner::Committed(EntityOwner::ChildSlot { .. }) => {
-                PresentationTargetKind::ChildSlot
-            }
-            _ => return None,
-        };
-        targets.push(FrameMutationTarget {
-            entity: claim.entity(),
-            current: claim.lifecycle(),
-            next: EntityLifecycle::Quarantined,
-            active_after: false,
-            interactive: false,
-            kind,
-        });
-    }
-    prepare_presentation_mutation(world, &targets)
-}
-
-pub(crate) fn repair_missing_pickable_for_cleanup_quarantine(
-    world: &mut World,
-    claims: &[ExactRegistryClaim],
-) -> bool {
-    if claims.iter().any(|claim| {
-        !matches!(
-            claim.lifecycle(),
-            EntityLifecycle::PreparedInert | EntityLifecycle::Leaving
-        )
-    }) {
-        return false;
-    }
-    let missing = claims
-        .iter()
-        .filter_map(|claim| {
-            world
-                .get::<Pickable>(claim.entity())
-                .is_none()
-                .then_some(claim.entity())
-        })
-        .collect::<Vec<_>>();
-    let claims_are_inert_and_exact = |world: &World| {
-        claims.iter().all(|claim| {
-            world
-                .resource::<RouteEntityRegistry>()
-                .record(claim.entity())
-                .is_some_and(|record| record.claim() == *claim)
-                && world.get::<RouteOwnershipSeal>(claim.entity())
-                    == Some(&RouteOwnershipSeal::new(claim.seal()))
-                && world.get::<Visibility>(claim.entity()) == Some(&Visibility::Hidden)
-                && world
-                    .get::<RouterInputBarrier>(claim.entity())
-                    .is_some_and(RouterInputBarrier::denies_all)
-                && world.get::<FrameLifecycle>(claim.entity())
-                    == Some(&FrameLifecycle(claim.lifecycle()))
-        })
-    };
-    if !claims_are_inert_and_exact(world) {
-        return false;
-    }
-    for entity in missing {
-        world.entity_mut(entity).insert(Pickable::IGNORE);
-    }
-    world.flush();
-    claims_are_inert_and_exact(world)
-        && claims
-            .iter()
-            .all(|claim| world.get::<Pickable>(claim.entity()) == Some(&Pickable::IGNORE))
-}
-
 pub(crate) fn validate_active_frame(world: &World, frame: &RealizedFrame) -> bool {
     validate_active_frame_with_child_slots(world, frame, &[])
 }
@@ -2954,10 +2875,6 @@ pub(crate) fn validate_active_frame_with_child_slots_and_entering_shells(
         ),
         CommittedFramePreflight::Ready
     )
-}
-
-pub(crate) fn validate_leaving_frame(world: &World, frame: &RealizedFrame) -> bool {
-    validate_leaving_frame_with_child_slots(world, frame, &[])
 }
 
 pub(crate) fn validate_leaving_frame_with_child_slots(

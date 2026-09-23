@@ -1,17 +1,14 @@
 # Roadmap
 
-**更新时间**：2026-09-22。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
+**更新时间**：2026-09-23。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
 ## Now
 
-- 候选精简、独立迁移基线及 idle host-loss 已完成。官方 native BSN 联动、输入/focus、公共同更新 snapshot 观察、真实导航/恢复 journeys 和推荐 BSN 示例已通过对应审查与验证；当前重心转向有界清理与最终审查，不扩大产品范围。
+- 官方 native BSN、输入/focus、公开导航/恢复与推荐示例已完成。旧公开机制和冗余私有 fixture 已按真实调用者清理，Core/ECS/public 独立及交叉审查、冻结源码全量验证通过；当前仅待 main 集成与合并后 smoke。
 
 ## Next
 
-- 对照统一 spec 归集已经存在的内部 default outlet、location/history、恢复、host/stale、输入/focus 与公共 snapshot 证据；不重做已完成的联动迁移，也不把单个检查点当成完整 MVP 验收。
-- 旧公开 writer/report 入口及专属延迟回放机制已退出，示例已作为独立 consumer 运行；完成私有替身最终边界核查，删除已被替代的重复事实，保留 renderer-neutral 独立验证；不新增 runtime 或通用事务框架。
-- 最终审查的混合诊断保留、发布后原请求结果及 native 隔离预期已修正，经完整相关门禁、普通更新补证和冻结增量复审；下一步是有界 fixture 减法后的最终同版本验收，不再重复整体架构评估。
-- 通过推荐 facade 的独立 BSN consumer、示例、全量验证与独立交叉审查后集成 main；完成前不标记 MVP PASS。
+- 将已通过验收的候选快进合入 main，合并后运行公开旅程、独立 BSN consumer 和示例 smoke，记录集成提交及剩余平台验证边界。
 
 ## Post-MVP
 

@@ -2681,13 +2681,6 @@ impl PreparedBranch {
     pub(crate) const fn from_realized(realized: RealizedBranch) -> Self {
         Self { realized }
     }
-
-    pub(crate) fn into_single_frame(self) -> Result<Option<RealizedFrame>, Self> {
-        match self.realized.into_single_frame() {
-            Ok(frame) => Ok(frame),
-            Err(realized) => Err(Self { realized }),
-        }
-    }
 }
 
 pub(crate) struct PendingCommit {
@@ -2707,24 +2700,6 @@ impl PendingCommit {
 
     pub(crate) fn frame(&self) -> Option<&RealizedFrame> {
         self.branch.first_frame()
-    }
-
-    pub(crate) fn take_single_frame(&mut self) -> Option<RealizedFrame> {
-        let branch = std::mem::replace(&mut self.branch, PreparedBranch::empty());
-        match branch.into_single_frame() {
-            Ok(frame) => frame,
-            Err(branch) => {
-                self.branch = branch;
-                None
-            }
-        }
-    }
-
-    pub(crate) fn restore_single_frame(&mut self, frame: RealizedFrame) {
-        debug_assert!(self.branch.frames().is_empty());
-        self.branch
-            .push_frame(frame)
-            .expect("restored Root frame must retain its empty branch owner");
     }
 }
 

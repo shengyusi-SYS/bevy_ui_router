@@ -390,34 +390,6 @@ impl<'a> FrameContentWriter<'a> {
         Ok(())
     }
 
-    pub fn despawn(&mut self, entity: ContentEntity) -> Result<(), ContentWriteError> {
-        self.validate_session(entity)?;
-        self.validate_live(entity)?;
-
-        let is_outlet = self
-            .plan
-            .outlets
-            .iter()
-            .any(|(outlet, _)| *outlet == entity);
-        if self.plan.parents[entity.index].is_some()
-            || !self.plan.children[entity.index].is_empty()
-            || is_outlet
-        {
-            return Err(ContentWriteError::new(
-                ContentWriteErrorKind::InvalidDespawn,
-            ));
-        }
-
-        self.plan.content[entity.index] = None;
-        self.plan
-            .content_order
-            .retain(|candidate| *candidate != entity);
-        self.plan
-            .topology_order
-            .retain(|candidate| *candidate != entity);
-        Ok(())
-    }
-
     pub fn declare_outlet(
         &mut self,
         anchor: ContentEntity,
@@ -480,7 +452,6 @@ pub enum ContentWriteErrorKind {
     DuplicateParent,
     RelationshipCycle,
     DuplicateOutlet,
-    InvalidDespawn,
 }
 
 #[derive(Debug)]
@@ -508,7 +479,6 @@ impl fmt::Display for ContentWriteError {
             ContentWriteErrorKind::DuplicateParent => "content entity already has a parent",
             ContentWriteErrorKind::RelationshipCycle => "content relationship would form a cycle",
             ContentWriteErrorKind::DuplicateOutlet => "content outlet is already declared",
-            ContentWriteErrorKind::InvalidDespawn => "content entity is still in use",
         };
         formatter.write_str(message)
     }
@@ -616,7 +586,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn outlets_despawn_and_unknown_handles_are_zero_write() {
+    fn invalid_outlets_and_unknown_handles_are_zero_write() {
         let mut plan = ContentPlan::new();
         let mut foreign_plan = ContentPlan::new();
         let anchor = writer(&mut plan).spawn_empty().unwrap();
@@ -644,19 +614,15 @@ pub(crate) mod tests {
             ContentWriteErrorKind::DuplicateOutlet
         );
         assert_eq!(plan, before);
+        let unknown = ContentEntity {
+            session: plan.session,
+            index: plan.content.len(),
+        };
         assert_eq!(
-            writer(&mut plan).despawn(anchor).unwrap_err().kind(),
-            ContentWriteErrorKind::InvalidDespawn
-        );
-        assert_eq!(plan, before);
-
-        let isolated = writer(&mut plan)
-            .spawn_solid_rect(SolidRect::new(2, 3, color()).unwrap())
-            .unwrap();
-        writer(&mut plan).despawn(isolated).unwrap();
-        let before = plan.clone();
-        assert_eq!(
-            writer(&mut plan).despawn(isolated).unwrap_err().kind(),
+            writer(&mut plan)
+                .declare_outlet(unknown, RouteSlotKey::named("unknown").unwrap())
+                .unwrap_err()
+                .kind(),
             ContentWriteErrorKind::UnknownHandle
         );
         assert_eq!(plan, before);

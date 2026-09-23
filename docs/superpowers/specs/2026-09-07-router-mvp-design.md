@@ -221,20 +221,20 @@ request snapshot 提供请求自身 requested/matched/status 和可分类 failur
 
 ## 10. 验收与维护证据
 
-当前证据归集至本记录所在修正检查点（前置 `a45cbc2`）。完整 Core/ECS/facade、workspace tests、独立 consumer/示例及静态检查通过；最终审查的三项接收端缺陷已修正并经独立增量复审。最后 test-only 普通更新补证另有定向通过证据。尚待有界 fixture 清理、最终同版本门禁及 main 集成，不等于 MVP 已完成。命令及检查点结果归 [实施 plan](../plans/2026-09-07-router-mvp-implementation.md)，不维护第二套测试清单。
+当前证据归集至最终私有 fixture 减法后的同一冻结源码。完整 Core/ECS/facade、workspace tests、独立 consumer/示例及静态检查通过；最终审查的三项接收端缺陷已修正并经独立增量复审，最后 test-only 普通更新补证另有定向通过证据。私有 fixture 减法经独立审查，完整门禁重跑通过；尚待 main 集成和合并后 smoke，不等于总体 MVP 已完成。命令及检查点结果归 [实施 plan](../plans/2026-09-07-router-mvp-implementation.md)，不维护第二套测试清单。
 
 | 用户结果/边界 | 必需的独立证据 | 当前验证入口与结论 |
 | --- | --- | --- |
 | 官方可复现依赖与 feature 分层 | resolved lock source/version，无 patch/replacement；无默认 Bevy、无 Core/View Scene 依赖 | [dependency_contract](../../../crates/bevy_ui_router/tests/dependency_contract.rs) 核对真实 resolved graph、lock 与 override 入口，独立 consumer 自身 lock 再核对；基线通过 |
 | 基础路由可用 | builder、index/pathless/静态/params/wildcard、location/search/fragment、无匹配、同优先级 MatchConflict、确定顺序的 Core/View 测试 | [Core matcher](../../../crates/bevy_ui_router_core/src/matcher.rs)、location/route_tree/branch_diff 及 View tests；基线通过，Core 独立审查认可这些职责 |
-| Renderer 边界真实独立 | 最小 fake renderer 或等价替身驱动实际逻辑，不依赖 BSN、不伪造 lifecycle 结论 | ECS 完整 `--no-default-features` 在本修正检查点通过；实际私有管线保留，最后有界 fixture 清理及最终重跑待完成，外部 ECS-only consumer 不冒称 renderer |
+| Renderer 边界真实独立 | 最小 fake renderer 或等价替身驱动实际逻辑，不依赖 BSN、不伪造 lifecycle 结论 | 最终六文件 fixture 减法后，ECS 完整 `--no-default-features` 612+1 通过；实际私有管线保留，外部 ECS-only consumer 不冒称 renderer |
 | 应用可直接使用 BSN | 独立临时 workspace 仅依赖 facade 与所需官方 Bevy crates，注册/运行 root、读取请求结果；短小 quick start | [facade_consumers](../../../crates/bevy_ui_router/tests/facade_consumers.rs) 直接运行 [quick start](../../../crates/bevy_ui_router/examples/bsn_quick_start.rs)，native consumer 同时验证公开调度后的同更新 snapshot；基线通过 |
 | 普通嵌套 UI | 内部 default outlet 的侧栏/工具栏/内容区示例；leaf 切换保留 layout/anchor/slot 和局部状态 | [bsn_nested](../../../crates/bevy_ui_router/examples/bsn_nested.rs) 经独立 consumer 执行真实 UI 布局、四步导航、exact Entity/父链/toolbar 状态对照；基线通过，限于 headless，不是窗口或设备验收 |
 | 历史与更新一致 | push/replace/back、NoBackEntry 同步拒绝、入队后 BackTargetUnavailable、失败 back、等价 location、search 变化、fragment-only leaf remount | [native public journeys](../../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) 的真实 factory input、排队/Back 与更新对照，独立 BSN consumer 验证完整 history；基线通过 |
 | 恢复与 host | boundary/fallback、真实 build/resolve/apply/mount error、恢复再失败、publication 前后 host loss、重新注册 | native public journeys、[BSN facade tests](../../../crates/bevy_ui_router/tests/bsn_facade_features.rs) 与 [ECS 私有精确窗口](../../../crates/bevy_ui_router_ecs/src/navigation/native_tests.rs) 通过；发布后的正常成功和原 Match/Build 失败均保留，HostLost 后一次普通更新仍稳定，原结果缺陷及 native 隔离预期已修正并复审 |
 | Owned-only 与 stale | host 值/关系保持，frame generation 和 task stale 拒绝，稀疏 prefix、owner 单次消费、post-write 局部漂移回归 | Core integration/engine、ECS navigation/registry/native_scene/native_frame 实际输入回归通过；Core/ECS 独立审查及修正增量复核完成，混合诊断去重与 native authored 值严格漂移拒绝有真实正反对照 |
 | 输入与焦点 | 原生 UI layout/picking 有真实正向命中；pending/leaving/failed/residual 拒绝，按下/拖拽跨离场后不再派发到旧目标；keyboard/gamepad gate、focus 释放、动态 child 刷新 | [native input](../../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[native focus](../../../crates/bevy_ui_router/tests/bsn_native_focus.rs)、BSN facade 动态 child 与 ECS gate 回归通过；真实正向命中、历史手势、应用目标保持和官方 focus 顺序已由 ECS/public 独立视角复核 |
-| 跨层收敛 | 受影响 crate 与最高层 public journeys、feature 组合、workspace fmt/check/test/doctest；独立 Core/ECS/public 审查及交叉复核 | 三视角独立与交叉审查已完成，三项缺陷修正经冻结增量复审与实际运行闭合；本检查点完整相关门禁通过，最终 fixture delta、同版本验证及 main 集成待完成，**总体未验收** |
+| 跨层收敛 | 受影响 crate 与最高层 public journeys、feature 组合、workspace fmt/check/test/doctest；独立 Core/ECS/public 审查及交叉复核 | 三视角独立与交叉审查、三项缺陷修正增量复审及最终 fixture 差异独立审查已完成；冻结源码的 workspace fmt/check/test/doctest、facade 四组合及 BSN 测试全部 exit 0，含 Core 428、ECS 660、public journeys 36、独立 LF/CRLF consumer 和 Core doctests 28；待 main 集成与 smoke，**总体未验收** |
 
 Windows 原生、最低 Rust 版本执行、GPU/窗口及真实硬件输入为 NOT_RUN；Linux LF/CRLF、headless 布局和原生输入系统测试不替代这些证据。此处不以已有基线的绿色结果覆盖后来复现的缺陷。
 
