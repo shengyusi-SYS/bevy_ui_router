@@ -1943,12 +1943,11 @@ impl std::fmt::Debug for BeginAuthoritySettlementError {
 #[doc(hidden)]
 pub enum ResolveMountOwner {
     Returned(MountRequest),
-    Reissued,
     Consumed,
 }
 
 #[doc(hidden)]
-#[must_use = "a failed mount resolution returns, reissues, or terminally consumes its request capability"]
+#[must_use = "a failed mount resolution returns or consumes its request capability"]
 pub struct ResolveMountError {
     kind: IntegrationError,
     owner: ResolveMountOwner,
@@ -5750,10 +5749,41 @@ impl BackCapacityCoreProducerSlot<'_> {
     }
 }
 
+const HOST_TRACE_RETENTION: usize = 64;
+
+#[derive(Default)]
+struct HostTraceLog {
+    events: Vec<HostTraceEvent>,
+}
+
+impl HostTraceLog {
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.events.capacity()
+    }
+
+    fn try_reserve(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+        let needed = additional.min(HOST_TRACE_RETENTION.saturating_sub(self.events.len()));
+        self.events.try_reserve(needed)
+    }
+
+    fn push(&mut self, event: HostTraceEvent) {
+        if self.events.len() == HOST_TRACE_RETENTION {
+            self.events.remove(0);
+        }
+        self.events.push(event);
+    }
+}
+
 pub struct RouterEngine {
     inner: CoreRouterEngine,
     admission: HostAdmissionIssuer,
-    host_trace: Vec<HostTraceEvent>,
+    host_trace: HostTraceLog,
+    // Registration deduplication is exact grant evidence, independent of log retention.
+    registered_top_slot: Option<HostTraceEvent>,
     #[cfg(any(test, feature = "test-support"))]
     testing_host_admission_owner: Option<HostAdmissionUnavailablePreStagingOwner>,
     #[cfg(any(test, feature = "test-support"))]
@@ -5816,7 +5846,8 @@ impl RouterEngine {
         Ok(Self {
             inner,
             admission,
-            host_trace: Vec::new(),
+            host_trace: HostTraceLog::default(),
+            registered_top_slot: None,
             #[cfg(any(test, feature = "test-support"))]
             testing_host_admission_owner: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -6968,18 +6999,20 @@ impl RouterEngine {
         }
         let version = grant.inner.version();
         let slot = grant.inner.top_slot();
-        if self.host_trace.iter().any(|event| {
-            event.kind() == HostTraceEventKind::TopSlotRegistered
-                && event.version() == Some(version)
-                && event.slot() == Some(slot)
-        }) {
+        if self
+            .registered_top_slot
+            .as_ref()
+            .is_some_and(|event| event.version() == Some(version) && event.slot() == Some(slot))
+        {
             return Err(IntegrationError::Duplicate);
         }
-        self.host_trace.push(HostTraceEvent::project(
+        let event = HostTraceEvent::project(
             HostTraceEventKind::TopSlotRegistered,
             Some(version.clone()),
             Some(slot),
-        ));
+        );
+        self.registered_top_slot = Some(event.clone());
+        self.host_trace.push(event);
         Ok(())
     }
 
@@ -7005,11 +7038,10 @@ impl RouterEngine {
             Some(version.clone()),
             Some(slot),
         );
-        let observed_trace = self.host_trace.iter().find(|event| {
-            event.kind() == HostTraceEventKind::TopSlotRegistered
-                && event.version() == Some(version)
-                && event.slot() == Some(slot)
-        });
+        let observed_trace = self
+            .registered_top_slot
+            .as_ref()
+            .filter(|event| event.version() == Some(version) && event.slot() == Some(slot));
         if !self.admission.is_outstanding_grant(&grant.inner.grant) {
             return Err(SourceBoundTopSlotRegistrationError::Operation(
                 SourceBoundTopSlotRegistrationOperationFailureEvidence {
@@ -7052,6 +7084,7 @@ impl RouterEngine {
                 },
             )
         })?;
+        self.registered_top_slot = Some(expected_trace.clone());
         self.host_trace.push(expected_trace);
         Ok(())
     }
@@ -7901,7 +7934,6 @@ impl RouterEngine {
                     CoreResolveMountOwner::Returned(inner) => {
                         ResolveMountOwner::Returned(MountRequest { inner })
                     }
-                    CoreResolveMountOwner::Reissued => ResolveMountOwner::Reissued,
                     CoreResolveMountOwner::Consumed => ResolveMountOwner::Consumed,
                 },
             })
@@ -9200,7 +9232,7 @@ impl RouterEngine {
             host: HostSnapshot::project(
                 self.inner.host().cloned(),
                 self.inner.top_slot(),
-                self.host_trace.clone(),
+                self.host_trace.events.clone(),
             ),
         }
     }
@@ -9573,12 +9605,20 @@ mod tests {
     ) -> HostLease {
         let history = engine.history().clone();
         let running = engine.snapshot().running_request();
+        let roots = engine
+            .active()
+            .frames()
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        let obligation_count = roots.len() + 1;
         let mut owner = None;
         assert!(
             engine
                 .begin_idle_host_loss(
                     lease,
-                    &CleanupManifest::new(Vec::new(), revision, 1),
+                    &CleanupManifest::new(roots, revision, obligation_count),
                     |value| owner = Some(value)
                 )
                 .is_ok()
@@ -9589,10 +9629,10 @@ mod tests {
                     owner.unwrap(),
                     IdleHostLossPhysicalFacts {
                         manifest_digest: revision,
-                        obligation_count: 1,
+                        obligation_count,
                         disposition: IdleHostLossPhysicalDisposition::Settled {
                             completion_digest: revision + 1,
-                            settled_count: 1
+                            settled_count: obligation_count
                         },
                     },
                     |_| ()
@@ -9650,6 +9690,68 @@ mod tests {
             panic!("exact admission installs one lease")
         };
         lease
+    }
+
+    #[test]
+    fn repeated_host_readmission_keeps_bounded_recent_trace_without_changing_requests_or_history() {
+        let (mut engine, mut lease) = confirmed_nested_engine_with_lease();
+        let request = settle_push(&mut engine, RouteLocation::new("/"));
+        let history = engine.history().clone();
+        let request_trace = engine.request(request).unwrap().trace().to_vec();
+        for revision in 1..=128 {
+            lease = settle_idle_host_and_readmit(&mut engine, lease, revision);
+            let snapshot = engine.snapshot();
+            assert!(snapshot.host().trace().len() <= 64);
+            assert_eq!(
+                snapshot.host().trace().last().unwrap().kind(),
+                HostTraceEventKind::HostReady
+            );
+            assert_eq!(
+                snapshot.host().trace().last().unwrap().version(),
+                snapshot.host().version()
+            );
+            assert_eq!(engine.history(), &history);
+            assert_eq!(
+                engine.request(request).unwrap().status(),
+                &RequestStatus::Succeeded
+            );
+            assert_eq!(engine.request(request).unwrap().trace(), request_trace);
+        }
+        assert!(engine.idle_host_loss_eligible());
+        let next = settle_push(&mut engine, RouteLocation::new("/"));
+        assert_eq!(
+            engine.request(next).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        assert_eq!(engine.history().len(), history.len() + 1);
+        drop(lease);
+    }
+
+    #[test]
+    fn top_slot_registration_dedup_survives_diagnostic_trace_eviction() {
+        let (mut engine, grant) = ready_engine();
+        engine.record_top_slot_registered(&grant).unwrap();
+        for _ in 0..HOST_TRACE_RETENTION {
+            engine.host_trace.push(HostTraceEvent::project(
+                HostTraceEventKind::AdmissionRejected,
+                None,
+                None,
+            ));
+        }
+        assert!(
+            engine
+                .snapshot()
+                .host()
+                .trace()
+                .iter()
+                .all(|event| { event.kind() != HostTraceEventKind::TopSlotRegistered })
+        );
+        assert_eq!(
+            engine.record_top_slot_registered(&grant),
+            Err(IntegrationError::Duplicate)
+        );
+        let _lease = engine.confirm_host(grant);
+        assert!(engine.idle_host_loss_eligible());
     }
 
     fn foreign_report_task() -> (RouterEngine, RootFrameTask) {
@@ -10763,9 +10865,6 @@ mod tests {
         assert_eq!(error.kind(), IntegrationError::ForeignRouter);
         let request = match error.into_owner() {
             ResolveMountOwner::Returned(request) => request,
-            ResolveMountOwner::Reissued => {
-                panic!("a foreign request remains owned by the caller")
-            }
             ResolveMountOwner::Consumed => {
                 panic!("a foreign request cannot be consumed by the receiver")
             }
@@ -10775,11 +10874,11 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_mount_resolution_reports_core_reissued_request() {
+    fn exhausted_mount_resolution_transfers_request_to_failure_cleanup() {
         let mut engine = confirmed_nested_engine();
         let request = pending_mount_request(&mut engine);
         engine.inner.testing_exhaust_slot_counter();
-        let before = engine.snapshot();
+        let request_id = request.request();
 
         let error = match engine.resolve_mount(request) {
             Ok(_) => panic!("an exhausted slot allocator must not issue a grant"),
@@ -10787,12 +10886,12 @@ mod tests {
         };
 
         assert_eq!(error.kind(), IntegrationError::Exhausted);
-        assert!(matches!(error.into_owner(), ResolveMountOwner::Reissued));
-        let Some(EngineAction::MountRequest(reissued)) = engine.action() else {
-            panic!("Core must reissue the exact exhausted request")
+        assert!(matches!(error.into_owner(), ResolveMountOwner::Consumed));
+        let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+            panic!("Core must transfer exhausted mount work to failure cleanup")
         };
-        assert!(engine.validate_mount_request(&reissued).is_ok());
-        assert_eq!(engine.snapshot(), before);
+        assert_eq!(failure.request(), request_id);
+        assert_eq!(failure.failure().kind(), NavigationFailureKind::Mount);
     }
 
     #[test]

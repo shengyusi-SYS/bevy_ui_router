@@ -84,8 +84,6 @@ impl CleanupScope {
 mod tests {
     use super::*;
 
-    const PHASE_3B_HOST_INTEGRITY_CARRY_FORWARD: &str = "Phase 3B must prove ECS cleanup does not despawn or replace app-owned host entities, and any required relationship updates are explicit.";
-
     #[test]
     fn cleanup_scope_targets_only_router_owned_subtree() {
         let scope = CleanupScope::router_owned_subtree(
@@ -103,14 +101,5 @@ mod tests {
         assert_eq!(scope.generation().raw(), 0);
         assert_eq!(scope.region(), OwnedRegion::RouterOwnedSubtree);
         assert!(scope.excludes_app_owned_host());
-    }
-
-    #[test]
-    fn phase_3b_host_integrity_verification_is_carried_forward() {
-        let note = PHASE_3B_HOST_INTEGRITY_CARRY_FORWARD;
-
-        assert!(note.contains("Phase 3B"));
-        assert!(note.contains("app-owned host"));
-        assert!(note.contains("does not despawn"));
     }
 }

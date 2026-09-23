@@ -6382,13 +6382,14 @@ fn nested_branch_reservation_exhaustion_is_complete_zero_change() {
 }
 
 #[test]
-fn nested_mount_resolution_exhaustion_reissues_request_without_fallback() {
+fn nested_mount_slot_exhaustion_settles_and_starts_queued_root_navigation() {
     let mut engine = ready_engine();
     let before = engine.ids.snapshot();
-    engine.push(RouteLocation::new("/items/1")).unwrap();
+    let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+    let next = engine.enqueue_push(RouteLocation::new("/")).unwrap();
     let reserved = engine.ids.snapshot();
-    assert_eq!(reserved.next_frame(), before.next_frame() + 2);
-    assert_eq!(reserved.next_frame_task(), before.next_frame_task() + 2);
+    assert_eq!(reserved.next_frame(), before.next_frame() + 3);
+    assert_eq!(reserved.next_frame_task(), before.next_frame_task() + 3);
     let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
         panic!("parent task expected")
     };
@@ -6403,25 +6404,43 @@ fn nested_mount_resolution_exhaustion_reissues_request_without_fallback() {
     engine.ids.testing_exhaust_slot_counter();
     let exhausted = engine.ids.snapshot();
 
+    let error = engine.resolve_mount(mount).unwrap_err();
+    assert_eq!(error.kind(), crate::mount::MountError::Exhausted);
     assert!(matches!(
-        engine.resolve_mount(mount).map_err(|error| error.kind()),
-        Err(crate::mount::MountError::Exhausted)
+        error.into_owner(),
+        super::ResolveMountOwner::Consumed
     ));
     assert_eq!(engine.ids.snapshot(), exhausted);
-    let Some(EngineAction::MountRequest(reissued)) = engine.action() else {
-        panic!("resolution exhaustion must reissue the same mount capability")
+    assert!(!engine.mount.projection().has_outstanding());
+    let Some(EngineAction::FailureCleanup(failure)) = engine.action() else {
+        panic!("permanent slot exhaustion must settle the attempt")
     };
-    let failure = engine
-        .reject_mount(
-            reissued,
-            crate::trace::MountRejectionKind::ParentAuthorityLost,
-        )
-        .unwrap();
+    assert_eq!(failure.request(), request);
+    assert_eq!(failure.failure().kind(), NavigationFailureKind::Mount);
+    assert_eq!(failure.logical_roots().len(), 1);
     assert_eq!(
-        failure.failure().kind(),
-        NavigationFailureKind::AuthorityLost
+        engine.request(next).unwrap().status(),
+        &RequestStatus::Queued
     );
-    assert_eq!(engine.ids.snapshot(), exhausted);
+    let cleanup = prepare_failure_cleanup(&mut engine, failure, 0x51e, 1);
+    let fallback = complete_failure_cleanup_into_router_fallback(&mut engine, request, &cleanup);
+    let cleanup = publish_action(&mut engine, EngineAction::FrameTask(fallback));
+    engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    assert!(
+        matches!(engine.request(request).unwrap().status(), RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::Mount)
+    );
+    assert!(
+        engine.history().is_empty(),
+        "the failed navigation must not enter history"
+    );
+    let cleanup = publish_current(&mut engine);
+    engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    assert_eq!(
+        engine.request(next).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(engine.history().current(), Some(&RouteLocation::new("/")));
+    assert!(engine.action().is_none());
 }
 
 #[test]
@@ -8120,6 +8139,89 @@ fn authority_protocol_failure_retires_lease_and_rejects_readmission_before_issue
         Err(AdmissionError::AuthorityExists)
     );
     assert_eq!(engine.ids.snapshot(), ids_before);
+}
+
+#[test]
+fn authority_protocol_terminal_prepares_queue_retention_before_consuming_owner() {
+    let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+    let running = engine.push(RouteLocation::new("/items/1")).unwrap();
+    let queued = (0..70)
+        .map(|_| engine.enqueue_push(RouteLocation::new("/items/2")).unwrap())
+        .collect::<Vec<_>>();
+    let before = engine.snapshot();
+    assert!(!engine.fail_closed_authority_protocol(|| false));
+    assert_eq!(engine.snapshot(), before);
+    assert!(issuer.has_current());
+
+    let consumed = std::cell::Cell::new(0);
+    assert!(
+        engine
+            .fail_closed_authority_protocol_retaining(&mut issuer, Some(lease), || consumed
+                .set(consumed.get() + 1),)
+            .is_ok()
+    );
+    assert_eq!(consumed.get(), 1);
+    assert!(!issuer.has_current());
+    assert!(engine.action().is_none());
+    assert!(engine.running_request().is_none());
+    assert!(engine.queue.is_empty());
+    assert_eq!(engine.records.len(), 64);
+    assert!(matches!(
+        engine.private_lookup(running),
+        PrivateRequestLookup::Evicted
+    ));
+    for request in &queued[..6] {
+        assert!(matches!(
+            engine.private_lookup(*request),
+            PrivateRequestLookup::Evicted
+        ));
+    }
+    for request in &queued[6..] {
+        let record = engine.request(*request).unwrap();
+        assert!(matches!(record.status(), RequestStatus::Failed(failure)
+            if failure.kind() == NavigationFailureKind::AuthorityLost));
+        assert_eq!(
+            record.trace().last(),
+            Some(&NavigationTraceEvent::request_terminal())
+        );
+    }
+}
+
+#[test]
+fn permanent_cleanup_failure_preserves_published_request_outcome_and_history() {
+    for (location, succeeded) in [("/items/2", true), ("/missing", false)] {
+        let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        settle_current(&mut engine);
+        let request = engine.push(RouteLocation::new(location)).unwrap();
+        let _normal_cleanup = publish_current(&mut engine);
+        let committed_history = engine.history().clone();
+        let queued = engine.enqueue_push(RouteLocation::new("/items/3")).unwrap();
+        let isolated = std::cell::Cell::new(0);
+        assert!(
+            engine
+                .fail_closed_authority_protocol_retaining(&mut issuer, Some(lease), || isolated
+                    .set(isolated.get() + 1),)
+                .is_ok()
+        );
+        assert_eq!(isolated.get(), 1);
+        assert_eq!(engine.history(), &committed_history);
+        let status = engine.request(request).unwrap().status();
+        if succeeded {
+            assert_eq!(status, &RequestStatus::Succeeded);
+        } else {
+            assert!(matches!(status, RequestStatus::Failed(failure)
+                if failure.kind() == NavigationFailureKind::Match));
+        }
+        assert!(
+            matches!(engine.request(queued).unwrap().status(), RequestStatus::Failed(failure)
+            if failure.kind() == NavigationFailureKind::AuthorityLost)
+        );
+        assert!(engine.running_request().is_none());
+        assert!(engine.action().is_none());
+        assert!(engine.pending_post_commit_terminal.is_none());
+        assert!(engine.pending_post_commit_settlement_trace.is_none());
+    }
 }
 
 #[test]

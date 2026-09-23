@@ -2,7 +2,7 @@ use super::*;
 use crate::prelude::*;
 use bevy_app::{App, TaskPoolPlugin};
 use bevy_asset::AssetPlugin;
-use bevy_ecs::prelude::Mut;
+use bevy_ecs::prelude::{Component, Mut};
 use bevy_ecs::template::{Template, TemplateContext};
 use bevy_internal::reflect as bevy_reflect;
 use bevy_scene::{SceneFunction, ScenePlugin};
@@ -227,6 +227,281 @@ fn settle(app: &mut App) {
     for _ in 0..20 {
         app.update();
     }
+}
+
+#[derive(Component, Clone, Default)]
+struct AppCleanupNotice;
+
+#[derive(Component)]
+struct AppHostCleanupObserved;
+
+#[derive(Resource)]
+struct AppCleanupHost(Entity);
+
+#[derive(Component)]
+struct AppHostChildrenObserved;
+
+#[derive(Component)]
+struct AppUnrelatedSpawnObserved;
+
+#[test]
+fn native_host_admission_allows_app_children_observer_to_mark_host() {
+    use bevy_ecs::prelude::{Commands, Insert, Local, On};
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+    ));
+    let driver = app
+        .register_bsn_view(ViewDriverKey::new("app-host-marker").unwrap(), |_| {
+            Ok(bevy_scene::bsn! { Node })
+        })
+        .unwrap();
+    let view = RouteViewKey::new("app-host-marker").unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)))
+        .id();
+    let unrelated = app.world_mut().spawn_empty().id();
+    let removable = app.world_mut().spawn_empty().id();
+    app.world_mut().add_observer(
+        move |event: On<Insert, Children>, mut commands: Commands, mut observed: Local<bool>| {
+            if event.entity == host && !*observed {
+                *observed = true;
+                commands.entity(host).insert(AppHostChildrenObserved);
+                commands.entity(unrelated).insert(AppHostChildrenObserved);
+                commands.spawn(AppUnrelatedSpawnObserved);
+                commands.entity(removable).despawn();
+            }
+        },
+    );
+    settle(&mut app);
+    assert!(
+        app.world().get::<AppHostChildrenObserved>(host).is_some(),
+        "the application's public Children observer must execute"
+    );
+    assert!(
+        app.world()
+            .get::<AppHostChildrenObserved>(unrelated)
+            .is_some()
+    );
+    assert!(app.world().get_entity(removable).is_err());
+    let mut spawned = app.world_mut().query::<&AppUnrelatedSpawnObserved>();
+    assert_eq!(spawned.iter(app.world()).count(), 1);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready,
+        "an unrelated app host marker must not reject host admission"
+    );
+    let host_before = ProjectionlessHostProjection::from(entry.host.as_ref().unwrap());
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Route);
+    assert_eq!(
+        entry.engine.active().location(),
+        Some(&RouteLocation::new("/"))
+    );
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert_eq!(
+        ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+        host_before
+    );
+    assert!(app.world().get::<AppHostChildrenObserved>(host).is_some());
+}
+
+#[test]
+fn native_failed_child_cleanup_allows_app_hook_to_mark_host() {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+    ));
+    app.world_mut()
+        .register_component_hooks::<AppCleanupNotice>()
+        .on_despawn(|mut world, _| {
+            let host = world.resource::<AppCleanupHost>().0;
+            world.commands().entity(host).insert(AppHostCleanupObserved);
+        });
+    let layout_driver = app
+        .register_bsn_view(ViewDriverKey::new("app-hook-layout").unwrap(), |_| {
+            Ok(bevy_scene::bsn! { Node AppCleanupNotice bevy_ui_router_bsn::DefaultOutlet })
+        })
+        .unwrap();
+    let child_driver = app
+        .register_bsn_view(ViewDriverKey::new("app-hook-child").unwrap(), |input| {
+            if input.location().path() == "/broken" {
+                return Err(bevy_ui_router_bsn::BsnBuildError::new(
+                    "application child build failed",
+                ));
+            }
+            Ok(bevy_scene::bsn! { Node })
+        })
+        .unwrap();
+    let reported_failure = Arc::new(std::sync::Mutex::new(None));
+    let fallback_failure = reported_failure.clone();
+    let fallback_driver = app
+        .register_bsn_view(
+            ViewDriverKey::new("app-hook-fallback").unwrap(),
+            move |input| {
+                *fallback_failure.lock().unwrap() = input.failure().cloned();
+                Ok(bevy_scene::bsn! { Node })
+            },
+        )
+        .unwrap();
+    let layout = RouteViewKey::new("app-hook-layout").unwrap();
+    let child = RouteViewKey::new("app-hook-child").unwrap();
+    let fallback = RouteViewKey::new("app-hook-fallback").unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(layout.clone()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("broken").unwrap(),
+            RouteNodeOptions::new().with_view(child.clone()),
+        )
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(layout, RouteViewDescriptor::new(layout_driver))
+        .unwrap();
+    views
+        .insert(child, RouteViewDescriptor::new(child_driver))
+        .unwrap();
+    views
+        .insert(fallback.clone(), RouteViewDescriptor::new(fallback_driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)))
+        .id();
+    app.insert_resource(AppCleanupHost(host));
+    app.update();
+    let host_before = ProjectionlessHostProjection::from(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap(),
+    );
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/broken"))
+        .unwrap();
+    settle(&mut app);
+    assert!(
+        app.world().get::<AppHostCleanupObserved>(host).is_some(),
+        "the application's own Scene component hook must execute"
+    );
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(
+        matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ),
+        "child failure must finish recovery after the app host marker changes: {:?}",
+        entry.engine.request(request).unwrap().status()
+    );
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    let original = reported_failure
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("fallback receives the original build failure");
+    assert_eq!(original.kind(), NavigationFailureKind::Build);
+    assert!(
+        original
+            .message()
+            .contains("application child build failed")
+    );
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Failed(original.clone())
+    );
+    assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Error);
+    assert_eq!(
+        entry.engine.active().requested(),
+        Some(&RouteLocation::new("/broken"))
+    );
+    assert_eq!(entry.engine.active().failure(), Some(&original));
+    assert_eq!(entry.engine.active().frames().len(), 1);
+    assert_eq!(
+        entry.engine.active().frames()[0].origin(),
+        &FrameOrigin::RouterFallback
+    );
+    assert!(entry.engine.history().is_empty());
+    assert_eq!(
+        ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+        host_before
+    );
+    assert!(app.world().get_entity(host).is_ok());
+
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.request(next).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Failed(original)
+    );
+    assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Route);
+    assert_eq!(
+        entry.engine.active().location(),
+        Some(&RouteLocation::new("/"))
+    );
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready
+    );
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert_eq!(
+        ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+        host_before
+    );
+    assert!(app.world().get::<AppHostCleanupObserved>(host).is_some());
 }
 
 #[derive(Clone, Copy)]

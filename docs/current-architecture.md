@@ -32,6 +32,10 @@ BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory �
 
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
+普通 cleanup ledger 用一个停止原因保存原 refreeze/settlement 证据；永久停止通过现有隔离与终结入口移交整个 ledger，不另存一个永久等待的前台 holder。应用自有 host 的无关组件变更不再要求完整 manifest 相等；host staging 也不再冻结整个 World 的实体/组件清单，配套的资源载体回填白名单已删除。相关 host/slot 身份、关系、registry、quarantine 与输入事实仍需匹配，foreign target 内容仍隔离保全。Core 的普通 fail-closed 和三条 Back 终结路径复用私有记录准备/安装，分支的 source、owner 和结果分类保持独立；发布后的清理失败保留已发布的原请求结果与 history。
+
+host trace 只保留最近 64 条事件，当前 top-slot 注册去重证据独立于日志保留，避免正常反复接纳导致诊断无限增长或日志淘汰改变 authority。
+
 facade 合同验证已迁往独立 consumer 与语义依赖检查；ECS 遗漏的旧文档 catalogue、两项 AST API 清单及已替代的私有源码形状断言也已退出。独立 workspace 的真实 BSN consumer 已运行嵌套/history/错误恢复与 LF/CRLF 对照；旧 session 专属公开拒绝行随 API 删除，身份、handle、navigation/publication 权限拒绝仍保留。ECS-only consumer 只证明插件资源、安装拒绝和普通更新行为，不声称外部独立 renderer；无 BSN 的渲染/lifecycle 独立性由 ECS 私有真实管线测试验证。推荐示例也由独立 consumer 直接运行；完整同版本验证已通过，集成状态见 plan。
 
 `a153520` 在同一独立 BSN consumer 内验证普通应用系统于 `Update` 的公开 `PublishSnapshots` 标签之后读取本轮完整 snapshots；实际 native 输入授权作为独立发布证据，防止延后一轮的旧快照靠 polling 通过。此 test-only 检查点没有新增 runtime 或公开 API。

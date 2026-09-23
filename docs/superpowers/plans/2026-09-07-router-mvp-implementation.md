@@ -1,5 +1,49 @@
 # Bevy UI Router MVP Implementation Plan
 
+## 上线前真实使用审查（2026-09-23，本轮审查与局部重构完成）
+
+本轮由用户明确要求全面核查并修正、清理、补充。沿用统一 spec；此前 Linux/headless MVP 通过不等于上线审查完成。以完整公开能力、生命周期分支和应用集成路径为审查单位，不以测试数量、抽样或未执行的旧文件代替证据。
+
+- [x] Core/View：逐模块核对定义/匹配、输入更新、history、请求队列与保留、诊断、identity、owner、恢复及 publication 的合同与真实正反验证。
+- [x] ECS/BSN：逐入口核对安装、host/outlet、官方 Scene preparation/apply/adoption、成功切换、partial failure、cleanup、stale、host loss/readmission 和长期重复使用。
+- [x] 输入/focus：完整核对原生 pointer 与历史手势、pending/failed/residual、动态内容、官方焦点队列及应用在 Ready 后消费 keyboard/gamepad gate；补真实 BSN 负向路径和独立有效目标对照。
+- [x] Facade/示例/依赖：核对所有 feature 的正向使用及禁用边界、原样独立 consumer、逐步布局/状态保留、文档命令与 runtime 前置；迁移有效旧断言后删除失效测试、脚本和无调用 fixture。
+- [x] 修正直接注入容量结果的 seam，使错误来自真实 reservation predicate；通过定向故障敏感性验证证明移除关键判定会使回归失败。
+- [x] 真实环境：按用户澄清面向全平台，但没有明显平台限制时不新增跨平台测试矩阵；静态核对平台限制，重点验证真实应用插件组合。未执行的最低 Rust、窗口/GPU 与设备输入不借 headless 结果替代。
+- [x] 对新增发现逐项复现/修正/回归，并做独立交叉复核；同一最终源码重跑 fmt、workspace all-target check、完整 tests/doctests、ECS 无 BSN、facade feature/consumer 门禁。
+
+主代理独占 Cargo/rustc、index 和提交。审查代理按 Core/View、ECS/BSN、输入/focus 划分；文件修改单独指定 owner。审查结果与命令证据在本节归集，不新增第二份 spec 或固定测试 catalogue。
+
+### 本轮减法与局部重构
+
+用户已确认先复盘根因再实施。保留路由、history、布局复用、失败恢复、owned-only 和输入撤权合同；不把可信应用代码当作恶意 World 沙箱，不以理论计数器耗尽驱动新协议。
+
+- [x] 用公开 BSN Scene 的应用组件 hook 验证 app-owned host 的无关组件变化；按实际写入授权收窄 ordinary failure cleanup 的 protected 校验。另以公开 Children observer 复现 host 接纳误拒绝，删除 staging 的全 World 组件/实体冻结及资源载体白名单，保留相关关系、目标写入范围和 exact ownership 拒绝。
+- [x] 整理 ordinary failure cleanup 的推进结果，区分完成、真实可重试等待和永久停止；停止物理写入不能替代请求终结，残留责任不能继续占据前台请求。
+- [x] 在真实路径支持下复用请求级终结准备与 owner 移交；删除被替代的永久 pending holder，不逐个新增 Back/refreeze 专属恢复 API，也不一次重写所有状态机。
+- [x] 更新旧测试中无意义的组件清单冻结和永久 Running 预期，保留写入范围、host 状态、原错误来源、history 与后续请求行为；同一版本运行受影响完整 crate 和 public consumer/journey 门禁。
+
+已撤下未实现的 Back 专用接口草稿。删除私有 shell 组件及极端计数器测试仅作为内部健壮性证据，不能代替公开应用故障或自动成为上线阻断。
+
+### 本轮结果与验证
+
+- 根因修正：可信 Scene 销毁 hook 给 host 添加普通组件后，仍按原 Build failure 发布 fallback，随后导航成功；host Children observer 修改、新建、删除无关应用实体后，接纳与导航正常。没有把新应用实体登记为 router-owned，也没有扩大清理写入集合。
+- 生命周期减法：ordinary ledger 合并永久停止原因并保留原证据，删除额外的永久等待 holder；拒绝移交时返回原 ledger。Core 四条终结路径复用私有记录准备/安装，不合并分支 source/owner/continuation。已发布 normal 保持 Succeeded，已发布 error 保持原失败，history 不被清理故障改写。
+- 长期使用与边界：host trace 保留最近 64 条，exact 注册去重独立保存；slot 耗尽不再无限重发；seal 耗尽在分配前拒绝。计数极限属于低成本健壮性修复，不据此夸大常见上线风险。
+- 示例与测试：嵌套示例每次导航检查布局/状态保留；独立 BSN consumer 连续 96 次替换检查存活实体和 history。补原生 pending/failed/residual、动态内容、Back/fallback 手势和应用 Ready 后输入消费。删除未注册旧测试、25 个无引用 fixture、失效 catalogue 脚本及无合同依据的源码形状扫描；必要 authority 边界由真实编译拒绝验证。
+- 测试有效性：临时绕过真实 verified/unresolved reservation、owner CAS、staging reservation 后，相关回归均实际失败；还原后完整门禁通过。没有保留 mutant，也没有用注入 terminal/classification 代替生产判断。
+- 独立审查：Core/View、普通 ECS/BSN、输入/focus、specialized Back/no-target/target-permanent/PostCommit、capacity 与 facade/示例分别核对，并对本轮终结分类与 host 写入范围交叉复核。未根据私有 receiver/batch 破坏探针新增恢复协议；未证明正常应用可达的既有 inert 分支不作为本轮扩张实现的理由。
+
+最终同一源码验证（成功命令输出已核对，0 failed / 0 ignored）：
+
+- `cargo fmt --all -- --check`，以及独立 consumer 源文件的 Rust 2024 格式检查。
+- `cargo check --workspace --all-targets --all-features --locked --offline`。
+- `cargo test --workspace --all-features --locked --offline`：1,217 项单元/集成测试、28 项 doctest；其中 Core 431、ECS 666，独立 consumer 与两个原样示例均通过。
+- `cargo test -p bevy_ui_router_ecs --no-default-features --locked --offline`：616 项单元测试与 1 项公开 API 测试。
+- facade 的无默认 feature、默认、仅 ecs、bsn 四组 `cargo check` 均通过；独立 consumer 同时验证启用组合及禁用模块拒绝。
+
+验证环境为 Linux/headless 与真实 Bevy Scene/UI/picking/focus 管线；未运行窗口/GPU、真实设备、最低 Rust 或其它操作系统原生执行。未发现本项目 runtime 的显式平台专属限制，按用户要求没有增加跨平台测试矩阵。既有 warnings 未作无关清零。
+
 > **For agentic workers:** 执行时使用 `subagent-driven-development` 或 `executing-plans`，按下述交付结果推进与审查。用户已授权统一规划、合理调度子代理和安排提交；不为每个小修复重复征求流程选择，不机械套用 TDD 或另立 spec。
 
 **Goal:** 完成可从稳定 facade 使用的官方同步 BSN Router MVP，保留完整基础/嵌套路由、history、恢复和 owned-only/input/focus 语义。

@@ -102,10 +102,9 @@ use crate::{
         BackCapacityRetireDisposition, BackCapacityRetireError, BackCapacityRetireOutcome,
         BackCapacityRetirementEvidence, BackNoTargetZeroCompletionPreparationEvidence,
         BackNoTargetZeroCompletionSourceIdentity, BoundBackCapacityReservation, CleanupLedger,
-        CleanupLedgerReserveError, CleanupLedgerReserveErrorKind,
-        CleanupSettlementPermanentEvidence, EnqueueRejected, FailedAuthorityBoundaryBinding,
-        FailedBoundaryDrift, FailedBoundarySource, FailedManifestBuildError,
-        FailedPreparedTopologyError, FailureCleanupSourceProjection,
+        CleanupLedgerReserveError, CleanupLedgerReserveErrorKind, EnqueueRejected,
+        FailedAuthorityBoundaryBinding, FailedBoundaryDrift, FailedBoundarySource,
+        FailedManifestBuildError, FailedPreparedTopologyError, FailureCleanupSourceProjection,
         FrozenBackNoTargetAuthorityPartition, FrozenCleanupManifest,
         FrozenOriginalCleanupLedgerTransfer, FrozenPostCommitAuthorityPartition,
         ManifestNeutralLedgerSlot, NoTargetCapacityPermit, PendingBoundaryBinding,
@@ -2082,7 +2081,6 @@ struct PendingHostConfirmation {
     staged: StagedProvisionalTopSlot,
     claim: ExactRegistryClaim,
     rejection: PreparedHostCandidateRejection,
-    reinserted_resources: [(Entity, bevy_ecs::component::ComponentId); 3],
 }
 
 struct ProvisionalHostAdmissionFailure {
@@ -2202,7 +2200,6 @@ pub(crate) struct RouterEntry {
     pending_mount_mutation_rejection: Option<PendingMountMutationRejection>,
     pending_failed_branch: Option<PendingFailedBranch>,
     failure_cleanup_permanent: Option<FailureCleanupPermanentStableInertOwner>,
-    cleanup_settlement_permanent_inert: Option<CleanupSettlementPermanentInertOwner>,
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
@@ -2557,7 +2554,6 @@ struct ProvenEmptyAttemptOwnerInventory {
     pending_mount_mutation_rejection_vacant: bool,
     pending_failed_branch_vacant: bool,
     failure_cleanup_permanent_vacant: bool,
-    cleanup_settlement_permanent_inert_vacant: bool,
     projectionless_fail_close_vacant: bool,
     cleanup_ledger_vacant: bool,
     authority_protocol_residual_vacant: bool,
@@ -2585,9 +2581,6 @@ impl ProvenEmptyAttemptOwnerInventory {
                 .is_none(),
             pending_failed_branch_vacant: entry.pending_failed_branch.is_none(),
             failure_cleanup_permanent_vacant: entry.failure_cleanup_permanent.is_none(),
-            cleanup_settlement_permanent_inert_vacant: entry
-                .cleanup_settlement_permanent_inert
-                .is_none(),
             projectionless_fail_close_vacant: entry.projectionless_fail_close.is_none(),
             cleanup_ledger_vacant: entry.cleanup_ledger.is_none(),
             authority_protocol_residual_vacant: entry.authority_protocol_residual.is_none(),
@@ -2619,7 +2612,6 @@ impl ProvenEmptyAttemptOwnerInventory {
             && self.pending_mount_mutation_rejection_vacant
             && self.pending_failed_branch_vacant
             && self.failure_cleanup_permanent_vacant
-            && self.cleanup_settlement_permanent_inert_vacant
             && self.projectionless_fail_close_vacant
             && self.cleanup_ledger_vacant
             && self.authority_protocol_residual_vacant
@@ -5467,14 +5459,8 @@ enum AuthorityProtocolResidualKind {
     PostReportSourceDrift(ProjectionlessSourceDriftEvidence),
     PreflightAuthorityLost(LifecyclePreflightEvidence),
     FailureCleanupCompletion(FailureCleanupCompletionMismatchView),
-    CleanupSettlementPermanent(CleanupSettlementPermanentEvidence),
+    CleanupStopped,
     FailureCleanupPermanentAuthority,
-}
-
-struct CleanupSettlementPermanentInertOwner {
-    evidence: CleanupSettlementPermanentEvidence,
-    ledger: CleanupLedger,
-    isolation_contradiction: Option<AuthorityIsolationContradiction>,
 }
 
 impl RouterEntry {
@@ -5792,7 +5778,6 @@ impl RouterNavigation {
             pending_mount_mutation_rejection: None,
             pending_failed_branch: None,
             failure_cleanup_permanent: None,
-            cleanup_settlement_permanent_inert: None,
             projectionless_fail_close: None,
             active: None,
             cleanup_ledger: None,
@@ -5872,7 +5857,10 @@ impl RouterNavigation {
                 NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
             })?;
         if entry.authority_protocol_residual.is_some()
-            || entry.cleanup_settlement_permanent_inert.is_some()
+            || entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_stopped)
         {
             return Err(NavigationEnqueueError::new(
                 NavigationEnqueueErrorKind::HostUnavailable,
@@ -5899,7 +5887,10 @@ impl RouterNavigation {
                 NavigationEnqueueError::new(NavigationEnqueueErrorKind::UnknownRouter)
             })?;
         if entry.authority_protocol_residual.is_some()
-            || entry.cleanup_settlement_permanent_inert.is_some()
+            || entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_stopped)
         {
             return Err(NavigationEnqueueError::new(
                 NavigationEnqueueErrorKind::HostUnavailable,
@@ -5946,7 +5937,10 @@ impl RouterNavigation {
                     }
                 }
                 if entry.authority_protocol_residual.is_some()
-                    || entry.cleanup_settlement_permanent_inert.is_some()
+                    || entry
+                        .cleanup_ledger
+                        .as_ref()
+                        .is_some_and(CleanupLedger::is_stopped)
                 {
                     return Err(NavigationEnqueueError::new(
                         NavigationEnqueueErrorKind::HostUnavailable,
@@ -6316,26 +6310,6 @@ impl HostObservationDelivery {
 }
 
 pub(crate) fn observe_authority_system(world: &mut World) {
-    let reinserted_resources = [
-        world
-            .component_id::<RouterNavigation>()
-            .expect("installed navigation"),
-        world
-            .component_id::<HostCandidateRevisionLatch>()
-            .expect("installed latch"),
-        world
-            .component_id::<HostCandidateRevisionState>()
-            .expect("installed revisions"),
-    ]
-    .map(|component| {
-        (
-            world
-                .resource_entities()
-                .get(component)
-                .expect("installed resource carrier"),
-            component,
-        )
-    });
     let count = world.resource::<RouterNavigation>().entries.len();
     for index in 0..count {
         world.resource_scope(|world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
@@ -6359,7 +6333,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                     if entry.host.is_some()
                         || entry.post_commit_compound.is_some()
                         || entry.authority_protocol_residual.is_some()
-                        || entry.cleanup_settlement_permanent_inert.is_some()
+                        || entry.cleanup_ledger.as_ref().is_some_and(CleanupLedger::is_stopped)
                         || entry
                             .cleanup_ledger
                             .as_ref()
@@ -6464,7 +6438,6 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         previous_candidate_source.as_ref().map(|source| source.digest()),
                         &mut latch,
                         prepared_rejection,
-                        reinserted_resources,
                     );
                     if let Ok(delivery) = delivery {
                         delivery.reconcile(entry);
@@ -6768,7 +6741,6 @@ fn drive_r3_unique_host_candidate(
     expected_observation_digest: Option<u64>,
     latch: &mut HostCandidateRevisionLatch,
     prepared_rejection: PreparedHostCandidateRejection,
-    reinserted_resources: [(Entity, bevy_ecs::component::ComponentId); 3],
 ) -> Result<HostObservationDelivery, HostCandidateCapacityEvidence> {
     if entry
         .settled_retired_host_evidence
@@ -6868,7 +6840,6 @@ fn drive_r3_unique_host_candidate(
                     staged,
                     claim,
                     rejection: prepared_rejection,
-                    reinserted_resources,
                 });
             } else {
                 let settlement =
@@ -6976,7 +6947,6 @@ fn complete_pending_host_confirmations(world: &mut World) {
                     &pending.candidate,
                     &pending.grant,
                     &pending.staged,
-                    &pending.reinserted_resources,
                 )
                 .map(PendingHostRejectionCause::Physical)
             });
@@ -21863,9 +21833,6 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
     if entry.failure_cleanup_permanent.is_some() {
         return;
     }
-    if entry.cleanup_settlement_permanent_inert.is_some() {
-        return;
-    }
     if let Some(mut failed) = entry.pending_failed_branch.take() {
         if entry.cleanup_ledger.is_some() {
             entry.pending_failed_branch = Some(failed);
@@ -22263,7 +22230,7 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
     let Some(mut ledger) = entry.cleanup_ledger.take() else {
         return;
     };
-    if ledger.cleanup_settlement_permanent_evidence().is_some() {
+    if ledger.is_stopped() {
         if let Err(ledger) = fail_closed_cleanup_settlement_permanent(world, entry, ledger) {
             entry.cleanup_ledger = Some(ledger);
         }
@@ -22275,7 +22242,14 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
     }
     if !ledger.is_settled() {
         let Some(attempt) = ledger.attempt(world) else {
-            entry.cleanup_ledger = Some(ledger);
+            if ledger.is_stopped() {
+                if let Err(ledger) = fail_closed_cleanup_settlement_permanent(world, entry, ledger)
+                {
+                    entry.cleanup_ledger = Some(ledger);
+                }
+            } else {
+                entry.cleanup_ledger = Some(ledger);
+            }
             return;
         };
         let settled = if ledger.is_failed_prepared() {
@@ -22296,7 +22270,7 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
             return;
         }
         if !settled {
-            if ledger.cleanup_settlement_permanent_evidence().is_some() {
+            if ledger.is_stopped() {
                 if let Err(ledger) = fail_closed_cleanup_settlement_permanent(world, entry, ledger)
                 {
                     entry.cleanup_ledger = Some(ledger);

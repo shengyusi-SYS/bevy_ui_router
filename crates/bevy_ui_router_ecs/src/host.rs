@@ -1297,41 +1297,17 @@ fn validate_granted_top_slot(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FrozenProvisionalProtectedEntity {
-    entity: Entity,
-    manifest: ComponentManifest,
-    parent: Option<Entity>,
-    children: Vec<Entity>,
-}
-
-impl FrozenProvisionalProtectedEntity {
-    fn try_observe(world: &World, entity: Entity) -> Result<Option<Self>, ()> {
-        Ok(Some(Self {
-            entity,
-            manifest: match ComponentManifest::try_from_world(world, entity)? {
-                Some(manifest) => manifest,
-                None => return Ok(None),
-            },
-            parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
-            children: try_children_of(world, entity)?,
-        }))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrozenProvisionalStagingPartition {
     slot_target: Option<Entity>,
     allowed_writes: Vec<Entity>,
     candidate_host: Entity,
     candidate_host_registration: Option<(RouterHandle, u64)>,
     candidate_host_topology: Option<HostCandidateObservationSource>,
-    candidate_host_non_children_manifest: ComponentManifest,
     candidate_host_parent: Option<Entity>,
     candidate_other_children: Vec<Entity>,
     input_focus: Option<Option<Entity>>,
     route_focus: Option<Option<Entity>>,
     input_gate: Option<Vec<Entity>>,
-    protected_foreign: Vec<FrozenProvisionalProtectedEntity>,
     protected_registry: ProtectedRegistryProjection,
     protected_quarantine: QuarantineLeaseTable,
 }
@@ -1415,44 +1391,13 @@ impl FrozenProvisionalStagingPartition {
         candidate: &ValidatedHostCandidate,
         slot_target: Option<Entity>,
     ) -> Result<Self, HostCandidateCapacityEvidence> {
-        let children_component = world.components().component_id::<Children>();
-        let candidate_entity = world
-            .get_entity(candidate.host)
-            .map_err(|_| staging_capacity_evidence(world, candidate, 0))?;
-        let candidate_host_non_children_manifest = ComponentManifest::try_new(
-            ComponentManifest::observed_component_ids(
-                world,
-                candidate_entity.archetype().components(),
-            )
-            .filter(|component| Some(*component) != children_component),
-        )
-        .map_err(|_| staging_capacity_evidence(world, candidate, world.iter_entities().count()))?;
-        let protected_count = world
-            .iter_entities()
-            .map(|entity| entity.id())
-            .filter(|entity| Some(*entity) != slot_target && *entity != candidate.host)
-            .count();
-        let mut protected_foreign = Vec::new();
-        protected_foreign
-            .try_reserve_exact(staging_reservation_capacity_input(protected_count))
-            .map_err(|_| staging_capacity_evidence(world, candidate, protected_count))?;
-        for entity in world
-            .iter_entities()
-            .map(|entity| entity.id())
-            .filter(|entity| Some(*entity) != slot_target && *entity != candidate.host)
-        {
-            let observed = FrozenProvisionalProtectedEntity::try_observe(world, entity)
-                .map_err(|_| staging_capacity_evidence(world, candidate, protected_count))?
-                .ok_or_else(|| staging_capacity_evidence(world, candidate, protected_count))?;
-            protected_foreign.push(observed);
-        }
-        protected_foreign.sort_by_key(|fact| fact.entity.to_bits());
+        let protected_count = world.iter_entities().count();
         let mut candidate_other_children = try_children_of(world, candidate.host)
             .map_err(|_| staging_capacity_evidence(world, candidate, protected_count))?;
         candidate_other_children.retain(|entity| Some(*entity) != slot_target);
         let mut allowed_writes = Vec::new();
         allowed_writes
-            .try_reserve_exact(1)
+            .try_reserve_exact(staging_reservation_capacity_input(1))
             .map_err(|_| staging_capacity_evidence(world, candidate, 1))?;
         if let Some(slot_target) = slot_target {
             allowed_writes.push(slot_target);
@@ -1484,7 +1429,6 @@ impl FrozenProvisionalStagingPartition {
                 candidate.registration_incarnation(),
             )),
             candidate_host_topology: Some(candidate.observation_source()),
-            candidate_host_non_children_manifest,
             candidate_host_parent: world.get::<ChildOf>(candidate.host).map(ChildOf::parent),
             candidate_other_children,
             input_focus: world.get_resource::<InputFocus>().map(InputFocus::get),
@@ -1492,7 +1436,6 @@ impl FrozenProvisionalStagingPartition {
                 .get_resource::<RouteFocusState>()
                 .map(RouteFocusState::focused),
             input_gate,
-            protected_foreign,
             protected_registry,
             protected_quarantine,
         })
@@ -1555,14 +1498,14 @@ impl FrozenProvisionalStagingPartition {
         self.slot_target.is_none()
             && self.allowed_writes.is_empty()
             && candidate_is_current(world, candidate)
-            && self.protected_matches_inner(world, false, None, &[])
+            && self.protected_matches_inner(world, false, None)
     }
 
     fn protected_matches(&self, world: &World, edge_written: bool) -> bool {
         let Some(slot_target) = self.slot_target else {
             return false;
         };
-        self.protected_matches_inner(world, edge_written, Some(slot_target), &[])
+        self.protected_matches_inner(world, edge_written, Some(slot_target))
     }
 
     fn protected_matches_inner(
@@ -1570,7 +1513,6 @@ impl FrozenProvisionalStagingPartition {
         world: &World,
         edge_written: bool,
         slot_target: Option<Entity>,
-        reinserted_resources: &[(Entity, bevy_ecs::component::ComponentId)],
     ) -> bool {
         if slot_target.is_some_and(|slot| self.allowed_writes.as_slice() != [slot])
             || slot_target.is_none() && !self.allowed_writes.is_empty()
@@ -1602,37 +1544,8 @@ impl FrozenProvisionalStagingPartition {
         {
             return false;
         }
-        let children_component = world.components().component_id::<Children>();
-        let Some(host_entity) = world.get_entity(self.candidate_host).ok() else {
-            return false;
-        };
-        let host_components =
-            ComponentManifest::observed_component_ids(world, host_entity.archetype().components());
-        let host_manifest_matches = host_components.clone().count()
-            == self
-                .candidate_host_non_children_manifest
-                .component_ids()
-                .len()
-                .saturating_add(usize::from(children_component.is_some_and(|children| {
-                    host_components
-                        .clone()
-                        .any(|component| component == children)
-                })))
-            && self
-                .candidate_host_non_children_manifest
-                .component_ids()
-                .iter()
-                .all(|expected| {
-                    host_components
-                        .clone()
-                        .any(|component| component == *expected)
-                })
-            && children_component.is_none_or(|children| {
-                host_components
-                    .clone()
-                    .any(|component| component == children)
-                    == world.get::<Children>(self.candidate_host).is_some()
-            });
+        // App-owned host components are not router ownership authority. Its
+        // registration, Node topology and relationships are checked above/below.
         let expected_children = self
             .candidate_other_children
             .iter()
@@ -1654,8 +1567,7 @@ impl FrozenProvisionalStagingPartition {
         let excluded_target = excluded_storage
             .as_ref()
             .map_or(&[][..], |value| &value[..]);
-        if !host_manifest_matches
-            || !observed_candidate_children.eq(expected_children)
+        if !observed_candidate_children.eq(expected_children)
             || world
                 .get_resource::<RouteEntityRegistry>()
                 .is_none_or(|registry| {
@@ -1668,72 +1580,7 @@ impl FrozenProvisionalStagingPartition {
         {
             return false;
         }
-        for expected in &self.protected_foreign {
-            let Ok(observed_entity) = world.get_entity(expected.entity) else {
-                return false;
-            };
-            if slot_target
-                .is_some_and(|slot| is_descendant_or_self_no_alloc(world, slot, expected.entity))
-            {
-                continue;
-            }
-            let expected_children = expected.children.iter().copied().filter(|entity| {
-                slot_target.is_none_or(|slot| !is_descendant_or_self_no_alloc(world, slot, *entity))
-            });
-            let observed_children = observed_entity
-                .get::<Children>()
-                .into_iter()
-                .flat_map(|children| children.iter().copied())
-                .filter(|entity| {
-                    slot_target
-                        .is_none_or(|slot| !is_descendant_or_self_no_alloc(world, slot, *entity))
-                });
-            let observed_components = ComponentManifest::observed_component_ids(
-                world,
-                observed_entity.archetype().components(),
-            );
-            let expected_components = expected
-                .manifest
-                .component_ids()
-                .iter()
-                .copied()
-                .filter(|component| Some(*component) != children_component);
-            let observed_non_children_count = observed_components
-                .clone()
-                .filter(|component| {
-                    Some(*component) != children_component
-                        && !reinserted_resources.contains(&(expected.entity, *component))
-                })
-                .count();
-            let expected_non_children_count = expected
-                .manifest
-                .component_ids()
-                .iter()
-                .filter(|component| Some(**component) != children_component)
-                .count();
-            if observed_non_children_count != expected_non_children_count
-                || !expected_components.clone().all(|component| {
-                    observed_components
-                        .clone()
-                        .any(|actual| actual == component)
-                })
-                || observed_entity.get::<ChildOf>().map(ChildOf::parent) != expected.parent
-                || !observed_children.eq(expected_children)
-            {
-                return false;
-            }
-        }
-        world
-            .iter_entities()
-            .map(|entity| entity.id())
-            .filter(|entity| Some(*entity) != slot_target && *entity != self.candidate_host)
-            .all(|entity| {
-                self.protected_foreign
-                    .iter()
-                    .any(|expected| expected.entity == entity)
-                    || slot_target
-                        .is_some_and(|slot| is_descendant_or_self_no_alloc(world, slot, entity))
-            })
+        true
     }
 
     fn digest(&self) -> u64 {
@@ -2142,42 +1989,11 @@ pub(crate) fn activated_source_bound_granted_top_slot_is_current(
     grant: &bevy_ui_router_core::integration::SourceBoundHostGrant,
     staged: &StagedProvisionalTopSlot,
 ) -> bool {
-    activated_source_bound_granted_top_slot_after_scopes_is_current(
-        world,
-        candidate,
-        grant,
-        staged,
-        &[],
-    )
-}
-
-pub(crate) fn activated_source_bound_granted_top_slot_after_scopes_is_current(
-    world: &World,
-    candidate: &PreparedEcsHostCandidateSource,
-    grant: &bevy_ui_router_core::integration::SourceBoundHostGrant,
-    staged: &StagedProvisionalTopSlot,
-    reinserted_resources: &[(Entity, bevy_ecs::component::ComponentId)],
-) -> bool {
-    // Only the exact resource component reinsertion planned before the scopes
-    // may differ. Their carrier identity and every other component/edge remain
-    // protected by the original partition; callbacks are not normalized away.
-    reinserted_resources.iter().all(|(entity, component)| {
-        world.resource_entities().get(*component) == Some(*entity)
-            && world
-                .get_entity(*entity)
-                .is_ok_and(|entity| entity.contains_id(*component))
-            && staged.partition.protected_foreign.iter().any(|expected| {
-                expected.entity == *entity && !expected.manifest.component_ids().contains(component)
-            })
-    }) && staged.partition.protected_matches_inner(
-        world,
-        true,
-        Some(staged.entity),
-        reinserted_resources,
-    ) && world
-        .resource::<RouteEntityRegistry>()
-        .record(staged.entity)
-        .is_some_and(|record| record.claim() == staged.claim)
+    staged.partition.protected_matches(world, true)
+        && world
+            .resource::<RouteEntityRegistry>()
+            .record(staged.entity)
+            .is_some_and(|record| record.claim() == staged.claim)
         && validate_source_bound_granted_top_slot(
             world,
             &candidate.candidate,
@@ -2191,7 +2007,6 @@ pub(crate) fn activated_source_bound_granted_top_slot_after_scopes_is_current(
 pub(crate) struct PostScopeHostConfirmationFailure {
     expected_partition: Arc<FrozenProvisionalStagingPartition>,
     observed_partition: ProvisionalStagingPartitionObservation,
-    reinserted_resources: Vec<(Entity, bevy_ecs::component::ComponentId)>,
     expected: HostConfirmationSlotObservation,
     observed: HostConfirmationSlotObservation,
 }
@@ -2211,18 +2026,10 @@ struct HostConfirmationSlotObservation {
 
 impl PostScopeHostConfirmationFailure {
     pub(crate) fn expected_digest(&self) -> u64 {
-        crate::cleanup::admission_evidence_digest(&(
-            &self.expected_partition,
-            &self.reinserted_resources,
-            &self.expected,
-        ))
+        crate::cleanup::admission_evidence_digest(&(&self.expected_partition, &self.expected))
     }
     pub(crate) fn observed_digest(&self) -> u64 {
-        crate::cleanup::admission_evidence_digest(&(
-            &self.observed_partition,
-            &self.reinserted_resources,
-            &self.observed,
-        ))
+        crate::cleanup::admission_evidence_digest(&(&self.observed_partition, &self.observed))
     }
 }
 
@@ -2231,15 +2038,8 @@ pub(crate) fn post_scope_host_confirmation_failure(
     candidate: &PreparedEcsHostCandidateSource,
     grant: &bevy_ui_router_core::integration::SourceBoundHostGrant,
     staged: &StagedProvisionalTopSlot,
-    reinserted_resources: &[(Entity, bevy_ecs::component::ComponentId)],
 ) -> Option<PostScopeHostConfirmationFailure> {
-    if activated_source_bound_granted_top_slot_after_scopes_is_current(
-        world,
-        candidate,
-        grant,
-        staged,
-        reinserted_resources,
-    ) {
+    if activated_source_bound_granted_top_slot_is_current(world, candidate, grant, staged) {
         return None;
     }
     Some(PostScopeHostConfirmationFailure {
@@ -2249,7 +2049,6 @@ pub(crate) fn post_scope_host_confirmation_failure(
             &candidate.candidate,
             staged.entity,
         ),
-        reinserted_resources: reinserted_resources.to_vec(),
         expected: HostConfirmationSlotObservation {
             entity: staged.entity,
             claim: Some(staged.claim.clone()),
@@ -3685,6 +3484,43 @@ pub(crate) mod tests {
         assert!(world.resource::<RouteEntityRegistry>().records().is_empty());
         assert!(world.resource::<QuarantineLeaseTable>().leases().is_empty());
         assert!(children_of(&world, host).is_empty());
+    }
+
+    #[test]
+    fn exhausted_seal_rejects_host_staging_without_allocating() {
+        let mut world = World::new();
+        world.insert_resource(RouteEntityRegistry::new());
+        world.insert_resource(QuarantineLeaseTable::new());
+        let host = world
+            .spawn((Node::default(), RouterHostRegistration::new(router())))
+            .id();
+        let candidate = unique_candidate(&world, &mut HostCandidateRevisionState::default());
+        world
+            .resource_mut::<RouteEntityRegistry>()
+            .exhaust_seal_sequence_for_test();
+        let entities_before = world
+            .iter_entities()
+            .map(|entity| entity.id())
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            let error = stage_provisional_top_slot(
+                &mut world,
+                SealedProvisionalTopSlotSpec::for_candidate(&candidate),
+            )
+            .expect_err("exhausted ownership identity must reject before allocation");
+            assert_eq!(error.kind, ProvisionalStageErrorKind::RegistryRejected);
+            assert!(error.entity.is_none());
+            assert!(error.settlement.is_none());
+            assert_eq!(
+                world
+                    .iter_entities()
+                    .map(|entity| entity.id())
+                    .collect::<Vec<_>>(),
+                entities_before
+            );
+            assert!(world.resource::<RouteEntityRegistry>().records().is_empty());
+            assert!(children_of(&world, host).is_empty());
+        }
     }
 
     fn unique_candidate(

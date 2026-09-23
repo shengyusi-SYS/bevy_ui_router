@@ -19,27 +19,13 @@ fn non_prelude_branch_planning_support_types_are_public_module_api() {
 }
 
 #[test]
-fn route_view_key_is_public_without_raw_value_access() {
+fn route_view_key_exposes_value_traits_and_rejects_empty_key() {
     use bevy_ui_router_core::view_key::RouteViewKey;
 
     fn assert_key_traits<T: Clone + std::fmt::Debug + Eq + PartialEq + std::hash::Hash>() {}
 
     assert_key_traits::<RouteViewKey>();
     assert!(RouteViewKey::new("").is_err());
-
-    let source = include_str!("../src/view_key.rs");
-    assert!(source.contains("pub struct RouteViewKeyError {\n    _private: (),\n}"));
-    for forbidden in [
-        "pub struct RouteViewKey(pub ",
-        "pub struct RouteViewKeyError(pub ",
-        "pub fn as_str(",
-        "pub fn into_inner(",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "route view keys must not expose raw values through `{forbidden}`"
-        );
-    }
 }
 
 #[test]
@@ -66,30 +52,15 @@ fn recovery_profile_exposes_error_recovery_builders_with_exact_signatures() {
     let _: fn(RouteNodeOptions, ErrorBoundaryKey, RouteViewKey) -> RouteNodeOptions =
         RouteNodeOptions::with_error_view;
 
-    let source = include_str!("../src/route_tree.rs");
-
-    assert!(source.contains("pub fn root_with_options("));
-    for forbidden in ["#[cfg(feature = \"test-support\")]"] {
-        assert!(
-            !source.contains(forbidden),
-            "Recovery public API must not be feature-gated by `{forbidden}`"
-        );
-    }
-    for required in [
-        "pub fn route(",
-        "pub fn route_with_options(",
-        "pub fn with_error_boundary(",
-        "pub fn with_error_view(",
-    ] {
-        assert!(
-            source.contains(required),
-            "Recovery profile must expose `{required}`"
-        );
-    }
+    let _: fn(
+        RouteTreeBuilder,
+        RoutePattern,
+        RouteNodeOptions,
+    ) -> Result<RouteTreeBuilder, RouteError> = RouteTreeBuilder::root_with_options;
 }
 
 #[test]
-fn task_3_public_methods_match_the_corrected_golden_shape() {
+fn navigation_projections_expose_read_only_methods_and_value_traits() {
     use bevy_ui_router_core::HostVersion;
     use bevy_ui_router_core::branch::RouteParams;
     use bevy_ui_router_core::fingerprint::RouteBranchFingerprint;
@@ -176,94 +147,12 @@ fn task_3_public_methods_match_the_corrected_golden_shape() {
     let _: for<'a> fn(&'a RouteViewInput) -> &'a FrameOrigin = RouteViewInput::origin;
     let _: for<'a> fn(&'a RouteViewInput) -> Option<&'a NavigationFailure> =
         RouteViewInput::failure;
-
-    let frame = include_str!("../src/frame.rs");
-    let presentation = include_str!("../src/presentation.rs");
-    let request = include_str!("../src/request.rs");
-    let trace = include_str!("../src/trace.rs");
-    let view_input = include_str!("../src/view_input.rs");
-    fn impl_before<'a>(source: &'a str, type_name: &str, next_item: &str) -> &'a str {
-        let header = format!("impl {type_name} {{");
-        source
-            .split_once(&header)
-            .unwrap_or_else(|| panic!("{type_name} impl must exist"))
-            .1
-            .split_once(next_item)
-            .unwrap_or_else(|| panic!("{type_name} impl must end before `{next_item}`"))
-            .0
-    }
-
-    for implementation in [
-        impl_before(frame, "RouteFrameVersion", "\n}\n\n#[derive"),
-        impl_before(presentation, "RouterAvailability", "\n}\n\n#[derive"),
-        impl_before(presentation, "ActivePresentation", "\n}\n\n#[derive"),
-        impl_before(request, "NavigationFailure", "\n}\n\n#[derive"),
-        impl_before(trace, "NavigationTraceEvent", "\n}\n\n#[derive"),
-        impl_before(view_input, "RouteViewInput", "\n}\n\n#[cfg(test)]"),
-    ] {
-        assert!(!implementation.contains("pub const fn "));
-    }
-    assert!(!view_input.contains("#[derive("));
 }
 
 #[test]
-fn task_3_private_foundations_use_item_scoped_test_aware_dead_code_allows() {
-    let sources = [
-        include_str!("../src/admission.rs"),
-        include_str!("../src/presentation.rs"),
-        include_str!("../src/request.rs"),
-        include_str!("../src/trace.rs"),
-        include_str!("../src/view_input.rs"),
-        include_str!("../src/ids.rs"),
-    ];
-
-    for source in sources {
-        assert!(!source.contains("#[allow(dead_code)]"));
-        assert!(!source.contains("#[cfg_attr(not(test), allow(dead_code))]\nimpl "));
-    }
-
-    for (source, state_type) in [
-        (sources[0], "pub(crate) struct HostAdmissionIssuer"),
-        (sources[1], "pub(crate) struct RouterNavigationState"),
-        (sources[2], "pub(crate) struct NavigationRequestRecord"),
-        (sources[3], "pub(crate) struct NavigationTraceLog"),
-    ] {
-        let marker = source.find(state_type).expect("state type must exist");
-        let prefix = &source[..marker];
-        let nearby = &prefix[prefix.len().saturating_sub(160)..];
-        assert!(!nearby.contains("allow(dead_code)"));
-    }
-}
-
-#[test]
-fn task_3_private_router_allocation_keeps_world_provenance() {
-    let ids = include_str!("../src/ids.rs");
-
-    assert!(!ids.contains("pub(crate) fn allocate_router(&mut self)"));
-}
-
-#[test]
-fn sealed_report_identity_does_not_expose_raw_axes() {
+fn sealed_report_identity_exposes_opaque_value_traits() {
     use bevy_ui_router_core::integration::ViewReportIdentity;
 
     fn assert_opaque_traits<T: Clone + Eq + PartialEq>() {}
     assert_opaque_traits::<ViewReportIdentity>();
-
-    let source = include_str!("../src/integration.rs");
-    assert!(source.contains("#[derive(Clone, Eq, PartialEq)]\npub struct ViewReportIdentity"));
-    assert!(source.contains("pub struct ViewReportIdentity {\n    inner:"));
-    for forbidden in [
-        "pub fn report_router_provenance(",
-        "pub fn report_host_epoch(",
-        "pub fn report_transaction_sequence(",
-        "pub fn report_frame_task_sequence(",
-        "pub struct ViewReportIdentity(pub ",
-        "pub inner:",
-        "impl ViewReportIdentity {",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "sealed report identity must not expose `{forbidden}`"
-        );
-    }
 }

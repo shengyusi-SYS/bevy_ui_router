@@ -367,7 +367,6 @@ pub(crate) enum MountMutationArtifact {
 
 pub(crate) enum ResolveMountOwner {
     Returned(FrameMountRequest),
-    Reissued,
     Consumed,
 }
 
@@ -3256,32 +3255,30 @@ enum PreparedBackNoTargetSourceRefreeze {
     Drift(BackNoTargetSourceDriftOwner),
 }
 
-struct PreparedBackNoTargetSourceDriftTerminal {
-    state: RouterNavigationState,
+// Request bookkeeping shared by terminal outcomes; branch status and authority
+// consumption remain with the caller that proved the corresponding source.
+struct PreparedTerminalRecords {
     records: VecDeque<NavigationRequestRecord>,
     evicted_through: Option<u64>,
     issued_view_tasks: Vec<FrameTaskIdentity>,
     report_dispositions: Vec<ReportDispositionRecord>,
     completed_cleanup: Vec<CompletedCleanupTombstone>,
+}
+
+struct PreparedBackNoTargetSourceDriftTerminal {
+    state: RouterNavigationState,
+    records: PreparedTerminalRecords,
     terminal: BackNoTargetSourceDriftTerminalEvidence,
 }
 
 struct PreparedBackTargetPermanentTerminal {
-    records: VecDeque<NavigationRequestRecord>,
-    evicted_through: Option<u64>,
-    issued_view_tasks: Vec<FrameTaskIdentity>,
-    report_dispositions: Vec<ReportDispositionRecord>,
-    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    records: PreparedTerminalRecords,
     terminal: BackTargetPermanentTerminalEvidence,
 }
 
 struct PreparedBackNoTargetCleanupTerminal {
     state: RouterNavigationState,
-    records: VecDeque<NavigationRequestRecord>,
-    evicted_through: Option<u64>,
-    issued_view_tasks: Vec<FrameTaskIdentity>,
-    report_dispositions: Vec<ReportDispositionRecord>,
-    completed_cleanup: Vec<CompletedCleanupTombstone>,
+    records: PreparedTerminalRecords,
     terminal: CoreBackNoTargetTerminalProjection,
 }
 
@@ -7358,69 +7355,66 @@ impl RouterEngine {
     where
         F: FnOnce() -> bool,
     {
-        let Some(request) = self
-            .current
-            .as_ref()
-            .map(|current| current.identity.request)
-        else {
+        let Some(current) = self.current.as_ref() else {
             return false;
         };
+        let request = current.identity.request;
         let failure = NavigationFailure::new(
             NavigationFailureKind::AuthorityLost,
             "authority settlement protocol invariant was violated",
         );
-        let mut terminal = self
-            .request(request)
-            .expect("current protocol-failure request remains retained")
-            .clone();
-        if terminal
-            .transition(RequestStatus::Failed(failure.clone()))
-            .is_err()
-            || terminal
-                .append_trace(NavigationTraceEvent::request_terminal())
-                .is_err()
-        {
+        // Publication, rather than the physical cleanup disposition, decides
+        // whether the request outcome has already become committed.
+        let status = match &current.stage {
+            WorkStage::PostCommitCleanup { .. }
+            | WorkStage::PostCommitAuthorityAccepted { .. }
+            | WorkStage::PostCommitAuthorityCleanup { .. } => {
+                current.attempt.published_request_status()
+            }
+            _ => RequestStatus::Failed(failure.clone()),
+        };
+        let mut records = self.records.clone();
+        let terminals = std::iter::once((request, status)).chain(
+            self.queue
+                .iter()
+                .map(|queued| (queued.request, RequestStatus::Failed(failure.clone()))),
+        );
+        for (request, status) in terminals {
+            let Some(record) = records.iter_mut().find(|record| record.id() == request) else {
+                return false;
+            };
+            if record.transition(status).is_err()
+                || record
+                    .append_trace(NavigationTraceEvent::request_terminal())
+                    .is_err()
+            {
+                return false;
+            }
+        }
+        let Some(records) = self.prepare_terminal_records(records) else {
             return false;
-        }
-        let mut queued_records = Vec::new();
-        if queued_records.try_reserve_exact(self.queue.len()).is_err() {
-            return false;
-        }
-        for queued in &self.queue {
-            let mut record = self
-                .request(queued.request)
-                .expect("queued protocol-failure request remains retained")
-                .clone();
-            record
-                .transition(RequestStatus::Failed(failure.clone()))
-                .expect("queued protocol-failure request is not terminal");
-            record
-                .append_trace(NavigationTraceEvent::request_terminal())
-                .expect("queued protocol-failure terminal event is last");
-            queued_records.push((queued.request, record));
-        }
+        };
+        let mut state = self.state.clone();
+        state.fail_closed_unavailable(
+            crate::presentation::RouterUnavailableReason::RegistryInvariantViolation,
+        );
+        self.debug_assert_history_authority();
 
         if !authority_mutation() {
             return false;
         }
-        self.retire_history_authority();
-        *self
-            .record_mut(request)
-            .expect("current protocol-failure request remains retained") = terminal;
-        for (queued, record) in queued_records {
-            *self
-                .record_mut(queued)
-                .expect("queued protocol-failure request remains retained") = record;
-        }
+        self.current_history_capability = None;
+        self.pending_history_preparation_error = None;
+        self.prepared_publication_authority = None;
+        self.install_terminal_records(records);
         self.queue.clear();
         self.current = None;
+        self.pending_post_commit_terminal = None;
+        self.pending_post_commit_settlement_trace = None;
         self.action = None;
         self.active_branch = None;
         self.active_child_slots.clear();
-        self.state.fail_closed_unavailable(
-            crate::presentation::RouterUnavailableReason::RegistryInvariantViolation,
-        );
-        self.retain_terminal_records();
+        self.state = state;
         true
     }
 
@@ -9605,46 +9599,18 @@ impl RouterEngine {
             )?;
         state.set_request(None);
 
-        let mut issued_view_tasks = self.issued_view_tasks.clone();
-        let mut report_dispositions = self.report_dispositions.clone();
-        let mut completed_cleanup = self.completed_cleanup.clone();
-        let mut evicted_through = self.evicted_through;
-        while records
-            .iter()
-            .filter(|record| is_terminal(record.status()))
-            .count()
-            > TERMINAL_RETENTION
-        {
-            let Some(index) = records
-                .iter()
-                .position(|record| is_terminal(record.status()))
-            else {
+        let records = match self.prepare_terminal_records(records) {
+            Some(records) => records,
+            None => {
                 return Err(
                     CoreBackNoTargetCompletionPreparationFailureProjection::RetentionInvariant,
                 );
-            };
-            let Some(evicted) = records.remove(index) else {
-                return Err(
-                    CoreBackNoTargetCompletionPreparationFailureProjection::RetentionInvariant,
-                );
-            };
-            let evicted_request = evicted.id();
-            issued_view_tasks.retain(|identity| identity.request != evicted_request);
-            report_dispositions
-                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
-            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
-            let sequence = evicted_request.sequence();
-            evicted_through =
-                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
-        }
+            }
+        };
 
         Ok(PreparedBackNoTargetCleanupTerminal {
             state,
             records,
-            evicted_through,
-            issued_view_tasks,
-            report_dispositions,
-            completed_cleanup,
             terminal: CoreBackNoTargetTerminalProjection {
                 request,
                 completion,
@@ -9689,19 +9655,11 @@ impl RouterEngine {
         let PreparedBackNoTargetCleanupTerminal {
             state,
             records,
-            evicted_through,
-            issued_view_tasks,
-            report_dispositions,
-            completed_cleanup,
             terminal,
         } = prepared;
         commit_reclaim();
         self.state = state;
-        self.records = records;
-        self.evicted_through = evicted_through;
-        self.issued_view_tasks = issued_view_tasks;
-        self.report_dispositions = report_dispositions;
-        self.completed_cleanup = completed_cleanup;
+        self.install_terminal_records(records);
         BackNoTargetCleanupCompletionCoreOutcome::Terminal(terminal)
     }
 
@@ -9797,66 +9755,24 @@ impl RouterEngine {
             return Err(owner);
         }
 
-        let mut issued_view_tasks = self.issued_view_tasks.clone();
-        let mut report_dispositions = self.report_dispositions.clone();
-        let mut completed_cleanup = self.completed_cleanup.clone();
-        let mut evicted_through = self.evicted_through;
-        while records
-            .iter()
-            .filter(|record| is_terminal(record.status()))
-            .count()
-            > TERMINAL_RETENTION
-        {
-            let Some(index) = records
-                .iter()
-                .position(|record| is_terminal(record.status()))
-            else {
-                return Err(owner);
-            };
-            let Some(evicted) = records.remove(index) else {
-                return Err(owner);
-            };
-            let evicted_request = evicted.id();
-            issued_view_tasks.retain(|identity| identity.request != evicted_request);
-            report_dispositions
-                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
-            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
-            let sequence = evicted_request.sequence();
-            evicted_through =
-                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
-        }
+        let records = match self.prepare_terminal_records(records) {
+            Some(records) => records,
+            None => return Err(owner),
+        };
 
         let terminal = match owner.into_terminal_evidence() {
             Ok(terminal) => terminal,
             Err(owner) => return Err(owner),
         };
-        Ok(PreparedBackTargetPermanentTerminal {
-            records,
-            evicted_through,
-            issued_view_tasks,
-            report_dispositions,
-            completed_cleanup,
-            terminal,
-        })
+        Ok(PreparedBackTargetPermanentTerminal { records, terminal })
     }
 
     fn install_prepared_back_target_permanent_terminal(
         &mut self,
         prepared: PreparedBackTargetPermanentTerminal,
     ) -> BackTargetPermanentTerminalEvidence {
-        let PreparedBackTargetPermanentTerminal {
-            records,
-            evicted_through,
-            issued_view_tasks,
-            report_dispositions,
-            completed_cleanup,
-            terminal,
-        } = prepared;
-        self.records = records;
-        self.evicted_through = evicted_through;
-        self.issued_view_tasks = issued_view_tasks;
-        self.report_dispositions = report_dispositions;
-        self.completed_cleanup = completed_cleanup;
+        let PreparedBackTargetPermanentTerminal { records, terminal } = prepared;
+        self.install_terminal_records(records);
         terminal
     }
 
@@ -9912,42 +9828,14 @@ impl RouterEngine {
             return Err(owner);
         }
 
-        let mut issued_view_tasks = self.issued_view_tasks.clone();
-        let mut report_dispositions = self.report_dispositions.clone();
-        let mut completed_cleanup = self.completed_cleanup.clone();
-        let mut evicted_through = self.evicted_through;
-        while records
-            .iter()
-            .filter(|record| is_terminal(record.status()))
-            .count()
-            > TERMINAL_RETENTION
-        {
-            let Some(index) = records
-                .iter()
-                .position(|record| is_terminal(record.status()))
-            else {
-                return Err(owner);
-            };
-            let Some(evicted) = records.remove(index) else {
-                return Err(owner);
-            };
-            let evicted_request = evicted.id();
-            issued_view_tasks.retain(|identity| identity.request != evicted_request);
-            report_dispositions
-                .retain(|record| record.target != DiagnosticTarget::Request(evicted_request));
-            completed_cleanup.retain(|tombstone| tombstone.request != evicted_request);
-            let sequence = evicted_request.sequence();
-            evicted_through =
-                Some(evicted_through.map_or(sequence, |current| current.max(sequence)));
-        }
+        let records = match self.prepare_terminal_records(records) {
+            Some(records) => records,
+            None => return Err(owner),
+        };
 
         Ok(PreparedBackNoTargetSourceDriftTerminal {
             state,
             records,
-            evicted_through,
-            issued_view_tasks,
-            report_dispositions,
-            completed_cleanup,
             terminal: owner.into_terminal_evidence(),
         })
     }
@@ -9959,18 +9847,10 @@ impl RouterEngine {
         let PreparedBackNoTargetSourceDriftTerminal {
             state,
             records,
-            evicted_through,
-            issued_view_tasks,
-            report_dispositions,
-            completed_cleanup,
             terminal,
         } = prepared;
         self.state = state;
-        self.records = records;
-        self.evicted_through = evicted_through;
-        self.issued_view_tasks = issued_view_tasks;
-        self.report_dispositions = report_dispositions;
-        self.completed_cleanup = completed_cleanup;
+        self.install_terminal_records(records);
         terminal
     }
 
@@ -11001,31 +10881,30 @@ impl RouterEngine {
         let grant = match self.mount.grant(&request.token, &mut self.ids) {
             Ok(grant) => grant,
             Err(MountError::Exhausted) => {
-                if let Some(failure_branch_index) = pending_bound_error_branch_index {
-                    if let Err(kind) = self.mount.reject(&request.token) {
-                        return Err(MountCapabilityError::new(
-                            kind,
-                            ResolveMountOwner::Returned(request),
-                        ));
-                    }
-                    let failure = self.begin_failure_cleanup_for_branch(
-                        PendingFailureKind::MountIssue,
-                        NavigationFailure::new(
-                            NavigationFailureKind::Mount,
-                            "bound error recovery slot allocation exhausted",
-                        ),
-                        failure_branch_index,
-                    );
-                    self.action = Some(EngineAction::FailureCleanup(failure));
+                if let Err(kind) = self.mount.reject(&request.token) {
                     return Err(MountCapabilityError::new(
-                        MountError::Exhausted,
-                        ResolveMountOwner::Consumed,
+                        kind,
+                        ResolveMountOwner::Returned(request),
                     ));
                 }
-                self.action = Some(EngineAction::MountRequest(request));
+                let failure_branch_index = self
+                    .current
+                    .as_ref()
+                    .and_then(|current| current.pending_mount.as_ref())
+                    .expect("validated mount retains its pending child")
+                    .child_index;
+                let failure = self.begin_failure_cleanup_for_branch(
+                    PendingFailureKind::MountIssue,
+                    NavigationFailure::new(
+                        NavigationFailureKind::Mount,
+                        "child slot allocation exhausted",
+                    ),
+                    failure_branch_index,
+                );
+                self.action = Some(EngineAction::FailureCleanup(failure));
                 return Err(MountCapabilityError::new(
                     MountError::Exhausted,
-                    ResolveMountOwner::Reissued,
+                    ResolveMountOwner::Consumed,
                 ));
             }
             Err(kind) => {
@@ -14959,7 +14838,7 @@ impl RouterEngine {
         request
     }
 
-    fn retire_history_authority(&mut self) {
+    fn debug_assert_history_authority(&self) {
         let prepared_history_owner = self
             .prepared_publication_authority
             .as_ref()
@@ -14984,6 +14863,10 @@ impl RouterEngine {
                 CommitError::Stale | CommitError::InvalidManifest
             ));
         }
+    }
+
+    fn retire_history_authority(&mut self) {
+        self.debug_assert_history_authority();
         self.current_history_capability = None;
         self.pending_history_preparation_error = None;
         self.prepared_publication_authority = None;
@@ -16137,6 +16020,57 @@ impl RouterEngine {
             current.identity.transaction,
             current.cleanup_batch,
         )
+    }
+
+    fn prepare_terminal_records(
+        &self,
+        records: VecDeque<NavigationRequestRecord>,
+    ) -> Option<PreparedTerminalRecords> {
+        let mut prepared = PreparedTerminalRecords {
+            records,
+            evicted_through: self.evicted_through,
+            issued_view_tasks: self.issued_view_tasks.clone(),
+            report_dispositions: self.report_dispositions.clone(),
+            completed_cleanup: self.completed_cleanup.clone(),
+        };
+        while prepared
+            .records
+            .iter()
+            .filter(|record| is_terminal(record.status()))
+            .count()
+            > TERMINAL_RETENTION
+        {
+            let index = prepared
+                .records
+                .iter()
+                .position(|record| is_terminal(record.status()))?;
+            let evicted = prepared.records.remove(index)?;
+            let request = evicted.id();
+            prepared
+                .issued_view_tasks
+                .retain(|identity| identity.request != request);
+            prepared
+                .report_dispositions
+                .retain(|record| record.target != DiagnosticTarget::Request(request));
+            prepared
+                .completed_cleanup
+                .retain(|tombstone| tombstone.request != request);
+            let sequence = request.sequence();
+            prepared.evicted_through = Some(
+                prepared
+                    .evicted_through
+                    .map_or(sequence, |current| current.max(sequence)),
+            );
+        }
+        Some(prepared)
+    }
+
+    fn install_terminal_records(&mut self, prepared: PreparedTerminalRecords) {
+        self.records = prepared.records;
+        self.evicted_through = prepared.evicted_through;
+        self.issued_view_tasks = prepared.issued_view_tasks;
+        self.report_dispositions = prepared.report_dispositions;
+        self.completed_cleanup = prepared.completed_cleanup;
     }
 
     fn retain_terminal_records(&mut self) {

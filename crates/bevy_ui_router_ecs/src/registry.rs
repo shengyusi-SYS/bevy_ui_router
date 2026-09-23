@@ -715,19 +715,7 @@ impl RouteEntityRegistry {
         &mut self,
         owner: &RegistryOwner,
     ) -> Result<(), RegistryWriteError> {
-        if self
-            .records
-            .iter()
-            .any(|record| record.owner.conflicts_with(owner))
-        {
-            return Err(RegistryWriteError::DuplicateOwner);
-        }
-        self.consumed_seal_sequences
-            .try_reserve(1)
-            .map_err(|_| RegistryWriteError::CapacityExhausted)?;
-        self.records
-            .try_reserve(1)
-            .map_err(|_| RegistryWriteError::CapacityExhausted)
+        self.try_reserve_registrations(std::slice::from_ref(owner))
     }
 
     /// Preflights a complete Scene allocation batch before any Entity or
@@ -763,6 +751,11 @@ impl RouteEntityRegistry {
         self.records
             .try_reserve(owners.len())
             .map_err(|_| RegistryWriteError::CapacityExhausted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_seal_sequence_for_test(&mut self) {
+        self.next_seal_sequence = u64::MAX;
     }
 
     #[cfg(test)]
@@ -2007,15 +2000,17 @@ impl QuarantineLeaseTable {
         origin: Option<QuarantineOrigin>,
         assigned_id: Option<QuarantineLeaseId>,
     ) -> Result<PreparedQuarantineTransfer, QuarantineTransferError> {
-        if verified_preparation_fault_injected() {
-            return Err(QuarantineTransferError::CapacityExhausted);
-        }
+        let reservation_count = if verified_preparation_fault_injected() {
+            usize::MAX
+        } else {
+            claims.len()
+        };
         if claims.is_empty() || manifests.len() != claims.len() {
             return Err(QuarantineTransferError::EmptyOwnedSet);
         }
         let mut records = Vec::new();
         records
-            .try_reserve(claims.len())
+            .try_reserve(reservation_count)
             .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
         for claim in &claims {
             let Some(record) = registry
@@ -2129,15 +2124,17 @@ impl QuarantineLeaseTable {
         actual_manifests: Vec<(Entity, ComponentManifest)>,
         facts: QuarantineFacts,
     ) -> Result<PreparedUnresolvedResidualTransfer, QuarantineTransferError> {
-        if unresolved_preparation_fault_injected() {
-            return Err(QuarantineTransferError::CapacityExhausted);
-        }
+        let reservation_count = if unresolved_preparation_fault_injected() {
+            usize::MAX
+        } else {
+            claims.len()
+        };
         if claims.is_empty() || actual_manifests.len() != claims.len() {
             return Err(QuarantineTransferError::EmptyOwnedSet);
         }
         let mut records = Vec::new();
         records
-            .try_reserve(claims.len())
+            .try_reserve(reservation_count)
             .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
         for claim in &claims {
             let Some(record) = registry

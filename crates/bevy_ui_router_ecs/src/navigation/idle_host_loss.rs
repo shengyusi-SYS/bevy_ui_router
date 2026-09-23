@@ -92,7 +92,6 @@ fn physically_idle(entry: &RouterEntry) -> bool {
         && entry.pending_mount_mutation_rejection.is_none()
         && entry.pending_failed_branch.is_none()
         && entry.failure_cleanup_permanent.is_none()
-        && entry.cleanup_settlement_permanent_inert.is_none()
         && entry.projectionless_fail_close.is_none()
         && entry.cleanup_ledger.is_none()
         && entry.post_commit_compound.is_none()

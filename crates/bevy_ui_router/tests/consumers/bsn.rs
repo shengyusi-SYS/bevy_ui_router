@@ -559,4 +559,57 @@ fn main() {
         app.world().get::<Node>(app_sibling).unwrap().width,
         Val::Px(83.0)
     );
+
+    // A long-lived application recovers, then replaces pages without accumulating
+    // old UI. Count live entities, not allocator slots, which may legitimately grow.
+    let restored = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(router, RouteLocation::new("/items/restored"))
+        .unwrap();
+    assert_eq!(
+        settle(&mut app, router, restored, ExpectedNative::Leaf(5)),
+        RequestStatus::Succeeded
+    );
+    let layout = only::<NativeLayout>(&mut app);
+    let anchor = only::<DefaultOutlet>(&mut app);
+    let toolbar = only::<ToolbarState>(&mut app);
+    app.world_mut().get_mut::<ToolbarState>(toolbar).unwrap().0 = 73;
+    let mut previous = assert_leaf(&mut app, "restored", 5);
+    let live_count = app.world().entities().count_spawned();
+    for index in 0..96 {
+        let item = format!("repeat-{index}");
+        let location = RouteLocation::new(format!("/items/{item}"));
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(router, location.clone())
+            .unwrap();
+        assert_eq!(
+            settle(&mut app, router, request, ExpectedNative::Leaf(index + 6)),
+            RequestStatus::Succeeded
+        );
+        assert!(app.world().get_entity(previous).is_err());
+        previous = assert_leaf(&mut app, &item, index + 6);
+        assert_preserved_layout(&mut app, layout, anchor, toolbar);
+        assert_eq!(app.world().entities().count_spawned(), live_count);
+        let snapshot = observed_router(&app);
+        assert_eq!(snapshot.active().location(), Some(&location));
+        assert_eq!(snapshot.history().current(), Some(&location));
+        assert_eq!(snapshot.history().entries().len(), 2);
+        assert_eq!(snapshot.running_request(), None);
+        assert!(!snapshot.cleanup().foreground_pending());
+    }
+    assert!(matches!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .request(router, first),
+        RequestLookup::NotRetained
+    ));
+    assert_eq!(calls.layout.load(Ordering::SeqCst), 2);
+    assert_eq!(app.world().get::<HostSentinel>(host).unwrap().0, 7);
+    assert_eq!(
+        app.world().get::<ChildOf>(app_sibling).unwrap().parent(),
+        host
+    );
 }

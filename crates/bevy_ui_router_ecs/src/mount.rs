@@ -45,8 +45,12 @@ fn reject_next_child_slot_owner_cas() {
 }
 
 #[cfg(test)]
-fn child_slot_owner_cas_fault_injected() -> bool {
-    REJECT_NEXT_CHILD_SLOT_OWNER_CAS.with(|fault| fault.replace(false))
+fn child_slot_owner_cas_expected_claim(claim: &ExactRegistryClaim) -> ExactRegistryClaim {
+    if REJECT_NEXT_CHILD_SLOT_OWNER_CAS.with(|fault| fault.replace(false)) {
+        claim.with_lifecycle_for_test(EntityLifecycle::Active)
+    } else {
+        claim.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -487,17 +491,27 @@ pub(crate) fn stage_child_slot(
     }
 
     let prior_anchor_children = children_of(world, outlet.anchor());
+    let owner = RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+        parent: parent.frame().clone(),
+        outlet: outlet_key.clone(),
+        slot: grant.slot(),
+    });
+    if world
+        .resource_mut::<RouteEntityRegistry>()
+        .try_reserve_registration(&owner)
+        .is_err()
+    {
+        return Err(ChildSlotStageFailure {
+            kind: ChildSlotStageErrorKind::RegistryRejected,
+            residual: None,
+        });
+    }
     let slot = world.spawn_empty().id();
     let initial_manifest = ComponentManifest::from_world(world, slot)
         .expect("a newly allocated empty Entity must have an archetype");
     let slot_claim = {
         let mut registry = world.resource_mut::<RouteEntityRegistry>();
         let seal = registry.issue_seal();
-        let owner = RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
-            parent: parent.frame().clone(),
-            outlet: outlet_key.clone(),
-            slot: grant.slot(),
-        });
         if registry
             .register(
                 slot,
@@ -723,16 +737,12 @@ pub(crate) fn confirm_child_slot(
         slot: slot_id,
     });
     #[cfg(test)]
-    let reject_owner_cas = child_slot_owner_cas_fault_injected();
+    let expected_claim = child_slot_owner_cas_expected_claim(&provisional.slot_claim);
     #[cfg(not(test))]
-    let reject_owner_cas = false;
-    let committed_claim = if reject_owner_cas {
-        None
-    } else {
-        world
-            .resource_mut::<RouteEntityRegistry>()
-            .compare_exchange_owner(&provisional.slot_claim, committed_owner)
-    };
+    let expected_claim = provisional.slot_claim.clone();
+    let committed_claim = world
+        .resource_mut::<RouteEntityRegistry>()
+        .compare_exchange_owner(&expected_claim, committed_owner);
     let Some(committed_claim) = committed_claim else {
         let cleanup = session.reject();
         return Err(confirmation_failure(
@@ -2462,6 +2472,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exhausted_seal_rejects_child_staging_without_allocating() {
+        let (mut world, _candidate, _top_slot, _engine, parent, _local_index, grant) =
+            realized_parent_with_outlet();
+        world
+            .resource_mut::<RouteEntityRegistry>()
+            .exhaust_seal_sequence_for_test();
+        let before = world_registry_snapshot(&world);
+        for _ in 0..2 {
+            let failure = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
+                .expect_err("exhausted ownership identity must reject before allocation");
+            assert_eq!(failure.kind(), ChildSlotStageErrorKind::RegistryRejected);
+            assert!(failure.into_residual().is_none());
+            assert_eq!(world_registry_snapshot(&world), before);
+        }
+    }
+
+    #[test]
     fn child_slot_seal_and_slot_id_are_not_reused_after_failure() {
         let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
             realized_parent_with_outlet();
@@ -2474,13 +2501,15 @@ pub(crate) mod tests {
             .expect("first child slot must issue an ownership seal");
 
         let failure = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant)
-            .expect_err("duplicate logical child owner must fail after issuing its seal");
+            .expect_err("duplicate logical child owner must fail before allocating another seal");
         assert!(failure.into_residual().is_none());
         let failed_seal = world
             .resource::<RouteEntityRegistry>()
             .latest_issued_seal()
-            .expect("failed child slot registration must still burn its issued seal");
-        assert_ne!(failed_seal, first_seal);
+            .expect("the previously issued seal remains the latest after preflight rejection");
+        // Preflight did not issue a seal. Previously issued identities remain
+        // consumed; the next actual allocation must still receive a fresh one.
+        assert_eq!(failed_seal, first_seal);
         let next_seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
         assert_ne!(next_seal, failed_seal);
 

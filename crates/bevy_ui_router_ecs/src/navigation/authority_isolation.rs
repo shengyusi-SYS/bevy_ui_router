@@ -29,11 +29,11 @@ use crate::{
 
 use super::{
     AuthorityProtocolResidualKind, AuthorityProtocolResidualOwner,
-    CleanupSettlementPermanentInertOwner, FailureCleanupCompletionInertOwner,
-    FrozenPostCommitInputIsolation, FrozenTargetPreparationPermanentPhysicalManifest, HostBinding,
-    PendingBackTargetExecution, PendingFailedBranch, PendingFailedBranchTerminal,
-    PostCommitInputIsolationFailure, PreparedPostCommitInputIsolation, RetiredHostBinding,
-    RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
+    FailureCleanupCompletionInertOwner, FrozenPostCommitInputIsolation,
+    FrozenTargetPreparationPermanentPhysicalManifest, HostBinding, PendingBackTargetExecution,
+    PendingFailedBranch, PendingFailedBranchTerminal, PostCommitInputIsolationFailure,
+    PreparedPostCommitInputIsolation, RetiredHostBinding, RouterEntry,
+    authority_settlement_logical_roots, precommit_authority_cause,
     projectionless_fail_close_capacity_probe,
 };
 
@@ -1240,10 +1240,8 @@ pub(super) fn fail_closed_cleanup_ledger_protocol(
     };
     let kind = match kind {
         Some(kind) => kind,
-        None => match ledger.take_cleanup_settlement_permanent_evidence() {
-            Some(evidence) => AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence),
-            None => return Err(ledger),
-        },
+        None if ledger.is_stopped() => AuthorityProtocolResidualKind::CleanupStopped,
+        None => return Err(ledger),
     };
     let active = entry.active.take();
     let (retired_host, lease) = match entry.host.take() {
@@ -1292,20 +1290,10 @@ pub(super) fn fail_closed_cleanup_ledger_protocol(
             .take()
             .expect("rejected cleanup permanent fail-close retains prepared isolation")
             .apply(world);
-        let AuthorityProtocolResidualKind::CleanupSettlementPermanent(evidence) = owner.kind else {
-            return Err(owner
-                .cleanup_settlement_ledger
-                .take()
-                .expect("a rejected native settlement transfer retains its entire ledger"));
-        };
-        entry.cleanup_settlement_permanent_inert = Some(CleanupSettlementPermanentInertOwner {
-            evidence,
-            ledger: owner
-                .cleanup_settlement_ledger
-                .take()
-                .expect("cleanup permanent residual retains its physical ledger"),
-            isolation_contradiction: owner.isolation_contradiction.take(),
-        });
+        return Err(owner
+            .cleanup_settlement_ledger
+            .take()
+            .expect("rejected cleanup termination returns its ledger and stop evidence"));
     }
     Ok(())
 }

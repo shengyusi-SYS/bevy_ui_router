@@ -17,6 +17,13 @@ struct Consumer {
     target: PathBuf,
 }
 
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        // Only this invocation's manifest/source/lock; retain the shared build cache.
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 impl Consumer {
     fn new(
         name: &str,
@@ -309,5 +316,48 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
         ),
     ] {
         Consumer::new(name, false, &["ecs"], false, source, false, false).rejects(code, symbol);
+    }
+
+    // Disabled modules are compiler-enforced boundaries, not just absent Cargo targets.
+    // The positive consumers above use each module with its owning feature enabled.
+    for (name, defaults, features, source, symbol) in [
+        (
+            "core-without-view",
+            false,
+            &[][..],
+            "use bevy_ui_router::view::RouteViewRegistry; fn main() {}",
+            "view",
+        ),
+        (
+            "default-without-ecs",
+            true,
+            &[][..],
+            "use bevy_ui_router::ecs::RouterNavigation; fn main() {}",
+            "ecs",
+        ),
+        (
+            "ecs-without-bsn",
+            false,
+            &["ecs"][..],
+            "use bevy_ui_router::bsn::AppBsnExt; fn main() {}",
+            "bsn",
+        ),
+        (
+            "core-without-engine-authority",
+            false,
+            &[][..],
+            "use bevy_ui_router::core::integration::RouterEngine; fn main() {}",
+            "integration",
+        ),
+        (
+            "ecs-without-registry-authority",
+            false,
+            &["ecs"][..],
+            "use bevy_ui_router::ecs::RouteEntityRegistry; fn main() {}",
+            "RouteEntityRegistry",
+        ),
+    ] {
+        Consumer::new(name, defaults, features, false, source, false, false)
+            .rejects("E0432", symbol);
     }
 }

@@ -172,6 +172,8 @@ fn assert_target_revoked(world: &World, target: Entity) {
 #[derive(Clone, Copy, Debug)]
 enum Departure {
     Replace,
+    Back,
+    Fallback,
     LoseHost,
 }
 
@@ -261,6 +263,26 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
         .push(router, RouteLocation::new("/"))
         .unwrap();
     await_success(&mut app, router, initial);
+    if matches!(departure, Departure::Back) {
+        let second = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new("/").with_fragment("second-entry"),
+            )
+            .unwrap();
+        await_success(&mut app, router, second);
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap()
+                .history()
+                .len(),
+            2
+        );
+    }
     // The regular next frame consumes the published tree in layout/picking.
     app.update();
     let router_target = app
@@ -370,6 +392,79 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
                 .replace(router, RouteLocation::new("/").with_fragment("replacement"))
                 .unwrap();
             await_success(&mut app, router, replacement);
+            let next_target = app
+                .world_mut()
+                .query_filtered::<Entity, With<NativeInputPage>>()
+                .single(app.world())
+                .unwrap();
+            assert_ne!(next_target, router_target);
+            assert!(
+                app.world()
+                    .resource::<RouterInputGate>()
+                    .allows_pointer(next_target)
+            );
+        }
+        Departure::Back => {
+            let back = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .back(router)
+                .unwrap();
+            await_success(&mut app, router, back);
+            let snapshot = app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap();
+            assert_eq!(snapshot.active().kind(), ActivePresentationKind::Route);
+            assert_eq!(snapshot.active().location(), Some(&RouteLocation::new("/")));
+            assert_eq!(snapshot.history().cursor(), Some(0));
+            assert_eq!(snapshot.history().current(), Some(&RouteLocation::new("/")));
+            assert_eq!(
+                snapshot.history().entries(),
+                [
+                    RouteLocation::new("/"),
+                    RouteLocation::new("/").with_fragment("second-entry")
+                ]
+            );
+            let next_target = app
+                .world_mut()
+                .query_filtered::<Entity, With<NativeInputPage>>()
+                .single(app.world())
+                .unwrap();
+            assert_ne!(next_target, router_target);
+            assert!(
+                app.world()
+                    .resource::<RouterInputGate>()
+                    .allows_pointer(next_target)
+            );
+        }
+        Departure::Fallback => {
+            let failed = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/missing"))
+                .unwrap();
+            for _ in 0..32 {
+                app.update();
+                if matches!(app.world().resource::<RouterSnapshots>().request(router, failed),
+                    RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(_)))
+                {
+                    break;
+                }
+            }
+            assert!(
+                matches!(app.world().resource::<RouterSnapshots>().request(router, failed),
+                RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(error)
+                    if error.kind() == NavigationFailureKind::Match))
+            );
+            let snapshot = app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap();
+            assert_eq!(snapshot.active().kind(), ActivePresentationKind::Error);
+            assert_eq!(snapshot.history().len(), 1);
             let next_target = app
                 .world_mut()
                 .query_filtered::<Entity, With<NativeInputPage>>()
@@ -504,6 +599,20 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
 fn native_replacement_revokes_existing_gestures_and_only_departing_focus() {
     for focus_on_application in [false, true] {
         native_input_journey(Departure::Replace, focus_on_application);
+    }
+}
+
+#[test]
+fn native_back_revokes_existing_gestures_and_only_departing_focus() {
+    for focus_on_application in [false, true] {
+        native_input_journey(Departure::Back, focus_on_application);
+    }
+}
+
+#[test]
+fn native_fallback_revokes_existing_gestures_and_only_departing_focus() {
+    for focus_on_application in [false, true] {
+        native_input_journey(Departure::Fallback, focus_on_application);
     }
 }
 
@@ -1034,5 +1143,486 @@ mod live_content_eligibility_review {
                 "restoring display must not replay the consumed AutoFocus intent"
             );
         }
+    }
+}
+
+mod inactive_native_journeys {
+    use super::*;
+    use bevy_app::PreUpdate;
+    use bevy_ecs::{
+        schedule::IntoScheduleConfigs,
+        template::{Template, TemplateContext},
+    };
+    use bevy_scene::{ResolvedScene, SceneFunction};
+    use bevy_ui_router::ecs::RouterInputSet;
+
+    #[derive(Component, Clone, Default)]
+    struct InactiveTarget;
+
+    #[derive(Clone)]
+    struct PendingRoot;
+    impl Template for PendingRoot {
+        type Output = ();
+        fn build_template(
+            &self,
+            context: &mut TemplateContext<'_, '_>,
+        ) -> bevy_ecs::error::Result<()> {
+            context
+                .entity
+                .insert((target_node(), InactiveTarget, DefaultOutlet));
+            Ok(())
+        }
+        fn clone_template(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CommandKind {
+        Keyboard,
+        Gamepad,
+    }
+
+    #[derive(Message, Clone, Copy)]
+    struct TargetCommand {
+        target: Entity,
+        kind: CommandKind,
+    }
+
+    #[derive(Resource, Default)]
+    struct CommandDeliveries(Vec<(Entity, CommandKind)>);
+
+    // This is an application consumer of the documented target-addressed
+    // keyboard/gamepad contract, scheduled at the public input boundary.
+    fn consume_commands(
+        mut commands: MessageReader<TargetCommand>,
+        gate: Res<RouterInputGate>,
+        mut delivered: ResMut<CommandDeliveries>,
+    ) {
+        for command in commands.read() {
+            let allowed = match command.kind {
+                CommandKind::Keyboard => gate.allows_keyboard(command.target),
+                CommandKind::Gamepad => gate.allows_gamepad(command.target),
+            };
+            if allowed {
+                delivered.0.push((command.target, command.kind));
+            }
+        }
+    }
+
+    fn app() -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.add_plugins(DefaultPlugins);
+        if !app.is_plugin_added::<AssetPlugin>() {
+            app.add_plugins(AssetPlugin::default());
+        }
+        if !app.is_plugin_added::<ScenePlugin>() {
+            app.add_plugins(ScenePlugin);
+        }
+        if !app.is_plugin_added::<InputFocusPlugin>() {
+            app.add_plugins(InputFocusPlugin);
+        }
+        observe_pointer_delivery(&mut app);
+        app.add_message::<TargetCommand>()
+            .init_resource::<CommandDeliveries>();
+        app.add_systems(PreUpdate, consume_commands.after(RouterInputSet::Ready));
+        let window = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .resolution
+            .set(320.0, 180.0);
+        app.world_mut().spawn(Camera2d);
+        let control = app
+            .world_mut()
+            .spawn(Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(140.0),
+                top: Val::Px(60.0),
+                width: Val::Px(48.0),
+                height: Val::Px(32.0),
+                ..Node::default()
+            })
+            .id();
+        (app, window, control)
+    }
+
+    fn target_node() -> Node {
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(20.0),
+            top: Val::Px(20.0),
+            width: Val::Px(48.0),
+            height: Val::Px(32.0),
+            ..Node::default()
+        }
+    }
+
+    fn install(app: &mut App, driver: ViewDriverKey, depth: usize) -> RouterHandle {
+        let page = RouteViewKey::new("inactive-page").unwrap();
+        let plain = RouteViewKey::new("inactive-plain").unwrap();
+        let plain_driver = app
+            .register_bsn_view(ViewDriverKey::new("inactive-plain").unwrap(), |_| {
+                Ok(bsn! { Node DefaultOutlet })
+            })
+            .unwrap();
+        let mut routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(page.clone()),
+            )
+            .unwrap();
+        let mut parent = routes.root_id().unwrap();
+        for _ in 0..depth {
+            parent = routes
+                .route_with_options(
+                    parent,
+                    RoutePattern::path("child").unwrap(),
+                    RouteNodeOptions::new().with_view(plain.clone()),
+                )
+                .unwrap();
+        }
+        let mut views = RouteViewRegistry::new();
+        views
+            .insert(page, RouteViewDescriptor::new(driver))
+            .unwrap();
+        views
+            .insert(plain.clone(), RouteViewDescriptor::new(plain_driver))
+            .unwrap();
+        let router = app
+            .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, plain))
+            .unwrap();
+        app.world_mut().spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..Node::default()
+            },
+            RouterHostRegistration::new(router),
+        ));
+        app.update();
+        router
+    }
+
+    fn pointers(app: &mut App, window: Entity, control: Entity) -> [(PointerId, Location); 2] {
+        let target = Location {
+            target: NormalizedRenderTarget::Window(
+                WindowRef::Primary.normalize(Some(window)).unwrap(),
+            ),
+            // The exact center authored by target_node. Publication's positive
+            // control below proves this same coordinate really hits the target.
+            position: Vec2::new(44.0, 36.0),
+        };
+        let pointers = [
+            (PointerId::Touch(0x991), target),
+            (
+                PointerId::Touch(0x992),
+                location_at(app.world(), window, control),
+            ),
+        ];
+        for (pointer, location) in &pointers {
+            app.world_mut().spawn((
+                *pointer,
+                PointerLocation::new(location.clone()),
+                PointerPress::default(),
+                PointerInteraction::default(),
+            ));
+        }
+        pointers
+    }
+
+    fn commands(app: &mut App, target: Entity) {
+        for kind in [CommandKind::Keyboard, CommandKind::Gamepad] {
+            app.world_mut()
+                .write_message(TargetCommand { target, kind });
+        }
+    }
+
+    fn action(app: &mut App, pointers: &[(PointerId, Location); 2], action: PointerAction) {
+        send_inputs(
+            app,
+            pointers.iter().map(|(pointer, location)| {
+                PointerInput::new(*pointer, location.clone(), action.clone())
+            }),
+        );
+    }
+
+    fn assert_running(app: &App, router: RouterHandle, request: NavigationRequestId) {
+        assert!(
+            matches!(app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Running(_))),
+            "the real nested Scene must still be pending at this input boundary"
+        );
+    }
+
+    #[test]
+    fn native_pending_pointer_and_ready_commands_wait_for_real_publication() {
+        let (mut app, window, control) = app();
+        let driver = app
+            .register_bsn_view(ViewDriverKey::new("inactive-pending").unwrap(), |_| {
+                Ok(SceneFunction(|_, root: &mut ResolvedScene| {
+                    root.push_bundle_template(PendingRoot);
+                }))
+            })
+            .unwrap();
+        // Each genuine child frame requires its own ordinary update. No test
+        // pause hook or lifecycle state injection keeps the root pending.
+        let depth = 8;
+        let router = install(&mut app, driver, depth);
+        let pointers = pointers(&mut app, window, control);
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(
+                router,
+                RouteLocation::new(format!("/{}", vec!["child"; depth].join("/"))),
+            )
+            .unwrap();
+        app.update();
+        let target = app
+            .world_mut()
+            .query_filtered::<Entity, With<InactiveTarget>>()
+            .single(app.world())
+            .unwrap();
+        assert_running(&app, router, request);
+        assert_target_revoked(app.world(), target);
+        for input in [
+            PointerAction::Press(PointerButton::Primary),
+            PointerAction::Move { delta: Vec2::X },
+            PointerAction::Release(PointerButton::Primary),
+        ] {
+            commands(&mut app, target);
+            action(&mut app, &pointers, input);
+            assert_running(&app, router, request);
+            assert_target_revoked(app.world(), target);
+            assert!(
+                !app.world()
+                    .resource::<PointerDeliveries>()
+                    .0
+                    .contains_key(&target)
+            );
+            assert!(app.world().resource::<CommandDeliveries>().0.is_empty());
+        }
+        let control_delivery = app.world().resource::<PointerDeliveries>().0[&control];
+        assert_eq!(control_delivery.presses, 1);
+        assert_eq!(control_delivery.releases, 1);
+        assert_eq!(control_delivery.clicks, 1);
+        await_success(&mut app, router, request);
+        app.update();
+        assert_eq!(
+            location_at(app.world(), window, target).position,
+            pointers[0].1.position
+        );
+        assert!(
+            app.world()
+                .resource::<HoverMap>()
+                .get(&pointers[0].0)
+                .is_some_and(|hits| hits.contains_key(&target))
+        );
+        commands(&mut app, target);
+        action(
+            &mut app,
+            &pointers,
+            PointerAction::Press(PointerButton::Primary),
+        );
+        action(
+            &mut app,
+            &pointers,
+            PointerAction::Release(PointerButton::Primary),
+        );
+        let delivery = app.world().resource::<PointerDeliveries>().0[&target];
+        assert_eq!(delivery.presses, 1);
+        assert_eq!(delivery.releases, 1);
+        assert_eq!(delivery.clicks, 1);
+        assert_eq!(
+            app.world().resource::<CommandDeliveries>().0,
+            vec![
+                (target, CommandKind::Keyboard),
+                (target, CommandKind::Gamepad)
+            ]
+        );
+    }
+
+    #[derive(Clone)]
+    struct PreserveApplicationChildThenFail(Entity);
+    impl Template for PreserveApplicationChildThenFail {
+        type Output = ();
+        fn build_template(
+            &self,
+            context: &mut TemplateContext<'_, '_>,
+        ) -> bevy_ecs::error::Result<()> {
+            let root = context.entity.id();
+            context.entity.insert((target_node(), InactiveTarget));
+            context.entity.world_scope(|world| {
+                world.entity_mut(self.0).insert(ChildOf(root));
+            });
+            Err("native retained pointer apply source".into())
+        }
+        fn clone_template(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn native_failed_retained_residual_rejects_pointer_and_ready_commands() {
+        let (mut app, window, control) = app();
+        // A pre-existing application entity attached by the Scene forces real
+        // failure retention: cleanup must preserve this foreign child.
+        let protected = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(7.0),
+                height: Val::Px(7.0),
+                ..Node::default()
+            })
+            .id();
+        let driver = app
+            .register_bsn_view(ViewDriverKey::new("inactive-failure").unwrap(), move |_| {
+                Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
+                    root.push_bundle_template(PreserveApplicationChildThenFail(protected));
+                }))
+            })
+            .unwrap();
+        let router = install(&mut app, driver, 0);
+        let pointers = pointers(&mut app, window, control);
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        for _ in 0..32 {
+            app.update();
+            if matches!(app.world().resource::<RouterSnapshots>().request(router, request),
+                RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(_)))
+            {
+                break;
+            }
+        }
+        assert!(
+            matches!(app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(error)
+                if error.kind() == NavigationFailureKind::Apply && error.message().contains("native retained pointer apply source")))
+        );
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap()
+                .active()
+                .kind(),
+            ActivePresentationKind::Error
+        );
+        let target = app.world().get::<ChildOf>(protected).unwrap().parent();
+        assert!(
+            app.world().get::<InactiveTarget>(target).is_some(),
+            "failed native root must remain physically present around protected app content"
+        );
+        assert_eq!(
+            app.world().get::<Node>(target).unwrap().width,
+            Val::Px(48.0)
+        );
+        assert_target_revoked(app.world(), target);
+        for input in [
+            PointerAction::Press(PointerButton::Primary),
+            PointerAction::Move { delta: Vec2::X },
+            PointerAction::Release(PointerButton::Primary),
+        ] {
+            commands(&mut app, target);
+            commands(&mut app, protected);
+            action(&mut app, &pointers, input);
+            assert!(app.world().get_entity(target).is_ok());
+            assert_eq!(
+                app.world().get::<ChildOf>(protected).unwrap().parent(),
+                target
+            );
+            assert_target_revoked(app.world(), target);
+            assert_target_revoked(app.world(), protected);
+            assert!(
+                !app.world()
+                    .resource::<PointerDeliveries>()
+                    .0
+                    .contains_key(&target)
+            );
+            assert!(
+                !app.world()
+                    .resource::<PointerDeliveries>()
+                    .0
+                    .contains_key(&protected)
+            );
+            assert!(app.world().resource::<CommandDeliveries>().0.is_empty());
+        }
+        let delivery = app.world().resource::<PointerDeliveries>().0[&control];
+        assert_eq!(delivery.presses, 1);
+        assert_eq!(delivery.releases, 1);
+        assert_eq!(delivery.clicks, 1);
+    }
+
+    #[test]
+    fn ready_application_consumer_tracks_dynamic_content_membership_and_visibility() {
+        let (mut app, _, _) = app();
+        let driver = app
+            .register_bsn_view(ViewDriverKey::new("ready-dynamic").unwrap(), |_| {
+                Ok(SceneFunction(|_, root: &mut ResolvedScene| {
+                    root.push_template(target_node());
+                    root.push_template(InactiveTarget);
+                }))
+            })
+            .unwrap();
+        let router = install(&mut app, driver, 0);
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/"))
+            .unwrap();
+        await_success(&mut app, router, request);
+        let root = app
+            .world_mut()
+            .query_filtered::<Entity, With<InactiveTarget>>()
+            .single(app.world())
+            .unwrap();
+        // All topology changes happen before the next public Refresh/Ready.
+        let child = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(10.0),
+                    height: Val::Px(10.0),
+                    ..Node::default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+        let consume = |app: &mut App, expected_child: bool| {
+            app.world_mut()
+                .resource_mut::<CommandDeliveries>()
+                .0
+                .clear();
+            commands(app, root);
+            commands(app, child);
+            app.update();
+            let mut expected = vec![(root, CommandKind::Keyboard), (root, CommandKind::Gamepad)];
+            if expected_child {
+                expected.extend([
+                    (child, CommandKind::Keyboard),
+                    (child, CommandKind::Gamepad),
+                ]);
+            }
+            assert_eq!(app.world().resource::<CommandDeliveries>().0, expected);
+        };
+        consume(&mut app, true);
+        app.world_mut().entity_mut(child).remove::<ChildOf>();
+        consume(&mut app, false);
+        app.world_mut().entity_mut(child).insert(ChildOf(root));
+        consume(&mut app, true);
+        app.world_mut().get_mut::<Node>(child).unwrap().display = bevy_ui::Display::None;
+        consume(&mut app, false);
+        app.world_mut().get_mut::<Node>(child).unwrap().display = bevy_ui::Display::Flex;
+        consume(&mut app, true);
+        app.world_mut().entity_mut(child).despawn();
+        consume(&mut app, false);
     }
 }

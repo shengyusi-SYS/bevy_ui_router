@@ -6193,6 +6193,7 @@ fn failure_cleanup_observed_entity_matches(
     observed: &FrozenFailureCleanupObservedEntity,
     removed: &[Entity],
     registry_manifest: Option<&ComponentManifest>,
+    app_owned_host: Option<Entity>,
 ) -> bool {
     let expected_children = expected
         .children
@@ -6206,15 +6207,24 @@ fn failure_cleanup_observed_entity_matches(
     } else {
         expected.children_component_present
     };
-    let manifest_is_exact = match expected.manifest.as_ref() {
-        Some(manifest) => observed_manifest_differs_only_by_allowed_relationships(
-            world,
-            expected.entity,
-            manifest,
-            children_changed,
-            false,
-        ),
-        None => !expected.present && observed.manifest.is_none(),
+    // An application owns its host components. Only routing facts constrain
+    // preservation here; unrelated application markers are not cleanup authority.
+    let manifest_is_exact = if app_owned_host == Some(expected.entity)
+        && expected.registry_claim.is_none()
+        && expected.ownership_seal.is_none()
+    {
+        world.get::<Node>(expected.entity).is_some()
+    } else {
+        match expected.manifest.as_ref() {
+            Some(manifest) => observed_manifest_differs_only_by_allowed_relationships(
+                world,
+                expected.entity,
+                manifest,
+                children_changed,
+                false,
+            ),
+            None => !expected.present && observed.manifest.is_none(),
+        }
     };
     observed.entity == expected.entity
         && observed.present == expected.present
@@ -6443,6 +6453,7 @@ impl FrozenFailureCleanupPartition {
                 &observed,
                 &unavailable,
                 None,
+                None,
             ) {
                 let observed = Some(observed);
                 return Err(self.evidence(
@@ -6469,6 +6480,7 @@ impl FrozenFailureCleanupPartition {
                 &observed,
                 &unavailable,
                 registry_manifest,
+                self.source.logical.host_entity(),
             ) {
                 let observed = Some(observed);
                 return Err(self.evidence(
@@ -7252,6 +7264,12 @@ impl PreparedCleanupLedger {
     }
 }
 
+enum CleanupStopReason {
+    Refreeze(FailureCleanupSettlementRefreezeEvidence),
+    Settlement(CleanupSettlementPermanentEvidence),
+    AttemptRevisionExhausted,
+}
+
 pub(crate) struct CleanupLedger {
     batch: Option<CleanupBatch>,
     back_no_target_batch: Option<BackNoTargetCleanupBatchView>,
@@ -7270,10 +7288,9 @@ pub(crate) struct CleanupLedger {
     authority_host_children: Option<Vec<Entity>>,
     back_no_target_authority_partition: Option<FrozenBackNoTargetAuthorityPartition>,
     failure_cleanup_partition: Option<FrozenFailureCleanupPartition>,
-    failure_cleanup_inert: Option<FailureCleanupSettlementRefreezeEvidence>,
+    stopped: Option<CleanupStopReason>,
     quarantine_detachment: Option<FrozenCleanupQuarantineDetachment>,
     cleanup_settlement_permanent_pending: Option<Box<CleanupSettlementPermanentCause>>,
-    cleanup_settlement_permanent: Option<CleanupSettlementPermanentEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9559,10 +9576,9 @@ impl CleanupLedger {
             authority_host_children: None,
             back_no_target_authority_partition: None,
             failure_cleanup_partition: prepared.failure_cleanup_partition,
-            failure_cleanup_inert: None,
+            stopped: None,
             quarantine_detachment: None,
             cleanup_settlement_permanent_pending: None,
-            cleanup_settlement_permanent: None,
         }
     }
 
@@ -9596,10 +9612,9 @@ impl CleanupLedger {
             authority_host_children: None,
             back_no_target_authority_partition: None,
             failure_cleanup_partition: None,
-            failure_cleanup_inert: None,
+            stopped: None,
             quarantine_detachment: None,
             cleanup_settlement_permanent_pending: None,
-            cleanup_settlement_permanent: None,
         }
     }
 
@@ -9879,13 +9894,14 @@ impl CleanupLedger {
     pub(crate) fn cleanup_settlement_permanent_evidence(
         &self,
     ) -> Option<&CleanupSettlementPermanentEvidence> {
-        self.cleanup_settlement_permanent.as_ref()
+        match self.stopped.as_ref() {
+            Some(CleanupStopReason::Settlement(evidence)) => Some(evidence),
+            _ => None,
+        }
     }
 
-    pub(crate) fn take_cleanup_settlement_permanent_evidence(
-        &mut self,
-    ) -> Option<CleanupSettlementPermanentEvidence> {
-        self.cleanup_settlement_permanent.take()
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.is_some()
     }
 
     pub(crate) fn post_commit_batch_matches(&self, batch: &PostCommitCleanupBatchView) -> bool {
@@ -9965,18 +9981,22 @@ impl CleanupLedger {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn exhaust_attempt_revision_for_test(&mut self) {
+        self.next_attempt = u64::MAX;
+    }
+
     pub(crate) fn attempt(&mut self, world: &World) -> Option<CleanupAttempt> {
-        if self.completion_digest.is_some()
-            || self.failure_cleanup_inert.is_some()
-            || self.cleanup_settlement_permanent.is_some()
-        {
+        if self.completion_digest.is_some() || self.stopped.is_some() {
             return None;
         }
         let revision = self.next_attempt;
-        self.next_attempt = self
-            .next_attempt
-            .checked_add(1)
-            .expect("cleanup attempt revision exhausted");
+        let Some(next_attempt) = self.next_attempt.checked_add(1) else {
+            self.stopped = Some(CleanupStopReason::AttemptRevisionExhausted);
+            self.issued_attempt = None;
+            return None;
+        };
+        self.next_attempt = next_attempt;
         let attempt = CleanupAttempt {
             ledger_domain: self.ledger_domain,
             revision,
@@ -10569,7 +10589,7 @@ impl CleanupLedger {
     }
 
     fn retain_cleanup_settlement_permanent_evidence(&mut self, world: &World) {
-        if self.cleanup_settlement_permanent.is_some() {
+        if self.stopped.is_some() {
             return;
         }
         if let Some(pending) = self.cleanup_settlement_permanent_pending.take() {
@@ -10580,7 +10600,7 @@ impl CleanupLedger {
                 self.obligations.len(),
                 *pending,
             ) {
-                Ok(evidence) => self.cleanup_settlement_permanent = Some(evidence),
+                Ok(evidence) => self.stopped = Some(CleanupStopReason::Settlement(evidence)),
                 Err(cause) => {
                     self.cleanup_settlement_permanent_pending = Some(Box::new(cause));
                 }
@@ -10644,7 +10664,7 @@ impl CleanupLedger {
             self.obligations.len(),
             cause,
         ) {
-            Ok(evidence) => self.cleanup_settlement_permanent = Some(evidence),
+            Ok(evidence) => self.stopped = Some(CleanupStopReason::Settlement(evidence)),
             Err(cause) => {
                 self.cleanup_settlement_permanent_pending = Some(Box::new(cause));
             }
@@ -10855,7 +10875,7 @@ impl CleanupLedger {
         evidence: FailureCleanupSettlementRefreezeEvidence,
     ) -> bool {
         self.failure_cleanup_partition = Some(partition);
-        self.failure_cleanup_inert = Some(evidence);
+        self.stopped = Some(CleanupStopReason::Refreeze(evidence));
         self.issued_attempt = None;
         false
     }
@@ -12471,7 +12491,10 @@ impl CleanupLedger {
     pub(crate) fn failure_cleanup_refreeze_evidence_for_test(
         &self,
     ) -> Option<&FailureCleanupSettlementRefreezeEvidence> {
-        self.failure_cleanup_inert.as_ref()
+        match self.stopped.as_ref() {
+            Some(CleanupStopReason::Refreeze(evidence)) => Some(evidence),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -12550,7 +12573,7 @@ impl CleanupLedger {
             || self.authority_host_children.is_some()
             || self.back_no_target_authority_partition.is_some()
             || self.failure_cleanup_partition.is_some()
-            || self.failure_cleanup_inert.is_some()
+            || self.stopped.is_some()
         {
             return Err(PostCommitOriginalFreezeFailure::IneligibleSource);
         }

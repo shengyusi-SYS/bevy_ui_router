@@ -10,6 +10,14 @@ struct Fixture<'a> {
     expected_stderr: &'a [&'a str],
 }
 
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn path_for_toml(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
@@ -39,6 +47,7 @@ fn dependency_features(features: &[&str]) -> String {
 
 fn assert_compile_fails(fixture: Fixture<'_>) {
     let root = scratch_dir(fixture.name);
+    let _scratch = Scratch(root.clone());
     fs::create_dir_all(root.join("src")).expect("fixture src directory should be created");
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -64,11 +73,15 @@ bevy_ui_router_core = {{ path = "{path}"{features} }}
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = Command::new(cargo)
         .arg("check")
+        .arg("--offline")
         .arg("--config")
         .arg("build.rustc-wrapper = ''")
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env(
+            "CARGO_TARGET_DIR",
+            manifest_dir.join("../../target/core-compile-fail"),
+        )
         .output()
         .expect("cargo check should run");
 
@@ -99,6 +112,32 @@ fn route_view_key_error_unit_literal_is_private() {
             "cannot find value `RouteViewKeyError` in this scope",
         ],
     });
+}
+
+#[test]
+fn consumer_cannot_open_sealed_view_report_identity() {
+    assert_compile_fails(Fixture {
+        name: "view_report_identity_inner_private",
+        code: "use bevy_ui_router_core::integration::ViewReportIdentity; fn inspect(identity: ViewReportIdentity) { let _ = identity.inner; } fn main() {}",
+        features: &[],
+        expected_stderr: &["error[E0616]", "field `inner`", "private"],
+    });
+    for method in [
+        "report_router_provenance",
+        "report_host_epoch",
+        "report_transaction_sequence",
+        "report_frame_task_sequence",
+    ] {
+        let code = format!(
+            "use bevy_ui_router_core::integration::ViewReportIdentity; fn inspect(identity: &ViewReportIdentity) {{ let _ = identity.{method}(); }} fn main() {{}}"
+        );
+        assert_compile_fails(Fixture {
+            name: method,
+            code: &code,
+            features: &[],
+            expected_stderr: &["error[E0599]", method],
+        });
+    }
 }
 
 #[test]

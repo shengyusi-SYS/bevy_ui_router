@@ -126,6 +126,7 @@ fn main() {
     let preserved = [layout, sidebar, column, toolbar, outlet, slot];
     let parents = preserved.map(|entity| app.world().get::<ChildOf>(entity).unwrap().parent());
     app.world_mut().get_mut::<ToolbarState>(toolbar).unwrap().0 = 7;
+    assert_preserved(&mut app, &preserved, &parents);
     let first_page = show_page(&mut app, "overview", slot, &preserved);
 
     let request = app
@@ -134,6 +135,7 @@ fn main() {
         .push(router, RouteLocation::new("/settings"))
         .unwrap();
     settle(&mut app, router, request, "/settings", 2, 1);
+    assert_preserved(&mut app, &preserved, &parents);
     let settings_page = show_page(&mut app, "settings", slot, &preserved);
     assert!(app.world().get_entity(first_page).is_err());
     // Replace the second history entry; Back still returns to the first one.
@@ -143,6 +145,7 @@ fn main() {
         .replace(router, RouteLocation::new("/help"))
         .unwrap();
     settle(&mut app, router, request, "/help", 2, 1);
+    assert_preserved(&mut app, &preserved, &parents);
     let help_page = show_page(&mut app, "help", slot, &preserved);
     assert!(app.world().get_entity(settings_page).is_err());
     let request = app
@@ -151,17 +154,24 @@ fn main() {
         .back(router)
         .unwrap();
     settle(&mut app, router, request, "/overview", 2, 0);
+    assert_preserved(&mut app, &preserved, &parents);
     show_page(&mut app, "overview", slot, &preserved);
     assert!(app.world().get_entity(help_page).is_err());
 
-    assert_eq!(only::<Layout>(&mut app), layout);
-    assert_eq!(only::<DefaultOutlet>(&mut app), outlet);
-    assert_eq!(only::<ToolbarState>(&mut app), toolbar);
-    for (entity, parent) in preserved.into_iter().zip(parents) {
+    println!("Preserved layout, sidebar, toolbar state=7, internal outlet and child slot.");
+}
+
+fn assert_preserved(app: &mut App, entities: &[Entity; 6], parents: &[Entity; 6]) {
+    let [layout, sidebar, column, toolbar, outlet, _slot] = *entities;
+    assert_eq!(only::<Layout>(app), layout);
+    assert_eq!(only::<Sidebar>(app), sidebar);
+    assert_eq!(only::<MainColumn>(app), column);
+    assert_eq!(only::<ToolbarState>(app), toolbar);
+    assert_eq!(only::<DefaultOutlet>(app), outlet);
+    for (&entity, &parent) in entities.iter().zip(parents) {
         assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), parent);
     }
     assert_eq!(app.world().get::<ToolbarState>(toolbar).unwrap().0, 7);
-    println!("Preserved layout, sidebar, toolbar state=7, internal outlet and child slot.");
 }
 
 fn settle(

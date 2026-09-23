@@ -211,6 +211,8 @@ Host loss 也适用于所有请求已终态、没有在途 cleanup 的空闲 Rou
 
 trusted Scene 不承担恶意脚本假设；Router 无需列举其全部应用组件或回滚 closure 外资源副作用。它仍必须正确处理同步失败、自己的 ownership/binding 漂移、host 丢失和正常 Scene 局部行为，不得以信任应用为理由跳过这些检查。
 
+应用拥有的 host 上，无关应用组件的增删不构成 cleanup authority 丢失；例如 Scene 组件的销毁 hook 可以记录应用自己的清理标记。host staging 同样不能以整个 World 的实体和组件集合不变作为接纳条件：可信 observer 可以增删无关应用实体。校验仍须保留 host 实例与注册身份、相关关系、目标/受保护内容分区和输入事实，不能把保护应用内容解释成冻结其全部组件集合。永久停止原因和物理残留由原 cleanup owner 保留；前台请求结束不能依赖另建一个无限等待的 holder。
+
 ## 9. Snapshots 与诊断
 
 request snapshot 提供请求自身 requested/matched/status 和可分类 failure；Router snapshot 分开提供 running request 摘要、active presentation、availability、history/can-back。queued/last-terminal 不能冒充 running，error presentation 的目标不能伪装成一次成功 history entry。

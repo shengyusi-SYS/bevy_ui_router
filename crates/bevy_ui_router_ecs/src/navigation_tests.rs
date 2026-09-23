@@ -8094,44 +8094,61 @@ fn nested_partial_child_frame_settles_before_core_advances() {
 }
 
 #[test]
-fn nested_mount_resolution_exhaustion_reissues_without_driver_rerun() {
+fn nested_mount_resolution_exhaustion_settles_and_runs_queued_root_without_driver_rerun() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
     let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let layout = RouteViewKey::new("layout").unwrap();
+    let fallback = RouteViewKey::new("fallback").unwrap();
     let router = install_nested_router(&mut app, observed.clone(), true);
     observe_authority_system(app.world_mut());
-    app.world_mut()
+    let request = app
+        .world_mut()
         .resource_mut::<RouterNavigation>()
         .push(router, RouteLocation::new("/items/1"))
         .unwrap();
     collect_navigation_system(app.world_mut());
     drive_navigation_system(app.world_mut());
-    {
+    let (host, queued) = {
         let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
+        let host = navigation.entries[0].host.as_ref().unwrap().host;
         navigation.entries[0].engine.testing_exhaust_slot_counter();
-    }
-    let world_before = authority_world_fingerprint(app.world());
-    let registry_before = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .to_vec();
+        let queued = navigation.push(router, RouteLocation::new("/")).unwrap();
+        (host, queued)
+    };
 
     drive_navigation_system(app.world_mut());
     drive_navigation_system(app.world_mut());
+    assert_eq!(*observed.lock().unwrap(), vec![layout.clone()]);
 
-    assert_eq!(*observed.lock().unwrap(), vec![layout]);
-    assert_eq!(authority_world_fingerprint(app.world()), world_before);
-    assert_eq!(
-        app.world().resource::<RouteEntityRegistry>().records(),
-        registry_before
-    );
+    run_updates_until_succeeded(&mut app, queued);
+
     let navigation = app.world().resource::<RouterNavigation>();
-    let pending = navigation.entries[0].pending_commit.as_ref().unwrap();
-    assert_eq!(pending.branch.frames().len(), 1);
-    assert!(pending.branch.child_slots().is_empty());
-    assert!(pending.final_task.is_none());
+    let entry = &navigation.entries[0];
+    assert!(
+        matches!(entry.engine.request(request).unwrap().status(), RequestStatus::Failed(failure)
+        if failure.kind() == bevy_ui_router_core::prelude::NavigationFailureKind::Mount)
+    );
+    assert_eq!(
+        entry.engine.request(queued).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(entry.engine.history().len(), 1);
+    assert_eq!(
+        entry.engine.history().current(),
+        Some(&RouteLocation::new("/"))
+    );
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(entry.pending_mount_request.is_none());
+    assert!(entry.pending_commit.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert_eq!(entry.host.as_ref().unwrap().host, host);
+    assert!(app.world().get::<Node>(host).is_some());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![layout.clone(), fallback, layout]
+    );
 }
 
 fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
@@ -8164,7 +8181,6 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         pending_mount_mutation_rejection: None,
         pending_failed_branch: None,
         failure_cleanup_permanent: None,
-        cleanup_settlement_permanent_inert: None,
         projectionless_fail_close: None,
         active: None,
         cleanup_ledger: None,
@@ -17252,10 +17268,7 @@ fn back_target_pending_rejection_enters_existing_failed_cleanup() {
             .iter()
             .find(|entry| entry.handle == router)
             .expect("partial settlement retains its RouterEntry");
-        let ledger = entry
-            .cleanup_ledger
-            .as_ref()
-            .expect("the real despawn hook drift must retain the active failure-cleanup ledger");
+        let ledger = stopped_cleanup_residual(entry, request);
         assert_eq!(
             ledger.failed_preflight_evidence(),
             Some(LifecyclePreflightEvidence::new(
@@ -17309,9 +17322,12 @@ fn back_target_pending_rejection_enters_existing_failed_cleanup() {
                 .find(|entry| entry.handle == router)
                 .expect("the failure cleanup retains its RouterEntry");
             let mut ledger = entry
-                .cleanup_ledger
+                .authority_protocol_residual
+                .as_mut()
+                .unwrap()
+                .cleanup_settlement_ledger
                 .take()
-                .expect("the partial settlement retains its unique ledger owner");
+                .expect("partial settlement retains its unique private ledger owner");
             assert!(
                 ledger.attempt(world).is_none(),
                 "postwrite target drift remains inert after its predicate is restored"
@@ -17355,7 +17371,11 @@ fn back_target_pending_rejection_enters_existing_failed_cleanup() {
                 request_view.diagnostics().to_vec(),
                 failed_owner_count,
             );
-            entry.cleanup_ledger = Some(ledger);
+            entry
+                .authority_protocol_residual
+                .as_mut()
+                .unwrap()
+                .cleanup_settlement_ledger = Some(ledger);
             stable
         },
     );
@@ -17363,10 +17383,7 @@ fn back_target_pending_rejection_enters_existing_failed_cleanup() {
         failed_owner_count_after_restore > 0,
         "the failed branch owner remains linearly held by the inert cleanup"
     );
-    assert!(matches!(
-        status_after_restore,
-        RequestStatus::Running(NavigationPhase::CleanupPending)
-    ));
+    assert!(matches!(status_after_restore, RequestStatus::Failed(_)));
 
     for _ in 0..3 {
         settle_cleanup_system(app.world_mut());
@@ -17377,10 +17394,7 @@ fn back_target_pending_rejection_enters_existing_failed_cleanup() {
             .iter()
             .find(|entry| entry.handle == router)
             .expect("the inert failure cleanup retains its RouterEntry");
-        let ledger = entry
-            .cleanup_ledger
-            .as_ref()
-            .expect("later ticks retain the same cleanup ledger owner");
+        let ledger = stopped_cleanup_residual(entry, request);
         let request_view = entry
             .engine
             .request(request)
@@ -17401,7 +17415,20 @@ fn back_target_pending_rejection_enters_existing_failed_cleanup() {
         assert_eq!(request_view.trace(), trace_after_restore);
         assert_eq!(request_view.diagnostics(), diagnostics_after_restore);
         assert_eq!(entry.engine.history(), &history_before);
-        assert_eq!(entry.engine.active(), &core_active_before);
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::None);
+        assert_eq!(
+            entry
+                .authority_protocol_residual
+                .as_ref()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .cloned()
+                .collect::<Vec<_>>(),
+            active_claims_before
+        );
         assert!(entry.pending_back_target_permanent_cleanup.is_none());
     }
 }
@@ -35304,6 +35331,23 @@ fn nested_pending_isolation_observer_drift_retains_inert_owner_for_retry() {
     }
 }
 
+fn stopped_cleanup_residual(entry: &RouterEntry, request: NavigationRequestId) -> &CleanupLedger {
+    assert!(matches!(
+        entry.engine.request(request).unwrap().status(),
+        RequestStatus::Failed(_)
+    ));
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert!(entry.cleanup_ledger.is_none());
+    entry
+        .authority_protocol_residual
+        .as_ref()
+        .expect("terminal cleanup retains private physical responsibility")
+        .cleanup_settlement_ledger
+        .as_ref()
+        .expect("the original ledger and typed evidence move into the private residual")
+}
+
 #[test]
 fn post_despawn_registry_claim_cas_cannot_mint_a_cleanup_receipt() {
     let mut app = App::new();
@@ -35337,16 +35381,13 @@ fn post_despawn_registry_claim_cas_cannot_mint_a_cleanup_receipt() {
     settle_cleanup_system(app.world_mut());
 
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    let ledger = entry
-        .cleanup_ledger
-        .as_ref()
-        .expect("failed receipt CAS must retain the activated owner");
+    let ledger = stopped_cleanup_residual(entry, request);
     assert_eq!(ledger.receipt_count(), 0);
     assert!(!ledger.is_settled());
     assert!(!ledger.failed_prepared_frames().is_empty());
     assert!(matches!(
         entry.engine.request(request).unwrap().status(),
-        RequestStatus::Running(_)
+        RequestStatus::Failed(_)
     ));
     assert!(app.world().get_entity(target).is_err());
     assert_eq!(
@@ -35362,7 +35403,7 @@ fn post_despawn_registry_claim_cas_cannot_mint_a_cleanup_receipt() {
 #[test]
 fn failed_output_prewrite_focus_drift_is_typed_inert_before_cleanup_write() {
     let mut app = App::new();
-    let (_request, _router) = prepare_exact_child_stale_failure(&mut app);
+    let (request, _router) = prepare_exact_child_stale_failure(&mut app);
     let first = {
         let world = app.world();
         let entry = &world.resource::<RouterNavigation>().entries[0];
@@ -35380,7 +35421,7 @@ fn failed_output_prewrite_focus_drift_is_typed_inert_before_cleanup_write() {
     settle_cleanup_system(app.world_mut());
 
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    let ledger = entry.cleanup_ledger.as_ref().unwrap();
+    let ledger = stopped_cleanup_residual(entry, request);
     assert!(app.world().get_entity(first).is_ok());
     assert_eq!(ledger.receipt_count(), 0);
     assert!(!ledger.issued_attempt_present_for_test());
@@ -35404,7 +35445,7 @@ fn failed_output_prewrite_focus_drift_is_typed_inert_before_cleanup_write() {
 #[test]
 fn failed_output_prewrite_logical_source_drift_is_typed_inert_before_cleanup_write() {
     let mut app = App::new();
-    let (_request, _router) = prepare_exact_child_stale_failure(&mut app);
+    let (request, _router) = prepare_exact_child_stale_failure(&mut app);
     let (first, host) = {
         let world = app.world();
         let entry = &world.resource::<RouterNavigation>().entries[0];
@@ -35423,7 +35464,7 @@ fn failed_output_prewrite_logical_source_drift_is_typed_inert_before_cleanup_wri
     settle_cleanup_system(app.world_mut());
 
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    let ledger = entry.cleanup_ledger.as_ref().unwrap();
+    let ledger = stopped_cleanup_residual(entry, request);
     assert!(app.world().get_entity(first).is_ok());
     assert_eq!(ledger.receipt_count(), 0);
     assert!(!ledger.issued_attempt_present_for_test());
@@ -35444,479 +35485,85 @@ fn failed_output_prewrite_logical_source_drift_is_typed_inert_before_cleanup_wri
 }
 
 #[test]
-fn failed_output_despawn_hook_protected_drift_stops_before_receipt_and_next_write() {
+fn failed_output_despawn_hook_app_host_marker_allows_recovery() {
     let mut app = App::new();
     install_cleanup_despawn_drift_hook(&mut app);
     let (request, _router) = prepare_exact_child_stale_failure(&mut app);
-    let (
-        first,
-        first_claim,
-        later,
-        later_claim,
-        later_physical_before,
-        protected,
-        host_before,
-        host_relationship_before,
-        physical_active_before,
-        logical_active_before,
-        requested_before,
-        matched_before,
-        diagnostics_before,
-        trace_before,
-        registry_before,
-        failed_frames_before,
-        failed_claims_before,
-    ) = {
+    let (first, later, host) = {
         let world = app.world();
         let entry = &world.resource::<RouterNavigation>().entries[0];
-        let failed = entry
-            .pending_failed_branch
-            .as_ref()
-            .expect("the real stale-child fixture retains its whole failed owner");
         let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
             world,
             world.resource::<RouteEntityRegistry>(),
-            &failed.branch,
+            &entry.pending_failed_branch.as_ref().unwrap().branch,
         )
-        .expect("the real failed output freezes an exact cleanup manifest");
+        .unwrap();
         let entities = manifest.entities();
-        assert!(
-            entities.len() >= 2,
-            "the hook-cycle fixture requires two independently frozen obligations"
-        );
-        let first = entities[0];
-        let later = entities[1];
-        assert_ne!(first, later);
-        let registry = world.resource::<RouteEntityRegistry>();
-        let first_claim = registry
-            .record(first)
-            .expect("the first target retains its exact registry record")
-            .claim();
-        let later_claim = registry
-            .record(later)
-            .expect("the later target retains its independent registry record")
-            .claim();
-        let host = entry
-            .host
-            .as_ref()
-            .expect("the failed output remains mounted under an app-owned host");
-        let protected = host.host;
-        let request_view = entry
-            .engine
-            .request(request)
-            .expect("the exact request remains retained");
+        (entities[0], entities[1], entry.host.as_ref().unwrap().host)
+    };
+    app.world_mut().insert_resource(CleanupDespawnDrift {
+        target: first,
+        action: CleanupDespawnDriftAction::ProtectedMarker(host),
+    });
+    settle_cleanup_system(app.world_mut());
+    assert!(app.world().get_entity(first).is_err());
+    assert!(app.world().get_entity(later).is_err());
+    for _ in 0..20 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(
+        matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ),
+        "application host marker must not prevent recovery"
+    );
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(app.world().get_entity(host).is_ok());
+    assert!(app.world().get::<CleanupDriftMarker>(host).is_some());
+}
+
+#[test]
+fn failed_output_despawn_hook_app_host_marker_preserves_host_authority() {
+    let mut app = App::new();
+    install_cleanup_despawn_drift_hook(&mut app);
+    let (request, _router) = prepare_exact_child_stale_failure(&mut app);
+    let (first, host, host_before, active_before) = {
+        let world = app.world();
+        let entry = &world.resource::<RouterNavigation>().entries[0];
+        let manifest = FrozenCleanupManifest::from_failed_prepared_branch(
+            world,
+            world.resource::<RouteEntityRegistry>(),
+            &entry.pending_failed_branch.as_ref().unwrap().branch,
+        )
+        .unwrap();
+        let host = entry.host.as_ref().unwrap();
         (
-            first,
-            first_claim,
-            later,
-            later_claim,
-            (
-                world.get::<ChildOf>(later).map(ChildOf::parent),
-                world.get::<Visibility>(later).copied(),
-                world
-                    .get::<Pickable>(later)
-                    .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable)),
-                world.get::<RouterInputBarrier>(later).copied(),
-                world.get::<RouteOwnershipSeal>(later).copied(),
-                world.get::<FrameLifecycle>(later).copied(),
-                world.get::<ChildSlotLifecycle>(later).copied(),
-                world.get::<ChildSlotAuthority>(later).cloned(),
-                world.get::<ProvisionalSlotLifecycle>(later).copied(),
-            ),
-            protected,
+            manifest.entities()[0],
+            host.host,
             ProjectionlessHostProjection::from(host),
-            (
-                world.get::<ChildOf>(protected).map(ChildOf::parent),
-                world
-                    .get::<Children>(protected)
-                    .map(|children| children.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-                world
-                    .get::<RouterHostRegistration>(protected)
-                    .map(RouterHostRegistration::testing_identity),
-            ),
-            entry.active.as_ref().map(|active| {
-                (
-                    active
-                        .frames()
-                        .iter()
-                        .map(|frame| frame.frame().clone())
-                        .collect::<Vec<_>>(),
-                    active.claims().cloned().collect::<Vec<_>>(),
-                )
-            }),
             entry.engine.active().clone(),
-            request_view.requested().cloned(),
-            request_view.matched().cloned(),
-            request_view.diagnostics().to_vec(),
-            request_view.trace().to_vec(),
-            registry.records().to_vec(),
-            failed
-                .branch
-                .frames()
-                .iter()
-                .map(|frame| frame.frame().clone())
-                .collect::<Vec<_>>(),
-            failed_branch_primary_claims(&failed.branch)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
         )
     };
     app.world_mut().insert_resource(CleanupDespawnDrift {
         target: first,
-        action: CleanupDespawnDriftAction::ProtectedMarker(protected),
+        action: CleanupDespawnDriftAction::ProtectedMarker(host),
     });
-
     settle_cleanup_system(app.world_mut());
-
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
     assert!(app.world().get_entity(first).is_err());
-    assert!(app.world().get::<CleanupDriftMarker>(protected).is_some());
-    assert!(
-        app.world().get_entity(later).is_ok(),
-        "the protected drift must stop before the next exact target write"
-    );
+    assert!(app.world().get::<CleanupDriftMarker>(host).is_some());
     assert_eq!(
-        (
-            app.world().get::<ChildOf>(later).map(ChildOf::parent),
-            app.world().get::<Visibility>(later).copied(),
-            app.world()
-                .get::<Pickable>(later)
-                .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable)),
-            app.world().get::<RouterInputBarrier>(later).copied(),
-            app.world().get::<RouteOwnershipSeal>(later).copied(),
-            app.world().get::<FrameLifecycle>(later).copied(),
-            app.world().get::<ChildSlotLifecycle>(later).copied(),
-            app.world().get::<ChildSlotAuthority>(later).cloned(),
-            app.world().get::<ProvisionalSlotLifecycle>(later).copied(),
-        ),
-        later_physical_before,
-        "the later target must retain its independently frozen physical facts"
+        ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
+        host_before
     );
-    assert_eq!(
-        app.world()
-            .resource::<RouteEntityRegistry>()
-            .record(first)
-            .map(|record| record.claim()),
-        Some(first_claim.clone()),
-        "the in-flight target must not retire before the physical-absent refreeze"
-    );
-    assert_eq!(
-        app.world()
-            .resource::<RouteEntityRegistry>()
-            .record(later)
-            .map(|record| record.claim()),
-        Some(later_claim.clone()),
-        "the later target must retain its exact unretired claim"
-    );
-    assert_eq!(
-        app.world().resource::<RouteEntityRegistry>().records(),
-        registry_before,
-        "protected post-despawn drift must perform zero registry writes"
-    );
-
-    let (
-        world_after_first,
-        registry_after_first,
-        host_after_first,
-        host_relationship_after_first,
-        physical_active_after_first,
-        logical_active_after_first,
-        requested_after_first,
-        matched_after_first,
-        status_after_first,
-        diagnostics_after_first,
-        trace_after_first,
-        ledger_projection_after_first,
-        failed_frames_after_first,
-        failed_claims_after_first,
-        owner_inventory_after_first,
-    ) = {
-        let world = app.world();
-        let entry = &world.resource::<RouterNavigation>().entries[0];
-        let ledger = entry
-            .cleanup_ledger
-            .as_ref()
-            .expect("protected drift retains the activated ECS cleanup owner");
-        assert!(ledger.is_failed_prepared());
-        assert_eq!(ledger.receipt_count(), 0);
-        assert!(!ledger.is_settled());
-        assert!(!ledger.issued_attempt_present_for_test());
-        let refreeze = ledger
-            .failure_cleanup_refreeze_evidence_for_test()
-            .expect("protected drift retains typed postwrite refreeze evidence");
-        assert_eq!(
-            refreeze.stage(),
-            crate::cleanup::FailureCleanupTransitionStage::PhysicalAbsent(first)
-        );
-        assert!(matches!(
-            refreeze.failure(),
-            crate::cleanup::FailureCleanupPartitionRefreezeFailure::Protected {
-                entity,
-                observed: Some(_),
-                ..
-            } if *entity == protected
-        ));
-        let retained = ledger
-            .failed_prepared_branch()
-            .expect("the activated ledger retains the whole failed branch owner");
-        let request_view = entry
-            .engine
-            .request(request)
-            .expect("the cleanup request remains retained");
-        assert_eq!(request_view.requested(), requested_before.as_ref());
-        assert_eq!(request_view.matched(), matched_before.as_ref());
-        assert_eq!(
-            &request_view.diagnostics()[..diagnostics_before.len()],
-            diagnostics_before.as_slice()
-        );
-        let activation_diagnostics = &request_view.diagnostics()[diagnostics_before.len()..];
-        assert_eq!(
-            activation_diagnostics.len(),
-            1,
-            "cleanup activation emits exactly one accepted failure diagnostic"
-        );
-        let activation_diagnostic = &activation_diagnostics[0];
-        assert_eq!(
-            activation_diagnostic.kind(),
-            DiagnosticEventKind::ReportDisposition
-        );
-        assert_eq!(
-            activation_diagnostic.severity(),
-            DiagnosticSeverity::Warning
-        );
-        assert_eq!(activation_diagnostic.request(), Some(request));
-        assert!(activation_diagnostic.frame().is_some());
-        assert_eq!(
-            activation_diagnostic.report_disposition(),
-            Some(ReportDisposition::Accepted)
-        );
-        assert_eq!(
-            activation_diagnostic.redacted_message(),
-            "accepted normal Apply failure: route view report application became stale"
-        );
-        assert!(request_view.trace().starts_with(&trace_before));
-        assert!(
-            request_view.trace()[trace_before.len()..]
-                .iter()
-                .all(|event| !matches!(
-                    event.kind(),
-                    NavigationTraceEventKind::CleanupSettled
-                        | NavigationTraceEventKind::RequestTerminal
-                )),
-            "zero receipts must publish neither cleanup nor terminal trace events"
-        );
-        assert!(matches!(
-            request_view.status(),
-            RequestStatus::Running(NavigationPhase::CleanupPending)
-        ));
-        assert_eq!(
-            ProjectionlessHostProjection::from(
-                entry
-                    .host
-                    .as_ref()
-                    .expect("protected drift preserves the app-owned host binding")
-            ),
-            host_before
-        );
-        assert_eq!(
-            (
-                world.get::<ChildOf>(protected).map(ChildOf::parent),
-                world
-                    .get::<Children>(protected)
-                    .map(|children| children.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-                world
-                    .get::<RouterHostRegistration>(protected)
-                    .map(RouterHostRegistration::testing_identity),
-            ),
-            host_relationship_before
-        );
-        let physical_active = entry.active.as_ref().map(|active| {
-            (
-                active
-                    .frames()
-                    .iter()
-                    .map(|frame| frame.frame().clone())
-                    .collect::<Vec<_>>(),
-                active.claims().cloned().collect::<Vec<_>>(),
-            )
-        });
-        assert_eq!(physical_active, physical_active_before);
-        assert_eq!(entry.engine.active(), &logical_active_before);
-        assert!(entry.pending_failed_branch.is_none());
-        assert!(entry.failure_cleanup_completion.is_none());
-        assert!(entry.failure_cleanup_permanent.is_none());
-        assert!(entry.authority_protocol_residual.is_none());
-        assert!(entry.pending_frame_drive.is_none());
-        assert!(entry.pending_mount_frame_task.is_none());
-        assert!(entry.pending_mount_request.is_none());
-        assert!(entry.pending_commit.is_none());
-        (
-            authority_world_fingerprint(world),
-            world.resource::<RouteEntityRegistry>().records().to_vec(),
-            ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
-            (
-                world.get::<ChildOf>(protected).map(ChildOf::parent),
-                world
-                    .get::<Children>(protected)
-                    .map(|children| children.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-                world
-                    .get::<RouterHostRegistration>(protected)
-                    .map(RouterHostRegistration::testing_identity),
-            ),
-            physical_active,
-            entry.engine.active().clone(),
-            request_view.requested().cloned(),
-            request_view.matched().cloned(),
-            request_view.status().clone(),
-            request_view.diagnostics().to_vec(),
-            request_view.trace().to_vec(),
-            ledger.projection(),
-            retained
-                .frames()
-                .iter()
-                .map(|frame| frame.frame().clone())
-                .collect::<Vec<_>>(),
-            failed_branch_primary_claims(retained)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            (
-                entry.pending_failed_branch.is_some(),
-                entry.cleanup_ledger.is_some(),
-                entry.failure_cleanup_completion.is_some(),
-                entry.failure_cleanup_permanent.is_some(),
-                entry.authority_protocol_residual.is_some(),
-                entry.pending_frame_drive.is_some(),
-                entry.pending_mount_frame_task.is_some(),
-                entry.pending_mount_request.is_some(),
-                entry.pending_commit.is_some(),
-            ),
-        )
-    };
-    assert_eq!(failed_frames_after_first, failed_frames_before);
-    assert_eq!(failed_claims_after_first, failed_claims_before);
-    assert_eq!(
-        owner_inventory_after_first,
-        (false, true, false, false, false, false, false, false, false)
-    );
-
-    for _ in 0..3 {
-        settle_cleanup_system(app.world_mut());
-
-        let world = app.world();
-        let entry = &world.resource::<RouterNavigation>().entries[0];
-        let ledger = entry
-            .cleanup_ledger
-            .as_ref()
-            .expect("the typed postwrite stop remains inert on later ticks");
-        let retained = ledger
-            .failed_prepared_branch()
-            .expect("later ticks retain the same whole failed owner inventory");
-        let request_view = entry.engine.request(request).unwrap();
-        assert_eq!(authority_world_fingerprint(world), world_after_first);
-        assert_eq!(
-            world.resource::<RouteEntityRegistry>().records(),
-            registry_after_first
-        );
-        assert_eq!(
-            ProjectionlessHostProjection::from(entry.host.as_ref().unwrap()),
-            host_after_first
-        );
-        assert_eq!(
-            (
-                world.get::<ChildOf>(protected).map(ChildOf::parent),
-                world
-                    .get::<Children>(protected)
-                    .map(|children| children.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-                world
-                    .get::<RouterHostRegistration>(protected)
-                    .map(RouterHostRegistration::testing_identity),
-            ),
-            host_relationship_after_first
-        );
-        assert_eq!(
-            entry.active.as_ref().map(|active| {
-                (
-                    active
-                        .frames()
-                        .iter()
-                        .map(|frame| frame.frame().clone())
-                        .collect::<Vec<_>>(),
-                    active.claims().cloned().collect::<Vec<_>>(),
-                )
-            }),
-            physical_active_after_first
-        );
-        assert_eq!(entry.engine.active(), &logical_active_after_first);
-        assert_eq!(request_view.requested(), requested_after_first.as_ref());
-        assert_eq!(request_view.matched(), matched_after_first.as_ref());
-        assert_eq!(request_view.status(), &status_after_first);
-        assert_eq!(request_view.diagnostics(), diagnostics_after_first);
-        assert_eq!(request_view.trace(), trace_after_first);
-        assert!(ledger.projection() == ledger_projection_after_first);
-        assert_eq!(ledger.receipt_count(), 0);
-        assert!(!ledger.issued_attempt_present_for_test());
-        assert_eq!(
-            retained
-                .frames()
-                .iter()
-                .map(|frame| frame.frame().clone())
-                .collect::<Vec<_>>(),
-            failed_frames_after_first
-        );
-        assert_eq!(
-            failed_branch_primary_claims(retained)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            failed_claims_after_first
-        );
-        assert_eq!(
-            (
-                entry.pending_failed_branch.is_some(),
-                entry.cleanup_ledger.is_some(),
-                entry.failure_cleanup_completion.is_some(),
-                entry.failure_cleanup_permanent.is_some(),
-                entry.authority_protocol_residual.is_some(),
-                entry.pending_frame_drive.is_some(),
-                entry.pending_mount_frame_task.is_some(),
-                entry.pending_mount_request.is_some(),
-                entry.pending_commit.is_some(),
-            ),
-            owner_inventory_after_first
-        );
-        assert!(world.get_entity(first).is_err());
-        assert!(world.get_entity(later).is_ok());
-        assert!(world.get::<CleanupDriftMarker>(protected).is_some());
-        assert_eq!(
-            world
-                .resource::<RouteEntityRegistry>()
-                .record(first)
-                .map(|record| record.claim()),
-            Some(first_claim.clone())
-        );
-        assert_eq!(
-            world
-                .resource::<RouteEntityRegistry>()
-                .record(later)
-                .map(|record| record.claim()),
-            Some(later_claim.clone())
-        );
-    }
-
-    let recovery_action_is_absent = app.world_mut().resource_scope(
-        |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-            navigation.entries[0].engine.action().is_none()
-        },
-    );
-    assert!(
-        recovery_action_is_absent,
-        "protected post-despawn drift must not issue a recovery action"
-    );
+    assert_eq!(entry.engine.active(), &active_before);
+    assert!(entry.authority_protocol_residual.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(entry.engine.request(request).is_some());
 }
 
 #[test]
@@ -35951,7 +35598,7 @@ fn post_despawn_external_parent_drift_stops_before_the_next_obligation() {
     settle_cleanup_system(app.world_mut());
 
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    let ledger = entry.cleanup_ledger.as_ref().unwrap();
+    let ledger = stopped_cleanup_residual(entry, request);
     assert_eq!(ledger.receipt_count(), 0);
     assert!(!ledger.is_settled());
     assert!(!ledger.issued_attempt_present_for_test());
@@ -35988,7 +35635,7 @@ fn post_despawn_external_parent_drift_stops_before_the_next_obligation() {
     );
     assert!(matches!(
         entry.engine.request(request).unwrap().status(),
-        RequestStatus::Running(NavigationPhase::CleanupPending)
+        RequestStatus::Failed(_)
     ));
     let world_after_first = authority_world_fingerprint(app.world());
     let registry_after_first = app
@@ -36001,7 +35648,7 @@ fn post_despawn_external_parent_drift_stops_before_the_next_obligation() {
     for _ in 0..3 {
         settle_cleanup_system(app.world_mut());
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
-        let ledger = entry.cleanup_ledger.as_ref().unwrap();
+        let ledger = stopped_cleanup_residual(entry, request);
         assert_eq!(ledger.receipt_count(), 0);
         assert!(!ledger.issued_attempt_present_for_test());
         assert!(
@@ -40276,6 +39923,62 @@ fn nested_entering_child_slot_foreign_descendant_is_pending_rejected() {
 }
 
 #[test]
+fn exhausted_cleanup_attempt_releases_foreground_owner() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_deep_nested_router(&mut app);
+    app.update();
+    commit_initial_deep_nested_branch(&mut app, router);
+    let slot = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .child_slots()[1]
+        .slot();
+    let request = prepare_deep_nested_branch_for_commit(
+        &mut app,
+        router,
+        RouteLocation::new("/sections/b/items/2"),
+    );
+    apply_child_slot_boundary_drift(&mut app, slot, ChildSlotBoundaryDrift::ForeignDescendant);
+    fail_next_verified_preparation_for_test();
+    commit_presentation_system(app.world_mut());
+    let published_history = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let location = RouteLocation::new("/sections/b/items/2");
+        assert!(entry.pending_commit.is_none());
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Route);
+        assert_eq!(entry.engine.active().location(), Some(&location));
+        assert_eq!(entry.engine.history().current(), Some(&location));
+        assert_eq!(entry.engine.history().len(), 2);
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        ));
+        entry.engine.history().clone()
+    };
+    settle_cleanup_system(app.world_mut());
+    app.world_mut().resource_mut::<RouterNavigation>().entries[0]
+        .cleanup_ledger
+        .as_mut()
+        .unwrap()
+        .exhaust_attempt_revision_for_test();
+    for _ in 0..20 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded,
+        "cleanup exhaustion cannot rewrite the already-published normal navigation result"
+    );
+    assert_eq!(entry.engine.history(), &published_history);
+    assert!(entry.engine.snapshot().running_request().is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert!(entry.cleanup_ledger.is_none());
+}
+
+#[test]
 fn nested_failed_transfer_keeps_the_same_ledger_for_a_higher_revision() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
@@ -40532,7 +40235,22 @@ fn quarantine_detach_hook_drift_is_not_rebaselined_or_published() {
         .resource_mut::<RouterNavigation>()
         .push(router, RouteLocation::new("/").with_fragment("replacement"))
         .unwrap();
-    app.update();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    commit_presentation_system(app.world_mut());
+    let published_history = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let location = RouteLocation::new("/").with_fragment("replacement");
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Route);
+        assert_eq!(entry.engine.active().location(), Some(&location));
+        assert_eq!(entry.engine.history().current(), Some(&location));
+        assert!(matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        ));
+        assert!(!app.world().resource::<QuarantineDetachHookDrift>().fired);
+        entry.engine.history().clone()
+    };
 
     for _ in 0..8 {
         if app.world().resource::<QuarantineDetachHookDrift>().fired {
@@ -40555,27 +40273,27 @@ fn quarantine_detach_hook_drift_is_not_rebaselined_or_published() {
                 .request(request)
                 .unwrap()
                 .status(),
-            RequestStatus::Failed(_)
+            RequestStatus::Succeeded
         ) {
             break;
         }
         app.update();
     }
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    assert!(matches!(
+    assert_eq!(
         entry.engine.request(request).unwrap().status(),
-        RequestStatus::Failed(failure)
-            if failure.kind() == NavigationFailureKind::AuthorityLost
-    ));
+        &RequestStatus::Succeeded,
+        "post-publication cleanup drift must retain the committed normal outcome"
+    );
+    assert_eq!(entry.engine.history(), &published_history);
     assert!(entry.cleanup_ledger.is_none());
-    assert!(entry.cleanup_settlement_permanent_inert.is_none());
     let residual = entry
         .authority_protocol_residual
         .as_ref()
         .expect("permanent cleanup-settlement drift must retain one fail-closed owner");
     assert!(matches!(
         residual.kind,
-        AuthorityProtocolResidualKind::CleanupSettlementPermanent(_)
+        AuthorityProtocolResidualKind::CleanupStopped
     ));
     assert_eq!(
         residual
@@ -40585,6 +40303,14 @@ fn quarantine_detach_hook_drift_is_not_rebaselined_or_published() {
             .receipt_count(),
         0,
         "permanent protected drift must not publish an ordinary terminal receipt",
+    );
+    assert!(
+        residual
+            .cleanup_settlement_ledger
+            .as_ref()
+            .unwrap()
+            .cleanup_settlement_permanent_evidence()
+            .is_some()
     );
     assert!(entry.active.is_none());
     assert!(entry.host.is_none());
