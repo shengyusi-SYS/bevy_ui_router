@@ -12,6 +12,7 @@
 | [唯一实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md) | 迁移依赖、结果阶段、验证、审查和提交边界 |
 | [Current Architecture](current-architecture.md) | 当前代码事实与缺口，不把目标写成已实现 |
 | [Roadmap](roadmap.md) | Now / Next / Post-MVP，不复制合同 |
+| [性能基线](performance.md) | 最小 benchmark 的运行方式、计时边界与测量结果；不是性能 SLA |
 | [历史证据索引](superpowers/README.md) | 已完成阶段、研究和审查的追溯入口 |
 
 ## 历史协议（原位归档）

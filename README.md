@@ -71,6 +71,14 @@ bevy_internal = { version = "=0.19.1", default-features = false, features = ["be
 
 标准 UI pointer 使用原生 UI picking。应用的 target-addressed keyboard/gamepad 系统应在 `bevy_ui_router::ecs::RouterInputSet::Ready` 后读取 `RouterInputGate`，按目标权限处理输入；动态内容改动在输入刷新前提交。`InputFocusPlugin` 提供原生焦点资源，Router 处理受管目标的发布与撤权，但不会自动为应用选择首焦点。原生 `TabNavigationPlugin` / `InputDispatchPlugin` 不会仅因安装 Router 就自动遵守 gate；这里的示例未安装它们。窗口示例演示显式 gated keyboard handler，不接入手柄设备。详见 [spec 的输入与焦点合同](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/superpowers/specs/2026-09-07-router-mvp-design.md#71-输入与焦点)。
 
+## 性能基线
+
+```sh
+cargo +stable bench -p bevy_ui_router --bench router_baseline --features bsn --locked > baseline.csv
+```
+
+测量无窗口的 Router/BSN 空闲帧、push/replace/back、失败恢复和有界重复使用，输出 CSV；不包含 UI 布局、GPU 或真实设备输入。计时边界、smoke 检查与结果见[性能基线说明](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/performance.md)。CI 只验证夹具行为，不设耗时门禁。
+
 ## 发布状态
 
 当前先完成发布准备，尚未发布 crates.io。按项目所有者选择，暂不授予开源许可证；仓库没有许可证文件，manifest 也没有虚构的 `license` 字段。公开发布前仍需明确许可和发布版本。

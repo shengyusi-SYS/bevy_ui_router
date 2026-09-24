@@ -43,6 +43,11 @@ required-features = ["bsn"]
 name = "bsn_nested"
 required-features = ["bsn"]
 
+[[bench]]
+name = "router_baseline"
+harness = false
+required-features = ["bsn"]
+
 [[test]]
 name = "default_facade_features"
 path = "tests/default_facade_features.rs"

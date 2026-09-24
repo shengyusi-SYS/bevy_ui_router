@@ -34,6 +34,8 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --locked
       - name: Test workspace and public consumers
         run: cargo test --workspace --all-features --locked
+      - name: Smoke test performance fixtures (no timing gate)
+        run: cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
       - name: Verify release packages and packaged public consumer
         run: |
           cargo package --workspace
