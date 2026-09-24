@@ -107,10 +107,9 @@ fn route_view_key_error_unit_literal_is_private() {
         name: "route_view_key_error_unit_literal",
         code: "use bevy_ui_router_core::view_key::RouteViewKeyError; fn main() { let _ = RouteViewKeyError; }",
         features: &[],
-        expected_stderr: &[
-            "error[E0423]",
-            "cannot find value `RouteViewKeyError` in this scope",
-        ],
+        // Stable and nightly phrase this differently. E0423 on this type is
+        // the contract: a named-field error cannot be used as a unit value.
+        expected_stderr: &["error[E0423]", "`RouteViewKeyError`"],
     });
 }
 

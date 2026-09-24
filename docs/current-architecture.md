@@ -78,4 +78,6 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 
 推荐 quick start 与普通内部 outlet 示例已交付，并把原文件作为独立 workspace consumer 编译运行。嵌套示例经真实 UI 布局验证 Push/Replace/Back、history 和 layout/toolbar/slot 保持；它是有限 headless 示例，不是窗口、GPU 或真实设备验收。
 
-最终审查复现的三处接收端缺陷已修正并通过增量复审：混合 Router 诊断与去重共同维护 exact 保留关系；post-commit terminal 冻结原 attempt 结果；native 隔离预期只更新实际写入角色，严格保留 authored 内容观察。私有 fixture 减法的独立审查、完整 Core/ECS/facade/workspace 同版本验证及正常/fallback/bound-error 的普通更新后公开快照与单次终态均通过。本地 main 快进到 `7a34fcc`，合并后公开旅程与独立 consumer smoke 通过。Windows 原生、最低 Rust 执行、GPU/窗口及真实硬件输入保持 NOT_RUN。
+2026-09-24 补充 `examples/windowed` 独立 workspace：Winit/UI renderer/font 由示例配置，不扩展库 feature。Linux/WSLg 软件渲染窗口经 OS 注入键鼠验证导航、布局计数保留、fallback/恢复、focus 释放和旧手势撤权；不等同于物理 GPU 或硬件设备验证。六包添加发布元数据和内部版本，标准 Cargo 打包及仅消费解压包的 BSN journey 通过；当前按用户选择暂不添加许可证或正式发布。
+
+此前审查复现的三处接收端缺陷已修正并通过增量复审：混合 Router 诊断与去重共同维护 exact 保留关系；post-commit terminal 冻结原 attempt 结果；native 隔离预期只更新实际写入角色，严格保留 authored 内容观察。私有 fixture 减法的独立审查、完整 Core/ECS/facade/workspace 同版本验证及正常/fallback/bound-error 的普通更新后公开快照与单次终态均通过。本地 main 快进到 `7a34fcc`，合并后公开旅程与独立 consumer smoke 通过。后续局部重构见实施 plan；Windows 原生、最低 Rust 执行、物理 GPU 加速及真实硬件输入仍为 NOT_RUN。

@@ -2,9 +2,12 @@
 name = "bevy_ui_router_bsn"
 version.workspace = true
 edition.workspace = true
+description = "Bevy scene notation adapters for Bevy UI Router"
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 bevy_ecs = { version = "0.19.1", default-features = false }
 bevy_scene = { version = "0.19.1", default-features = false }
-bevy_ui_router_core = { path = "../bevy_ui_router_core" }
-bevy_ui_router_view = { path = "../bevy_ui_router_view" }
+bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0" }
+bevy_ui_router_view = { path = "../bevy_ui_router_view", version = "0.1.0" }

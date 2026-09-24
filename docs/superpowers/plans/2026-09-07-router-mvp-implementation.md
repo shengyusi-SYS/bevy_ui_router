@@ -1,5 +1,25 @@
 # Bevy UI Router MVP Implementation Plan
 
+## MVP 发布准备（2026-09-24）
+
+用户确认推进窗口示例、打包和最小发布检查；许可证明确选择暂不授予，先完成准备。因此本轮不发布 crates.io、不打正式 release tag。沿用现有 spec，不扩展 Router 能力或跨平台矩阵。
+
+- [x] 独立 `examples/windowed` 应用使用公开 facade、官方 BSN、Winit 和 UI renderer，实际窗口验收 push/replace/back、共享布局状态、构建失败/fallback、恢复以及输入/focus 撤权。窗口图形依赖不加入库的 feature。
+- [x] 为六个库补内部依赖版本及描述/repository/readme，验证真实打包产物和独立消费者；不把 `--no-verify` 或仍引用工作区源码的编译当作包验证。
+- [x] 单 Linux CI 固化 fmt、all-target/all-feature check、完整 workspace/consumer 测试；更新使用与发布说明，记录实际运行环境及尚未验证项。
+
+Cargo/rustc 验证和 index 仍由主代理独占；独立代理负责元数据与 CI，主代理负责窗口示例、实际交互、产物验证及文档收尾。
+
+### 发布准备结果
+
+- 窗口应用使用独立 workspace/lock，根 workspace 显式 exclude；CI 分开解析和构建，避免 Winit/render feature 合并到 headless 测试。原库的 runtime 和 feature 合同未扩张。
+- Linux/WSLg X11 窗口实际显示正常页和错误 fallback。通过 OS 注入的鼠标/键盘输入验证：布局计数从 0 到 1 后跨 push/replace/back 保留；页面点击与 Space 正向计数；切页后 focus 清空，新页无焦点时 Space 不生效；按住旧页按钮并切页后，旧 Entity 不再收到 release/click，新页计数保持 0。Build failure 保持 history，随后普通导航恢复。软件渲染和 OS 事件不冒充物理 GPU/硬件验证。
+- 六包内部依赖均有版本，补 description/repository/readme；共享 README 的仓库链接改为绝对 URL，避免解压包中的相对链接失效。按用户选择无 license 字段/文件，也未发布。
+- 标准在线 `cargo +stable package --workspace --allow-dirty` 对六包逐个解压构建通过。stable 1.98.1 与 nightly 的离线多包验证均出现临时 registry 的 `no hash listed` 内部错误；没有用 `--no-verify` 掩盖。新增产物消费者脚本只 patch 六个 Router 包到实际解压目录，核对完整来源后执行包内原样 BSN journey（含 96 次替换），已通过。
+- 稳定版执行发现 Core 一条 compile-fail 断言依赖 nightly 完整措辞；保留 E0423 与目标类型验证，删除易变句子。原非法构造仍被拒绝，修正后完整 workspace 重跑通过：Rust 1.98.1，fmt、all-target/all-feature check、1,217 项单元/集成测试及 28 项 doctest，0 failed / 0 ignored。
+- 元数据/CI、窗口公开入口/插件/input gate、产物消费者来源分别独立复核，未发现新增阻断。远端 CI 尚未触发；没有把本地命令成功写成远端成功。
+- 最终独立窗口命令 `cargo +stable check --manifest-path examples/windowed/Cargo.toml --all-targets --locked --offline` 与对应 `build` 通过；该可执行文件再次完成上述完整 OS 交互序列。实际后端为 Vulkan / llvmpipe（CPU 软件渲染）。更新后的六个打包产物及其独立消费者复验均通过；本轮不提交/推送正式 release，不运行其它平台或最低 Rust 矩阵。
+
 ## 上线前真实使用审查（2026-09-23，本轮审查与局部重构完成）
 
 本轮由用户明确要求全面核查并修正、清理、补充。沿用统一 spec；此前 Linux/headless MVP 通过不等于上线审查完成。以完整公开能力、生命周期分支和应用集成路径为审查单位，不以测试数量、抽样或未执行的旧文件代替证据。

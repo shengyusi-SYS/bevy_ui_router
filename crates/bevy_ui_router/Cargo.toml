@@ -2,6 +2,9 @@
 name = "bevy_ui_router"
 version.workspace = true
 edition.workspace = true
+description = "Composable routing for Bevy applications with optional ECS and BSN integration"
+repository.workspace = true
+readme.workspace = true
 autotests = false
 
 [features]
@@ -13,11 +16,11 @@ platform = ["dep:bevy_ui_router_platform"]
 devtools = []
 
 [dependencies]
-bevy_ui_router_core = { path = "../bevy_ui_router_core" }
-bevy_ui_router_view = { path = "../bevy_ui_router_view", optional = true, default-features = false }
-bevy_ui_router_ecs = { path = "../bevy_ui_router_ecs", optional = true }
-bevy_ui_router_bsn = { path = "../bevy_ui_router_bsn", optional = true }
-bevy_ui_router_platform = { path = "../bevy_ui_router_platform", optional = true }
+bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0" }
+bevy_ui_router_view = { path = "../bevy_ui_router_view", version = "0.1.0", optional = true, default-features = false }
+bevy_ui_router_ecs = { path = "../bevy_ui_router_ecs", version = "0.1.0", optional = true }
+bevy_ui_router_bsn = { path = "../bevy_ui_router_bsn", version = "0.1.0", optional = true }
+bevy_ui_router_platform = { path = "../bevy_ui_router_platform", version = "0.1.0", optional = true }
 
 [dev-dependencies]
 bevy_app = { version = "0.19.1", default-features = false }

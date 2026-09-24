@@ -238,7 +238,9 @@ request snapshot 提供请求自身 requested/matched/status 和可分类 failur
 | 输入与焦点 | 原生 UI layout/picking 有真实正向命中；pending/leaving/failed/residual 拒绝，按下/拖拽跨离场后不再派发到旧目标；keyboard/gamepad gate、focus 释放、动态 child 刷新 | [native input](../../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[native focus](../../../crates/bevy_ui_router/tests/bsn_native_focus.rs)、BSN facade 动态 child 与 ECS gate 回归通过；真实正向命中、历史手势、应用目标保持和官方 focus 顺序已由 ECS/public 独立视角复核 |
 | 跨层收敛 | 受影响 crate 与最高层 public journeys、feature 组合、workspace fmt/check/test/doctest；独立 Core/ECS/public 审查及交叉复核 | 三视角独立与交叉审查、三项缺陷修正增量复审及最终 fixture 差异独立审查已完成；冻结源码的 workspace fmt/check/test/doctest、facade 四组合及 BSN 测试全部 exit 0，含 Core 428、ECS 660、public journeys 36、独立 LF/CRLF consumer 和 Core doctests 28；本地 main 快进合并与公开旅程/独立 consumer smoke 均通过，**MVP PASS（限定已运行环境）** |
 
-Windows 原生、最低 Rust 版本执行、GPU/窗口及真实硬件输入为 NOT_RUN；Linux LF/CRLF、headless 布局和原生输入系统测试不替代这些证据。此处不以已有基线的绿色结果覆盖后来复现的缺陷。
+2026-09-24 补充发布准备验收：独立 [窗口示例](../../../examples/windowed/src/main.rs) 在 Linux/WSLg 真实窗口与软件渲染下，经 OS 注入鼠标/键盘事件验证 push/replace/back、布局 Entity/计数保留、原 Build failure fallback/history 保持、恢复、focus 释放及旧页面手势撤权。六个库的标准 Cargo 打包验证和仅引用解压包的独立 BSN consumer 通过；当前按用户选择暂不授予开源许可证，也未正式发布。
+
+Windows 原生、最低 Rust 版本执行、物理 GPU 加速及真实硬件输入仍为 NOT_RUN；OS 注入事件、Linux LF/CRLF、headless 布局和原生输入系统测试不替代这些证据。此处不以已有基线的绿色结果覆盖后来复现的缺陷。
 
 测试断言用户行为和最小不变量，不再解析多份 Markdown 互相证明一致。既有有价值回归在替代验证落地后迁移或合并；不按固定测试数量或文件名验收。文本/consumer harness 兼容 LF/CRLF 和 Windows 路径，无法实际运行的平台验证必须明确记录。
 

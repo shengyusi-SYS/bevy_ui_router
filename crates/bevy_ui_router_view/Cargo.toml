@@ -2,13 +2,16 @@
 name = "bevy_ui_router_view"
 version.workspace = true
 edition.workspace = true
+description = "Renderer-neutral view contracts for Bevy UI Router"
+repository.workspace = true
+readme.workspace = true
 
 [features]
 default = []
 test-support = []
 
 [dependencies]
-bevy_ui_router_core = { path = "../bevy_ui_router_core" }
+bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0" }
 
 [dev-dependencies]
-bevy_ui_router_core = { path = "../bevy_ui_router_core", features = ["test-support"] }
+bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0", features = ["test-support"] }

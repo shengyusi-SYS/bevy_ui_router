@@ -1,6 +1,6 @@
 # Bevy UI Router 文档索引
 
-**更新时间**：2026-09-23。包含官方同步 BSN adapter 的 MVP 已在本地 `main` 集成并通过既定验收；Windows 原生、最低 Rust 版本、窗口/GPU 及真实设备输入未运行。旧 data-only API 无兼容义务，基础路由、内部 outlet、renderer-neutral 边界与输入/focus 责任仍保留。
+**更新时间**：2026-09-24。包含官方同步 BSN adapter 的 MVP 已通过既定功能验收，并补充 Linux/WSLg 真实窗口、软件渲染与 OS 注入键鼠交互验证；Windows 原生、最低 Rust、物理 GPU 加速与硬件设备输入未验证。当前按所有者选择先完成发布准备，不授予开源许可证或正式发布。旧 data-only API 无兼容义务，基础路由、内部 outlet、renderer-neutral 边界与输入/focus 责任仍保留。
 
 ## 当前依据
 

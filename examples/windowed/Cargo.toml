@@ -1,0 +1,18 @@
+[package]
+name = "router_windowed"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+bevy_ui_router = { path = "../../crates/bevy_ui_router", features = ["bsn"] }
+bevy_ecs = { version = "0.19.1", default-features = false }
+bevy_scene = { version = "0.19.1", default-features = false }
+bevy_input_focus = { version = "0.19.1", default-features = false }
+bevy_internal = { version = "0.19.1", default-features = false, features = [
+    "std", "multi_threaded", "bevy_log", "bevy_asset", "bevy_scene",
+    "bevy_winit", "x11", "bevy_ui_render", "bevy_picking", "default_font",
+] }

@@ -1,14 +1,15 @@
 # Roadmap
 
-**更新时间**：2026-09-23。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
+**更新时间**：2026-09-24。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
 ## Now
 
 - 官方 native BSN、输入/focus、公开导航/恢复与推荐示例已完成。旧公开机制和冗余私有 fixture 已按真实调用者清理，Core/ECS/public 独立及交叉审查、冻结源码全量验证通过；本地 main 已快进集成，合并后 smoke 通过。
+- 补充独立窗口示例、六包打包配置、打包消费者验证和单 Linux CI。Linux/WSLg 真实窗口、软件渲染和 OS 注入键鼠交互已验证；图形示例独立 workspace，避免污染 headless 测试。
 
 ## Next
 
-- 按实际使用反馈维护已验收的 MVP；Windows 原生、最低 Rust 版本及窗口/GPU/真实设备输入仍需在有相应环境时单独验证。远端发布另行决定。
+- 按实际使用反馈维护已验收的 MVP；按所有者选择暂不授予开源许可证，先完成发布准备。正式发布前确定许可与版本。Windows 原生、最低 Rust、物理 GPU 加速和硬件设备输入未验证，不为这些未运行项扩张 MVP 功能或测试矩阵。
 
 ## Post-MVP
 

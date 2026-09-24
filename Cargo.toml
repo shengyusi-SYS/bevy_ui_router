@@ -7,8 +7,11 @@ members = [
     "crates/bevy_ui_router_platform",
     "crates/bevy_ui_router",
 ]
+exclude = ["examples/windowed"]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/shengyusi-SYS/bevy_ui_router"
+readme = "README.md"
