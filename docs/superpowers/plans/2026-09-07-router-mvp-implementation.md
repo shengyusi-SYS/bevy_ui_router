@@ -1,5 +1,17 @@
 # Bevy UI Router MVP Implementation Plan
 
+## 分类器剩余热点局部简化（2026-09-25）
+
+用户确认在 `f44089c` 上重新 profile，并按证据选择一项局部优化。延续已有合同、公开基准和验证范围；主代理独占 Cargo/rustc，独立代理只读复核，保留已有两份 manifest 改动。
+
+- [x] 隔离副本重新计时：128 子节点 settlement 约 8 ms，其中分类约 6.4 ms；native cleanup preparation 约 5 ms。两个单变量插桩对照显示，分类时仅有两项的关系组件 HashSet 改为固定数组，比复用 registry 查询的整体收益更高；独立确认成员判断等价，不跨 World 写入边界。
+- [x] 无插桩交替对照确认收益后，仅落实关系组件固定数组；保持原提前返回、normalized/foreign/missing component 判定、写后复验及所有行为回归，不同时加入 registry 索引或其它优化。
+- [x] 冻结源码执行完整受影响 crate、最高层公开使用/consumer gate、格式/静态检查及两轮原样完整 benchmark，独立审查并更新性能记录。
+
+结果：生产代码仅替换分类函数的一处两元素集合及三处成员判断；独立审查确认 `None`、提前返回和全部写后复验语义不变。`cargo +stable fmt --all -- --check`、workspace all-target/all-feature check、完整 workspace 1,220 项单元/集成与 28 项 doctest，以及无 BSN 的 ECS 619 + 1 项测试均通过，0 failed / 0 ignored；ECS/BSN 单独的 669 + 1 项测试亦通过。check/test 沿用 2 个构建任务、关闭 incremental 与 dev/test debug info。
+
+两轮原样完整 benchmark 均 exit 0，断言通过，原始 96 行及分位数/soak/未改善场景统一归[性能记录](../../performance.md#2026-09-25-分类器局部简化)。128 子节点正式导航 p50 为 16.3–17.0 ms，相较前轮 p50 均值约减少 7.2%；不将临时短对照的约 14–15% 替代正式收益。未修改 benchmark、Cargo.lock、公开 API 或平台矩阵，未采纳其它优化候选。
+
 ## 性能问题局部修正（2026-09-25）
 
 用户已确认先做两项有运行证据的局部简化：同轮 cleanup classification 共享未结算实体集合；合并 seal 发行/注册，删除 lifetime consumed-seal 账本。沿用现有 spec 和公开 API，不增加全局缓存、Entity 索引或跨平台性能矩阵。

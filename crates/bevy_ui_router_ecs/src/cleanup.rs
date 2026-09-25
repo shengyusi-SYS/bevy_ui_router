@@ -15231,16 +15231,13 @@ fn classify_obligation_with_unsettled(
     let relationship_components = [
         world.components().component_id::<ChildOf>(),
         world.components().component_id::<Children>(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<HashSet<_>>();
+    ];
     let normalized_manifest = ComponentManifest::new(
         actual_manifest
             .component_ids()
             .iter()
             .copied()
-            .filter(|component| !relationship_components.contains(component)),
+            .filter(|component| !relationship_components.contains(&Some(*component))),
     );
     let mut foreign_components = actual_manifest
         .component_ids()
@@ -15248,7 +15245,7 @@ fn classify_obligation_with_unsettled(
         .copied()
         .filter(|component| {
             !obligation.manifest.component_ids().contains(component)
-                && !relationship_components.contains(component)
+                && !relationship_components.contains(&Some(*component))
         })
         .collect::<Vec<_>>();
     foreign_components.sort_unstable();
@@ -15263,7 +15260,7 @@ fn classify_obligation_with_unsettled(
             .copied()
             .filter(|component| {
                 !actual_manifest.component_ids().contains(component)
-                    && !relationship_components.contains(component)
+                    && !relationship_components.contains(&Some(*component))
             })
             .collect::<Vec<_>>()
     };
