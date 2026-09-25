@@ -511,27 +511,21 @@ pub(crate) fn stage_child_slot(
         .expect("a newly allocated empty Entity must have an archetype");
     let slot_claim = {
         let mut registry = world.resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        if registry
-            .register(
-                slot,
-                owner,
-                seal,
-                initial_manifest.clone(),
-                EntityLifecycle::PreparedInert,
-            )
-            .is_err()
-        {
-            world.despawn(slot);
-            return Err(ChildSlotStageFailure {
-                kind: ChildSlotStageErrorKind::RegistryRejected,
-                residual: None,
-            });
+        match registry.register(
+            slot,
+            owner,
+            initial_manifest.clone(),
+            EntityLifecycle::PreparedInert,
+        ) {
+            Ok(claim) => claim,
+            Err(_) => {
+                world.despawn(slot);
+                return Err(ChildSlotStageFailure {
+                    kind: ChildSlotStageErrorKind::RegistryRejected,
+                    residual: None,
+                });
+            }
         }
-        registry
-            .record(slot)
-            .expect("new child slot registry record must exist")
-            .claim()
     };
     let provisional = ProvisionalChildSlot {
         slot,
@@ -2510,7 +2504,9 @@ pub(crate) mod tests {
         // Preflight did not issue a seal. Previously issued identities remain
         // consumed; the next actual allocation must still receive a fresh one.
         assert_eq!(failed_seal, first_seal);
-        let next_seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+        let next_seal = world
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_unregistered_seal_for_test();
         assert_ne!(next_seal, failed_seal);
 
         let cleanup_request = engine
@@ -2818,17 +2814,14 @@ pub(crate) mod tests {
             .manifest()
             .clone();
         let mut foreign_registry = RouteEntityRegistry::new();
-        let foreign_seal = foreign_registry.issue_seal();
-        foreign_registry
+        resulting[anchor_index] = foreign_registry
             .register(
                 mounted.anchor(),
                 mounted.anchor_claim().owner().clone(),
-                foreign_seal,
                 anchor_manifest,
                 EntityLifecycle::Active,
             )
             .unwrap();
-        resulting[anchor_index] = foreign_registry.record(mounted.anchor()).unwrap().claim();
         let slot_before = mounted.slot_claim().clone();
         let anchor_before = mounted.anchor_claim().clone();
 
@@ -2865,18 +2858,14 @@ pub(crate) mod tests {
             .manifest()
             .clone();
         let mut foreign_registry = RouteEntityRegistry::new();
-        let foreign_seal = foreign_registry.issue_seal();
-        foreign_registry
+        *mounted.anchor_binding.source_claim_mut() = foreign_registry
             .register(
                 foreign_entity,
                 mounted.anchor_claim().owner().clone(),
-                foreign_seal,
                 anchor_manifest,
                 EntityLifecycle::PreparedInert,
             )
             .unwrap();
-        *mounted.anchor_binding.source_claim_mut() =
-            foreign_registry.record(foreign_entity).unwrap().claim();
         let slot_before = mounted.slot_claim().clone();
         let anchor_before = mounted.anchor_claim().clone();
 

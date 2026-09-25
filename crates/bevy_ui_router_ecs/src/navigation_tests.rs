@@ -1060,7 +1060,7 @@ fn idle_host_loss_retained_admission_does_not_normalize_non_relationship_drift()
                 let replacement = app
                     .world_mut()
                     .resource_mut::<RouteEntityRegistry>()
-                    .issue_seal();
+                    .issue_unregistered_seal_for_test();
                 app.world_mut()
                     .entity_mut(top)
                     .insert(RouteOwnershipSeal::new(replacement));
@@ -1951,7 +1951,9 @@ fn install_cleanup_despawn_drift_hook(app: &mut App) {
                         .compare_exchange_lifecycle(&claim, EntityLifecycle::Quarantined);
                 }
                 Some(CleanupDespawnDriftAction::ExternalParentSeal(parent)) => {
-                    let seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+                    let seal = world
+                        .resource_mut::<RouteEntityRegistry>()
+                        .issue_unregistered_seal_for_test();
                     world
                         .commands()
                         .entity(parent)
@@ -3352,7 +3354,7 @@ fn current_authority_loss_host_top_slot_enters_unique_authority_publisher() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -3495,7 +3497,7 @@ fn failed_task_missing_pickable_after_current_boundary_loss_fail_closes_once() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(current_boundary.entity())
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -3671,7 +3673,7 @@ fn assert_failed_authority_reserve_contradiction_fail_closes_once(
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -3800,7 +3802,7 @@ fn normal_authority_missing_visibility_fail_closes_full_owner_once() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(boundary.entity())
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4017,7 +4019,7 @@ fn assert_failed_terminal_missing_component_fail_closes_once(
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(boundary.entity())
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4242,7 +4244,7 @@ fn failed_authority_begin_rejection_restores_owner_and_fresh_trigger_can_publish
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4473,7 +4475,7 @@ fn failed_authority_begin_contradiction_fail_closes_once_through_settle_caller()
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(current_boundary.entity())
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4559,7 +4561,7 @@ fn failed_authority_trigger_exhaustion_fail_closes_once_with_full_owner() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(current_boundary.entity())
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4632,7 +4634,7 @@ fn failed_authority_physical_task_target_selects_target_and_current_roots() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4716,7 +4718,7 @@ fn failed_authority_cleanup_request_uses_its_exact_sealed_roots() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4766,7 +4768,7 @@ fn failed_authority_registration_begin_uses_current_branch_roots() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -4847,7 +4849,7 @@ fn failed_authority_composed_owner_isolates_optional_active_branch() {
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(current_boundary.entity())
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -9325,22 +9327,13 @@ fn spawn_exact_host_top_extra(
             .component_id::<ChildOf>()
             .expect("the real plugin registers ChildOf"),
     ]);
-    let seal = {
-        let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        registry
-            .register(
-                entity,
-                owner,
-                seal,
-                manifest,
-                EntityLifecycle::PreparedInert,
-            )
-            .expect("one exact HostTopSlot extra must be registrable");
-        seal
-    };
+    let claim = app
+        .world_mut()
+        .resource_mut::<RouteEntityRegistry>()
+        .register(entity, owner, manifest, EntityLifecycle::PreparedInert)
+        .expect("one exact HostTopSlot extra must be registrable");
     app.world_mut().entity_mut(entity).insert((
-        RouteOwnershipSeal::new(seal),
+        RouteOwnershipSeal::new(claim.seal()),
         ProvisionalSlotLifecycle::PreparedInert,
         ChildOf(parent),
     ));
@@ -9351,7 +9344,7 @@ fn spawn_exact_host_top_extra(
     let record = registry
         .record(entity)
         .expect("the HostTopSlot extra retains its exact record");
-    let claim = record.claim();
+    assert_eq!(record.claim(), claim);
     let physical = ComponentManifest::from_world(world, entity)
         .expect("the committed HostTopSlot extra has one physical manifest");
     assert!(
@@ -9401,37 +9394,35 @@ fn spawn_exact_provisional_child_slot_extra(
         ])
     };
     let authority = ChildSlotAuthority::new(parent.clone(), outlet.clone(), slot);
-    let seal = {
-        let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        registry
-            .register(
-                entity,
-                RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
-                    parent,
-                    outlet,
-                    slot,
-                }),
-                seal,
-                manifest,
-                EntityLifecycle::PreparedInert,
-            )
-            .expect("one exact provisional ChildSlot extra must be registrable");
-        seal
-    };
+    let claim = app
+        .world_mut()
+        .resource_mut::<RouteEntityRegistry>()
+        .register(
+            entity,
+            RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+                parent,
+                outlet,
+                slot,
+            }),
+            manifest,
+            EntityLifecycle::PreparedInert,
+        )
+        .expect("one exact provisional ChildSlot extra must be registrable");
     app.world_mut().entity_mut(entity).insert((
-        RouteOwnershipSeal::new(seal),
+        RouteOwnershipSeal::new(claim.seal()),
         ChildSlotLifecycle::ProvisionalInert,
         authority,
         ChildOf(parent_entity),
     ));
     app.world_mut().flush();
-    let claim = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .record(entity)
-        .map(|record| record.claim())
-        .expect("the provisional ChildSlot extra retains its exact record");
+    assert_eq!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(entity)
+            .map(|record| record.claim())
+            .expect("the provisional ChildSlot extra retains its exact record"),
+        claim
+    );
     assert!(cleanup_claim_has_exact_authority(app.world(), &claim));
     (entity, claim)
 }
@@ -13359,26 +13350,22 @@ fn back_target_driver_failure_exact_task_claim_blocks_zero_physical_report() {
             .component_id::<FrameLifecycle>()
             .expect("the active branch registers frame lifecycle"),
     ]);
-    let seal = {
-        let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        registry
-            .register(
-                residual,
-                RegistryOwner::Committed(EntityOwner::FrameOutput {
-                    frame: task.frame().clone(),
-                    output: u64::MAX,
-                    local_index: usize::MAX,
-                }),
-                seal,
-                manifest,
-                EntityLifecycle::PreparedInert,
-            )
-            .unwrap();
-        seal
-    };
+    let claim = app
+        .world_mut()
+        .resource_mut::<RouteEntityRegistry>()
+        .register(
+            residual,
+            RegistryOwner::Committed(EntityOwner::FrameOutput {
+                frame: task.frame().clone(),
+                output: u64::MAX,
+                local_index: usize::MAX,
+            }),
+            manifest,
+            EntityLifecycle::PreparedInert,
+        )
+        .unwrap();
     app.world_mut().entity_mut(residual).insert((
-        RouteOwnershipSeal::new(seal),
+        RouteOwnershipSeal::new(claim.seal()),
         FrameLifecycle(EntityLifecycle::PreparedInert),
     ));
 
@@ -13497,12 +13484,10 @@ fn back_target_driver_failure_registry_only_residual_safe_stops_pre_report_indet
                 .all(|record| !record.owner().conflicts_with(&owner)),
             "the registry-only fixture requires a unique active-root FrameOutput owner"
         );
-        let seal = registry.issue_seal();
         registry
             .register(
                 registry_only_residual,
                 owner,
-                seal,
                 ComponentManifest::new(Vec::new()),
                 EntityLifecycle::Active,
             )
@@ -18940,37 +18925,35 @@ fn spawn_exact_unclassified_same_authority_descendant(
             .component_id::<ChildOf>()
             .expect("the real router registers hierarchy relationships"),
     ]);
-    let seal = {
-        let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        registry
-            .register(
-                entity,
-                RegistryOwner::Committed(EntityOwner::FrameOutput {
-                    frame,
-                    output: u64::MAX,
-                    local_index: usize::MAX,
-                }),
-                seal,
-                manifest.clone(),
-                EntityLifecycle::PreparedInert,
-            )
-            .expect("one exact same-authority unclassified Entity must be registrable");
-        seal
-    };
+    let claim = app
+        .world_mut()
+        .resource_mut::<RouteEntityRegistry>()
+        .register(
+            entity,
+            RegistryOwner::Committed(EntityOwner::FrameOutput {
+                frame,
+                output: u64::MAX,
+                local_index: usize::MAX,
+            }),
+            manifest.clone(),
+            EntityLifecycle::PreparedInert,
+        )
+        .expect("one exact same-authority unclassified Entity must be registrable");
     app.world_mut().entity_mut(entity).insert((
-        RouteOwnershipSeal::new(seal),
+        RouteOwnershipSeal::new(claim.seal()),
         FrameLifecycle(EntityLifecycle::PreparedInert),
         ChildOf(parent),
     ));
     app.world_mut().flush();
 
-    let claim = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .record(entity)
-        .map(|record| record.claim())
-        .expect("the unclassified same-authority Entity retains its exact claim");
+    assert_eq!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(entity)
+            .map(|record| record.claim())
+            .expect("the unclassified same-authority Entity retains its exact claim"),
+        claim
+    );
     assert_eq!(
         ComponentManifest::from_world(app.world(), entity),
         Some(manifest),
@@ -29879,7 +29862,7 @@ fn back_no_target_authority_residual_postwrite_drift_becomes_installed_inert_onc
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(target)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -31150,7 +31133,7 @@ fn back_no_target_committed_host_top_extras_classify_by_router_authority() {
     let drifted_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(same_extra)
         .insert(RouteOwnershipSeal::new(drifted_seal));
@@ -32525,37 +32508,35 @@ fn back_no_target_registered_frame_and_child_extras_preserve_authority_evidence(
             .component_id::<ChildOf>()
             .expect("the real router registers hierarchy relationships"),
     ]);
-    let same_authority_seal = {
-        let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        registry
-            .register(
-                same_authority_descendant,
-                RegistryOwner::Committed(EntityOwner::FrameOutput {
-                    frame: retired_same_authority_frame.clone(),
-                    output: u64::MAX,
-                    local_index: usize::MAX,
-                }),
-                seal,
-                same_authority_manifest,
-                EntityLifecycle::PreparedInert,
-            )
-            .expect("the retired real frame identity admits one new exact companion fact");
-        seal
-    };
+    let same_authority_claim = app
+        .world_mut()
+        .resource_mut::<RouteEntityRegistry>()
+        .register(
+            same_authority_descendant,
+            RegistryOwner::Committed(EntityOwner::FrameOutput {
+                frame: retired_same_authority_frame.clone(),
+                output: u64::MAX,
+                local_index: usize::MAX,
+            }),
+            same_authority_manifest,
+            EntityLifecycle::PreparedInert,
+        )
+        .expect("the retired real frame identity admits one new exact companion fact");
     app.world_mut()
         .entity_mut(same_authority_descendant)
         .insert((
-            RouteOwnershipSeal::new(same_authority_seal),
+            RouteOwnershipSeal::new(same_authority_claim.seal()),
             FrameLifecycle(EntityLifecycle::PreparedInert),
             ChildOf(active_output),
         ));
-    let same_authority_claim = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .record(same_authority_descendant)
-        .map(|record| record.claim())
-        .expect("the companion descendant retains its exact registry claim");
+    assert_eq!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(same_authority_descendant)
+            .map(|record| record.claim())
+            .expect("the companion descendant retains its exact registry claim"),
+        same_authority_claim
+    );
     assert!(cleanup_claim_has_exact_authority(
         app.world(),
         &same_authority_claim,
@@ -38078,7 +38059,7 @@ fn reconciliation_authority_three_lost_closures_revalidate_later_facts_and_burn_
         let stale_seal = app
             .world_mut()
             .resource_mut::<RouteEntityRegistry>()
-            .issue_seal();
+            .issue_unregistered_seal_for_test();
         app.world_mut()
             .entity_mut(entity)
             .insert(RouteOwnershipSeal::new(stale_seal));
@@ -38213,7 +38194,7 @@ fn reconciliation_authority_later_lost_closure_restored_exact_stops_stale_tombst
         let stale_seal = app
             .world_mut()
             .resource_mut::<RouteEntityRegistry>()
-            .issue_seal();
+            .issue_unregistered_seal_for_test();
         app.world_mut().entity_mut(claim.entity()).insert((
             RouteOwnershipSeal::new(stale_seal),
             FrameLifecycle(EntityLifecycle::Leaving),
@@ -38374,7 +38355,7 @@ fn reconciliation_authority_mixed_verified_lost_closure_revalidates_both_local_s
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(mixed_lost)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -38782,7 +38763,7 @@ fn reconciliation_authority_loss_retains_lost_top_slot_edge_without_host_write()
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(top_slot)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -38931,7 +38912,7 @@ fn reconciliation_authority_loss_preserved_seal_drift_clears_authority_without_c
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(preserved_shell)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -39010,7 +38991,7 @@ fn reconciliation_authority_loss_inner_content_seal_drift_retires_claim_without_
     let stale_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(inner_content)
         .insert(RouteOwnershipSeal::new(stale_seal));
@@ -39056,30 +39037,36 @@ fn reconciliation_authority_loss_inner_content_seal_drift_retires_claim_without_
             .authority_lost_tombstone(inner_content)
             .is_some()
     );
-    let former_owner = app
+    let former_claim = app
         .world()
         .resource::<QuarantineLeaseTable>()
         .authority_lost_tombstone(inner_content)
         .unwrap()
         .former_claim()
-        .owner()
         .clone();
     let manifest = ComponentManifest::from_world(app.world(), inner_content).unwrap();
-    app.world_mut()
+    let new_claim = app
+        .world_mut()
         .resource_mut::<RouteEntityRegistry>()
         .register(
             inner_content,
-            former_owner,
-            stale_seal,
+            former_claim.owner().clone(),
             manifest,
             EntityLifecycle::Active,
         )
         .unwrap();
-    assert!(
+    assert_ne!(new_claim.seal(), former_claim.seal());
+    assert_ne!(new_claim.seal(), stale_seal);
+    app.world_mut()
+        .entity_mut(inner_content)
+        .insert(RouteOwnershipSeal::new(new_claim.seal()));
+    assert_eq!(
         app.world()
             .resource::<QuarantineLeaseTable>()
             .authority_lost_tombstone(inner_content)
-            .is_some()
+            .unwrap()
+            .former_claim(),
+        &former_claim
     );
 }
 
@@ -39277,25 +39264,24 @@ fn authority_lost_parent_replacement_preserves_exact_child_and_new_parent_claim(
         router,
         RouteLocation::new("/items/2").with_fragment("parent-claim-replaced"),
     );
-    let (new_seal, manifest) = {
+    let (new_claim, manifest) = {
         let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
         let manifest = registry.record(parent).unwrap().manifest().clone();
-        let new_seal = registry.issue_seal();
         assert!(registry.remove_exact(&parent_claim));
-        registry
+        let new_claim = registry
             .register(
                 parent,
                 parent_claim.owner().clone(),
-                new_seal,
                 manifest.clone(),
                 EntityLifecycle::Active,
             )
             .unwrap();
-        (new_seal, manifest)
+        assert_ne!(new_claim.seal(), parent_claim.seal());
+        (new_claim, manifest)
     };
     app.world_mut()
         .entity_mut(parent)
-        .insert(RouteOwnershipSeal::new(new_seal));
+        .insert(RouteOwnershipSeal::new(new_claim.seal()));
     let child_is_obligated = {
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         crate::cleanup::FrozenCleanupManifest::from_authority_settlement(
@@ -39339,7 +39325,7 @@ fn authority_lost_parent_replacement_preserves_exact_child_and_new_parent_claim(
         .resource::<RouteEntityRegistry>()
         .record(parent)
         .unwrap();
-    assert_eq!(parent_record.seal(), new_seal);
+    assert_eq!(parent_record.claim(), new_claim);
     assert_eq!(parent_record.manifest(), &manifest);
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
     assert!(matches!(
@@ -40122,7 +40108,7 @@ fn quarantine_prepublication_drift_retries_before_terminal_publication() {
     let stale_root_seal = app
         .world_mut()
         .resource_mut::<RouteEntityRegistry>()
-        .issue_seal();
+        .issue_unregistered_seal_for_test();
     app.world_mut()
         .entity_mut(leaving_output)
         .insert(RouteOwnershipSeal::new(stale_root_seal));
@@ -40459,7 +40445,9 @@ fn pickable_repair_parent_drift_is_zero_transfer_and_retryable() {
                 drift.parent
             };
             let Some(parent) = parent else { return };
-            let stale_seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+            let stale_seal = world
+                .resource_mut::<RouteEntityRegistry>()
+                .issue_unregistered_seal_for_test();
             world
                 .commands()
                 .entity(parent)
@@ -44773,24 +44761,17 @@ fn active_frame_rejects_reregistered_top_slot_claim() {
             record.manifest().clone(),
         )
     };
-    let new_seal = {
+    let new_claim = {
         let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
         assert!(registry.remove_exact(&old_claim));
-        let seal = registry.issue_seal();
         registry
-            .register(
-                top_slot,
-                owner,
-                seal,
-                manifest,
-                EntityLifecycle::PreparedInert,
-            )
-            .unwrap();
-        seal
+            .register(top_slot, owner, manifest, EntityLifecycle::PreparedInert)
+            .unwrap()
     };
+    assert_ne!(new_claim.seal(), old_claim.seal());
     app.world_mut()
         .entity_mut(top_slot)
-        .insert(RouteOwnershipSeal::new(new_seal));
+        .insert(RouteOwnershipSeal::new(new_claim.seal()));
 
     let active = app.world().resource::<RouterNavigation>().entries[0]
         .active
@@ -45528,14 +45509,12 @@ fn failed_host_revision_is_latched_before_the_next_observation() {
     let blocker = app.world_mut().spawn_empty().id();
     {
         let mut registry = app.world_mut().resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
         registry
             .register(
                 blocker,
                 RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
                     ProvisionalTopSlotOwner::new(revision),
                 )),
-                seal,
                 ComponentManifest::new(Vec::new()),
                 EntityLifecycle::PreparedInert,
             )

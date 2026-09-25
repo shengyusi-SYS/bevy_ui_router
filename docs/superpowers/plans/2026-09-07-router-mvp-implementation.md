@@ -1,5 +1,22 @@
 # Bevy UI Router MVP Implementation Plan
 
+## 性能问题局部修正（2026-09-25）
+
+用户已确认先做两项有运行证据的局部简化：同轮 cleanup classification 共享未结算实体集合；合并 seal 发行/注册，删除 lifetime consumed-seal 账本。沿用现有 spec 和公开 API，不增加全局缓存、Entity 索引或跨平台性能矩阵。
+
+- [x] 每轮只读 evidence collection 复用惰性集合；保留单实体分类入口及每次 World/receipt 写入后的重新采集，独立运行完整 ECS/BSN 与 public navigation/input/focus 回归和优化构建基准。
+- [x] 唯一内部注册入口分配身份并返回 exact claim，迁移生产调用和有效测试；保持失败后身份不复用、容量预留、domain/owner/lifecycle/CAS 与写后复验，删除被替代的历史账本及旧私有协议测试。
+- [x] 独立审查两项改动；最终源码运行受影响完整 crate、最高层 facade/consumer gate、格式/静态检查，并以相同 fixture 的两轮完整基准复测。原始记录与解释更新到性能文档。
+
+主代理独占 Cargo/rustc 与 index；保留已有 ECS/BSN manifest 的版本范围改动，不纳入本轮重构范围。
+
+### 局部修正结果与验证
+
+- cleanup 集合只在同一只读 `collect_evidence` 中共享，独立分类及 World/receipt 写入后的重新采集保持不变。融合注册使生产调用无法提交旧 seal，成功直接得到 exact claim；失败序号仍消耗，删除 lifetime 历史列表而保留 domain、单调序号及 exact record 校验。
+- 迁移生产调用及真实 drift fixture；旧私有 seal 注入协议测试由新入口下的不复用、stale/foreign claim/CAS 拒绝测试替代，补注册后删除、失败尝试及同 tick registry 替换的 projection 回归。独立审查覆盖两项改动和全部测试迁移，未发现阻断。
+- Rust 1.98.1 下 `cargo +stable fmt --all -- --check`、`git diff --check`、`cargo +stable check --workspace --all-targets --all-features --locked --offline` 通过。完整 `cargo +stable test --workspace --all-features --locked --offline`：1,220 项单元/集成及 28 项 doctest；ECS `--features bsn`：669 + 1 项；ECS `--no-default-features`：619 + 1 项，均 0 failed / 0 ignored。完整 workspace 包含最高层 public journey、原生输入/focus 和独立消费者 gate。check/test 使用 2 个构建任务、关闭 incremental 与 dev/test debug info，既有 warnings 未作无关清零。
+- 两轮默认 128 样本优化 benchmark 均正常退出，全部行为断言通过，fixture 与锁文件 hash 未变；结果及精确测量边界统一记录在[性能文档](../../performance.md#2026-09-25-局部修正)和[原始 CSV](../../performance-baseline-2026-09-25.csv)。128 子节点导航约减少 53%；32/128 子节点原先约 50% 的连续使用退化未再出现，但约 18 ms 的大页面 CPU 成本仍在。未重跑窗口/GPU或新增跨平台矩阵，也未把该项余量视为已解决。
+
 ## MVP 发布准备（2026-09-24）
 
 用户确认推进窗口示例、打包和最小发布检查；许可证明确选择暂不授予，先完成准备。因此本轮不发布 crates.io、不打正式 release tag。沿用现有 spec，不扩展 Router 能力或跨平台矩阵。

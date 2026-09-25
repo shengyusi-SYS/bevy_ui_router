@@ -1120,21 +1120,25 @@ mod tests {
     }
 
     fn register_owned(world: &mut World, entity: Entity, owner: EntityOwner) {
-        let seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
-        world
-            .entity_mut(entity)
-            .insert(RouteOwnershipSeal::new(seal));
-        let manifest = ComponentManifest::from_world(world, entity).unwrap();
-        world
+        let initial_manifest = ComponentManifest::from_world(world, entity).unwrap();
+        let claim = world
             .resource_mut::<RouteEntityRegistry>()
             .register(
                 entity,
                 RegistryOwner::Committed(owner),
-                seal,
-                manifest,
+                initial_manifest.clone(),
                 EntityLifecycle::PreparedInert,
             )
             .unwrap();
+        world
+            .entity_mut(entity)
+            .insert(RouteOwnershipSeal::new(claim.seal()));
+        let manifest = ComponentManifest::from_world(world, entity).unwrap();
+        assert!(
+            world
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_manifest_exact(&claim, &initial_manifest, manifest)
+        );
     }
 
     fn two_level_fixture() -> (

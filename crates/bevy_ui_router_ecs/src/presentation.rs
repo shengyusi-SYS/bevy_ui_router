@@ -2048,25 +2048,13 @@ fn register_allocated(
     let manifest = realization_manifest(world, role, has_children, runtime_components);
     let claim = {
         let mut registry = world.resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        if registry
-            .register(
-                entity,
-                owner,
-                seal,
-                manifest,
-                EntityLifecycle::PreparedInert,
-            )
-            .is_err()
-        {
-            world.despawn(entity);
-            return Err(RealizationError::RegistryRejected);
+        match registry.register(entity, owner, manifest, EntityLifecycle::PreparedInert) {
+            Ok(claim) => claim,
+            Err(_) => {
+                world.despawn(entity);
+                return Err(RealizationError::RegistryRejected);
+            }
         }
-        let claim = registry
-            .record(entity)
-            .expect("registered realization entity is retained")
-            .claim();
-        claim
     };
     Ok(RealizedEntity {
         entity,
@@ -5119,20 +5107,14 @@ pub(crate) mod tests {
             .manifest()
             .clone();
         let mut foreign_registry = RouteEntityRegistry::new();
-        let foreign_seal = foreign_registry.issue_seal();
-        foreign_registry
+        *frame.outlets[0].anchor_binding.source_claim_mut() = foreign_registry
             .register(
                 current_anchor.entity(),
                 current_anchor.owner().clone(),
-                foreign_seal,
                 anchor_manifest,
                 current_anchor.lifecycle(),
             )
             .unwrap();
-        *frame.outlets[0].anchor_binding.source_claim_mut() = foreign_registry
-            .record(current_anchor.entity())
-            .unwrap()
-            .claim();
 
         let transitions = frame.lifecycle_transitions(EntityLifecycle::Active);
         let resulting = world
@@ -5183,18 +5165,14 @@ pub(crate) mod tests {
             .manifest()
             .clone();
         let mut foreign_registry = RouteEntityRegistry::new();
-        let foreign_seal = foreign_registry.issue_seal();
-        foreign_registry
+        *frame.outlets[0].anchor_binding.source_claim_mut() = foreign_registry
             .register(
                 foreign_entity,
                 current_anchor.owner().clone(),
-                foreign_seal,
                 anchor_manifest,
                 current_anchor.lifecycle(),
             )
             .unwrap();
-        *frame.outlets[0].anchor_binding.source_claim_mut() =
-            foreign_registry.record(foreign_entity).unwrap().claim();
 
         let transitions = frame.lifecycle_transitions(EntityLifecycle::Active);
         let resulting = world
@@ -5275,17 +5253,14 @@ pub(crate) mod tests {
         let new_claim = {
             let mut registry = world.resource_mut::<RouteEntityRegistry>();
             assert!(registry.remove_exact(&stale_claim));
-            let seal = registry.issue_seal();
             registry
                 .register(
                     top_slot,
                     owner,
-                    seal,
                     manifest.clone(),
                     EntityLifecycle::PreparedInert,
                 )
-                .unwrap();
-            registry.record(top_slot).unwrap().claim()
+                .unwrap()
         };
         world
             .entity_mut(top_slot)
@@ -5834,12 +5809,10 @@ pub(crate) mod tests {
         };
         {
             let mut registry = world.resource_mut::<RouteEntityRegistry>();
-            let seal = registry.issue_seal();
             registry
                 .register(
                     blocker,
                     RegistryOwner::Committed(EntityOwner::FrameContentTarget(task.frame().clone())),
-                    seal,
                     ComponentManifest::new(Vec::new()),
                     EntityLifecycle::PreparedInert,
                 )

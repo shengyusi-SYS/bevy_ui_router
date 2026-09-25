@@ -409,24 +409,12 @@ pub(crate) fn create_native_scene(
     for (index, owner) in owners.into_iter().enumerate() {
         let entity = world.spawn_empty().id();
         let empty = ComponentManifest::new([]);
-        let registration = {
-            let mut registry = world.resource_mut::<RouteEntityRegistry>();
-            let seal = registry.issue_seal();
-            registry
-                .register(
-                    entity,
-                    owner,
-                    seal,
-                    empty.clone(),
-                    EntityLifecycle::PreparedInert,
-                )
-                .map(|()| {
-                    registry
-                        .record(entity)
-                        .expect("the just-registered native allocation is retained")
-                        .claim()
-                })
-        };
+        let registration = world.resource_mut::<RouteEntityRegistry>().register(
+            entity,
+            owner,
+            empty.clone(),
+            EntityLifecycle::PreparedInert,
+        );
         let claim = match registration {
             Ok(claim) => claim,
             Err(error) => {

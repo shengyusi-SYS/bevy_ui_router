@@ -856,11 +856,9 @@ fn prepare_content_cleanup_inner(
             registry
                 .try_reserve_registrations(&[owner.clone()])
                 .map_err(|error| NativeCleanupPreparationError::Registry { entity, error })?;
-            let seal = registry.issue_seal();
             registry
-                .register(entity, owner, seal, manifest.clone(), lifecycle)
-                .map_err(|error| NativeCleanupPreparationError::Registry { entity, error })?;
-            registry.record(entity).unwrap().claim()
+                .register(entity, owner, manifest.clone(), lifecycle)
+                .map_err(|error| NativeCleanupPreparationError::Registry { entity, error })?
         };
         frame.entities.push(RealizedEntity {
             entity,

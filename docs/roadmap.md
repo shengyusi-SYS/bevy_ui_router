@@ -1,16 +1,17 @@
 # Roadmap
 
-**更新时间**：2026-09-24。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
+**更新时间**：2026-09-25。范围与验收归 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md)，具体依赖和证据归 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
 ## Now
 
 - 官方 native BSN、输入/focus、公开导航/恢复与推荐示例已完成。旧公开机制和冗余私有 fixture 已按真实调用者清理，Core/ECS/public 独立及交叉审查、冻结源码全量验证通过；本地 main 已快进集成，合并后 smoke 通过。
 - 补充独立窗口示例、六包打包配置、打包消费者验证和单 Linux CI。Linux/WSLg 真实窗口、软件渲染和 OS 注入键鼠交互已验证；图形示例独立 workspace，避免污染 headless 测试。
 - 最小公开 API 性能基线已完成两轮优化构建测量，见[结果与边界](performance.md)。功能验收结论不等于性能就绪。
+- 按实测定位完成两项局部简化：cleanup 每轮只读采集共享未结算集合；合并 seal 发行/注册并删除历史账本。完整回归及两轮相同基准通过，128 子节点导航 p50 从约 37–39 ms 降至 17.6–18.3 ms；32/128 子节点原有约 50% 的连续使用退化未再出现。
 
 ## Next
 
-- 优先定位实测的页面切换成本与连续使用退化：128 子节点导航约 37–39 ms，32/128 子节点的重复使用首末批均出现约 50% 增幅。先 profile 历史 seal 查询与 native cleanup 重复验证候选，再决定局部简化；不削弱既有 ownership/lifecycle 语义，不先扩建性能平台。
+- 若目标应用需要约 128 个子节点的单帧切换，继续定位修正后的剩余 cleanup 成本：当前约 18 ms 尚不含 UI 布局与渲染，不能视为已满足 60 Hz 帧预算。按实际页面规模决定下一项局部优化，不直接扩展全局缓存、索引或性能平台。
 - 按实际使用反馈维护已验收的 MVP；按所有者选择暂不授予开源许可证，先完成发布准备。正式发布前确定许可与版本。Windows 原生、最低 Rust、物理 GPU 加速和硬件设备输入未验证，不为这些未运行项扩张 MVP 功能或测试矩阵。
 
 ## Post-MVP

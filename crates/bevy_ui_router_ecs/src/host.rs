@@ -2209,12 +2209,10 @@ fn stage_prepared_provisional_top_slot(
     let slot = world.spawn_empty().id();
     let (seal, owner, claim) = {
         let mut registry = world.resource_mut::<RouteEntityRegistry>();
-        let seal = registry.issue_seal();
-        registry
+        let claim = registry
             .register(
                 slot,
                 provisional_owner,
-                seal,
                 prepared
                     .registry_manifest
                     .take()
@@ -2222,11 +2220,7 @@ fn stage_prepared_provisional_top_slot(
                 EntityLifecycle::PreparedInert,
             )
             .expect("pre-reserved fresh provisional registration cannot fail");
-        let claim = registry
-            .record(slot)
-            .expect("newly registered provisional slot must exist")
-            .claim();
-        (seal, owner, claim)
+        (claim.seal(), owner, claim)
     };
     let partition_bound = prepared.bind_registration(slot, seal);
     let staged = StagedProvisionalTopSlot {

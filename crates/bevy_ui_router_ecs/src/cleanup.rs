@@ -254,7 +254,9 @@ fn apply_cleanup_prepublication_drift(world: &mut World, phase: CleanupPrepublic
         return;
     };
     if let Some(parent) = external_parent {
-        let seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+        let seal = world
+            .resource_mut::<RouteEntityRegistry>()
+            .issue_unregistered_seal_for_test();
         world
             .commands()
             .entity(parent)
@@ -384,9 +386,8 @@ fn apply_authority_removal_postwrite_drift(world: &mut World) {
         };
         let mut registry = world.resource_mut::<RouteEntityRegistry>();
         assert!(registry.remove_exact(&claim));
-        let seal = registry.issue_seal();
         registry
-            .register(entity, owner, seal, manifest, lifecycle)
+            .register(entity, owner, manifest, lifecycle)
             .expect("registry-only drift must install a fresh exact claim");
     }
 }
@@ -463,7 +464,9 @@ fn apply_authority_residual_postwrite_drift(world: &mut World) {
         });
     if let Some(entities) = entities {
         for entity in entities {
-            let stale_seal = world.resource_mut::<RouteEntityRegistry>().issue_seal();
+            let stale_seal = world
+                .resource_mut::<RouteEntityRegistry>()
+                .issue_unregistered_seal_for_test();
             world
                 .entity_mut(entity)
                 .insert(RouteOwnershipSeal::new(stale_seal));
@@ -14951,6 +14954,10 @@ fn collect_evidence(
     obligations: &[CleanupObligation],
     receipts: &[Option<CleanupReceipt>],
 ) -> Vec<(usize, CleanupEvidence)> {
+    // Classification only reads this batch. Share its unchanged membership here,
+    // and rebuild it on the next collection after any World/receipt mutation.
+    // Lazy construction preserves the allocation-free early rejection paths.
+    let unsettled = std::cell::OnceCell::new();
     obligations
         .iter()
         .enumerate()
@@ -14958,7 +14965,7 @@ fn collect_evidence(
         .map(|(index, _)| {
             (
                 index,
-                classify_obligation(world, obligations, receipts, index),
+                classify_obligation_with_unsettled(world, obligations, receipts, index, &unsettled),
             )
         })
         .collect()
@@ -15108,6 +15115,22 @@ fn classify_obligation(
     receipts: &[Option<CleanupReceipt>],
     index: usize,
 ) -> CleanupEvidence {
+    classify_obligation_with_unsettled(
+        world,
+        obligations,
+        receipts,
+        index,
+        &std::cell::OnceCell::new(),
+    )
+}
+
+fn classify_obligation_with_unsettled(
+    world: &World,
+    obligations: &[CleanupObligation],
+    receipts: &[Option<CleanupReceipt>],
+    index: usize,
+    unsettled: &std::cell::OnceCell<HashSet<Entity>>,
+) -> CleanupEvidence {
     let obligation = &obligations[index];
     let authority_settlement = matches!(
         obligation.terminal_mode,
@@ -15247,15 +15270,17 @@ fn classify_obligation(
     missing_components.sort_unstable();
     missing_components.dedup();
 
-    let unsettled_owned = obligations
-        .iter()
-        .enumerate()
-        .filter_map(|(candidate, obligation)| {
-            receipts[candidate]
-                .is_none()
-                .then_some(obligation.claim.entity())
-        })
-        .collect::<HashSet<_>>();
+    let unsettled_owned = unsettled.get_or_init(|| {
+        obligations
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate, obligation)| {
+                receipts[candidate]
+                    .is_none()
+                    .then_some(obligation.claim.entity())
+            })
+            .collect::<HashSet<_>>()
+    });
     let mut foreign_descendants = Vec::new();
     let mut visited = HashSet::new();
     let mut relationship_cycle = false;

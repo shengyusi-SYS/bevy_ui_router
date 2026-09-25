@@ -258,11 +258,6 @@ impl OwnershipSeal {
     pub(crate) const fn stable_identity(self) -> (u64, u64) {
         (self.domain, self.sequence)
     }
-
-    #[cfg(test)]
-    const fn fixture(domain: u64, sequence: u64) -> Self {
-        Self { domain, sequence }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -504,17 +499,14 @@ impl ExactRegistryClaim {
 pub(crate) enum RegistryWriteError {
     CapacityExhausted,
     SealExhausted,
-    ForeignOrUnissuedSeal,
     DuplicateEntity,
     DuplicateOwner,
-    DuplicateSeal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Resource)]
 pub(crate) struct RouteEntityRegistry {
     seal_domain: u64,
     next_seal_sequence: u64,
-    consumed_seal_sequences: Vec<u64>,
     records: Vec<RouteEntityRecord>,
 }
 
@@ -522,20 +514,17 @@ pub(crate) struct RouteEntityRegistry {
 pub(crate) struct ProtectedRegistryProjection {
     seal_domain: u64,
     next_seal_sequence: u64,
-    consumed_seal_sequences: Vec<u64>,
     records: Vec<RouteEntityRecord>,
 }
 
 impl ProtectedRegistryProjection {
     pub(crate) fn bind_single_registration(&mut self, seal: OwnershipSeal) -> bool {
         if seal.domain != self.seal_domain
-            || seal.sequence != self.next_seal_sequence.saturating_add(1)
-            || self.consumed_seal_sequences.len() == self.consumed_seal_sequences.capacity()
+            || Some(seal.sequence) != self.next_seal_sequence.checked_add(1)
         {
             return false;
         }
         self.next_seal_sequence = seal.sequence;
-        self.consumed_seal_sequences.push(seal.sequence);
         true
     }
 }
@@ -624,7 +613,6 @@ impl RouteEntityRegistry {
             seal_domain: allocate_registry_domain(&NEXT_SEAL_DOMAIN)
                 .expect("ownership seal domain exhausted"),
             next_seal_sequence: 0,
-            consumed_seal_sequences: Vec::new(),
             records: Vec::new(),
         }
     }
@@ -643,7 +631,6 @@ impl RouteEntityRegistry {
         ProtectedRegistryProjection {
             seal_domain: self.seal_domain,
             next_seal_sequence: self.next_seal_sequence,
-            consumed_seal_sequences: self.consumed_seal_sequences.clone(),
             records: self
                 .records
                 .iter()
@@ -657,12 +644,6 @@ impl RouteEntityRegistry {
         &self,
         excluded_targets: &[Entity],
     ) -> Result<ProtectedRegistryProjection, ()> {
-        let mut consumed_seal_sequences = Vec::new();
-        consumed_seal_sequences
-            .try_reserve_exact(self.consumed_seal_sequences.len().saturating_add(1))
-            .map_err(|_| ())?;
-        consumed_seal_sequences.extend_from_slice(&self.consumed_seal_sequences);
-
         let record_count = self
             .records
             .iter()
@@ -680,7 +661,6 @@ impl RouteEntityRegistry {
         Ok(ProtectedRegistryProjection {
             seal_domain: self.seal_domain,
             next_seal_sequence: self.next_seal_sequence,
-            consumed_seal_sequences,
             records,
         })
     }
@@ -692,7 +672,6 @@ impl RouteEntityRegistry {
     ) -> bool {
         self.seal_domain == expected.seal_domain
             && self.next_seal_sequence == expected.next_seal_sequence
-            && self.consumed_seal_sequences == expected.consumed_seal_sequences
             && self
                 .records
                 .iter()
@@ -700,15 +679,15 @@ impl RouteEntityRegistry {
                 .eq(expected.records.iter())
     }
 
-    pub(crate) fn issue_seal(&mut self) -> OwnershipSeal {
+    fn allocate_seal(&mut self) -> Result<OwnershipSeal, RegistryWriteError> {
         self.next_seal_sequence = self
             .next_seal_sequence
             .checked_add(1)
-            .expect("ownership seal sequence exhausted");
-        OwnershipSeal {
+            .ok_or(RegistryWriteError::SealExhausted)?;
+        Ok(OwnershipSeal {
             domain: self.seal_domain,
             sequence: self.next_seal_sequence,
-        }
+        })
     }
 
     pub(crate) fn try_reserve_registration(
@@ -722,8 +701,8 @@ impl RouteEntityRegistry {
     /// hook-triggering component is created. Repeating the single-item reserve
     /// without inserting records does not reserve space for the whole batch.
     ///
-    /// This is metadata preparation, not ownership. Callers still issue a seal
-    /// and register each exact Entity, without running application code between
+    /// This is metadata preparation, not ownership. Callers still register
+    /// each exact Entity, without running application code between
     /// this check and the registrations, then revalidate after component writes.
     pub(crate) fn try_reserve_registrations(
         &mut self,
@@ -745,9 +724,6 @@ impl RouteEntityRegistry {
         self.next_seal_sequence
             .checked_add(count)
             .ok_or(RegistryWriteError::SealExhausted)?;
-        self.consumed_seal_sequences
-            .try_reserve(owners.len())
-            .map_err(|_| RegistryWriteError::CapacityExhausted)?;
         self.records
             .try_reserve(owners.len())
             .map_err(|_| RegistryWriteError::CapacityExhausted)
@@ -759,6 +735,12 @@ impl RouteEntityRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn issue_unregistered_seal_for_test(&mut self) -> OwnershipSeal {
+        self.allocate_seal()
+            .expect("ownership seal sequence exhausted")
+    }
+
+    #[cfg(test)]
     pub(crate) fn latest_issued_seal(&self) -> Option<OwnershipSeal> {
         (self.next_seal_sequence != 0).then_some(OwnershipSeal {
             domain: self.seal_domain,
@@ -766,23 +748,17 @@ impl RouteEntityRegistry {
         })
     }
 
+    /// Issuance precedes conflict checks, so every failed issued attempt still
+    /// consumes its sequence. This only updates registry metadata; the caller
+    /// receives the exact claim before any component or hook-triggering write.
     pub(crate) fn register(
         &mut self,
         entity: Entity,
         owner: RegistryOwner,
-        seal: OwnershipSeal,
         manifest: ComponentManifest,
         lifecycle: EntityLifecycle,
-    ) -> Result<(), RegistryWriteError> {
-        if seal.domain != self.seal_domain
-            || seal.sequence == 0
-            || seal.sequence > self.next_seal_sequence
-        {
-            return Err(RegistryWriteError::ForeignOrUnissuedSeal);
-        }
-        if self.consumed_seal_sequences.contains(&seal.sequence) {
-            return Err(RegistryWriteError::DuplicateSeal);
-        }
+    ) -> Result<ExactRegistryClaim, RegistryWriteError> {
+        let seal = self.allocate_seal()?;
         if self.records.iter().any(|record| record.entity == entity) {
             return Err(RegistryWriteError::DuplicateEntity);
         }
@@ -793,15 +769,16 @@ impl RouteEntityRegistry {
         {
             return Err(RegistryWriteError::DuplicateOwner);
         }
-        self.consumed_seal_sequences.push(seal.sequence);
-        self.records.push(RouteEntityRecord {
+        let record = RouteEntityRecord {
             entity,
             owner,
             seal,
             manifest,
             lifecycle,
-        });
-        Ok(())
+        };
+        let claim = record.claim();
+        self.records.push(record);
+        Ok(claim)
     }
 
     pub(crate) fn record(&self, entity: Entity) -> Option<&RouteEntityRecord> {
@@ -2776,58 +2753,64 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn registry_rejects_duplicate_entity_owner_and_seal_without_partial_write() {
+    fn failed_registrations_preserve_records_and_never_reuse_issued_seals() {
         let mut registry = RouteEntityRegistry::new();
         let mut world = World::new();
         let first = world.spawn_empty().id();
         let second = world.spawn_empty().id();
-        let owner = ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(1));
-        let other_owner = ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(2));
-        let first_seal = registry.issue_seal();
-        let second_seal = registry.issue_seal();
+        let owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(1)),
+        ));
+        let other_owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(2)),
+        ));
         let manifest = ComponentManifest::new([]);
-
-        registry
+        let first_claim = registry
             .register(
                 first,
-                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner.clone())),
-                first_seal,
+                owner.clone(),
                 manifest.clone(),
                 EntityLifecycle::PreparedInert,
             )
             .unwrap();
+        assert_eq!(registry.record(first).unwrap().claim(), first_claim);
+        assert_eq!(first_claim.seal().sequence, 1);
         let baseline = registry.records().to_vec();
         assert_eq!(
             registry.register(
                 first,
-                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(other_owner.clone())),
-                second_seal,
+                other_owner.clone(),
                 manifest.clone(),
-                EntityLifecycle::PreparedInert
+                EntityLifecycle::PreparedInert,
             ),
             Err(RegistryWriteError::DuplicateEntity)
         );
+        let duplicate_entity_seal = registry.latest_issued_seal().unwrap();
+        assert_eq!(duplicate_entity_seal.sequence, 2);
+        assert_eq!(registry.records(), baseline);
         assert_eq!(
             registry.register(
                 second,
-                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner)),
-                second_seal,
+                owner,
                 manifest.clone(),
-                EntityLifecycle::PreparedInert
+                EntityLifecycle::PreparedInert,
             ),
             Err(RegistryWriteError::DuplicateOwner)
         );
-        assert_eq!(
-            registry.register(
+        let duplicate_owner_seal = registry.latest_issued_seal().unwrap();
+        assert_eq!(duplicate_owner_seal.sequence, 3);
+        assert_eq!(registry.records(), baseline);
+        let second_claim = registry
+            .register(
                 second,
-                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(other_owner)),
-                first_seal,
+                other_owner,
                 manifest,
-                EntityLifecycle::PreparedInert
-            ),
-            Err(RegistryWriteError::DuplicateSeal)
-        );
-        assert_eq!(registry.records(), baseline.as_slice());
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        assert_eq!(second_claim.seal().sequence, 4);
+        assert_ne!(second_claim.seal(), duplicate_entity_seal);
+        assert_ne!(second_claim.seal(), duplicate_owner_seal);
     }
 
     #[test]
@@ -2844,10 +2827,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let mut registry = RouteEntityRegistry::new();
         registry.try_reserve_registrations(&owners).unwrap();
-        let capacities = (
-            registry.records.capacity(),
-            registry.consumed_seal_sequences.capacity(),
-        );
+        let capacity = registry.records.capacity();
         assert_eq!(
             registry.next_seal_sequence, 0,
             "reservation is not seal issuance"
@@ -2856,39 +2836,123 @@ pub(crate) mod tests {
         let mut world = World::new();
         for owner in owners {
             let entity = world.spawn_empty().id();
-            let seal = registry.issue_seal();
             registry
                 .register(
                     entity,
                     owner,
-                    seal,
                     ComponentManifest::new([]),
                     EntityLifecycle::PreparedInert,
                 )
                 .unwrap();
             assert_eq!(
-                (
-                    registry.records.capacity(),
-                    registry.consumed_seal_sequences.capacity()
-                ),
-                capacities,
+                registry.records.capacity(),
+                capacity,
                 "every registration must fit the prepared batch capacity"
             );
         }
         let retired = registry.records[0].claim();
         assert!(registry.remove_exact(&retired));
-        assert_eq!(
-            registry.register(
+        let replacement = registry
+            .register(
                 retired.entity(),
                 retired.owner().clone(),
-                retired.seal(),
                 ComponentManifest::new([]),
-                retired.lifecycle()
-            ),
-            Err(RegistryWriteError::DuplicateSeal)
+                retired.lifecycle(),
+            )
+            .unwrap();
+        assert_ne!(replacement.seal(), retired.seal());
+        assert_eq!(replacement.seal().sequence, 14);
+        let baseline = registry.records().to_vec();
+        assert!(
+            registry
+                .compare_exchange_lifecycle(&retired, EntityLifecycle::Active)
+                .is_none()
         );
-        assert_eq!(registry.next_seal_sequence, 13);
-        assert_eq!(registry.consumed_seal_sequences.len(), 13);
+        assert!(
+            registry
+                .compare_exchange_owner(&retired, retired.owner().clone())
+                .is_none()
+        );
+        assert!(!registry.compare_exchange_manifest_exact(
+            &retired,
+            &ComponentManifest::new([]),
+            ComponentManifest::new([world.register_component::<A>()]),
+        ));
+        assert!(!registry.remove_exact(&retired));
+        assert_eq!(registry.records(), baseline);
+        assert_eq!(registry.records.capacity(), capacity);
+    }
+
+    #[test]
+    fn protected_projection_detects_registration_even_after_record_removal() {
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let source = registry.protected_projection_excluding(&[]);
+        let mut bound = registry.try_protected_projection_excluding(&[]).unwrap();
+        let claim = registry
+            .register(
+                entity,
+                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(1)),
+                )),
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        assert!(bound.bind_single_registration(claim.seal()));
+        assert!(registry.matches_protected_projection_excluding(&bound, &[entity]));
+        assert!(registry.remove_exact(&claim));
+        assert!(registry.records().is_empty());
+        assert!(!registry.matches_protected_projection_excluding(&source, &[]));
+    }
+
+    #[test]
+    fn protected_projection_detects_failed_registration_without_record_changes() {
+        let mut registry = RouteEntityRegistry::new();
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
+            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(1)),
+        ));
+        registry
+            .register(
+                entity,
+                owner.clone(),
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        let source = registry.try_protected_projection_excluding(&[]).unwrap();
+        let records = registry.records().to_vec();
+        assert_eq!(
+            registry.register(
+                entity,
+                owner,
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            ),
+            Err(RegistryWriteError::DuplicateEntity)
+        );
+        assert_eq!(registry.records(), records);
+        assert!(!registry.matches_protected_projection_excluding(&source, &[]));
+    }
+
+    #[test]
+    fn protected_projection_detects_registry_replacement_in_the_same_tick() {
+        let mut world = World::new();
+        world.init_resource::<RouteEntityRegistry>();
+        let source = world
+            .resource::<RouteEntityRegistry>()
+            .protected_projection_excluding(&[]);
+        let tick = world.read_change_tick();
+        world.insert_resource(RouteEntityRegistry::new());
+        assert_eq!(world.read_change_tick(), tick);
+        assert!(
+            !world
+                .resource::<RouteEntityRegistry>()
+                .matches_protected_projection_excluding(&source, &[])
+        );
     }
 
     #[test]
@@ -2913,12 +2977,10 @@ pub(crate) mod tests {
         assert_eq!(registry, before);
         let mut world = World::new();
         let entity = world.spawn_empty().id();
-        let seal = registry.issue_seal();
         registry
             .register(
                 entity,
                 provisional,
-                seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -2947,16 +3009,33 @@ pub(crate) mod tests {
         );
         assert_eq!(registry, before);
         registry.try_reserve_registrations(&owners[..1]).unwrap();
-        let last = registry.issue_seal();
-        assert_eq!(last.sequence, u64::MAX);
+        let mut world = World::new();
+        let last = registry
+            .register(
+                world.spawn_empty().id(),
+                owners[0].clone(),
+                ComponentManifest::new([]),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        assert_eq!(last.seal().sequence, u64::MAX);
+        let exhausted = registry.clone();
         for _ in 0..2 {
             assert_eq!(
-                registry.try_reserve_registrations(&owners[..1]),
+                registry.try_reserve_registrations(&owners[1..]),
                 Err(RegistryWriteError::SealExhausted)
             );
-            assert_eq!(registry.next_seal_sequence, u64::MAX);
+            assert_eq!(
+                registry.register(
+                    world.spawn_empty().id(),
+                    owners[1].clone(),
+                    ComponentManifest::new([]),
+                    EntityLifecycle::PreparedInert,
+                ),
+                Err(RegistryWriteError::SealExhausted)
+            );
+            assert_eq!(registry, exhausted);
         }
-        let exhausted = registry.clone();
         registry.try_reserve_registrations(&[]).unwrap();
         assert_eq!(registry, exhausted);
     }
@@ -2975,14 +3054,11 @@ pub(crate) mod tests {
             outlet: outlet.clone(),
             slot,
         };
-        let first_seal = registry.issue_seal();
-        let duplicate_seal = registry.issue_seal();
 
         registry
             .register(
                 first,
                 RegistryOwner::Provisional(owner.clone()),
-                first_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -2993,7 +3069,6 @@ pub(crate) mod tests {
             registry.register(
                 duplicate,
                 RegistryOwner::Provisional(owner),
-                duplicate_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             ),
@@ -3029,9 +3104,6 @@ pub(crate) mod tests {
         let first = world.spawn_empty().id();
         let same_location = world.spawn_empty().id();
         let same_slot = world.spawn_empty().id();
-        let first_seal = registry.issue_seal();
-        let location_seal = registry.issue_seal();
-        let slot_seal = registry.issue_seal();
         registry
             .register(
                 first,
@@ -3040,7 +3112,6 @@ pub(crate) mod tests {
                     outlet: outlet.clone(),
                     slot: child_slot,
                 }),
-                first_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3054,7 +3125,6 @@ pub(crate) mod tests {
                     outlet: outlet.clone(),
                     slot: other_slot,
                 }),
-                location_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             ),
@@ -3069,7 +3139,6 @@ pub(crate) mod tests {
                     outlet: other_outlet,
                     slot: child_slot,
                 }),
-                slot_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             ),
@@ -3089,8 +3158,6 @@ pub(crate) mod tests {
         let mut world = World::new();
         let first = world.spawn_empty().id();
         let second = world.spawn_empty().id();
-        let first_seal = registry.issue_seal();
-        let second_seal = registry.issue_seal();
         let outlet = RouteSlotKey::default();
         registry
             .register(
@@ -3100,7 +3167,6 @@ pub(crate) mod tests {
                     outlet: outlet.clone(),
                     slot: first_child_slot,
                 }),
-                first_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3113,7 +3179,6 @@ pub(crate) mod tests {
                     outlet,
                     slot: second_child_slot,
                 }),
-                second_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3130,14 +3195,12 @@ pub(crate) mod tests {
         let mut registry = RouteEntityRegistry::new();
         let mut world = World::new();
         let entity = world.spawn_empty().id();
-        let seal = registry.issue_seal();
         registry
             .register(
                 entity,
                 RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
                     ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(31)),
                 )),
-                seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3162,14 +3225,12 @@ pub(crate) mod tests {
         let first = world.spawn_empty().id();
         let second = world.spawn_empty().id();
         for (entity, revision) in [(first, 41), (second, 43)] {
-            let seal = registry.issue_seal();
             registry
                 .register(
                     entity,
                     RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
                         ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(revision)),
                     )),
-                    seal,
                     ComponentManifest::new([]),
                     EntityLifecycle::PreparedInert,
                 )
@@ -3203,33 +3264,61 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn registry_rejects_foreign_zero_and_unissued_seals_without_partial_write() {
+    fn registry_domains_reject_foreign_exact_claims_without_partial_write() {
         let mut registry = RouteEntityRegistry::new();
         let mut foreign = RouteEntityRegistry::new();
         let mut world = World::new();
         let entity = world.spawn_empty().id();
-        let owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
-            ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(8)),
+        let (parent, _, slot) = child_owner_fixture();
+        let owner = RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
+            parent: parent.clone(),
+            outlet: RouteSlotKey::default(),
+            slot,
+        });
+        let manifest = ComponentManifest::new([]);
+        let claim = registry
+            .register(
+                entity,
+                owner.clone(),
+                manifest.clone(),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        let foreign_claim = foreign
+            .register(
+                entity,
+                owner,
+                manifest.clone(),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        assert_eq!(claim.seal().sequence, foreign_claim.seal().sequence);
+        assert_ne!(claim.seal().domain, foreign_claim.seal().domain);
+        let baseline = registry.clone();
+        assert!(
+            registry
+                .compare_exchange_lifecycle(&foreign_claim, EntityLifecycle::Active)
+                .is_none()
+        );
+        assert!(
+            registry
+                .compare_exchange_owner(
+                    &foreign_claim,
+                    RegistryOwner::Committed(EntityOwner::ChildSlot {
+                        parent,
+                        outlet: RouteSlotKey::default(),
+                        slot,
+                    }),
+                )
+                .is_none()
+        );
+        assert!(!registry.compare_exchange_manifest_exact(
+            &foreign_claim,
+            &manifest,
+            ComponentManifest::new([world.register_component::<A>()]),
         ));
-        let foreign_seal = foreign.issue_seal();
-        for seal in [
-            foreign_seal,
-            OwnershipSeal::fixture(registry.seal_domain, 0),
-            OwnershipSeal::fixture(registry.seal_domain, 1),
-        ] {
-            let baseline = registry.records().to_vec();
-            assert_eq!(
-                registry.register(
-                    entity,
-                    owner.clone(),
-                    seal,
-                    ComponentManifest::new([]),
-                    EntityLifecycle::PreparedInert,
-                ),
-                Err(RegistryWriteError::ForeignOrUnissuedSeal)
-            );
-            assert_eq!(registry.records(), baseline);
-        }
+        assert!(!registry.remove_exact(&foreign_claim));
+        assert_eq!(registry, baseline);
     }
 
     #[test]
@@ -3237,7 +3326,6 @@ pub(crate) mod tests {
         let mut registry = RouteEntityRegistry::new();
         let mut world = World::new();
         let entity = world.spawn_empty().id();
-        let seal = registry.issue_seal();
         let owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
             ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(9)),
         ));
@@ -3245,7 +3333,6 @@ pub(crate) mod tests {
             .register(
                 entity,
                 owner,
-                seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3279,13 +3366,10 @@ pub(crate) mod tests {
         let second_owner = RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
             ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(2)),
         ));
-        let first_seal = registry.issue_seal();
-        let second_seal = registry.issue_seal();
-        registry
+        let first_claim = registry
             .register(
                 first,
                 first_owner,
-                first_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3294,7 +3378,6 @@ pub(crate) mod tests {
             .register(
                 second,
                 second_owner,
-                second_seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
@@ -3330,21 +3413,23 @@ pub(crate) mod tests {
         );
         assert!(registry.records().is_empty());
 
-        let replacement = world.spawn_empty().id();
         let baseline = table.leases().to_vec();
-        assert_eq!(
-            registry.register(
-                replacement,
-                RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
-                    ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(3)),
-                )),
-                first_seal,
+        let replacement = registry
+            .register(
+                first,
+                first_claim.owner().clone(),
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
-            ),
-            Err(RegistryWriteError::DuplicateSeal)
+            )
+            .unwrap();
+        assert_ne!(replacement.seal(), first_claim.seal());
+        assert!(
+            registry
+                .compare_exchange_lifecycle(&first_claim, EntityLifecycle::Active)
+                .is_none()
         );
-        assert!(registry.records().is_empty());
+        assert!(!registry.remove_exact(&first_claim));
+        assert_eq!(registry.record(first).unwrap().claim(), replacement);
         assert_eq!(table.leases(), baseline);
     }
 
@@ -3354,14 +3439,12 @@ pub(crate) mod tests {
         let entity = world.spawn(A).id();
         let expected = ComponentManifest::from_world(&world, entity).unwrap();
         let mut registry = RouteEntityRegistry::new();
-        let seal = registry.issue_seal();
         registry
             .register(
                 entity,
                 RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
                     ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(7)),
                 )),
-                seal,
                 expected.clone(),
                 EntityLifecycle::PreparedInert,
             )
@@ -3393,14 +3476,12 @@ pub(crate) mod tests {
         let entity = world.spawn(A).id();
         let expected = ComponentManifest::from_world(&world, entity).unwrap();
         let mut registry = RouteEntityRegistry::new();
-        let seal = registry.issue_seal();
         registry
             .register(
                 entity,
                 RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
                     ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(8)),
                 )),
-                seal,
                 expected,
                 EntityLifecycle::PreparedInert,
             )
@@ -3429,14 +3510,12 @@ pub(crate) mod tests {
         let mut world = World::new();
         let entity = world.spawn_empty().id();
         let mut registry = RouteEntityRegistry::new();
-        let seal = registry.issue_seal();
         registry
             .register(
                 entity,
                 RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(
                     ProvisionalTopSlotOwner::new(HostCandidateRevision::fixture(13)),
                 )),
-                seal,
                 ComponentManifest::new([]),
                 EntityLifecycle::PreparedInert,
             )
