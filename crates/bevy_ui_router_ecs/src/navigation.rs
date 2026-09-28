@@ -132,8 +132,9 @@ use crate::{
     frame_local::{
         validate_active_branch_for_splice, validate_active_branch_local,
         validate_active_branch_with_entering, validate_branch_descendants,
-        validate_leaving_branch_for_splice, validate_prepared_branch,
-        validate_preserved_branch_local, validate_reconciliation_entering_branch,
+        validate_entering_mount_parent, validate_leaving_branch_for_splice,
+        validate_prepared_branch, validate_preserved_branch_local,
+        validate_reconciliation_entering_branch,
     },
     host::{
         HostCandidateCapacityEvidence, HostCandidateClassification, HostCandidateIdentityCounter,
@@ -893,13 +894,7 @@ pub(crate) struct PendingBackTargetAppliedReportInput {
     report: BackTargetAppliedReport,
 }
 
-pub(crate) struct PendingBackTargetAppliedPhysicalIndeterminate {
-    owner: PendingBackTargetAppliedReportInput,
-    evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
-}
-
 pub(crate) struct PendingBackTargetAppliedReportMismatch {
-    source: BackTargetDriverPostReportRefreezeSource,
     owner: PendingBackTargetAppliedReportInput,
     mismatch: PreparationReceiverMismatchView,
 }
@@ -924,14 +919,7 @@ pub(crate) struct PendingBackTargetAppliedStagingConflict {
     evidence: BackTargetDriverStagingMismatchEvidence,
 }
 
-pub(crate) struct PendingBackTargetAppliedMountRequest {
-    driving: PendingBackTargetDriving,
-    request: MountRequest,
-    pending: PendingCommit,
-}
-
 pub(crate) struct PendingBackTargetAppliedMountRequestPairingMismatch {
-    source: BackTargetDriverPostReportRefreezeSource,
     driving: PendingBackTargetDriving,
     request: MountRequest,
     pending: PendingCommit,
@@ -1601,9 +1589,17 @@ pub(crate) enum PendingBackTargetResumeBlocked {
         mismatch: PreparationReceiverMismatchView,
     },
     DriverFailure(PendingBackTargetDriverFailure),
-    AppliedPhysicalIndeterminate(PendingBackTargetAppliedPhysicalIndeterminate),
     AppliedReportMismatch(PendingBackTargetAppliedReportMismatch),
-    AppliedMountRequestPending(PendingBackTargetAppliedMountRequest),
+    MountFailureMismatch {
+        driving: PendingBackTargetDriving,
+        mismatch: PreparationReceiverMismatchView,
+    },
+    CleanupOnlyMismatch {
+        history: HistoryExecutionBindingView,
+        branch: FailedPreparedBranch,
+        outcome: BackTargetDriverFailureCoreOutcome,
+        mismatch: PreparationReceiverMismatchView,
+    },
     AppliedMountRequestPairingMismatch(PendingBackTargetAppliedMountRequestPairingMismatch),
     AppliedCommitPending(PendingBackTargetAppliedCommit),
     AppliedCommitPairingMismatch(PendingBackTargetAppliedCommitPairingMismatch),
@@ -5446,6 +5442,13 @@ pub(crate) struct AuthorityProtocolResidualOwner {
     pub(crate) host: Option<RetiredHostBinding>,
 }
 
+#[cfg(test)]
+impl AuthorityProtocolResidualOwner {
+    pub(crate) fn retained_cleanup_settlement_ledger(&self) -> Option<&CleanupLedger> {
+        self.cleanup_settlement_ledger.as_ref()
+    }
+}
+
 enum AuthorityProtocolResidualKind {
     #[cfg(feature = "bsn")]
     NativeCreation(crate::presentation::native_scene::NativeSceneIsolationFailure),
@@ -5623,8 +5626,14 @@ impl RouterEntry {
                     mount.role() == crate::branch_transaction::ReconciliationSlotRoleKind::MountNew
                         && mount.expected_slot_lifecycle() == EntityLifecycle::PreparedInert
                 })
+        } else if let Some(request) = self.pending_mount_request.as_ref() {
+            self.engine
+                .reconciliation_projection_for_mount_request(request)
+                .is_ok()
         } else {
-            false
+            self.engine
+                .reconciliation_projection_for_pending_mount()
+                .is_ok()
         };
         projection_is_current.then_some(pending.branch.as_realized())
     }
@@ -8780,16 +8789,28 @@ fn dispatch_pending_back_target(entry: &mut RouterEntry) -> BackTargetDispatchOu
                         );
                         BackTargetDispatchOutcome::Action(EngineAction::Commit(ticket))
                     }
-                    Err(resume) => {
-                        entry.pending_back_target_execution =
-                            Some(PendingBackTargetExecution::ResumeBlocked(
-                                PendingBackTargetResumeBlocked::Start {
-                                    start: BackTargetStart::Ready(resume),
-                                    retirement,
-                                },
-                            ));
-                        BackTargetDispatchOutcome::SafeStopped
-                    }
+                    Err(resume) => match resume.into_mount_request_parts() {
+                        Ok((request, history, continuation)) => {
+                            drop(retirement);
+                            entry.pending_back_target_execution = Some(
+                                PendingBackTargetExecution::Driving(PendingBackTargetDriving {
+                                    history,
+                                    continuation,
+                                }),
+                            );
+                            BackTargetDispatchOutcome::Action(EngineAction::MountRequest(request))
+                        }
+                        Err(resume) => {
+                            entry.pending_back_target_execution =
+                                Some(PendingBackTargetExecution::ResumeBlocked(
+                                    PendingBackTargetResumeBlocked::Start {
+                                        start: BackTargetStart::Ready(resume),
+                                        retirement,
+                                    },
+                                ));
+                            BackTargetDispatchOutcome::SafeStopped
+                        }
+                    },
                 },
             }
         }
@@ -9929,7 +9950,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     );
                                     let (returned_pending, task, outlets) =
                                         match route_back_target_applied_report(
-                                            world, entry, pending, task, report,
+                                            entry, pending, task, report,
                                         ) {
                                             RouteBackTargetAppliedOutcome::Handled => continue,
                                             RouteBackTargetAppliedOutcome::NonTarget {
@@ -9984,6 +10005,30 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     .pending_commit
                                     .take()
                                     .unwrap_or_else(PendingCommit::new);
+                                if let Some(PendingBackTargetExecution::Driving(owner)) =
+                                    entry.pending_back_target_execution.as_ref()
+                                    && let BackTargetExecutionPairingOutcome::Mismatch(mismatch) =
+                                        entry.engine.validate_back_target_execution_pairing(
+                                            BackTargetExecutionOwnerRef::Driving {
+                                                history: &owner.history,
+                                                continuation: &owner.continuation,
+                                            },
+                                            BackTargetPhysicalOwnerRef::MountRequest(
+                                                entry.pending_mount_request.as_ref().unwrap(),
+                                            ),
+                                        )
+                                {
+                                    let Some(PendingBackTargetExecution::Driving(owner)) =
+                                        entry.pending_back_target_execution.take()
+                                    else { unreachable!("the borrowed target owner remains held") };
+                                    entry.pending_back_target_execution = Some(
+                                        PendingBackTargetExecution::ResumeBlocked(
+                                            PendingBackTargetResumeBlocked::DrivingPairingMismatch { owner, mismatch },
+                                        ),
+                                    );
+                                    entry.pending_commit = Some(pending);
+                                    continue;
+                                }
                                 let request_is_exact = entry
                                     .pending_mount_request
                                     .as_ref()
@@ -10022,7 +10067,9 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                             .find(|frame| frame.frame() == request.parent())
                                     });
                                     let exact_entering = entering_parent.is_some_and(|parent| {
-                                        validate_realized_frame(world, parent)
+                                        validate_entering_mount_parent(
+                                            world, parent, pending.branch.as_realized(), entry.active.as_ref(),
+                                        )
                                     });
                                     let exact_active = active_parent
                                         .is_some_and(|parent| validate_active_frame(world, parent));
@@ -12982,6 +13029,112 @@ fn inject_back_target_driver_staging_drift(entry: &mut RouterEntry) {
         Some(PendingBackTargetExecution::DriverFailureStagingDrift(owner));
 }
 
+fn finish_back_target_mount_failure(entry: &mut RouterEntry) {
+    if !matches!(
+        entry.pending_back_target_execution,
+        Some(PendingBackTargetExecution::Driving(_))
+    ) || entry.pending_failed_branch.is_none()
+    {
+        return;
+    }
+    let failed = entry.pending_failed_branch.take().unwrap();
+    let PendingFailedBranch { terminal, branch } = failed;
+    let request = match terminal {
+        PendingFailedBranchTerminal::Request(request) => request,
+        PendingFailedBranchTerminal::RegistrationBegin(error) => {
+            match error.reject(&mut entry.engine) {
+                Ok(request) => request,
+                Err(error) => {
+                    entry.pending_failed_branch = Some(PendingFailedBranch {
+                        terminal: PendingFailedBranchTerminal::RegistrationBegin(error),
+                        branch,
+                    });
+                    return;
+                }
+            }
+        }
+        terminal => {
+            entry.pending_failed_branch = Some(PendingFailedBranch { terminal, branch });
+            return;
+        }
+    };
+    let Some(PendingBackTargetExecution::Driving(driving)) =
+        entry.pending_back_target_execution.take()
+    else {
+        unreachable!("target mount failure retains its original driving owner")
+    };
+    let PendingBackTargetDriving {
+        history,
+        continuation,
+    } = driving;
+    let request = match entry
+        .engine
+        .finish_back_target_mount_failure(continuation, request)
+    {
+        r3_core::FinishBackTargetMountFailureOutcome::Matched(request) => {
+            drop(history);
+            request
+        }
+        r3_core::FinishBackTargetMountFailureOutcome::Mismatch {
+            capacity,
+            request,
+            mismatch,
+        } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::MountFailureMismatch {
+                    driving: PendingBackTargetDriving {
+                        history,
+                        continuation: capacity,
+                    },
+                    mismatch,
+                },
+            ));
+            request
+        }
+    };
+    entry.pending_failed_branch = Some(PendingFailedBranch {
+        terminal: PendingFailedBranchTerminal::Request(request),
+        branch,
+    });
+}
+
+fn consume_back_target_cleanup_only(
+    entry: &mut RouterEntry,
+    history: HistoryExecutionBindingView,
+    branch: FailedPreparedBranch,
+    outcome: BackTargetDriverFailureCoreOutcome,
+) {
+    // PhysicalResidual and applied mount failures always require cleanup. The complete
+    // branch (including slots/native residuals) is proved by the existing cleanup path.
+    assert!(entry.pending_failed_branch.is_none());
+    match entry.engine.consume_back_target_driver_failure(outcome) {
+        BackTargetDriverFailureConsumeOutcome::FailureCleanup(request) => {
+            drop(history);
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch,
+            });
+        }
+        BackTargetDriverFailureConsumeOutcome::Mismatch {
+            owner: outcome,
+            mismatch,
+        } => {
+            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
+                PendingBackTargetResumeBlocked::CleanupOnlyMismatch {
+                    history,
+                    branch,
+                    outcome,
+                    mismatch,
+                },
+            ));
+        }
+        BackTargetDriverFailureConsumeOutcome::FallbackReleased
+        | BackTargetDriverFailureConsumeOutcome::Terminal(_) => {
+            unreachable!("cleanup-only failure cannot publish fallback or terminal before cleanup")
+        }
+    }
+}
+
 fn consume_back_target_driver_reported(
     entry: &mut RouterEntry,
     reported: BackTargetDriverFailureReported,
@@ -13226,7 +13379,6 @@ fn store_back_target_applied_staging_mismatch(
 }
 
 fn route_back_target_applied_report(
-    world: &mut World,
     entry: &mut RouterEntry,
     pending: PendingCommit,
     task: RootFrameTask,
@@ -13287,35 +13439,10 @@ fn route_back_target_applied_report(
             report,
         );
     };
-    let owner = PendingBackTargetAppliedReportInput {
-        driving,
-        task,
-        pending,
-        report,
-    };
-    let source = match freeze_back_target_driver_physical_partition_source(
-        world,
-        entry,
-        &owner.driving,
-        &owner.task,
-    ) {
-        Ok(source) => source,
-        Err(evidence) => {
-            entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedPhysicalIndeterminate(
-                    PendingBackTargetAppliedPhysicalIndeterminate { owner, evidence },
-                ),
-            ));
-            return RouteBackTargetAppliedOutcome::Handled;
-        }
-    };
-    let post_source = source.seal_for_report();
-    let PendingBackTargetAppliedReportInput {
-        driving,
-        task,
-        pending,
-        report,
-    } = owner;
+    // Applying a report only advances Core's exact request and returns its next
+    // owner. Mount, publication and failure cleanup validate the complete branch
+    // in their respective execution paths; a root-only cleanup proof does not
+    // authorize this transition and would reject valid nested entering frames.
     let PendingBackTargetDriving {
         history,
         continuation,
@@ -13341,24 +13468,16 @@ fn route_back_target_applied_report(
                 BackTargetPhysicalOwnerRef::MountRequest(&request),
             ) {
                 BackTargetExecutionPairingOutcome::Matched => {
-                    drop(post_source);
                     entry.pending_back_target_execution =
-                        Some(PendingBackTargetExecution::ResumeBlocked(
-                            PendingBackTargetResumeBlocked::AppliedMountRequestPending(
-                                PendingBackTargetAppliedMountRequest {
-                                    driving,
-                                    request,
-                                    pending,
-                                },
-                            ),
-                        ));
+                        Some(PendingBackTargetExecution::Driving(driving));
+                    entry.pending_mount_request = Some(request);
+                    entry.pending_commit = Some(pending);
                 }
                 BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
                     entry.pending_back_target_execution =
                         Some(PendingBackTargetExecution::ResumeBlocked(
                             PendingBackTargetResumeBlocked::AppliedMountRequestPairingMismatch(
                                 PendingBackTargetAppliedMountRequestPairingMismatch {
-                                    source: post_source,
                                     driving,
                                     request,
                                     pending,
@@ -13370,7 +13489,6 @@ fn route_back_target_applied_report(
             }
         }
         BackTargetAppliedReportOutcome::Commit { capacity, ticket } => {
-            drop(post_source);
             let owner = PendingBackTargetAppliedCommit {
                 driving: PendingBackTargetDriving {
                     history,
@@ -13403,38 +13521,12 @@ fn route_back_target_applied_report(
             }
         }
         BackTargetAppliedReportOutcome::FailureCleanup(owner) => {
-            let physical = BackTargetDriverUnverifiedPhysicalOwner::Residual(
+            consume_back_target_cleanup_only(
+                entry,
+                history,
                 failed_prepared_branch(pending, None),
+                BackTargetDriverFailureCoreOutcome::FailureCleanup(owner),
             );
-            match reclassify_back_target_driver_post_report(world, entry, &post_source, physical) {
-                BackTargetDriverPhysicalClassification::Reportable(physical) => {
-                    consume_back_target_driver_reported(
-                        entry,
-                        BackTargetDriverFailureReported {
-                            source: post_source,
-                            history,
-                            physical,
-                            outcome: BackTargetDriverFailureCoreOutcome::FailureCleanup(owner),
-                        },
-                    );
-                }
-                BackTargetDriverPhysicalClassification::Indeterminate(indeterminate) => {
-                    let BackTargetDriverPhysicalIndeterminateOwner { original, evidence } =
-                        indeterminate;
-                    store_back_target_driver_failure(
-                        entry,
-                        PendingBackTargetDriverFailure::PostReportPhysicalIndeterminate(
-                            PendingBackTargetDriverPostReportPhysicalIndeterminate {
-                                source: post_source,
-                                history,
-                                physical: original,
-                                outcome: BackTargetDriverFailureCoreOutcome::FailureCleanup(owner),
-                                evidence,
-                            },
-                        ),
-                    );
-                }
-            }
         }
         BackTargetAppliedReportOutcome::Mismatch {
             capacity,
@@ -13445,7 +13537,6 @@ fn route_back_target_applied_report(
             entry.pending_back_target_execution = Some(PendingBackTargetExecution::ResumeBlocked(
                 PendingBackTargetResumeBlocked::AppliedReportMismatch(
                     PendingBackTargetAppliedReportMismatch {
-                        source: post_source,
                         owner: PendingBackTargetAppliedReportInput {
                             driving: PendingBackTargetDriving {
                                 history,
@@ -13620,6 +13711,58 @@ fn route_back_target_frame_failure(
             return store_back_target_driver_staging_mismatch(entry, owner);
         }
         BackTargetExecutionPairingOutcome::Matched => {}
+    }
+
+    let has_nested_topology = !matches!(task.mount_target(), FrameMountTarget::TopSlot { .. })
+        || entry
+            .active
+            .as_ref()
+            .is_some_and(|active| active.frames().len() != 1 || !active.child_slots().is_empty());
+    if has_nested_topology {
+        let PendingBackTargetDriving {
+            history,
+            continuation,
+        } = driving;
+        match entry.engine.report_back_target_failed(
+            &history,
+            continuation,
+            task,
+            kind,
+            message.clone(),
+            BackTargetDriverFailureReportMode::PhysicalResidual,
+        ) {
+            BackTargetDriverFailureReportOutcome::Reported(outcome) => {
+                let branch = match physical {
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending) => {
+                        failed_prepared_branch(pending, None)
+                    }
+                    BackTargetDriverUnverifiedPhysicalOwner::Residual(branch) => branch,
+                };
+                consume_back_target_cleanup_only(entry, history, branch, outcome);
+            }
+            BackTargetDriverFailureReportOutcome::Mismatch {
+                capacity,
+                task,
+                mismatch,
+            } => {
+                let owner = back_target_driver_staging_mismatch(
+                    Some(BackTargetDriverStagingOwner::Driving(
+                        PendingBackTargetDriving {
+                            history,
+                            continuation: capacity,
+                        },
+                    )),
+                    BackTargetDriverStagingMismatchObservation::PairingMismatch,
+                    Some(mismatch),
+                    physical,
+                    task,
+                    kind,
+                    message,
+                );
+                return store_back_target_driver_staging_mismatch(entry, owner);
+            }
+        }
+        return RouteBackTargetFrameFailureOutcome::Handled;
     }
 
     let source = match freeze_back_target_driver_physical_partition_source_with_owner(
@@ -14567,7 +14710,6 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
         return true;
     };
     match route_back_target_applied_report(
-        world,
         entry,
         pending,
         task,
@@ -21279,10 +21421,9 @@ fn settle_post_commit_retired_host_edge(
         || !physical
             .original_freeze
             .terminals_are_current(world, &physical.original)
-        || physical
-            .partition
-            .top_target()
-            .is_none_or(|top| top.entity() != edge.top_slot || top.claim() != &edge.top_slot_claim)
+        || physical.partition.top_target().is_none_or(|top| {
+            top.entity() != edge.top_slot || top.registered_claim() != Some(&edge.top_slot_claim)
+        })
         || !physical.partition.refreeze(
             world,
             &physical.settled_authority,
@@ -21827,6 +21968,7 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
         }
         return;
     }
+    finish_back_target_mount_failure(entry);
     if entry.pending_back_target_execution.is_some() {
         return;
     }

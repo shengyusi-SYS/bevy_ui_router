@@ -1,6 +1,6 @@
 # Bevy UI Router 文档索引
 
-**更新时间**：2026-09-24。包含官方同步 BSN adapter 的 MVP 已通过既定功能验收，并补充 Linux/WSLg 真实窗口、软件渲染与 OS 注入键鼠交互验证；Windows 原生、最低 Rust、物理 GPU 加速与硬件设备输入未验证。当前按所有者选择先完成发布准备，不授予开源许可证或正式发布。旧 data-only API 无兼容义务，基础路由、内部 outlet、renderer-neutral 边界与输入/focus 责任仍保留。
+**更新时间**：2026-09-28。本项目是独立的通用 Bevy UI Router，面向开源发布。嵌套分支因 query/search 变化重建后的 Back 缺陷已修复，并通过官方 Bevy 基线的完整回归；当前范围与验收见 [MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 和 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。本库验收以仓库内可复现的测试、示例和发布检查为依据，不依赖特定消费应用的业务、测试状态或发布流程。Linux/WSLg 窗口使用软件渲染；Windows 原生、最低 Rust、物理 GPU 加速与硬件设备输入未验证。尚未正式发布，具体许可证待确定。
 
 ## 当前依据
 
@@ -25,4 +25,4 @@
 
 [全局工程决策指导](global-architecture-engineering-decision-guide.md) 和编号研究资料是非规范参考，不能另立范围或完成标准；引用旧依赖/API 时核对当前官方版本。
 
-实现存在、生产集成、推荐 facade 可达和真实用户旅程通过分别记录。当前 MVP 结论以统一 spec 的实际验收、独立审查和本地 main 集成为据；历史 Recovery PASS、探针与单个检查点不能单独证明它。未运行的平台项目继续按 NOT_RUN 记录。
+实现存在、生产集成、推荐 facade 可达和真实用户旅程通过分别记录。当前 MVP 结论以统一 spec/plan 的最新修复与验收记录为据；历史 MVP/Recovery PASS、探针与单个检查点不能证明新组合已通过。未运行的平台项目继续按 NOT_RUN 记录。

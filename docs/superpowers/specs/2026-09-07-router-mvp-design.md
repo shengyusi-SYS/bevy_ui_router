@@ -1,8 +1,10 @@
 # Bevy UI Router 统一 MVP Design Spec
 
+> 2026-09-28 验收补充：官方 Bevy facade 回归复现并修复了嵌套分支因 search 变化重建后的 Back 停滞。既有逐项基线未覆盖此组合；合同不变，完整回归通过。当前证据见统一实施 plan 的“嵌套 Back 挂载与失败收敛修复”节。
+
 **日期**：2026-09-07
 
-**状态**：MVP accepted on local `main`（2026-09-23）。总体目标与范围已获用户确认；完整修订稿经独立审查和交叉复核，第 12 节最小机制有官方依赖探针证据。实际产品验收见第 10 节；未运行平台项目仍保持 NOT_RUN。
+**状态**：2026-09-28 基础 Back 缺陷修复及本库完整回归通过，2026-09-23 的本地 main 验收记录保留为历史证据。总体目标与范围已获用户确认；完整修订稿经独立审查和交叉复核，第 12 节最小机制有官方依赖探针证据。实际产品验收见第 10 节；未运行平台项目仍保持 NOT_RUN。本库是独立通用项目，消费应用的业务接线、缺陷与验收不构成本库合同或发布门禁。
 
 **用途**：MVP 产品范围、架构、公共语义与验收结果的统一依据。实施顺序和当前事实分别由 implementation plan 与 current-architecture 记录。本文替代旧 Target、Matrix、Fixture、Allowlist、Golden、Journeys、Goals 的范围与重复规范地位；旧文件暂留供已有实现/测试迁移和历史追溯，不能反向扩张新 MVP。
 
@@ -14,7 +16,7 @@ MVP 交付官方同步、代码驱动 BSN adapter，同时保留 renderer-neutra
 
 必须交付：
 
-- 官方 crates.io Bevy `0.19.1`，无 Bevy fork、patch 或 source replacement；Core/View 和 facade 默认功能不依赖 Bevy。
+- 官方 crates.io Bevy `0.19.x`，已验证 `0.19.0` / `0.19.1`，默认 lock 为 `0.19.1`；无 Bevy fork、patch 或 source replacement；Core/View 和 facade 默认功能不依赖 Bevy。
 - builder-first 路由树、静态/参数/末尾 wildcard 匹配、index route、pathless layout、raw location/search/fragment、route-local params。
 - 单条嵌套路由链、每个 layout 的单个 default outlet、common-prefix 保留、suffix 替换、memory history。
 - 官方 native Scene 的同步 factory/resolve/apply、内部容器上的 outlet 声明、基本错误诊断与 request/router snapshots。
@@ -275,3 +277,70 @@ Windows 原生、最低 Rust 版本执行、物理 GPU 加速及真实硬件输�
 选择依据：官方 `0.19.1` 探针已覆盖匿名 child 首次失败、部分 Node 写入失败、成功 sibling 后深层失败、根模板提前引用后代再失败、原 Scene 整体替换 resolve target、root/child 双向命名引用、成功后的 Children 顺序、额外空 Children 的可观察性，以及公开 API 对 cached inclusion 的区分。预挂树方案需要干预官方关系写入，没有相对于独立创建义务的必要优势，因此不采用。
 
 这些是机制可行性证据，不是完整 Router ownership、hook 漂移、输入隔离或 cleanup PASS。生产实现仍需第 10 节与 plan 阶段 C/D 的跨层验证；不把探针里的直接 despawn、固定编号或仅计数检查复制成产品权限证明。
+
+## 13. 原生内容清理减法方案（2026-09-25；2026-09-27 完成 P1–P4）
+
+本节记录已批准的内容清理方案。P1 对照和有界原型决定 go，P2 已完成全部生产消费者迁移及完整工作区验证，P3 正式两轮 benchmark 和 BRP 窗口验收已完成；随后用户继续授权 P4，操作内计划通过独立复核、完整回归、三轮对照及 BRP 复验，详细门禁与性能边界归唯一 plan 和性能记录。第 1–12 节及 AGENTS 的现有合同继续成立；实施与验收见唯一 plan 的同名阶段。基线为 `55911d6`，运行证据归 [性能记录](../../performance.md)。
+
+### 13.1 核心需求与本轮目标
+
+产品仍是通用同步 BSN UI Router：应用声明路由和 view，绑定自有 host，使用 push/replace/back 切换嵌套页面，保留公共布局和状态；history、错误结果、输入和焦点与已发布页面一致。正常 Scene 可以包含普通应用组件及真实 hook/observer；Router 管理自己的结构和明确的内容边界，不冻结无关应用状态。
+
+本轮只解决已有测量暴露的内容规模成本。固定三条路由的公开基准中，32 个子节点正常导航 p50 约 1.6–1.8 ms，128 个约 16.3–17.0 ms，且不含布局和渲染。临时插桩显示每次 128 节点导航约有 8,775 次清理分类。不能把完整导航时间称为纯 Router 额外成本，也不能从这些点推出全库复杂度或跨平台 SLA。
+
+必须保留：现有匹配/location/history 语义、common-prefix 保留、内部 default outlet、原错误与恢复结果、stale 拒绝、exact frame/host/slot 身份、单一 owner、创建失败责任、owned-only 清理、真实回调后的复验、原生输入/历史手势与 focus 撤权、终态有界收敛。性能改进不能靠延后未完成清理、减少场景工作或把成功终点提前来获得。
+
+### 13.2 方案比较与选择
+
+| 方案 | 获益来源 | 主要代价与判断 |
+| --- | --- | --- |
+| 继续局部微调 | 少量 claim 克隆、临时分配、重复读取 | 风险较低，但逐实体乘以全集合的工作仍在；只接受新 profile 指向的独立小改动，不作为主路线 |
+| **同一清理协议内区分结构登记与内容授权** | 取消普通内容为退出而新增的登记/marker 写入及配套复验，按验证目的减少证据构造 | 推荐先做有界原型；需要贯通义务、owner、输入、残留和完成凭据，风险中等偏高，不能当成单函数修补 |
+| 全面重写 Router 或新增快速/保守双 runtime | 理论自由度大 | 目前没有 Core/matcher/history 热点证据；迁移和维护成本高，不纳入本轮 |
+
+现有临时逐实体义务是 BSN 接入原清理协议的有意桥接，不是未删除的永久 authored-component 白名单。需要改变的是桥接和执行成本，不能通过恢复旧 data-only 限制来降低成本。
+
+### 13.3 推荐的内部责任模型
+
+保留一个 `CleanupLedger` 和现有 `CleanupOwner` 的线性移交。清理义务在内部区分两种授权证据（名称仅用于设计表达，不冻结公共 API）：
+
+- **Registered**：Router 自建 shell/root/slot，以及尚未完成 adoption 的创建期产物，继续使用该 Entity 自己的 exact registry claim、seal、lifecycle 和实际 retirement。
+- **ContainedContent**：已完成 adoption 的普通内容，使用 exact Entity（含 generation）、source frame/root/shell 身份和冻结的关系证据。实际 authority 由 ledger 中原 frame owner 持有；证据和 root claim 都不能替代或重建该 owner，也不能把 root claim 冒充普通 child 的 registry record。
+
+准备阶段在只读 World 下确定当次内容目标、child-frame 边界、顺序和必要容量，把普通内容义务保留在原 owner 的私有状态中；目标是取消为适配 ledger 而给普通后代新登记 `FrameOutput`、插入 `NativeCleanupContent`/seal/lifecycle 的过程。原 root 已有的必要登记仍保留。准备不完整时返还原 owner，不产生第二个前台 holder。
+
+冻结目标之后，hook 后的重新观察仅用于验证和分类，不能自动把新挂入的 Entity 加入旧清理权限。已移出边界的普通内容按既有应用责任处理；目标缺失、关系变化、实际残留和原有创建义务分别处理，不以当前 closure 为空推导历史义务完成。已登记结构仍按自己的 exact claim 结算。
+
+执行继续按 child-frame 到 parent-frame、内容叶到根处理可证明的目标。真实 despawn/relationship/component mutation 后复验当前 source、剩余目标及完整相关 target/protected partition，漂移时停止后续破坏性写入；不得用初始快照做无条件递归 despawn。原错误、已发布 history/结果及残留隔离责任继续通过现有完成通道移交。清理范围、完成 digest/count、receipt 和 terminal 必须覆盖全部实际义务，不能只把新内容义务藏在原 `entities.len()` 之外。
+
+异常移交是同一迁移的必要部分：普通内容残留以原 owner、exact source shell/root 的实际隔离及当前关系取证，不能为了进入 quarantine 又临时补登记普通节点；已失去 containment 的内容按对应角色与应用责任处理。原登记结构和创建期残留继续各自的 exact claim 证明。若这一接缝无法保持完整来源和唯一 owner，原型应否决该路线，不能用只覆盖成功导航的计时证明可交付。
+
+### 13.4 校验范围与复用边界
+
+验证分别回答三个问题：授权 source 是否仍相同；下一写是否仍落在允许目标内；目标与完整相关 protected closure 是否仍分离。登记结构按 exact claim 验证，普通内容按 source 与内容关系验证；不是所有 Entity 都必须具有同一种 registry/manifest 身份。
+
+保护应用内容不等于要求可信回调前后所有无关组件或 `Node` 样式都相等。拟在 native cleanup 中贯彻第 8 节的这一边界：保留身份、关系、隔离、输入与实际写入范围所需事实；无关应用组件/样式的合法变化不单独构成清理权限丢失。对 Router 自己承诺保持的 authored 值与实际写集仍作相应验证。采用这一调整须同步迁移原私有 marker 测试，保留真实回调修改关系、转移内容或破坏隔离时的拒绝对照。
+
+只在同一无 mutation 的观察区间内复用成员集合、借用比较及预备容量。分开轻量有效性比较与错误时的完整证据构造；但不得因此丢失原 failure/source/owner，也不能把观测 snapshot 转为 authority。当前 `matches_exact` 已直接比较字段，不能把仅在错误分支构造的完整快照计入正常优化收益。
+
+本提案不承诺所有 hook 场景线性化。保留逐写复验时，真实回调路径仍可能有重复遍历；首要收益来自删除转换步骤、缩小合法校验范围和减少物化证据。若仍有热点，按新 profile 决定下一项，不预先增加全局索引、dirty tracking、跨写缓存或回调白名单。
+
+P3 后重新 profile 并经用户继续授权，P4 采用统一操作内的 removal plan：一次冻结角色与删除顺序，每次真实写后直接比较包含预期删除变化的完整 partition，避免为每个剩余目标重新生成完整分类结果。它保留逐写复验，仍可能有重复扫描；只能复用与当前角色和失败语义相同的既有 primitive，不能将 failed-prepared 的规则直接套用普通离场。作为第二阶段单独测量，不将其收益与取消 marker 的收益混为一谈。也不以目标自身的 hook flag 推断“无回调”：关系组件删除可能触发父实体组件变化及其 observer。
+
+### 13.5 验收与停止条件
+
+- 继续使用现有公开 1/32/128 节点、push/replace/back、失败/恢复、空闲和连续使用基线。增加同内容的直接 Bevy/BSN 创建删除对照，仅用于估计引擎基础成本；它不实现 Router 的全部行为，差值不宣称为严格的逐系统归因。必要的分段计数只放隔离诊断构建，正式时间使用无插桩版本。
+- 回归同时证明正常任意组件、动态内容/内部 outlet/布局保持，以及真实回调下的移出内容、protected 关系变化、当前目标消失、部分创建失败、host loss 和 terminal/input/focus 行为。私有 marker 的形状不再作为必须保留的产品行为。
+- 比较绝对 p50/p95、内容规模增长、重复使用趋势和实际工作次数；不给未经测量的倍数或毫秒承诺。60 Hz 的 16.7 ms 是整帧参考，不是允许 Router 用满的预算；仅略低于该值不能宣称完整 UI 性能就绪。
+- 原型若需要扩大删除目标、放弃真实写后复验、引入第二套正常导航状态机、改变公共 Core/history 语义，或增加难以解释的长期状态，则本路线不按原计划进入生产。若收益仅为测量噪声或少量常数改善，与迁移成本不相称，也应收口，不为完成计划继续重构。
+
+本轮不新增异步加载、缓存页面、过渡动画、多 outlet、多 Router 产品旅程、后台 reaper、公开审计 API、全平台 benchmark 或安全沙箱。已有平台与发布准备边界保持；目标为独立开源发布，具体许可证尚待确定。
+
+
+### 13.6 本轮验收结果
+
+同一 ledger 的内容授权迁移已覆盖全部生产出口；普通内容转换机制及其输入/焦点修补退出。真实销毁回调移走剩余内容时，原版本的永久 PostCommitCleanup 得到修正：原 owner/receipt 有界结算，发布结果保持，仍在原页面内的残留保持隔离。相关 source/protected 关系、登记祖先变化的拒绝与无关组件/样式变化的允许均有真实行为回归。
+
+P3 主工作区 1,226 项单元/集成和 28 项 doctest 通过，完整无 BSN 的 ECS 619+1 通过；公开 consumer、原生输入/focus 和动态内容覆盖保留。窗口使用用户要求的 BRP 进程内输入与 renderer 截图方法复验，不影响其它窗口，不冒充硬件输入。正式正常导航 p50 为 1 子节点 0.179–0.247 ms、32 子节点 1.380–1.556 ms、128 子节点 12.586–13.328 ms；相对同日基线均值分别 +0.9%、−12.3%、−22.6%。具体分位数、失败/恢复、soak 和环境见性能记录。
+
+P4 在新的 profile 与继续授权后完成：按当前实际图准备一次动作/receipt，每次写后重新核对完整相关事实，不物化所有剩余目标的重复分类。主工作区 1,229 项单元/集成、28 项 doctest、无 BSN 620+1、静态检查与 BRP 渲染/input 复验通过；真实合法回调及同批重挂删除顺序均有回归。三轮原样正式对照显示相对 P2，32/128 子节点正常 p50 均值分别降低 21.8%/35.6%，128 子节点为 7.976–9.176 ms。小页面及恢复未证明收益。逐写扫描仍存在，这一 CPU 时间仍不含布局和渲染，不能称大型 UI 性能就绪；不据此自动扩大重构。

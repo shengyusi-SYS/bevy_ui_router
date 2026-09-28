@@ -699,10 +699,6 @@ pub(super) fn prepare_authority_isolation_targets<'a>(
     let mut known = Vec::new();
     let mut exact = Vec::new();
     for claim in stored_claims {
-        #[cfg(feature = "bsn")]
-        if crate::presentation::native_frame::is_escaped_cleanup_content(world, claim.entity()) {
-            continue;
-        }
         if !known.contains(&claim.entity()) && try_push(&mut known, claim.entity()).is_err() {
             return AuthorityIsolationPreparation::RetryableCapacity;
         }
@@ -879,7 +875,7 @@ pub(super) fn prepare_post_commit_input_isolation(
             .partition()
             .targets()
             .iter()
-            .map(|target| target.claim()),
+            .filter_map(|target| target.registered_claim()),
         gate_targets.iter().copied(),
         authority.partition().targets().len(),
     );

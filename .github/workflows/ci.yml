@@ -35,7 +35,9 @@ jobs:
       - name: Test workspace and public consumers
         run: cargo test --workspace --all-features --locked
       - name: Smoke test performance fixtures (no timing gate)
-        run: cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+        run: |
+          cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
+          ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
       - name: Verify release packages and packaged public consumer
         run: |
           cargo package --workspace
@@ -43,5 +45,7 @@ jobs:
       # Resolve and build separately so graphical features do not enter headless tests.
       - name: Fetch window example dependencies
         run: cargo fetch --manifest-path examples/windowed/Cargo.toml --locked
-      - name: Check window example
-        run: cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
+      - name: Check window example and opt-in debug bridge
+        run: |
+          cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
+          cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked

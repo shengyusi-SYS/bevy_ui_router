@@ -1,4 +1,6 @@
 //! A real window, renderer and device-input integration using only public APIs.
+#[cfg(all(debug_assertions, feature = "ui-debug"))]
+mod ui_debug;
 use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
 use bevy_internal::{picking::Pickable, prelude::*};
 use bevy_scene::{Scene, bsn};
@@ -39,6 +41,7 @@ fn main() {
         primary_window: Some(Window {
             title: "Bevy UI Router - MVP".into(),
             resolution: (960, 640).into(),
+            focused: !cfg!(all(debug_assertions, feature = "ui-debug")),
             ..default()
         }),
         ..default()
@@ -46,6 +49,8 @@ fn main() {
     // Do not install InputDispatchPlugin or TabNavigationPlugin: this example
     // explicitly gates its target-addressed keyboard handler below.
     .add_plugins(InputFocusPlugin);
+    #[cfg(all(debug_assertions, feature = "ui-debug"))]
+    app.add_plugins(ui_debug::UiDebugPlugin);
 
     let mut views = RouteViewRegistry::new();
     let layout = register(&mut app, &mut views, "layout", |_| {

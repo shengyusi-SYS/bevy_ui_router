@@ -86,12 +86,6 @@ fn collect_frame_local_entities_with_policy(
             {
                 if let Some(record) = registry.record(child) {
                     if !matches!(record.owner(), RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. }) if parent == frame)
-                        && !(matches!(record.owner(), RegistryOwner::Committed(EntityOwner::FrameOutput { frame: owner, .. }) if owner == frame)
-                            && world
-                                .get::<crate::presentation::native_frame::NativeCleanupContent>(
-                                    child,
-                                )
-                                .is_some())
                     {
                         return Err(FrameLocalError::OwnershipDrift(child));
                     }
@@ -229,6 +223,45 @@ pub(crate) fn validate_prepared_branch(
         )?;
     }
     validate_branch_descendants(world, branch).map(|_| ())
+}
+
+/// Validate an entering parent before creating its next child slot. A replaced
+/// frame can share a committed slot with the old frame until publication.
+pub(crate) fn validate_entering_mount_parent(
+    world: &World,
+    frame: &crate::presentation::RealizedFrame,
+    entering: &RealizedBranch,
+    active: Option<&RealizedBranch>,
+) -> bool {
+    let existing = active
+        .into_iter()
+        .flat_map(RealizedBranch::frames)
+        .filter(|old| {
+            frame
+                .sealed_reconciliation_entering_shell_for(old)
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    let leaving = active
+        .into_iter()
+        .flat_map(RealizedBranch::frames)
+        .filter_map(|old| frame.sealed_reconciliation_leaving_sibling_shell_for(old))
+        .cloned()
+        .collect::<Vec<_>>();
+    let existing_slots = active
+        .into_iter()
+        .flat_map(RealizedBranch::child_slots)
+        .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+        .count();
+    existing.len() <= 1
+        && (existing.is_empty() || existing_slots == 1)
+        && validate_reconciliation_entering_frame_with_child_slots(
+            world,
+            frame,
+            &child_slot_expectations(entering, frame.frame()),
+            existing.first().copied(),
+            &leaving,
+        )
 }
 
 pub(crate) fn validate_reconciliation_entering_branch(

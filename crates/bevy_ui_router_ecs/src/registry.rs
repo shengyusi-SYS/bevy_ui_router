@@ -1281,8 +1281,143 @@ impl QuarantineRootProjection {
     }
 }
 
+/// An unregistered content obligation retained by the same lease as its exact
+/// structural source. These facts never masquerade as a registry record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContainedResidualFact {
+    pub(crate) identity: crate::cleanup::CleanupTargetIdentity,
+    pub(crate) expected_parent: Entity,
+    pub(crate) ledger_domain: u64,
+    pub(crate) manifest_digest: u64,
+    pub(crate) attempt_revision: u64,
+    pub(crate) obligation: usize,
+    pub(crate) obligation_binding: u64,
+    pub(crate) receipt_binding: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContainedResidualRecord {
+    pub(crate) fact: ContainedResidualFact,
+    pub(crate) terminal_identity: crate::cleanup::CleanupTargetIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContainedResidualLeaseIdentity {
+    Verified {
+        id: QuarantineLeaseId,
+        generation: u64,
+        operation_sequence: u64,
+    },
+    Unresolved {
+        sequence: u64,
+    },
+}
+
+fn prepare_contained_records(
+    registry: &RouteEntityRegistry,
+    source_claims: &[ExactRegistryClaim],
+    terminal_claims: impl IntoIterator<Item = ExactRegistryClaim>,
+    facts: Vec<ContainedResidualFact>,
+) -> Result<Vec<ContainedResidualRecord>, QuarantineTransferError> {
+    let terminal_claims = terminal_claims.into_iter().collect::<Vec<_>>();
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(facts.len())
+        .map_err(|_| QuarantineTransferError::CapacityExhausted)?;
+    let mut entities = HashSet::new();
+    let mut receipts = HashSet::new();
+    for fact in facts {
+        let crate::cleanup::CleanupTargetIdentity::ContainedContent {
+            entity,
+            root,
+            shell,
+        } = &fact.identity
+        else {
+            return Err(QuarantineTransferError::UnknownOwnedEntity);
+        };
+        if registry.record(*entity).is_some()
+            || !entities.insert(*entity)
+            || !receipts.insert((fact.ledger_domain, fact.attempt_revision, fact.obligation))
+            || fact.manifest_digest == 0
+            || fact.obligation_binding == 0
+            || fact.receipt_binding == 0
+            || [root, shell].iter().any(|claim| {
+                !source_claims.contains(claim)
+                    || registry
+                        .record(claim.entity())
+                        .is_none_or(|record| record.claim() != **claim)
+            })
+        {
+            return Err(QuarantineTransferError::UnknownOwnedEntity);
+        }
+        let projected = |source: &ExactRegistryClaim| {
+            terminal_claims
+                .iter()
+                .find(|claim| {
+                    claim.entity() == source.entity()
+                        && claim.owner() == source.owner()
+                        && claim.seal() == source.seal()
+                })
+                .cloned()
+        };
+        let terminal_identity = crate::cleanup::CleanupTargetIdentity::ContainedContent {
+            entity: *entity,
+            root: projected(root).ok_or(QuarantineTransferError::UnknownOwnedEntity)?,
+            shell: projected(shell).ok_or(QuarantineTransferError::UnknownOwnedEntity)?,
+        };
+        records.push(ContainedResidualRecord {
+            fact,
+            terminal_identity,
+        });
+    }
+    Ok(records)
+}
+
+impl PreparedQuarantineTransfer {
+    pub(crate) fn contained_records(&self) -> &[ContainedResidualRecord] {
+        &self.contained
+    }
+
+    pub(crate) fn attach_contained(
+        &mut self,
+        registry: &RouteEntityRegistry,
+        facts: Vec<ContainedResidualFact>,
+    ) -> Result<(), QuarantineTransferError> {
+        let records = prepare_contained_records(
+            registry,
+            &self.source_claims,
+            self.records.iter().map(QuarantineLeaseRecord::claim),
+            facts,
+        )?;
+        self.entity_count = self
+            .records
+            .len()
+            .checked_add(records.len())
+            .ok_or(QuarantineTransferError::CapacityExhausted)?;
+        self.contained = records;
+        Ok(())
+    }
+}
+
+impl PreparedUnresolvedResidualTransfer {
+    pub(crate) fn attach_contained(
+        &mut self,
+        registry: &RouteEntityRegistry,
+        facts: Vec<ContainedResidualFact>,
+    ) -> Result<(), QuarantineTransferError> {
+        self.contained = prepare_contained_records(
+            registry,
+            &self.source_claims,
+            self.records.iter().map(RouteEntityRecord::claim),
+            facts,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QuarantineLease {
+    contained: Vec<ContainedResidualRecord>,
     id: QuarantineLeaseId,
     generation: u64,
     operation_sequence: u64,
@@ -1295,6 +1430,7 @@ pub(crate) struct QuarantineLease {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnresolvedResidual {
+    contained: Vec<ContainedResidualRecord>,
     sequence: u64,
     records: Vec<RouteEntityRecord>,
     actual_manifests: Vec<(Entity, ComponentManifest)>,
@@ -1304,7 +1440,15 @@ pub(crate) struct UnresolvedResidual {
 impl UnresolvedResidual {
     #[cfg(test)]
     pub(crate) fn owned_entities(&self) -> Vec<Entity> {
-        self.records.iter().map(RouteEntityRecord::entity).collect()
+        self.records
+            .iter()
+            .map(RouteEntityRecord::entity)
+            .chain(
+                self.contained
+                    .iter()
+                    .map(|record| record.fact.identity.entity()),
+            )
+            .collect()
     }
 }
 
@@ -1313,6 +1457,11 @@ impl QuarantineLease {
         self.records
             .iter()
             .map(QuarantineLeaseRecord::entity)
+            .chain(
+                self.contained
+                    .iter()
+                    .map(|record| record.fact.identity.entity()),
+            )
             .collect()
     }
     pub(crate) fn foreign_descendants(&self) -> &[Entity] {
@@ -1357,6 +1506,7 @@ pub(crate) enum QuarantineTransferError {
 }
 
 pub(crate) struct PreparedQuarantineTransfer {
+    contained: Vec<ContainedResidualRecord>,
     id: QuarantineLeaseId,
     source_claims: Vec<ExactRegistryClaim>,
     root: QuarantineRootProjection,
@@ -1367,6 +1517,7 @@ pub(crate) struct PreparedQuarantineTransfer {
 }
 
 pub(crate) struct PreparedUnresolvedResidualTransfer {
+    contained: Vec<ContainedResidualRecord>,
     sequence: u64,
     source_claims: Vec<ExactRegistryClaim>,
     records: Vec<RouteEntityRecord>,
@@ -1393,7 +1544,7 @@ struct AuthorityLostResidual {
     generation: u64,
     operation_sequence: u64,
     provenance: AuthorityLostResidualProvenance,
-    retired_claim: ExactRegistryClaim,
+    retired_identity: crate::cleanup::CleanupTargetIdentity,
     frozen_expected_manifest: ComponentManifest,
     observed_manifest: Option<ComponentManifest>,
     entity_present_at_receipt: bool,
@@ -1435,8 +1586,8 @@ impl AuthorityLostTombstone<'_> {
         self.residual.operation_sequence
     }
 
-    pub(crate) const fn former_claim(&self) -> &ExactRegistryClaim {
-        &self.residual.retired_claim
+    pub(crate) fn source_identity(&self) -> &crate::cleanup::CleanupTargetIdentity {
+        &self.residual.retired_identity
     }
 
     pub(crate) fn matches_prepared_terminal(
@@ -1448,7 +1599,7 @@ impl AuthorityLostTombstone<'_> {
             && self.residual.operation_sequence == expected.operation_sequence
             && self.residual.provenance
                 == AuthorityLostResidualProvenance::Cleanup(expected.provenance.clone())
-            && self.residual.retired_claim == expected.retired_claim
+            && self.residual.retired_identity == expected.retired_identity
             && self.residual.frozen_expected_manifest == expected.frozen_expected_manifest
             && self.residual.observed_manifest == expected.observed_manifest
             && self.residual.entity_present_at_receipt == expected.entity_present_at_receipt
@@ -1469,7 +1620,7 @@ pub(crate) struct PreparedAuthorityLostResidualTerminalProjection {
     generation: u64,
     operation_sequence: u64,
     provenance: CleanupAuthorityLostResidualProvenance,
-    retired_claim: ExactRegistryClaim,
+    retired_identity: crate::cleanup::CleanupTargetIdentity,
     frozen_expected_manifest: ComponentManifest,
     observed_manifest: Option<ComponentManifest>,
     entity_present_at_receipt: bool,
@@ -1515,8 +1666,8 @@ impl PreparedAuthorityLostResidualTerminalProjection {
         self.provenance.terminal_receipt_binding
     }
 
-    pub(crate) const fn retired_claim(&self) -> &ExactRegistryClaim {
-        &self.retired_claim
+    pub(crate) fn source_identity(&self) -> &crate::cleanup::CleanupTargetIdentity {
+        &self.retired_identity
     }
 
     pub(crate) const fn frozen_expected_manifest(&self) -> &ComponentManifest {
@@ -1553,7 +1704,7 @@ impl PreparedAuthorityLostResidualTransfer {
                 provenance: match &residual.provenance {
                     AuthorityLostResidualProvenance::Cleanup(provenance) => provenance.clone(),
                 },
-                retired_claim: residual.retired_claim.clone(),
+                retired_identity: residual.retired_identity.clone(),
                 frozen_expected_manifest: residual.frozen_expected_manifest.clone(),
                 observed_manifest: residual.observed_manifest.clone(),
                 entity_present_at_receipt: residual.entity_present_at_receipt,
@@ -1572,16 +1723,15 @@ impl PreparedAuthorityLostResidualTransfer {
         };
         !self.residuals.is_empty()
             && self.residuals.iter().all(|residual| {
-                let entity = residual.retired_claim.entity();
+                let entity = residual.retired_identity.entity();
                 let registry_was_exact = self
                     .source_claims
                     .iter()
-                    .any(|claim| claim == &residual.retired_claim);
+                    .any(|claim| residual.retired_identity.registered() == Some(claim));
                 let registry_is_current = if registry_was_exact {
-                    registry
-                        .record(entity)
-                        .is_some_and(|record| record.claim() == residual.retired_claim)
-                        && residual.observed_registry_claim.is_none()
+                    registry.record(entity).is_some_and(|record| {
+                        residual.retired_identity.registered() == Some(&record.claim())
+                    }) && residual.observed_registry_claim.is_none()
                 } else {
                     registry.record(entity).map(RouteEntityRecord::claim)
                         == residual.observed_registry_claim
@@ -1594,7 +1744,10 @@ impl PreparedAuthorityLostResidualTransfer {
                     && table.authority_lost_tombstone(entity).is_none()
                     && registry_is_current
                     && (!registry_was_exact
-                        || !cleanup_claim_has_exact_authority(world, &residual.retired_claim))
+                        || !residual
+                            .retired_identity
+                            .registered()
+                            .is_some_and(|claim| cleanup_claim_has_exact_authority(world, claim)))
                     && (world.get_entity(entity).is_ok() == residual.entity_present_at_receipt)
                     && world.get::<ChildOf>(entity).map(ChildOf::parent)
                         == residual.actual_parent_at_receipt
@@ -1874,6 +2027,7 @@ fn try_clone_actual_manifests(
 
 fn try_clone_quarantine_lease(source: &QuarantineLease) -> Result<QuarantineLease, ()> {
     Ok(QuarantineLease {
+        contained: source.contained.clone(),
         id: source.id,
         generation: source.generation,
         operation_sequence: source.operation_sequence,
@@ -1887,6 +2041,7 @@ fn try_clone_quarantine_lease(source: &QuarantineLease) -> Result<QuarantineLeas
 
 fn try_clone_unresolved_residual(source: &UnresolvedResidual) -> Result<UnresolvedResidual, ()> {
     Ok(UnresolvedResidual {
+        contained: source.contained.clone(),
         sequence: source.sequence,
         records: try_clone_registry_records(&source.records)?,
         actual_manifests: try_clone_actual_manifests(&source.actual_manifests)?,
@@ -1902,7 +2057,7 @@ fn try_clone_authority_lost_residual(
         generation: source.generation,
         operation_sequence: source.operation_sequence,
         provenance: source.provenance.clone(),
-        retired_claim: try_clone_exact_registry_claim(&source.retired_claim)?,
+        retired_identity: source.retired_identity.clone(),
         frozen_expected_manifest: source.frozen_expected_manifest.try_clone()?,
         observed_manifest: source
             .observed_manifest
@@ -2052,6 +2207,7 @@ impl QuarantineLeaseTable {
             }
         };
         Ok(PreparedQuarantineTransfer {
+            contained: Vec::new(),
             id,
             source_claims: claims,
             root,
@@ -2081,6 +2237,7 @@ impl QuarantineLeaseTable {
             })
         });
         self.leases.push(QuarantineLease {
+            contained: prepared.contained,
             id: prepared.id,
             generation: 1,
             operation_sequence: 0,
@@ -2147,6 +2304,7 @@ impl QuarantineLeaseTable {
         // even if a later revalidation abandons the prepared transfer.
         self.next_residual_sequence = sequence;
         Ok(PreparedUnresolvedResidualTransfer {
+            contained: Vec::new(),
             sequence,
             source_claims: claims,
             records,
@@ -2169,6 +2327,7 @@ impl QuarantineLeaseTable {
             })
         });
         self.unresolved.push(UnresolvedResidual {
+            contained: prepared.contained,
             sequence: prepared.sequence,
             records: prepared.records,
             actual_manifests: prepared.actual_manifests,
@@ -2189,10 +2348,10 @@ impl QuarantineLeaseTable {
         let mut receipt_identities = HashSet::new();
         let mut entities = HashSet::new();
         for fact in facts.facts() {
-            let entity = fact.retired_claim().entity();
+            let entity = fact.source_identity().entity();
             let registry_exact = registry
                 .record(entity)
-                .is_some_and(|record| record.claim() == *fact.retired_claim());
+                .is_some_and(|record| fact.source_identity().registered() == Some(&record.claim()));
             if fact.manifest_digest() == 0
                 || fact.obligation_binding() == 0
                 || fact.terminal_receipt_binding() == 0
@@ -2210,7 +2369,7 @@ impl QuarantineLeaseTable {
                 || self.record(entity).is_some()
                 || self.unresolved_record(entity).is_some()
                 || self.authority_lost.iter().any(|residual| {
-                    residual.retired_claim.entity() == entity
+                    residual.retired_identity.entity() == entity
                         || matches!(
                             &residual.provenance,
                             AuthorityLostResidualProvenance::Cleanup(provenance)
@@ -2255,7 +2414,7 @@ impl QuarantineLeaseTable {
                 .facts()
                 .iter()
                 .filter(|fact| fact.registry_exact_at_receipt())
-                .map(|fact| fact.retired_claim().clone()),
+                .filter_map(|fact| fact.source_identity().registered().cloned()),
         );
         let mut residuals = Vec::new();
         residuals
@@ -2283,7 +2442,7 @@ impl QuarantineLeaseTable {
                             terminal_receipt_binding: fact.terminal_receipt_binding(),
                         },
                     ),
-                    retired_claim: fact.retired_claim().clone(),
+                    retired_identity: fact.source_identity().clone(),
                     frozen_expected_manifest: fact.frozen_expected_manifest().clone(),
                     observed_manifest: fact.observed_manifest().cloned(),
                     entity_present_at_receipt: fact.entity_present_at_receipt(),
@@ -2370,8 +2529,59 @@ impl QuarantineLeaseTable {
     ) -> Option<AuthorityLostTombstone<'_>> {
         self.authority_lost
             .iter()
-            .find(|residual| residual.retired_claim.entity() == entity)
+            .find(|residual| residual.retired_identity.entity() == entity)
             .map(|residual| AuthorityLostTombstone { residual })
+    }
+
+    pub(crate) fn contained_record(
+        &self,
+        entity: Entity,
+    ) -> Option<(ContainedResidualLeaseIdentity, &ContainedResidualRecord)> {
+        self.leases
+            .iter()
+            .find_map(|lease| {
+                lease
+                    .contained
+                    .iter()
+                    .find(|record| record.fact.identity.entity() == entity)
+                    .map(|record| {
+                        (
+                            ContainedResidualLeaseIdentity::Verified {
+                                id: lease.id,
+                                generation: lease.generation,
+                                operation_sequence: lease.operation_sequence,
+                            },
+                            record,
+                        )
+                    })
+            })
+            .or_else(|| {
+                self.unresolved.iter().find_map(|residual| {
+                    residual
+                        .contained
+                        .iter()
+                        .find(|record| record.fact.identity.entity() == entity)
+                        .map(|record| {
+                            (
+                                ContainedResidualLeaseIdentity::Unresolved {
+                                    sequence: residual.sequence,
+                                },
+                                record,
+                            )
+                        })
+                })
+            })
+    }
+
+    pub(crate) fn contained_records(&self) -> impl Iterator<Item = &ContainedResidualRecord> {
+        self.leases
+            .iter()
+            .flat_map(|lease| lease.contained.iter())
+            .chain(
+                self.unresolved
+                    .iter()
+                    .flat_map(|residual| residual.contained.iter()),
+            )
     }
 
     pub(crate) fn inert_owned_entities(&self) -> impl Iterator<Item = Entity> + '_ {

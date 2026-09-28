@@ -508,6 +508,11 @@ fn facade_native_root_publishes_and_refreshes_dynamic_content() {
             .resource::<RouterInputGate>()
             .allows_keyboard(dynamic)
     );
+    let retained_dynamic = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+    let retained_grandchild = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(retained_dynamic)))
+        .id();
     app.world_mut().entity_mut(dynamic).remove::<ChildOf>();
     app.update();
     assert!(
@@ -539,6 +544,11 @@ fn facade_native_root_publishes_and_refreshes_dynamic_content() {
         app.world().get_entity(dynamic).is_ok(),
         "a pre-moved-out child belongs to the application"
     );
+    assert!(
+        app.world().get_entity(retained_dynamic).is_err()
+            && app.world().get_entity(retained_grandchild).is_err(),
+        "dynamic content still inside the leaving page must be cleaned"
+    );
     assert!(app.world().get_entity(host).is_ok());
 }
 
@@ -558,4 +568,233 @@ fn facade_outlet_declaration_is_usable_in_an_official_scene() {
         .unwrap()
         .id();
     assert!(app.world().get::<DefaultOutlet>(root).is_some());
+}
+
+#[test]
+fn facade_native_cleanup_observer_can_return_remaining_content_and_focus_to_application() {
+    assert_cleanup_observer_returns_application_content(2);
+}
+
+#[test]
+fn facade_native_cleanup_retains_contained_residual_beside_escaped_content() {
+    assert_cleanup_observer_returns_application_content(3);
+}
+
+fn assert_cleanup_observer_returns_application_content(content: usize) {
+    use bevy_ecs::prelude::*;
+    use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
+
+    #[derive(Component)]
+    struct EscapeOnDespawn;
+
+    #[derive(Resource)]
+    struct EscapeObservation {
+        children: Vec<Entity>,
+        application_parent: Entity,
+        callback_count: usize,
+        escaped: Option<Entity>,
+    }
+
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+        InputFocusPlugin,
+    ));
+    let driver = app
+        .register_bsn_view(ViewDriverKey::new("native").unwrap(), move |_| {
+            Ok(bevy_scene::SceneFunction(
+                move |_, root: &mut bevy_scene::ResolvedScene| {
+                    root.push_template(Node::default());
+                    root.push_template(NativePage);
+                    for _ in 0..content {
+                        let mut child = bevy_scene::ResolvedScene::default();
+                        child.push_template(Node::default());
+                        root.get_or_insert_related_resolved_scenes::<ChildOf>()
+                            .scenes
+                            .push(child);
+                    }
+                },
+            ))
+        })
+        .unwrap();
+    let view = RouteViewKey::new("page").unwrap();
+    let routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    let router = app
+        .add_ui_router(RouterConfig::new(routes, views, view))
+        .unwrap();
+    let host = app
+        .world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)))
+        .id();
+    let application_parent = app.world_mut().spawn(Node::default()).id();
+    app.update();
+    let initial = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    for _ in 0..16 {
+        app.update();
+    }
+    assert!(matches!(
+        app.world().resource::<RouterSnapshots>().request(router, initial),
+        RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded
+    ));
+    let root = app
+        .world_mut()
+        .query_filtered::<Entity, With<NativePage>>()
+        .single(app.world())
+        .unwrap();
+    let children = app
+        .world()
+        .get::<Children>(root)
+        .unwrap()
+        .iter()
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), content);
+    for child in children.iter().copied() {
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_keyboard(child)
+        );
+        app.world_mut().entity_mut(child).insert(EscapeOnDespawn);
+    }
+    app.insert_resource(EscapeObservation {
+        children,
+        application_parent,
+        callback_count: 0,
+        escaped: None,
+    });
+    app.add_observer(
+        |event: On<Despawn, EscapeOnDespawn>,
+         mut commands: Commands,
+         mut observation: ResMut<EscapeObservation>| {
+            observation.callback_count += 1;
+            if observation.callback_count != 1 {
+                return;
+            }
+            let sibling = observation
+                .children
+                .iter()
+                .copied()
+                .find(|child| *child != event.entity)
+                .unwrap();
+            let parent = observation.application_parent;
+            // This mutation is emitted by an actual Bevy despawn observer and applied
+            // by the normal command flush, while cleanup still has remaining content.
+            commands.queue(move |world: &mut World| {
+                assert!(
+                    world.get_entity(sibling).is_ok(),
+                    "the sibling must still be alive when the observer runs"
+                );
+                world.entity_mut(sibling).insert(ChildOf(parent));
+                world
+                    .resource_mut::<InputFocus>()
+                    .set(sibling, FocusCause::Pressed);
+                world.resource_mut::<EscapeObservation>().escaped = Some(sibling);
+            });
+        },
+    );
+    let replacement = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(router, RouteLocation::new("/").with_fragment("replacement"))
+        .unwrap();
+    let mut settled = false;
+    for _ in 0..32 {
+        app.update();
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let snapshot = snapshots.get(router).unwrap();
+        if matches!(snapshots.request(router, replacement), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+            && snapshot.running_request().is_none()
+            && !snapshot.cleanup().foreground_pending()
+        {
+            settled = true;
+            break;
+        }
+    }
+    assert!(
+        settled,
+        "published replacement and foreground cleanup must finish within 32 updates"
+    );
+    // Additional normal updates ensure a later gate/focus refresh does not reclaim
+    // the application-owned entity after the cleanup request has completed.
+    for _ in 0..4 {
+        app.update();
+    }
+    let observation = app.world().resource::<EscapeObservation>();
+    assert_eq!(
+        observation.callback_count, 1,
+        "the escaped sibling must not also be despawned"
+    );
+    let escaped = observation
+        .escaped
+        .expect("the real despawn observer must run");
+    assert!(app.world().get_entity(escaped).is_ok());
+    assert_eq!(
+        app.world().get::<ChildOf>(escaped).unwrap().parent(),
+        application_parent
+    );
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(escaped));
+    let gate = app.world().resource::<RouterInputGate>();
+    assert!(!gate.allows_keyboard(escaped));
+    assert!(!gate.allows_pointer(escaped));
+    assert!(!gate.allows_gamepad(escaped));
+    let retained = observation
+        .children
+        .iter()
+        .copied()
+        .filter(|entity| *entity != escaped && app.world().get_entity(*entity).is_ok())
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), content - 2);
+    for entity in retained {
+        assert_eq!(
+            app.world().get::<ChildOf>(entity).map(ChildOf::parent),
+            Some(root)
+        );
+        assert!(!gate.allows_keyboard(entity));
+        assert!(!gate.allows_pointer(entity));
+        assert!(!gate.allows_gamepad(entity));
+        let mut ancestor = Some(entity);
+        let mut hidden_by_display = false;
+        while let Some(current) = ancestor {
+            hidden_by_display |= app
+                .world()
+                .get::<Node>(current)
+                .is_some_and(|node| node.display == bevy_ui::Display::None);
+            ancestor = app.world().get::<ChildOf>(current).map(ChildOf::parent);
+        }
+        assert!(
+            hidden_by_display,
+            "contained residual must remain visually isolated"
+        );
+    }
+    assert!(app.world().get_entity(host).is_ok());
+    assert!(app.world().get_entity(application_parent).is_ok());
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    assert!(
+        matches!(snapshots.request(router, replacement), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+    );
+    assert!(snapshots.get(router).unwrap().running_request().is_none());
+    assert!(
+        !snapshots
+            .get(router)
+            .unwrap()
+            .cleanup()
+            .foreground_pending()
+    );
 }

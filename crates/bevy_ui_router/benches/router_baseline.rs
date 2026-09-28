@@ -1,5 +1,6 @@
 //! Public-API, headless Router CPU-side elapsed-time baseline. See docs/performance.md.
 //! No renderer, UI layout, OS events, async I/O, or frame pacing is installed.
+//! ROUTER_BENCH_SHAPE=flat (default) or nested selects equal-sized content trees.
 use std::time::{Duration, Instant};
 
 use bevy_app::{App, TaskPoolPlugin};
@@ -12,6 +13,89 @@ use bevy_ui_router::prelude::*;
 const WARMUP_CYCLES: usize = 32;
 const IDLE_BATCH: usize = 32;
 const SOAK_BATCHES: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+enum ContentShape {
+    Flat,
+    Nested,
+}
+
+impl ContentShape {
+    fn from_env() -> Self {
+        match std::env::var("ROUTER_BENCH_SHAPE") {
+            Err(std::env::VarError::NotPresent) => Self::Flat,
+            Ok(value) if value == "flat" => Self::Flat,
+            Ok(value) if value == "nested" => Self::Nested,
+            value => panic!("ROUTER_BENCH_SHAPE must be flat or nested, got {value:?}"),
+        }
+    }
+
+    fn levels(self) -> usize {
+        match self {
+            Self::Flat => 1,
+            Self::Nested => 4,
+        }
+    }
+}
+
+// Distribute the same node budget across a shallow forest. Above the final
+// level each parent has at most two children; no extra container nodes exist.
+fn branches(content: usize, levels: usize) -> impl Iterator<Item = usize> {
+    let roots = if levels == 1 { content } else { content.min(2) };
+    (0..roots).map(move |index| content / roots + usize::from(index < content % roots))
+}
+
+fn append_content(root: &mut ResolvedScene, content: usize, levels: usize) {
+    for size in branches(content, levels) {
+        let mut child = ResolvedScene::default();
+        child.push_template(Node::default());
+        child.push_template(Content);
+        if size > 1 {
+            append_content(&mut child, size - 1, levels - 1);
+        }
+        root.get_or_insert_related_resolved_scenes::<ChildOf>()
+            .scenes
+            .push(child);
+    }
+}
+
+fn spawn_control_content(world: &mut World, parent: Entity, content: usize, levels: usize) {
+    for size in branches(content, levels) {
+        let child = world
+            .spawn((Node::default(), Content, ChildOf(parent)))
+            .id();
+        if size > 1 {
+            spawn_control_content(world, child, size - 1, levels - 1);
+        }
+    }
+}
+
+fn assert_content_shape(app: &mut App, page: Entity, count: usize, shape: ContentShape) {
+    let content = app
+        .world_mut()
+        .query_filtered::<Entity, With<Content>>()
+        .iter(app.world())
+        .collect::<Vec<_>>();
+    assert_eq!(content.len(), count);
+    let mut max_depth = 0;
+    for child in content {
+        let mut current = child;
+        let mut depth = 0;
+        while current != page {
+            assert!(app.world().get::<Content>(current).is_some());
+            assert!(app.world().get::<Node>(current).is_some());
+            current = app.world().get::<ChildOf>(current).unwrap().parent();
+            depth += 1;
+            assert!(
+                depth <= shape.levels(),
+                "content must reach its page within the expected depth"
+            );
+        }
+        max_depth = max_depth.max(depth);
+    }
+    // Existing sizes: one leaf, or enough nodes to populate all four levels.
+    assert_eq!(max_depth, if count == 1 { 1 } else { shape.levels() });
+}
 
 #[derive(Component, Clone, Default)]
 struct Layout;
@@ -46,6 +130,7 @@ struct Fixture {
     router: RouterHandle,
     host: Entity,
     content: usize,
+    shape: ContentShape,
     issued: Vec<NavigationRequestId>,
 }
 
@@ -63,7 +148,7 @@ struct Sample {
 }
 
 impl Fixture {
-    fn new(content: usize) -> Self {
+    fn new(content: usize, shape: ContentShape) -> Self {
         let mut app = base_app();
         let layout = app
             .register_bsn_view(ViewDriverKey::new("layout").unwrap(), |_| {
@@ -76,6 +161,10 @@ impl Fixture {
                 Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
                     root.push_template(Node::default());
                     root.push_template(Page(id));
+                    if matches!(shape, ContentShape::Nested) {
+                        append_content(root, content, shape.levels());
+                        return;
+                    }
                     for _ in 0..content {
                         let mut child = ResolvedScene::default();
                         child.push_template(Node::default());
@@ -147,6 +236,7 @@ impl Fixture {
             router,
             host,
             content,
+            shape,
             issued: Vec::new(),
         };
         fixture.navigate(Action::Push, "/items/a", false);
@@ -219,13 +309,10 @@ impl Fixture {
             .iter(self.app.world())
             .collect::<Vec<_>>();
         assert_eq!(content.len(), self.content);
+        assert_content_shape(&mut self.app, page, self.content, self.shape);
         let gate = self.app.world().resource::<RouterInputGate>();
         assert!(gate.allows_keyboard(page));
         for child in content {
-            assert_eq!(
-                self.app.world().get::<ChildOf>(child).unwrap().parent(),
-                page
-            );
             assert!(gate.allows_keyboard(child));
         }
         let snapshot = self.snapshot();
@@ -303,7 +390,7 @@ impl Fixture {
 }
 
 // Comparable authored content without Router; Router-owned wrappers are intentionally absent.
-fn control(content: usize) -> App {
+fn control(content: usize, shape: ContentShape) -> App {
     let mut app = base_app();
     let host = app.world_mut().spawn(Node::default()).id();
     let layout = app
@@ -320,10 +407,18 @@ fn control(content: usize) -> App {
         .world_mut()
         .spawn((Node::default(), Page("a".into()), ChildOf(outlet)))
         .id();
-    for _ in 0..content {
-        app.world_mut()
-            .spawn((Node::default(), Content, ChildOf(page)));
+    match shape {
+        ContentShape::Flat => {
+            for _ in 0..content {
+                app.world_mut()
+                    .spawn((Node::default(), Content, ChildOf(page)));
+            }
+        }
+        ContentShape::Nested => {
+            spawn_control_content(app.world_mut(), page, content, shape.levels())
+        }
     }
+    assert_content_shape(&mut app, page, content, shape);
     app
 }
 
@@ -379,6 +474,7 @@ fn main() {
             "supported arguments: --bench, --test (smoke only)"
         );
     }
+    let shape = ContentShape::from_env();
     let smoke = args.iter().any(|arg| arg == "--test");
     let samples = if smoke {
         2
@@ -392,7 +488,7 @@ fn main() {
     };
     assert!(samples > 0);
     eprintln!(
-        "Router baseline: {}-{}, optimized={}, samples={samples}, idle frames/sample={IDLE_BATCH}; {}",
+        "Router baseline: {}-{}, optimized={}, shape={shape:?}, samples={samples}, idle frames/sample={IDLE_BATCH}; {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         !cfg!(debug_assertions),
@@ -406,7 +502,7 @@ fn main() {
         "scenario,content_children,batch,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,retained_requests"
     );
     for content in [1, 32, 128] {
-        let mut plain = control(content);
+        let mut plain = control(content, shape);
         let values = idle(&mut plain, samples);
         report(
             "idle_control",
@@ -416,7 +512,7 @@ fn main() {
             plain.world().entities().count_spawned(),
             0,
         );
-        let mut fixture = Fixture::new(content);
+        let mut fixture = Fixture::new(content, shape);
         let values = idle(&mut fixture.app, samples);
         fixture.assert_page("a", 1, 0);
         report(
@@ -491,7 +587,7 @@ fn main() {
             );
         }
         // A fresh, normally warmed fixture keeps failure diagnostics out of soak comparisons.
-        let mut fixture = Fixture::new(content);
+        let mut fixture = Fixture::new(content, shape);
         for _ in 0..WARMUP_CYCLES {
             fixture.cycle();
         }

@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 use toml::Value;
 
-pub const BEVY_VERSION: &str = "0.19.1";
+pub const BEVY_VERSION: &str = "0.19.x";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 pub fn is_bevy_package(name: &str) -> bool {
@@ -94,7 +94,14 @@ pub fn lock_violations(lock: &Value) -> Vec<String> {
         if !is_bevy_package(name) {
             continue;
         }
-        if package.get("version").and_then(Value::as_str) != Some(BEVY_VERSION) {
+        let supported = package
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(|version| version.strip_prefix("0.19."))
+            .is_some_and(|patch| {
+                !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+            });
+        if !supported {
             violations.push(format!("{name}: must resolve to Bevy {BEVY_VERSION}"));
         }
         if package.get("source").and_then(Value::as_str) != Some(CRATES_IO) {

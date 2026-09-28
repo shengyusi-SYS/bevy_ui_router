@@ -4157,6 +4157,17 @@ pub enum BackTargetDriverFailureReportOutcome {
     },
 }
 
+/// Completes the Back lifecycle owner after the ordinary mount failure algorithm.
+#[doc(hidden)]
+pub enum FinishBackTargetMountFailureOutcome {
+    Matched(FailureCleanupRequest),
+    Mismatch {
+        capacity: LifecycleContinuationCapacity,
+        request: FailureCleanupRequest,
+        mismatch: PreparationReceiverMismatchView,
+    },
+}
+
 #[doc(hidden)]
 pub enum BackTargetDriverFailureConsumeOutcome {
     FailureCleanup(FailureCleanupRequest),
@@ -5016,6 +5027,31 @@ impl BackTargetResume {
         } = self;
         match action {
             BackTargetResumeAction::FrameTask(task) => Ok((task, execution, continuation)),
+            action => Err(Self {
+                action,
+                execution,
+                continuation,
+            }),
+        }
+    }
+
+    pub fn into_mount_request_parts(
+        self,
+    ) -> Result<
+        (
+            MountRequest,
+            HistoryExecutionBindingView,
+            LifecycleContinuationCapacity,
+        ),
+        Self,
+    > {
+        let Self {
+            action,
+            execution,
+            continuation,
+        } = self;
+        match action {
+            BackTargetResumeAction::MountRequest(request) => Ok((request, execution, continuation)),
             action => Err(Self {
                 action,
                 execution,
@@ -8529,6 +8565,34 @@ impl RouterEngine {
     }
 
     #[doc(hidden)]
+    pub fn finish_back_target_mount_failure(
+        &mut self,
+        capacity: LifecycleContinuationCapacity,
+        request: FailureCleanupRequest,
+    ) -> FinishBackTargetMountFailureOutcome {
+        let owner = CoreBackTargetDriverFailureCleanup {
+            scope: capacity.inner.scope.clone(),
+            request: request.inner,
+        };
+        if let Err(inner) = self
+            .inner
+            .inspect_back_target_driver_failure_cleanup(&owner)
+        {
+            return FinishBackTargetMountFailureOutcome::Mismatch {
+                capacity,
+                request: FailureCleanupRequest {
+                    inner: owner.request,
+                },
+                mismatch: PreparationReceiverMismatchView { inner },
+            };
+        }
+        drop(capacity);
+        FinishBackTargetMountFailureOutcome::Matched(FailureCleanupRequest {
+            inner: owner.request,
+        })
+    }
+
+    #[doc(hidden)]
     pub fn consume_back_target_driver_failure(
         &mut self,
         owner: BackTargetDriverFailureCoreOutcome,
@@ -9250,6 +9314,27 @@ impl RouterEngine {
             .reconciliation_projection_for(task.inner.identity())
             .map(|inner| ReconciliationProjectionView { inner })
             .ok_or(IntegrationError::Stale)
+    }
+
+    #[doc(hidden)]
+    pub fn reconciliation_projection_for_pending_mount(
+        &self,
+    ) -> Result<ReconciliationProjectionView<'_>, IntegrationError> {
+        self.inner
+            .reconciliation_projection_for_pending_mount()
+            .map(|inner| ReconciliationProjectionView { inner })
+            .map_err(map_mount_error)
+    }
+
+    #[doc(hidden)]
+    pub fn reconciliation_projection_for_mount_request(
+        &self,
+        request: &MountRequest,
+    ) -> Result<ReconciliationProjectionView<'_>, IntegrationError> {
+        self.inner
+            .reconciliation_projection_for_mount_request(&request.inner)
+            .map(|inner| ReconciliationProjectionView { inner })
+            .map_err(map_mount_error)
     }
 
     #[doc(hidden)]
@@ -10806,6 +10891,42 @@ mod tests {
     }
 
     #[test]
+    fn pending_mount_reconciliation_borrows_without_consuming_the_engine_action() {
+        let mut engine = confirmed_nested_engine();
+        engine.push(RouteLocation::new("/items/1")).unwrap();
+        engine.collect();
+        assert!(matches!(
+            engine.reconciliation_projection_for_pending_mount(),
+            Err(IntegrationError::Stale)
+        ));
+        let EngineAction::FrameTask(parent) = engine.action().unwrap() else {
+            panic!("parent task expected")
+        };
+        engine
+            .report_applied_with_outlets(parent, vec![RouteSlotKey::default()])
+            .unwrap();
+        let before = engine.inner.testing_snapshot();
+        let projection = engine
+            .reconciliation_projection_for_pending_mount()
+            .expect("the actual queued mount must expose reconciliation");
+        assert_eq!(projection.entering().count(), 2);
+        assert_eq!(engine.inner.testing_snapshot(), before);
+        let EngineAction::MountRequest(request) = engine.action().unwrap() else {
+            panic!("borrowing must leave the original mount action in Core")
+        };
+        assert!(matches!(
+            engine.reconciliation_projection_for_pending_mount(),
+            Err(IntegrationError::Stale)
+        ));
+        assert!(
+            engine
+                .reconciliation_projection_for_mount_request(&request)
+                .is_ok()
+        );
+        assert!(engine.resolve_mount(request).is_ok());
+    }
+
+    #[test]
     fn mount_request_validation_is_exact_and_read_only_for_foreign_and_stale_tokens() {
         fn pending_mount(engine: &mut RouterEngine) -> MountRequest {
             engine.push(RouteLocation::new("/items/1")).unwrap();
@@ -10829,6 +10950,11 @@ mod tests {
         };
         let before_exact = receiver.inner.testing_snapshot();
         assert_eq!(receiver.validate_mount_request(&exact), Ok(()));
+        let projection = receiver
+            .reconciliation_projection_for_mount_request(&exact)
+            .expect("the pending mount borrows its exact reconciliation");
+        assert_eq!(projection.entering().count(), 2);
+        assert_eq!(projection.preserved().len(), 0);
         assert_eq!(receiver.inner.testing_snapshot(), before_exact);
 
         let mut foreign = confirmed_nested_engine();
@@ -10839,6 +10965,10 @@ mod tests {
             receiver.validate_mount_request(&foreign),
             Err(IntegrationError::ForeignRouter)
         );
+        assert!(matches!(
+            receiver.reconciliation_projection_for_mount_request(&foreign),
+            Err(IntegrationError::ForeignRouter)
+        ));
         assert_eq!(receiver.inner.testing_snapshot(), before_foreign);
 
         receiver.resolve_mount(exact).unwrap();
@@ -10847,6 +10977,10 @@ mod tests {
             receiver.validate_mount_request(&stale),
             Err(IntegrationError::Stale)
         );
+        assert!(matches!(
+            receiver.reconciliation_projection_for_mount_request(&stale),
+            Err(IntegrationError::Stale)
+        ));
         assert_eq!(receiver.inner.testing_snapshot(), before_stale);
     }
 
@@ -14871,6 +15005,60 @@ mod tests {
             exact_before_consume,
             "the returned whole fallback owner must remain exact"
         );
+    }
+
+    #[test]
+    fn back_target_mount_failure_returns_whole_inputs_to_wrong_receiver_then_finishes() {
+        for after_mutation in [false, true] {
+            let mut exact = nested_mount_back_fixture();
+            let owner = take_verified_back_target(&mut exact);
+            let BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) =
+                exact.resume_back_target_with_retirement(owner, || {})
+            else {
+                panic!("nested Back must resume")
+            };
+            let (mount, _history, capacity) = resume
+                .into_mount_request_parts()
+                .unwrap_or_else(|_| panic!("retained parent must request its child mount"));
+            let scope = capacity.inner.scope.clone();
+            let failure = if after_mutation {
+                let grant = exact.resolve_mount(mount).unwrap();
+                exact
+                    .reject_mount_after_mutation(MountMutationArtifact::Grant(grant))
+                    .unwrap()
+            } else {
+                exact
+                    .reject_mount(mount, MountRejectionKind::MissingOutlet)
+                    .unwrap()
+            };
+            let receiver = format!("{:?}", failure.inner);
+            let mut foreign = confirmed_engine();
+            let before = foreign.inner.testing_snapshot();
+            let (capacity, failure) =
+                match foreign.finish_back_target_mount_failure(capacity, failure) {
+                    FinishBackTargetMountFailureOutcome::Mismatch {
+                        capacity, request, ..
+                    } => (capacity, request),
+                    FinishBackTargetMountFailureOutcome::Matched(_) => {
+                        panic!("foreign receiver consumed Back continuation")
+                    }
+                };
+            assert_eq!(foreign.inner.testing_snapshot(), before);
+            assert_eq!(capacity.inner.scope, scope);
+            assert_eq!(format!("{:?}", failure.inner), receiver);
+            let before = exact.inner.testing_snapshot();
+            let FinishBackTargetMountFailureOutcome::Matched(failure) =
+                exact.finish_back_target_mount_failure(capacity, failure)
+            else {
+                panic!("original receiver must accept the returned owners")
+            };
+            assert_eq!(format!("{:?}", failure.inner), receiver);
+            assert_eq!(exact.inner.testing_snapshot(), before);
+            assert!(
+                exact.action().is_none(),
+                "no duplicate cleanup action may remain"
+            );
+        }
     }
 
     #[test]

@@ -1024,12 +1024,12 @@ fn failed_prepared_sparse_local_claim_loss_does_not_flatten_exact_siblings() {
             .obligations
             .iter()
             .filter(|obligation| obligation.terminal_mode == CleanupTerminalMode::AuthorityLost)
-            .map(|obligation| obligation.claim.entity())
+            .map(|obligation| obligation.entity())
             .collect::<Vec<_>>(),
         vec![target.entity()]
     );
     assert!(manifest.obligations.iter().any(|obligation| {
-        obligation.claim.entity() != target.entity()
+        obligation.entity() != target.entity()
             && obligation.terminal_mode == CleanupTerminalMode::Normal
     }));
 }
@@ -1407,7 +1407,7 @@ fn exact_external_slot_only_authority_branch_preserves_exact_terminal_mode() {
         .is_ok()
     );
     assert_eq!(obligations.len(), 1);
-    assert_eq!(obligations[0].claim.entity(), child_slot);
+    assert_eq!(obligations[0].entity(), child_slot);
     assert_eq!(
         obligations[0].terminal_mode,
         CleanupTerminalMode::AuthorityExact
@@ -1472,7 +1472,13 @@ fn authority_structural_duplicate_is_invalid_topology_without_flat_lost_fallback
     );
     assert!(obligations.iter().all(|obligation| {
         obligation.terminal_mode != CleanupTerminalMode::AuthorityLost
-            || !cleanup_claim_has_exact_authority(app.world(), &obligation.claim)
+            || !cleanup_claim_has_exact_authority(
+                app.world(),
+                obligation
+                    .identity
+                    .registered()
+                    .expect("registered test fixture"),
+            )
     }));
 }
 
@@ -1726,9 +1732,11 @@ fn nested_cleanup_exact_claim_drift_in_each_unit_is_world_zero() {
         let frozen_claim = ledger
             .obligations
             .iter()
-            .find(|obligation| obligation.claim.entity() == target)
+            .find(|obligation| obligation.entity() == target)
             .unwrap()
-            .claim
+            .identity
+            .registered()
+            .expect("registered test fixture")
             .clone();
         let drifted_claim = app
             .world_mut()
@@ -1753,7 +1761,7 @@ fn nested_cleanup_exact_claim_drift_in_each_unit_is_world_zero() {
         let obligation = ledger
             .obligations
             .iter()
-            .position(|obligation| obligation.claim.entity() == target)
+            .position(|obligation| obligation.entity() == target)
             .unwrap();
 
         assert!(
@@ -1849,7 +1857,7 @@ fn failed_prepared_branch_child_slot_lifecycle_drift_is_locally_lost_and_bounded
         app.world()
             .resource::<QuarantineLeaseTable>()
             .authority_lost_tombstone(child_slot)
-            .is_some_and(|tombstone| tombstone.former_claim() == &exact_claim)
+            .is_some_and(|tombstone| tombstone.source_identity().registered() == Some(&exact_claim))
     );
 }
 
@@ -2624,7 +2632,7 @@ fn one_entity_failure_ledger(
         .manifest()
         .clone();
     let obligations = vec![CleanupObligation {
-        claim,
+        identity: CleanupTargetIdentity::Registered(claim),
         manifest,
         expected_parent,
         unit_root: entity,
@@ -2755,7 +2763,11 @@ fn absent_entity_with_an_alternative_registry_claim_is_stale_not_complete() {
     let parent = world.spawn_empty().id();
     let entity = registered_entity(&mut world, parent);
     let mut ledger = one_entity_failure_ledger(&mut world, entity, parent);
-    let original = ledger.obligations[0].claim.clone();
+    let original = ledger.obligations[0]
+        .identity
+        .registered()
+        .expect("registered test fixture")
+        .clone();
     assert!(world.despawn(entity));
     let alternative = world
         .resource_mut::<RouteEntityRegistry>()
@@ -2787,7 +2799,11 @@ fn stale_living_claim_never_clears_focus_before_settlement_revalidation() {
         let parent = world.spawn_empty().id();
         let entity = registered_entity(&mut world, parent);
         let mut ledger = one_entity_failure_ledger(&mut world, entity, parent);
-        let claim = ledger.obligations[0].claim.clone();
+        let claim = ledger.obligations[0]
+            .identity
+            .registered()
+            .expect("registered test fixture")
+            .clone();
         world.insert_resource(InputFocus::from_entity(entity));
         world
             .resource_mut::<RouteFocusState>()
@@ -2858,12 +2874,19 @@ fn nested_cleanup_obligation_digest_binds_exact_claim_lifecycle() {
     let prepared = ledger.obligations[0].clone();
     let quarantined_claim = world
         .resource::<RouteEntityRegistry>()
-        .prepare_lifecycle_mutation(&[(prepared.claim.clone(), EntityLifecycle::Quarantined)])
+        .prepare_lifecycle_mutation(&[(
+            prepared
+                .identity
+                .registered()
+                .expect("registered test fixture")
+                .clone(),
+            EntityLifecycle::Quarantined,
+        )])
         .unwrap()
         .resulting_claims()[0]
         .clone();
     let mut quarantined = prepared.clone();
-    quarantined.claim = quarantined_claim;
+    quarantined.identity = CleanupTargetIdentity::Registered(quarantined_claim);
 
     assert_ne!(
         manifest_digest(&[prepared]),
@@ -3041,4 +3064,120 @@ fn router_cleanup_observation_counts_terminal_quarantine_events_not_receipts() {
         pending.last_disposition(),
         Some(bevy_ui_router_core::prelude::CleanupDisposition::QuarantinedProtectedParent)
     );
+}
+
+#[test]
+fn registered_same_batch_reparent_uses_actual_leaf_order_and_individual_removal_receipts() {
+    use bevy_ecs::prelude::{Despawn, On, ResMut, Resource};
+
+    #[derive(Component)]
+    struct RecordDespawn;
+    #[derive(Resource, Default)]
+    struct DespawnOrder(Vec<Entity>);
+
+    let mut world = World::new();
+    world.insert_resource(RouteEntityRegistry::new());
+    world.insert_resource(QuarantineLeaseTable::new());
+    world.insert_resource(DespawnOrder::default());
+    world.add_observer(
+        |event: On<Despawn, RecordDespawn>, mut order: ResMut<DespawnOrder>| {
+            order.0.push(event.entity);
+        },
+    );
+    let host = world.spawn_empty().id();
+    let frame = frame_fixture();
+    let mut obligations = Vec::new();
+    for local_index in 0..2 {
+        let entity = world.spawn_empty().id();
+        let initial = ComponentManifest::from_world(&world, entity).unwrap();
+        let claim = world
+            .resource_mut::<RouteEntityRegistry>()
+            .register(
+                entity,
+                RegistryOwner::Committed(EntityOwner::FrameOutput {
+                    frame: frame.clone(),
+                    output: 1,
+                    local_index,
+                }),
+                initial.clone(),
+                EntityLifecycle::PreparedInert,
+            )
+            .unwrap();
+        world.entity_mut(entity).insert((
+            ChildOf(host),
+            RouteOwnershipSeal::new(claim.seal()),
+            FrameLifecycle(claim.lifecycle()),
+            RecordDespawn,
+        ));
+        world.flush();
+        let manifest = ComponentManifest::from_world(&world, entity).unwrap();
+        assert!(
+            world
+                .resource_mut::<RouteEntityRegistry>()
+                .compare_exchange_manifest_exact(&claim, &initial, manifest.clone())
+        );
+        obligations.push(CleanupObligation {
+            identity: CleanupTargetIdentity::Registered(claim),
+            manifest,
+            expected_parent: host,
+            unit_root: entity,
+            authorized_parent: host,
+            allow_missing_components: false,
+            terminal_mode: CleanupTerminalMode::Normal,
+        });
+    }
+    let parent = obligations[0].entity();
+    let child = obligations[1].entity();
+    let manifest = FrozenCleanupManifest {
+        digest: manifest_digest(&obligations),
+        obligations,
+        mount_parents: Vec::new(),
+        boundary_drifts: Vec::new(),
+        pending_boundary_loss_claims: Vec::new(),
+    };
+    let prepared = CleanupLedger::prepare_physical(None, manifest, &NEXT_LEDGER_DOMAIN).unwrap();
+    let mut ledger = CleanupLedger::activate(prepared, None);
+
+    // Actual relationships change after freezing the manifest. Both exact claims
+    // still belong to this batch; the ordinary production classifier decides
+    // whether that remains removable instead of receiving a synthetic verdict.
+    world.entity_mut(child).insert(ChildOf(parent));
+    world.flush();
+    let attempt = ledger.attempt(&world).unwrap();
+    for (index, evidence) in &attempt.evidence {
+        assert!(
+            matches!(evidence, CleanupEvidence::Exact {
+            foreign_descendants,
+            foreign_components,
+            missing_components,
+            protected_parent: None,
+            relationship_cycle: false,
+            ..
+        } if foreign_descendants.is_empty() && foreign_components.is_empty() && missing_components.is_empty()),
+            "registered obligation {index} must be accepted by the real classifier: {evidence:?}"
+        );
+    }
+    assert!(
+        matches!(&attempt.evidence.iter().find(|(index, _)| *index == 1).unwrap().1,
+        CleanupEvidence::Exact { actual_parent: Some(actual), .. } if *actual == parent)
+    );
+    assert!(ledger.settle(&mut world, attempt));
+    assert_eq!(world.resource::<DespawnOrder>().0, vec![child, parent]);
+    assert_eq!(ledger.receipt_count(), 2);
+    assert_eq!(ledger.disposition(0), Some(CleanupDisposition::Removed));
+    assert_eq!(
+        ledger.disposition(1),
+        Some(CleanupDisposition::RemovedDetached)
+    );
+    assert!(ledger.is_settled());
+    for entity in [parent, child] {
+        assert!(world.get_entity(entity).is_err());
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(entity)
+                .is_none()
+        );
+    }
+    assert!(world.get_entity(host).is_ok());
 }

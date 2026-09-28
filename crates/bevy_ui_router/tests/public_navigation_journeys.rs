@@ -653,6 +653,21 @@ fn recovery_r3_admission_fixture(label: &str) -> RecoveryR3AdmissionFixture {
 }
 
 fn nested_fixture() -> NestedFixture {
+    nested_fixture_with_depth(2, RoutePattern::pathless())
+}
+
+fn nested_fixture_with_depth(depth: usize, root_pattern: RoutePattern) -> NestedFixture {
+    assert!(depth >= 2);
+    nested_fixture_with_patterns(
+        root_pattern,
+        (2..depth).map(|_| RoutePattern::pathless()).collect(),
+    )
+}
+
+fn nested_fixture_with_patterns(
+    root_pattern: RoutePattern,
+    ancestors: Vec<RoutePattern>,
+) -> NestedFixture {
     let mut app = native_app();
 
     let layout = RouteViewKey::new("nested-layout").unwrap();
@@ -668,14 +683,26 @@ fn nested_fixture() -> NestedFixture {
     }
     let mut routes = RouteTree::builder()
         .root_with_options(
-            RoutePattern::pathless(),
+            root_pattern,
             RouteNodeOptions::new().with_view(layout.clone()),
         )
         .unwrap();
     let layout_route = routes.root_id().unwrap();
+    let mut leaf_parent = layout_route;
+    for pattern in ancestors {
+        leaf_parent = routes
+            .route_with_options(
+                leaf_parent,
+                pattern,
+                RouteNodeOptions::new()
+                    .with_view(layout.clone())
+                    .with_slot(RouteSlotKey::default()),
+            )
+            .unwrap();
+    }
     let leaf_route = routes
         .route_with_options(
-            layout_route,
+            leaf_parent,
             RoutePattern::path("items/:id").unwrap(),
             RouteNodeOptions::new()
                 .with_view(leaf.clone())
@@ -2150,6 +2177,321 @@ fn history_c1_replace_then_back_restores_prior_route() {
     assert_eq!(after.history().current(), Some(&route_a));
     assert_eq!(after.active().frames()[0], protected_layout);
     assert_eq!(after.active().frames()[1].slot(), protected_child_slot);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_back_restores_nested_location_after_search_rebuild() {
+    let mut fixture = nested_fixture();
+    let original = RouteLocation::new("/items/1").with_search("filter=archived");
+    let next = RouteLocation::new("/items/2");
+    for location in [original.clone(), next.clone()] {
+        let request = push_and_settle(&mut fixture.app, fixture.router, location, None, None);
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    }
+    let old_layout = node_entities_with_width(&mut fixture.app, 41)[0];
+    let old_leaf = node_entities_with_width(&mut fixture.app, 43)[0];
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .expect("a published prior entry must enqueue Back");
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+    assert_succeeded(&terminal);
+    assert_eq!(terminal.requested(), Some(&original));
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().location(), Some(&original));
+    assert_eq!(after.history().entries(), [original.clone(), next]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(after.history().current(), Some(&original));
+    assert!(fixture.app.world().get_entity(old_layout).is_err());
+    assert!(fixture.app.world().get_entity(old_leaf).is_err());
+    assert_eq!(node_entities_with_width(&mut fixture.app, 41).len(), 1);
+    assert_eq!(node_entities_with_width(&mut fixture.app, 43).len(), 1);
+    let effects = fixture.control.effects();
+    let restored = &effects[effects.len() - 2..];
+    for effect in restored {
+        assert_eq!(effect.location, original);
+        assert_eq!(effect.search.as_deref(), Some("filter=archived"));
+    }
+    assert_eq!(restored[1].id_param.as_deref(), Some("1"));
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_back_rebuilds_deep_ancestors_and_mounts_each_child() {
+    let mut fixture = nested_fixture_with_depth(3, RoutePattern::pathless());
+    let original = RouteLocation::new("/items/1").with_search("filter=original");
+    let next = RouteLocation::new("/items/2");
+    for location in [original.clone(), next.clone()] {
+        let request = push_and_settle(&mut fixture.app, fixture.router, location, None, None);
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    }
+    let old_layouts = node_entities_with_width(&mut fixture.app, 41);
+    assert_eq!(old_layouts.len(), 2);
+    let effects_before = fixture.control.effects().len();
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .unwrap();
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+    assert_succeeded(&terminal);
+    assert_eq!(
+        terminal
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::MountGranted)
+            .count(),
+        2
+    );
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().frames().len(), 3);
+    assert_eq!(after.active().location(), Some(&original));
+    assert_eq!(after.history().entries(), [original.clone(), next]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert!(
+        old_layouts
+            .iter()
+            .all(|entity| fixture.app.world().get_entity(*entity).is_err())
+    );
+    assert_eq!(node_entities_with_width(&mut fixture.app, 41).len(), 2);
+    assert_eq!(node_entities_with_width(&mut fixture.app, 43).len(), 1);
+    let effects = fixture.control.effects();
+    assert_eq!(effects.len() - effects_before, 3);
+    for effect in &effects[effects_before..] {
+        assert_eq!(effect.location, original);
+        assert_eq!(effect.search.as_deref(), Some("filter=original"));
+    }
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_back_rebuilds_parameterized_section_beneath_preserved_root() {
+    let mut fixture = nested_fixture_with_patterns(
+        RoutePattern::path("/").unwrap(),
+        vec![RoutePattern::path("sections/:section").unwrap()],
+    );
+    let original = RouteLocation::new("/sections/a/items/1");
+    let next = RouteLocation::new("/sections/b/items/2");
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        original.clone(),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let original_layouts = node_entities_with_width(&mut fixture.app, 41);
+    assert_eq!(original_layouts.len(), 2);
+    let first_root = router_snapshot(&fixture.app, fixture.router)
+        .active()
+        .frames()[0]
+        .clone();
+    let second = push_and_settle(&mut fixture.app, fixture.router, next.clone(), None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+    let before = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(before.active().frames()[0], first_root);
+    let current_layouts = node_entities_with_width(&mut fixture.app, 41);
+    assert_eq!(current_layouts.len(), 2);
+    let preserved = current_layouts
+        .iter()
+        .copied()
+        .filter(|entity| original_layouts.contains(entity))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        preserved.len(),
+        1,
+        "only the root content survives the section parameter change"
+    );
+    let root_entity = preserved[0];
+    let old_section = *current_layouts
+        .iter()
+        .find(|entity| **entity != root_entity)
+        .unwrap();
+    let old_leaf = node_entities_with_width(&mut fixture.app, 43)[0];
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(root_entity)
+        .insert(LocalState(61));
+    let effects_before = fixture.control.effects().len();
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .unwrap();
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+    assert_succeeded(&terminal);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().location(), Some(&original));
+    assert_eq!(after.active().frames().len(), 3);
+    assert_eq!(after.active().frames()[0], first_root);
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(root_entity),
+        Some(&LocalState(61))
+    );
+    assert!(fixture.app.world().get_entity(old_section).is_err());
+    assert!(fixture.app.world().get_entity(old_leaf).is_err());
+    assert_eq!(node_entities_with_width(&mut fixture.app, 41).len(), 2);
+    assert_eq!(node_entities_with_width(&mut fixture.app, 43).len(), 1);
+    assert!(terminal.trace().iter().any(|event| event.kind()
+        == NavigationTraceEventKind::MountGranted
+        && event.frame() == Some(&after.active().frames()[1])));
+    assert_eq!(after.history().entries(), [original.clone(), next]);
+    assert_eq!(after.history().cursor(), Some(0));
+    let effects = fixture.control.effects();
+    assert_eq!(effects.len() - effects_before, 2);
+    for effect in &effects[effects_before..] {
+        assert_eq!(effect.location, original);
+    }
+    assert_eq!(
+        effects[effects_before].params,
+        [("section".to_owned(), "a".to_owned())]
+    );
+    assert_eq!(
+        effects[effects_before + 1].params,
+        [("id".to_owned(), "1".to_owned())]
+    );
+    assert_eq!(effects.last().unwrap().id_param.as_deref(), Some("1"));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_back_restores_child_beneath_preserved_parent() {
+    let mut fixture = nested_fixture_with_depth(2, RoutePattern::path("/").unwrap());
+    let original = RouteLocation::new("/items/1");
+    let parent_only = RouteLocation::new("/");
+    for location in [original.clone(), parent_only.clone()] {
+        let request = push_and_settle(&mut fixture.app, fixture.router, location, None, None);
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    }
+    let before = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(before.active().frames().len(), 1);
+    let preserved_parent = before.active().frames()[0].clone();
+    let parent_entity = node_entities_with_width(&mut fixture.app, 41)[0];
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(parent_entity)
+        .insert(LocalState(47));
+    let effects_before = fixture.control.effects().len();
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .unwrap();
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+    assert_succeeded(&terminal);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().location(), Some(&original));
+    assert_eq!(after.active().frames().len(), 2);
+    assert_eq!(after.active().frames()[0], preserved_parent);
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(parent_entity),
+        Some(&LocalState(47))
+    );
+    assert_eq!(after.history().entries(), [original, parent_only]);
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(fixture.control.effects().len() - effects_before, 1);
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn history_back_nested_mount_failure_settles_and_allows_retry() {
+    assert_nested_back_failure_allows_retry(
+        FixtureMode::MissingOutlet { width: 41 },
+        NavigationFailureKind::Mount,
+    );
+}
+
+#[test]
+fn history_back_nested_apply_failure_settles_and_allows_retry() {
+    assert_nested_back_failure_allows_retry(
+        FixtureMode::ApplyFailure,
+        NavigationFailureKind::Apply,
+    );
+}
+
+#[test]
+fn history_back_nested_layout_build_failure_settles_and_allows_retry() {
+    assert_nested_back_failure_allows_retry(
+        FixtureMode::BuildFailure,
+        NavigationFailureKind::Build,
+    );
+}
+
+fn assert_nested_back_failure_allows_retry(mode: FixtureMode, expected: NavigationFailureKind) {
+    let mut fixture = nested_fixture();
+    let original = RouteLocation::new("/items/1").with_search("filter=original");
+    let next = RouteLocation::new("/items/2");
+    for location in [original.clone(), next] {
+        let request = push_and_settle(&mut fixture.app, fixture.router, location, None, None);
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    }
+    let history = router_snapshot(&fixture.app, fixture.router)
+        .history()
+        .clone();
+    let failed_view = if expected != NavigationFailureKind::Apply {
+        &fixture.layout
+    } else {
+        &fixture.leaf
+    };
+    fixture.control.set_one_shot_mode(failed_view, mode);
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .unwrap();
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+    assert_failed(&terminal, expected);
+    assert_eq!(terminal.requested(), Some(&original));
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router).history(),
+        &history
+    );
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    if expected == NavigationFailureKind::Mount {
+        assert!(
+            terminal
+                .trace()
+                .iter()
+                .any(|event| event.mount_rejection() == Some(MountRejectionKind::MissingOutlet))
+        );
+    } else if expected == NavigationFailureKind::Apply {
+        let partial = fixture.control.partial_writes.lock().unwrap();
+        assert!(
+            !partial.is_empty(),
+            "the official BSN apply must actually write before failing"
+        );
+        assert!(
+            partial
+                .iter()
+                .all(|entity| fixture.app.world().get_entity(*entity).is_err())
+        );
+    }
+    let retry = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .unwrap();
+    let terminal = drive_request_to_terminal(&mut fixture.app, fixture.router, retry);
+    assert_succeeded(&terminal);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.history().entries(), history.entries());
+    assert_eq!(after.history().cursor(), Some(0));
+    assert_eq!(after.active().location(), Some(&original));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 

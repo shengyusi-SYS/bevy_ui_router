@@ -2242,6 +2242,7 @@ pub(crate) struct CoreBackTargetDriverFailureCleanupExpectedProjection {
 pub(crate) struct CoreBackTargetDriverFailureCleanupObservedProjection {
     scope: CoreBackTargetEngineScopeProjection,
     pub(crate) current: Option<FrameTaskIdentity>,
+    pub(crate) action: CoreBackTargetReceiverActionProjection,
     pub(crate) stage: CoreBackTargetReceiverStageProjection,
 }
 
@@ -12250,13 +12251,26 @@ impl RouterEngine {
         let observed = CoreBackTargetDriverFailureCleanupObservedProjection {
             scope: self.back_target_engine_scope_projection(),
             current: current.map(|current| current.identity.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
             stage: Self::back_target_stage_projection(current),
         };
         let exact = owner.scope.matches_engine_scope(
             observed.scope.world,
             observed.scope.router,
             observed.scope.history,
-        ) && observed.current.as_ref() == Some(&expected.request.receiver.identity)
+        ) && observed.action == CoreBackTargetReceiverActionProjection::Missing
+            && owner.scope.request() == owner.request.request()
+            && current.is_some_and(|current| {
+                matches!(
+                    current.attempt,
+                    AttemptKind::Normal(NavigationCommandKind::Back)
+                ) && !current.reservation.is_empty()
+                    && !current.target_frames.is_empty()
+                    && owner
+                        .scope
+                        .matches_execution(&self.current_history_execution_projection(current))
+            })
+            && observed.current.as_ref() == Some(&expected.request.receiver.identity)
             && observed.stage
                 == CoreBackTargetReceiverStageProjection::FailureCleanupManifestPending(
                     expected.request.receiver.clone(),
@@ -13737,6 +13751,27 @@ impl RouterEngine {
         self.running_request()
             .and_then(|request| self.request(request))
             .and_then(NavigationRequestRecord::requested)
+    }
+
+    pub(crate) fn reconciliation_projection_for_pending_mount(
+        &self,
+    ) -> Result<&RouteReconciliationProjection, MountError> {
+        match self.action.as_ref() {
+            Some(EngineAction::MountRequest(request)) => {
+                self.reconciliation_projection_for_mount_request(request)
+            }
+            _ => Err(MountError::Stale),
+        }
+    }
+
+    pub(crate) fn reconciliation_projection_for_mount_request(
+        &self,
+        request: &FrameMountRequest,
+    ) -> Result<&RouteReconciliationProjection, MountError> {
+        self.validate_mount_request(request)?;
+        let current = self.current.as_ref().ok_or(MountError::Stale)?;
+        self.reconciliation_projection_for(&current.identity)
+            .ok_or(MountError::Stale)
     }
 
     pub(crate) fn reconciliation_projection_for(

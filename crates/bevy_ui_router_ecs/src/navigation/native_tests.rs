@@ -1074,7 +1074,9 @@ fn issued_native_fallback_host_loss_covers_original_active_and_readmits_without_
             .remove::<RouterHostRegistration>();
         if retry {
             app.insert_resource(
-                crate::presentation::native_frame::NativeCleanupCapacityLimit { after_claims: 0 },
+                crate::presentation::native_frame::NativeCleanupCapacityRequest {
+                    additional_targets: usize::MAX,
+                },
             );
             app.update();
             let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -1096,7 +1098,8 @@ fn issued_native_fallback_host_loss_covers_original_active_and_readmits_without_
                 0
             );
             app.world_mut()
-                .remove_resource::<crate::presentation::native_frame::NativeCleanupCapacityLimit>();
+                .remove_resource::<crate::presentation::native_frame::NativeCleanupCapacityRequest>(
+                );
         }
         settle(&mut app);
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -1138,9 +1141,7 @@ fn issued_native_fallback_host_loss_covers_original_active_and_readmits_without_
 
 #[test]
 fn authority_native_cleanup_retains_current_projection_after_capacity_retry() {
-    use crate::presentation::native_frame::{
-        NativeCleanupCapacityLimit, NativeCleanupPreparationError,
-    };
+    use crate::presentation::native_frame::NativeCleanupPreparationError;
     let (mut app, router, host, _, _) = fixture(false);
     app.world_mut()
         .resource_mut::<RouterNavigation>()
@@ -1182,7 +1183,7 @@ fn authority_native_cleanup_retains_current_projection_after_capacity_retry() {
     app.world_mut()
         .entity_mut(host)
         .remove::<RouterHostRegistration>();
-    app.insert_resource(NativeCleanupCapacityLimit { after_claims: 1 });
+    crate::cleanup::fail_next_reservation_for_test();
     app.update();
     let claims = {
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -1199,13 +1200,11 @@ fn authority_native_cleanup_retains_current_projection_after_capacity_retry() {
         let claims = active.claims().cloned().collect::<Vec<_>>();
         assert_eq!(
             claims.len(),
-            3,
-            "original shell/root plus actual partial content claim"
+            2,
+            "only original shell/root claims; captured ordinary targets remain with the owner"
         );
         claims
     };
-    app.world_mut()
-        .remove_resource::<NativeCleanupCapacityLimit>();
     let added = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
     app.update();
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -1677,9 +1676,12 @@ fn native_success_dependencies_move_into_frame_and_release_after_cleanup() {
 }
 
 #[test]
-fn native_idle_host_loss_post_marker_escape_is_bounded_and_returns_app_focus() {
-    use crate::presentation::native_frame::NativeCleanupContent;
-    use bevy_ecs::prelude::{Commands, Insert, On};
+fn native_idle_host_loss_despawn_escape_is_bounded_and_returns_app_focus() {
+    use bevy_ecs::prelude::{Commands, Despawn, On};
+    #[derive(Component)]
+    struct EscapeTrigger;
+    #[derive(Resource, Default)]
+    struct EscapeCalls(usize);
     let (mut app, router, host, _, _) = fixture(false);
     app.world_mut()
         .resource_mut::<RouterNavigation>()
@@ -1694,11 +1696,20 @@ fn native_idle_host_loss_post_marker_escape_is_bounded_and_returns_app_focus() {
         .native_root()
         .unwrap();
     let child = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+    // Cleanup removes the later child first, so its real despawn callback can
+    // move the still-live first child out of the original content boundary.
+    let trigger = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(root), EscapeTrigger))
+        .id();
     let application = app.world_mut().spawn(Node::default()).id();
+    app.init_resource::<EscapeCalls>();
     app.world_mut().add_observer(
-        move |event: On<Insert, NativeCleanupContent>, mut commands: Commands| {
-            if event.entity == child {
+        move |event: On<Despawn, EscapeTrigger>, mut commands: Commands| {
+            if event.entity == trigger {
                 commands.queue(move |world: &mut World| {
+                    assert!(world.get_entity(child).is_ok());
+                    world.resource_mut::<EscapeCalls>().0 += 1;
                     world.entity_mut(child).insert(ChildOf(application));
                     world
                         .resource_mut::<InputFocus>()
@@ -1719,9 +1730,127 @@ fn native_idle_host_loss_post_marker_escape_is_bounded_and_returns_app_focus() {
     );
     assert!(entry.active.is_none());
     assert!(entry.idle_host_terminal.is_some());
+    assert_eq!(app.world().resource::<EscapeCalls>().0, 1);
+    assert!(app.world().get_entity(trigger).is_err());
+    assert!(
+        !app.world()
+            .resource::<RouterInputGate>()
+            .allows_keyboard(child)
+    );
     assert_eq!(
         app.world().get::<ChildOf>(child).map(ChildOf::parent),
         Some(application)
     );
     assert_eq!(app.world().resource::<InputFocus>().get(), Some(child));
+}
+
+#[test]
+fn native_cleanup_despawn_registered_ancestor_stops_remaining_content_removal() {
+    use crate::presentation::FrameLifecycle;
+    use crate::registry::ComponentManifest;
+    use bevy_ecs::prelude::{Commands, Despawn, On};
+
+    #[derive(Component)]
+    struct RegisterAncestorOnDespawn;
+    #[derive(Resource, Default)]
+    struct RegistrationCalls(usize);
+
+    let (mut app, router, host, _, _) = fixture(false);
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    let frame = &app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .frames()[0];
+    let root = frame.native_root().unwrap();
+    let frame_identity = frame.frame().clone();
+    let parent = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+    let child = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(parent)))
+        .id();
+    // The deepest target is genuinely removed first. Its callback establishes
+    // a registry boundary while the remaining child's relationships stay intact.
+    let trigger = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(child), RegisterAncestorOnDespawn))
+        .id();
+    app.init_resource::<RegistrationCalls>();
+    app.world_mut().add_observer(
+        move |event: On<Despawn, RegisterAncestorOnDespawn>, mut commands: Commands| {
+            if event.entity != trigger {
+                return;
+            }
+            let frame_identity = frame_identity.clone();
+            commands.queue(move |world: &mut World| {
+                assert!(world.get_entity(child).is_ok());
+                assert_eq!(
+                    world.get::<ChildOf>(child).map(ChildOf::parent),
+                    Some(parent)
+                );
+                let manifest = ComponentManifest::from_world(world, parent).unwrap();
+                let claim = world
+                    .resource_mut::<RouteEntityRegistry>()
+                    .register(
+                        parent,
+                        RegistryOwner::Committed(EntityOwner::FrameOutput {
+                            frame: frame_identity,
+                            output: u64::MAX,
+                            local_index: 0,
+                        }),
+                        manifest,
+                        EntityLifecycle::Active,
+                    )
+                    .unwrap();
+                world.entity_mut(parent).insert((
+                    RouteOwnershipSeal::new(claim.seal()),
+                    FrameLifecycle(claim.lifecycle()),
+                ));
+                world.resource_mut::<RegistrationCalls>().0 += 1;
+            });
+        },
+    );
+    let replacement = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(
+            router,
+            RouteLocation::new("/").with_fragment("registered-ancestor"),
+        )
+        .unwrap();
+    for _ in 0..32 {
+        app.update();
+    }
+    assert_eq!(app.world().resource::<RegistrationCalls>().0, 1);
+    assert!(app.world().get_entity(trigger).is_err());
+    assert!(
+        app.world().get_entity(child).is_ok(),
+        "cleanup must not traverse the newly registered ancestor boundary"
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(child).map(ChildOf::parent),
+        Some(parent)
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(parent).map(ChildOf::parent),
+        Some(root)
+    );
+    assert!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(parent)
+            .is_some()
+    );
+    assert!(app.world().get_entity(host).is_ok());
+    let snapshots = app.world().resource::<RouterSnapshots>();
+    assert!(
+        matches!(snapshots.request(router, replacement), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+    );
+    let snapshot = snapshots.get(router).unwrap();
+    assert!(snapshot.running_request().is_none());
+    assert!(!snapshot.cleanup().foreground_pending());
 }

@@ -23,14 +23,13 @@ pub(crate) struct NativeFrameContent {
     // Retain resolve dependencies through apply and unfinished physical settlement.
     dependencies: Vec<UntypedHandle>,
     cleanup: Option<NativeCleanupPreparation>,
-    cleanup_failure: Option<NativeCleanupPreparationError>,
 }
 
 #[derive(Debug)]
 struct NativeCleanupPreparation {
     /// Frozen containment is validation evidence; the enclosing RealizedFrame retains authority.
     closure: Vec<(Entity, Option<Entity>, Vec<Entity>)>,
-    next: usize,
+    targets: Vec<(Entity, Entity, ComponentManifest)>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,11 +39,6 @@ pub(crate) enum NativeCleanupPreparationError {
     },
     Content(crate::frame_local::FrameLocalError),
     MissingEntity(Entity),
-    Registry {
-        entity: Entity,
-        error: crate::registry::RegistryWriteError,
-    },
-    Protected(Box<NativeCleanupProtectedDrift>),
     Projection {
         root: Entity,
         expected: Vec<(Entity, Option<Entity>, Vec<Entity>)>,
@@ -52,71 +46,22 @@ pub(crate) enum NativeCleanupPreparationError {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct NativeCleanupProtectedDrift {
-    entity: Entity,
-    expected: crate::cleanup::FrozenFailureCleanupObservedEntity,
-    observed: crate::cleanup::FrozenFailureCleanupObservedEntity,
-    expected_node: Option<Node>,
-    observed_node: Option<Node>,
-}
-
 impl NativeCleanupPreparationError {
     pub(crate) fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Capacity { .. }
-                | Self::Registry {
-                    error: crate::registry::RegistryWriteError::CapacityExhausted,
-                    ..
-                }
-        )
+        matches!(self, Self::Capacity { .. })
     }
-}
-
-#[derive(bevy_ecs::component::Component, Clone, Debug)]
-pub(crate) struct NativeCleanupContent {
-    pub(crate) root: Entity,
-    pub(crate) shell: Entity,
-    pub(crate) expected_parent: Entity,
-    identity: ExactRegistryClaim,
 }
 
 pub(crate) fn is_native_content(world: &World, entity: Entity) -> bool {
     world
         .get::<native_scene::NativeContentRoot>(entity)
         .is_some()
-        || world.get::<NativeCleanupContent>(entity).is_some()
 }
 
 pub(crate) fn is_native_shell(world: &World, entity: Entity) -> bool {
     world
         .get::<native_scene::NativeFrameShell>(entity)
         .is_some()
-}
-
-pub(crate) fn is_escaped_cleanup_content(world: &World, entity: Entity) -> bool {
-    world
-        .get::<NativeCleanupContent>(entity)
-        .is_some_and(|content| {
-            world
-                .resource::<RouteEntityRegistry>()
-                .record(entity)
-                .or_else(|| {
-                    world
-                        .get_resource::<QuarantineLeaseTable>()
-                        .and_then(|table| {
-                            table
-                                .record(entity)
-                                .or_else(|| table.unresolved_record(entity))
-                        })
-                })
-                .is_none_or(|record| {
-                    record.owner() == content.identity.owner()
-                        && record.seal() == content.identity.seal()
-                })
-                && !cleanup_content_is_contained(world, entity)
-        })
 }
 
 /// Observe visual ancestry, not ownership. Only an already authorized publication
@@ -171,56 +116,17 @@ pub(crate) fn authored_target_is_visible(
 
 #[cfg(test)]
 #[derive(bevy_ecs::resource::Resource)]
-pub(crate) struct NativeCleanupCapacityLimit {
-    pub(crate) after_claims: usize,
+pub(crate) struct NativeCleanupCapacityRequest {
+    pub(crate) additional_targets: usize,
 }
 
-fn cleanup_registration_capacity(world: &World, index: usize) -> usize {
+fn cleanup_capacity_input(world: &World, target_count: usize) -> usize {
     #[cfg(test)]
-    if world
-        .get_resource::<NativeCleanupCapacityLimit>()
-        .is_some_and(|limit| index > limit.after_claims)
-    {
-        return usize::MAX;
+    if let Some(request) = world.get_resource::<NativeCleanupCapacityRequest>() {
+        return request.additional_targets;
     }
-    let _ = (world, index);
-    1
-}
-
-/// Surrender only the cleanup bookkeeping issued for this exact escaped child.
-/// The retired seal is never reused and no authored component or relationship is changed.
-pub(crate) fn release_escaped_cleanup_content(world: &mut World) {
-    let escaped = world
-        .query::<(Entity, &NativeCleanupContent)>()
-        .iter(world)
-        .filter(|(entity, _)| !cleanup_content_is_contained(world, *entity))
-        .map(|(entity, content)| (entity, content.identity.clone()))
-        .collect::<Vec<_>>();
-    for (entity, issued) in escaped {
-        let current = world
-            .resource::<RouteEntityRegistry>()
-            .record(entity)
-            .filter(|record| record.owner() == issued.owner() && record.seal() == issued.seal())
-            .map(|record| record.claim());
-        let Some(current) = current else {
-            continue;
-        };
-        let markers_are_exact = world.get::<RouteOwnershipSeal>(entity)
-            == Some(&RouteOwnershipSeal::new(current.seal()))
-            && world.get::<FrameLifecycle>(entity) == Some(&FrameLifecycle(current.lifecycle()));
-        if world
-            .resource_mut::<RouteEntityRegistry>()
-            .remove_exact(&current)
-        {
-            if markers_are_exact && let Ok(mut entity) = world.get_entity_mut(entity) {
-                entity.remove::<(RouteOwnershipSeal, FrameLifecycle)>();
-                // Retain non-authoritative provenance while the original cleanup
-                // owner still contains this surrendered obligation. All input and
-                // cleanup consumers exclude it outside the original content root.
-            }
-            world.flush();
-        }
-    }
+    let _ = world;
+    target_count
 }
 
 fn content_structure_is_exact(world: &World, root: Entity, shell: Entity) -> bool {
@@ -243,20 +149,30 @@ fn content_structure_is_exact(world: &World, root: Entity, shell: Entity) -> boo
     let Some(shell_record) = record(shell) else {
         return false;
     };
-    let RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) = root_record.owner()
+    content_structure_matches(world, &root_record.claim(), &shell_record.claim())
+}
+
+fn content_structure_matches(
+    world: &World,
+    root_claim: &ExactRegistryClaim,
+    shell_claim: &ExactRegistryClaim,
+) -> bool {
+    let root = root_claim.entity();
+    let shell = shell_claim.entity();
+    let RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame)) = root_claim.owner()
     else {
         return false;
     };
-    shell_record.owner() == &RegistryOwner::Committed(EntityOwner::FrameShell(frame.clone()))
+    shell_claim.owner() == &RegistryOwner::Committed(EntityOwner::FrameShell(frame.clone()))
         && world.get::<FrameContentTarget>(root) == Some(&FrameContentTarget(frame.clone()))
         && world.get::<FrameShell>(shell) == Some(&FrameShell(frame.clone()))
         && world.get::<RouteOwnershipSeal>(root)
-            == Some(&RouteOwnershipSeal::new(root_record.seal()))
+            == Some(&RouteOwnershipSeal::new(root_claim.seal()))
         && world.get::<RouteOwnershipSeal>(shell)
-            == Some(&RouteOwnershipSeal::new(shell_record.seal()))
-        && world.get::<FrameLifecycle>(root) == Some(&FrameLifecycle(root_record.lifecycle()))
-        && world.get::<FrameLifecycle>(shell) == Some(&FrameLifecycle(shell_record.lifecycle()))
-        && world.get::<native_scene::NativeContentRoot>(root).is_some()
+            == Some(&RouteOwnershipSeal::new(shell_claim.seal()))
+        && world.get::<FrameLifecycle>(root) == Some(&FrameLifecycle(root_claim.lifecycle()))
+        && world.get::<FrameLifecycle>(shell) == Some(&FrameLifecycle(shell_claim.lifecycle()))
+        && is_native_content(world, root)
         && is_native_shell(world, shell)
         && world.get::<ChildOf>(root).map(ChildOf::parent) == Some(shell)
         && world
@@ -264,30 +180,30 @@ fn content_structure_is_exact(world: &World, root: Entity, shell: Entity) -> boo
             .is_some_and(|children| children.len() == 1 && children[0] == root)
 }
 
-/// A cleanup marker is bookkeeping outside its original live content boundary.
-/// It does not turn an escaped ordinary child into a permanent Router target.
-pub(crate) fn cleanup_content_is_contained(world: &World, entity: Entity) -> bool {
-    let Some(content) = world.get::<NativeCleanupContent>(entity) else {
+/// Current relationships are facts, not authority. The caller retains the original
+/// frame owner and validates its exact source claims before authorizing mutation.
+/// Any registered structure (including a child slot) terminates ordinary containment.
+pub(crate) fn current_containment(
+    world: &World,
+    target: Entity,
+    root: Entity,
+    shell: Entity,
+) -> bool {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return false;
     };
-    let mut current = entity;
+    let table = world.get_resource::<QuarantineLeaseTable>();
+    let mut current = target;
     let mut visited = HashSet::new();
     while visited.insert(current) {
-        if current == content.root {
-            return content_structure_is_exact(world, content.root, content.shell);
+        if current == root {
+            return content_structure_is_exact(world, root, shell);
         }
-        if current != entity
-            && world
-                .resource::<RouteEntityRegistry>()
-                .record(current)
-                .is_some_and(|record| {
-                    !matches!(
-                        record.owner(),
-                        RegistryOwner::Committed(EntityOwner::FrameOutput { .. })
-                    ) || world
-                        .get::<NativeCleanupContent>(current)
-                        .is_none_or(|parent| parent.root != content.root)
-                })
+        if world.get_entity(current).is_err()
+            || registry.record(current).is_some()
+            || table.is_some_and(|table| {
+                table.record(current).is_some() || table.unresolved_record(current).is_some()
+            })
         {
             return false;
         }
@@ -305,32 +221,36 @@ pub(crate) fn cleanup_content_is_contained(world: &World, entity: Entity) -> boo
     false
 }
 
-pub(crate) fn content_scope_is_inert(world: &World, entity: Entity) -> bool {
-    let shell = if world
-        .get::<native_scene::NativeContentRoot>(entity)
-        .is_some()
-    {
-        world.get::<ChildOf>(entity).map(ChildOf::parent)
-    } else {
-        world
-            .get::<NativeCleanupContent>(entity)
-            .filter(|_| cleanup_content_is_contained(world, entity))
-            .map(|content| content.shell)
+pub(crate) fn content_scope_is_inert_for(
+    world: &World,
+    root_claim: &ExactRegistryClaim,
+    shell_claim: &ExactRegistryClaim,
+) -> bool {
+    let shell = shell_claim.entity();
+    content_structure_matches(world, root_claim, shell_claim)
+        && world
+            .get::<Node>(shell)
+            .is_some_and(|node| node.display == Display::None)
+        && world.get::<Visibility>(shell) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(shell) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(shell)
+            .is_some_and(RouterInputBarrier::denies_all)
+}
+
+pub(crate) fn content_scope_is_inert(world: &World, root: Entity) -> bool {
+    let Some(shell) = world.get::<ChildOf>(root).map(ChildOf::parent) else {
+        return false;
     };
-    shell.is_some_and(|shell| {
-        let root = world
-            .get::<NativeCleanupContent>(entity)
-            .map_or(entity, |content| content.root);
-        content_structure_is_exact(world, root, shell)
-            && world
-                .get::<Node>(shell)
-                .is_some_and(|node| node.display == Display::None)
-            && world.get::<Visibility>(shell) == Some(&Visibility::Hidden)
-            && world.get::<Pickable>(shell) == Some(&Pickable::IGNORE)
-            && world
-                .get::<RouterInputBarrier>(shell)
-                .is_some_and(RouterInputBarrier::denies_all)
-    })
+    content_structure_is_exact(world, root, shell)
+        && world
+            .get::<Node>(shell)
+            .is_some_and(|node| node.display == Display::None)
+        && world.get::<Visibility>(shell) == Some(&Visibility::Hidden)
+        && world.get::<Pickable>(shell) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(shell)
+            .is_some_and(RouterInputBarrier::denies_all)
 }
 
 pub(super) fn isolate_native_frame(
@@ -437,15 +357,7 @@ pub(crate) fn collect_content(
             {
                 continue;
             }
-            let cleanup_content = world
-                .get::<NativeCleanupContent>(entity)
-                .is_some_and(|content| content.root == root)
-                && matches!(record.owner(), RegistryOwner::Committed(EntityOwner::FrameOutput { frame: owner, .. }) if owner == frame)
-                && world.get::<RouteOwnershipSeal>(entity)
-                    == Some(&RouteOwnershipSeal::new(record.seal()));
-            if !cleanup_content {
-                return Err(FrameLocalError::OwnershipDrift(entity));
-            }
+            return Err(FrameLocalError::OwnershipDrift(entity));
         }
         if world.get_entity(entity).is_err() {
             return Err(FrameLocalError::OwnershipDrift(entity));
@@ -461,8 +373,6 @@ pub(crate) fn collect_content(
                         .is_some_and(|record| {
                             world.get::<RouteOwnershipSeal>(entity)
                                 == Some(&RouteOwnershipSeal::new(record.seal()))
-                                && !(world.get::<NativeCleanupContent>(entity).is_some()
-                                    && !cleanup_content_is_contained(world, entity))
                         })
                 })
         {
@@ -618,7 +528,6 @@ fn realize_native_with_mount(
             focus_owner: None,
             dependencies,
             cleanup: None,
-            cleanup_failure: None,
         }),
     };
     result.entities[0].parent = result.mount.slot;
@@ -761,26 +670,9 @@ pub(crate) fn finish_focus(
 }
 
 /// Called only for a frame retained by an accepted leaving/failed role owner.
-/// Fresh claims narrow that existing owner's current content into the shared cleanup ledger.
-/// The frame stores partial progress before the first hook-triggering write.
+/// Only relationship evidence and capacity are prepared for ordinary content.
+/// The frame retains the frozen targets and remains the sole lifecycle owner.
 pub(crate) fn prepare_content_cleanup(
-    world: &mut World,
-    frame: &mut RealizedFrame,
-) -> Result<(), NativeCleanupPreparationError> {
-    let result = prepare_content_cleanup_inner(world, frame);
-    if let Err(error) = &result {
-        if let Some(native) = frame.native.as_mut() {
-            // The owner retains the current observation even if a downstream
-            // residual receiver must return it for capacity. This is not the
-            // separately held original Scene failure or an error history.
-            native.cleanup_failure = Some(error.clone());
-        }
-        release_escaped_cleanup_content(world);
-    }
-    result
-}
-
-fn prepare_content_cleanup_inner(
     world: &mut World,
     frame: &mut RealizedFrame,
 ) -> Result<(), NativeCleanupPreparationError> {
@@ -791,14 +683,26 @@ fn prepare_content_cleanup_inner(
         // An absent content boundary has no current descendants to acquire.
         // Keep every original/partially prepared obligation and its evidence:
         // the authority cleanup ledger must still classify absent structures
-        // and any surviving claims. Escaped ordinary content is surrendered by
-        // the same exact bookkeeping release used after preparation failure.
-        release_escaped_cleanup_content(world);
+        // and any surviving ordinary targets captured before the source disappeared.
         return Ok(());
     }
     let content = collect_content(world, frame.frame(), root)
         .map_err(NativeCleanupPreparationError::Content)?;
     if frame.native.as_ref().unwrap().cleanup.is_none() {
+        let requested = cleanup_capacity_input(world, content.len().saturating_sub(1));
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(requested)
+            .map_err(|_| NativeCleanupPreparationError::Capacity { requested })?;
+        for entity in content.iter().copied().skip(1) {
+            let parent = world
+                .get::<ChildOf>(entity)
+                .map(ChildOf::parent)
+                .ok_or(NativeCleanupPreparationError::MissingEntity(entity))?;
+            let manifest = ComponentManifest::from_world(world, entity)
+                .ok_or(NativeCleanupPreparationError::MissingEntity(entity))?;
+            targets.push((entity, parent, manifest));
+        }
         let closure = content
             .iter()
             .copied()
@@ -813,89 +717,11 @@ fn prepare_content_cleanup_inner(
                 )
             })
             .collect::<Vec<_>>();
-        frame
-            .entities
-            .try_reserve(content.len().saturating_sub(1))
-            .map_err(|_| NativeCleanupPreparationError::Capacity {
-                requested: content.len(),
-            })?;
         frame.native.as_mut().unwrap().cleanup =
-            Some(NativeCleanupPreparation { closure, next: 1 });
+            Some(NativeCleanupPreparation { targets, closure });
     }
     if !cleanup_projection_is_current(world, frame) {
         return Err(cleanup_projection_error(world, frame));
-    }
-    // This is an operation-local preservation proof, not a second content owner.
-    // Each write is checked before any next write. A retry retains the original
-    // target projection and claims while observing the current protected closure.
-    let protected = freeze_cleanup_protected(world, frame, &content)?;
-    let lifecycle = frame.entities[0].claim.lifecycle();
-    loop {
-        let state = frame.native.as_ref().unwrap().cleanup.as_ref().unwrap();
-        if state.next >= state.closure.len() {
-            break;
-        }
-        let index = state.next;
-        let (entity, parent, _) = &state.closure[index];
-        let entity = *entity;
-        let parent = parent.ok_or(NativeCleanupPreparationError::MissingEntity(entity))?;
-        let requested = cleanup_registration_capacity(world, index);
-        frame
-            .entities
-            .try_reserve(requested)
-            .map_err(|_| NativeCleanupPreparationError::Capacity { requested })?;
-        let owner = RegistryOwner::Committed(EntityOwner::FrameOutput {
-            frame: frame.frame.clone(),
-            output: u64::MAX,
-            local_index: index,
-        });
-        let manifest = ComponentManifest::from_world(world, entity)
-            .ok_or(NativeCleanupPreparationError::MissingEntity(entity))?;
-        let claim = {
-            let mut registry = world.resource_mut::<RouteEntityRegistry>();
-            registry
-                .try_reserve_registrations(&[owner.clone()])
-                .map_err(|error| NativeCleanupPreparationError::Registry { entity, error })?;
-            registry
-                .register(entity, owner, manifest.clone(), lifecycle)
-                .map_err(|error| NativeCleanupPreparationError::Registry { entity, error })?
-        };
-        frame.entities.push(RealizedEntity {
-            entity,
-            claim: claim.clone(),
-            role: RealizedRole::Empty,
-            parent,
-            solid_rect: None,
-        });
-        frame
-            .native
-            .as_mut()
-            .unwrap()
-            .cleanup
-            .as_mut()
-            .unwrap()
-            .next += 1;
-        world.entity_mut(entity).insert((
-            RouteOwnershipSeal::new(claim.seal()),
-            FrameLifecycle(lifecycle),
-            NativeCleanupContent {
-                root,
-                shell: frame.shell(),
-                expected_parent: parent,
-                identity: claim.clone(),
-            },
-        ));
-        world.flush();
-        let actual = ComponentManifest::from_world(world, entity)
-            .ok_or(NativeCleanupPreparationError::MissingEntity(entity))?;
-        validate_cleanup_protected(world, &protected)?;
-        if !world
-            .resource_mut::<RouteEntityRegistry>()
-            .compare_exchange_manifest_exact(&claim, &manifest, actual)
-            || !cleanup_projection_is_current(world, frame)
-        {
-            return Err(cleanup_projection_error(world, frame));
-        }
     }
     // Root authored component changes are legitimate until this cleanup freeze.
     let record = world
@@ -915,98 +741,15 @@ fn prepare_content_cleanup_inner(
     Ok(())
 }
 
-struct CleanupProtectedEntity {
-    entity: Entity,
-    observed: crate::cleanup::FrozenFailureCleanupObservedEntity,
-    node: Option<Node>,
-}
-
-fn freeze_cleanup_protected(
-    world: &World,
+pub(crate) fn contained_cleanup_targets(
     frame: &RealizedFrame,
-    targets: &[Entity],
-) -> Result<Vec<CleanupProtectedEntity>, NativeCleanupPreparationError> {
-    let mut ancestor = frame.shell();
-    let mut ancestors = HashSet::new();
-    while let Some(parent) = world.get::<ChildOf>(ancestor).map(ChildOf::parent) {
-        if !ancestors.insert(ancestor)
-            || world
-                .get::<Children>(parent)
-                .is_none_or(|children| !children.contains(&ancestor))
-        {
-            return Err(NativeCleanupPreparationError::Content(
-                crate::frame_local::FrameLocalError::OwnershipDrift(ancestor),
-            ));
-        }
-        ancestor = parent;
-    }
-    let mut visited = HashSet::new();
-    let mut pending = vec![ancestor];
-    let mut protected = Vec::new();
-    while let Some(entity) = pending.pop() {
-        if !visited.insert(entity) {
-            return Err(NativeCleanupPreparationError::Content(
-                crate::frame_local::FrameLocalError::RelationshipCycle(entity),
-            ));
-        }
-        for child in world
-            .get::<Children>(entity)
-            .into_iter()
-            .flat_map(|children| children.iter().copied())
-        {
-            if world.get::<ChildOf>(child).map(ChildOf::parent) != Some(entity) {
-                return Err(NativeCleanupPreparationError::Content(
-                    crate::frame_local::FrameLocalError::OwnershipDrift(child),
-                ));
-            }
-            pending.push(child);
-        }
-        if targets.contains(&entity) {
-            continue;
-        }
-        protected
-            .try_reserve(1)
-            .map_err(|_| NativeCleanupPreparationError::Capacity { requested: 1 })?;
-        protected.push(CleanupProtectedEntity {
-            entity,
-            observed: crate::cleanup::FrozenFailureCleanupObservedEntity::observe(
-                world,
-                world.resource::<RouteEntityRegistry>(),
-                entity,
-            ),
-            node: world.get::<Node>(entity).cloned(),
-        });
-    }
-    Ok(protected)
-}
-
-fn validate_cleanup_protected(
-    world: &World,
-    protected: &[CleanupProtectedEntity],
-) -> Result<(), NativeCleanupPreparationError> {
-    for expected in protected {
-        let node = world.get::<Node>(expected.entity).cloned();
-        if !expected
-            .observed
-            .matches_exact(world, world.resource::<RouteEntityRegistry>())
-            || node != expected.node
-        {
-            return Err(NativeCleanupPreparationError::Protected(Box::new(
-                NativeCleanupProtectedDrift {
-                    entity: expected.entity,
-                    expected: expected.observed.clone(),
-                    observed: crate::cleanup::FrozenFailureCleanupObservedEntity::observe(
-                        world,
-                        world.resource::<RouteEntityRegistry>(),
-                        expected.entity,
-                    ),
-                    expected_node: expected.node.clone(),
-                    observed_node: node,
-                },
-            )));
-        }
-    }
-    Ok(())
+) -> Vec<(Entity, Entity, ComponentManifest)> {
+    frame
+        .native
+        .as_ref()
+        .and_then(|native| native.cleanup.as_ref())
+        .map(|cleanup| cleanup.targets.clone())
+        .unwrap_or_default()
 }
 
 fn cleanup_projection_error(world: &World, frame: &RealizedFrame) -> NativeCleanupPreparationError {
@@ -1229,27 +972,21 @@ mod tests {
     }
 
     #[test]
-    fn absent_native_root_retains_partial_cleanup_and_releases_escaped_child() {
+    fn absent_native_root_retains_captured_targets_and_original_owner() {
         for despawn_host in [false, true] {
             let (mut app, host, mut frame) = active_native_frame();
             let root = frame.native_root().unwrap();
-            app.world_mut()
-                .insert_resource(NativeCleanupCapacityLimit { after_claims: 1 });
-            assert!(
-                prepare_content_cleanup(app.world_mut(), &mut frame)
-                    .unwrap_err()
-                    .is_retryable()
-            );
+            prepare_content_cleanup(app.world_mut(), &mut frame).unwrap();
             let claims = frame.claims().cloned().collect::<Vec<_>>();
             let native = frame.native.as_ref().unwrap();
             let closure = native.cleanup.as_ref().unwrap().closure.clone();
-            let next = native.cleanup.as_ref().unwrap().next;
-            let failure = format!("{:?}", native.cleanup_failure);
             let focus = native
                 .focus_owner
                 .as_ref()
                 .map(|owner| owner.source.clone());
-            let escaped = claims[2].entity();
+            let targets = contained_cleanup_targets(&frame);
+            assert_eq!(targets.len(), 2);
+            let escaped = targets[0].0;
             let authored = app.world().get::<Node>(escaped).unwrap().clone();
             let application = app.world_mut().spawn(Node::default()).id();
             app.world_mut()
@@ -1263,8 +1000,6 @@ mod tests {
             assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
             let native = frame.native.as_ref().unwrap();
             assert_eq!(native.cleanup.as_ref().unwrap().closure, closure);
-            assert_eq!(native.cleanup.as_ref().unwrap().next, next);
-            assert_eq!(format!("{:?}", native.cleanup_failure), failure);
             assert_eq!(
                 native
                     .focus_owner
@@ -1284,11 +1019,17 @@ mod tests {
                     .is_none()
             );
             assert!(app.world().get::<RouteOwnershipSeal>(escaped).is_none());
-            assert!(is_escaped_cleanup_content(app.world(), escaped));
-            assert!(
-                frame
-                    .cleanup_members()
-                    .any(|(claim, _)| claim == &claims[2])
+            assert!(!current_containment(
+                app.world(),
+                escaped,
+                root,
+                frame.shell()
+            ));
+            assert_eq!(contained_cleanup_targets(&frame), targets);
+            assert_eq!(
+                frame.claims().count(),
+                2,
+                "ordinary content never acquired a claim"
             );
         }
     }
@@ -1307,46 +1048,44 @@ mod tests {
         );
         assert!(!error.is_retryable());
         assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
-        assert!(frame.native.as_ref().unwrap().cleanup_failure.is_some());
     }
 
     #[test]
-    fn cleanup_retry_retains_partial_claims_and_original_owner() {
+    fn cleanup_capacity_retry_retains_original_owner_until_complete_capture() {
         let (mut app, _, mut frame) = active_native_frame();
         let original_frame = frame.frame().clone();
-        let original_shell = frame.entities[0].claim.clone();
-        app.world_mut()
-            .insert_resource(NativeCleanupCapacityLimit { after_claims: 1 });
+        let claims = frame.claims().cloned().collect::<Vec<_>>();
+        app.insert_resource(NativeCleanupCapacityRequest {
+            additional_targets: usize::MAX,
+        });
         let error = prepare_content_cleanup(app.world_mut(), &mut frame).unwrap_err();
+        assert!(matches!(
+            error,
+            NativeCleanupPreparationError::Capacity {
+                requested: usize::MAX
+            }
+        ));
         assert!(error.is_retryable());
-        assert_eq!(frame.entities.len(), 3);
-        let partial = frame.entities[2].claim.clone();
-        assert_eq!(
-            frame
-                .native
-                .as_ref()
-                .unwrap()
-                .cleanup
-                .as_ref()
-                .unwrap()
-                .next,
-            2
-        );
+        assert!(frame.native.as_ref().unwrap().cleanup.is_none());
+        assert!(contained_cleanup_targets(&frame).is_empty());
+        assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
         app.world_mut()
-            .remove_resource::<NativeCleanupCapacityLimit>();
+            .remove_resource::<NativeCleanupCapacityRequest>();
         prepare_content_cleanup(app.world_mut(), &mut frame).unwrap();
-        assert_eq!(frame.entities.len(), 4);
-        assert_eq!(frame.entities[2].claim, partial);
-        assert_eq!(frame.entities[0].claim, original_shell);
+        let targets = contained_cleanup_targets(&frame);
+        assert_eq!(targets.len(), 2);
         assert_eq!(frame.frame(), &original_frame);
-        assert_eq!(
-            app.world()
-                .resource::<RouteEntityRegistry>()
-                .record(partial.entity())
-                .unwrap()
-                .claim(),
-            partial
-        );
+        assert_eq!(frame.claims().cloned().collect::<Vec<_>>(), claims);
+        for (entity, _, _) in targets {
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(entity)
+                    .is_none()
+            );
+            assert!(app.world().get::<RouteOwnershipSeal>(entity).is_none());
+            assert!(app.world().get::<FrameLifecycle>(entity).is_none());
+        }
         assert_eq!(
             app.world()
                 .get::<Node>(frame.native_root().unwrap())
@@ -1357,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_excludes_pre_moved_content_and_releases_post_marker_escape() {
+    fn cleanup_excludes_content_moved_out_before_capture() {
         let (mut app, _, mut frame) = active_native_frame();
         let root = frame.native_root().unwrap();
         let children = app.world().get::<Children>(root).unwrap().to_vec();
@@ -1365,124 +1104,416 @@ mod tests {
         app.world_mut()
             .entity_mut(children[0])
             .insert(ChildOf(application));
-        let escaped = children[1];
-        app.world_mut().add_observer(
-            move |event: On<Insert, NativeCleanupContent>, mut commands: Commands| {
-                if event.entity == escaped {
-                    commands.entity(escaped).insert(ChildOf(application));
-                }
-            },
-        );
-        let error = prepare_content_cleanup(app.world_mut(), &mut frame).unwrap_err();
-        assert!(!error.is_retryable());
-        for child in children {
-            assert!(app.world().get_entity(child).is_ok());
-            assert_eq!(
-                app.world().get::<ChildOf>(child).map(ChildOf::parent),
-                Some(application)
-            );
-            assert!(
-                app.world()
-                    .resource::<RouteEntityRegistry>()
-                    .record(child)
-                    .is_none()
-            );
-            assert!(app.world().get::<RouteOwnershipSeal>(child).is_none());
-            assert!(child != escaped || is_escaped_cleanup_content(app.world(), child));
-        }
+        prepare_content_cleanup(app.world_mut(), &mut frame).unwrap();
+        let targets = contained_cleanup_targets(&frame);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, children[1]);
         assert_eq!(
-            frame.entities.len(),
-            3,
-            "only the post-marker escaped claim was ever issued"
+            app.world().get::<ChildOf>(children[0]).map(ChildOf::parent),
+            Some(application)
         );
-        assert!(frame.native.as_ref().unwrap().cleanup_failure.is_some());
-    }
-
-    #[test]
-    fn cleanup_stops_after_hook_changes_protected_sibling() {
-        let (mut app, host, mut frame) = active_native_frame();
-        let protected = app
-            .world_mut()
-            .spawn((
-                Node {
-                    width: Val::Px(303.0),
-                    ..Node::default()
-                },
-                ChildOf(host),
-            ))
-            .id();
-        app.world_mut().add_observer(
-            move |_: On<Insert, NativeCleanupContent>, mut nodes: Query<&mut Node>| {
-                nodes.get_mut(protected).unwrap().width = Val::Px(404.0);
-            },
-        );
-        let error = prepare_content_cleanup(app.world_mut(), &mut frame).unwrap_err();
         assert!(
-            matches!(error, NativeCleanupPreparationError::Protected(evidence) if evidence.entity == protected)
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(children[0])
+                .is_none()
         );
-        assert_eq!(
-            frame.entities.len(),
-            3,
-            "no next marker is issued after protected drift"
-        );
-        assert!(app.world().get_entity(protected).is_ok());
-        assert!(collect_content(app.world(), frame.frame(), frame.native_root().unwrap()).is_ok());
+        assert_eq!(frame.claims().count(), 2);
     }
 
     #[test]
-    fn public_replace_settles_post_marker_escape_without_retaining_app_focus_authority() {
-        use bevy_input_focus::{FocusCause, InputFocus};
+    fn public_replace_cleans_unregistered_contained_targets() {
         let (mut app, _, frame) = active_native_frame();
         let root = frame.native_root().unwrap();
-        let escaped = app.world().get::<Children>(root).unwrap()[0];
-        let application = app.world_mut().spawn(Node::default()).id();
+        let mut targets = app.world().get::<Children>(root).unwrap().to_vec();
+        let dynamic = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+        let grandchild = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(dynamic)))
+            .id();
+        targets.extend([dynamic, grandchild]);
         let router = app.world().resource::<RouterNavigation>().entries[0].handle;
         app.world_mut().resource_mut::<RouterNavigation>().entries[0].active =
             Some(crate::branch_transaction::RealizedBranch::from_single_frame(frame));
-        app.init_resource::<InputFocus>();
-        app.world_mut().add_observer(
-            move |event: On<Insert, NativeCleanupContent>, mut commands: Commands| {
-                if event.entity == escaped {
-                    commands.queue(move |world: &mut World| {
-                        world.entity_mut(escaped).insert(ChildOf(application));
-                        world
-                            .resource_mut::<InputFocus>()
-                            .set(escaped, FocusCause::Navigated);
-                    });
-                }
-            },
-        );
+        for entity in &targets {
+            assert!(
+                app.world()
+                    .resource::<RouteEntityRegistry>()
+                    .record(*entity)
+                    .is_none()
+            );
+            assert!(app.world().get::<FrameLifecycle>(*entity).is_none());
+        }
         let request = app
             .world_mut()
             .resource_mut::<RouterNavigation>()
-            .replace(router, RouteLocation::new("/").with_fragment("replacement"))
+            .replace(router, RouteLocation::new("/").with_fragment("cleanup"))
             .unwrap();
         for _ in 0..12 {
             app.update();
         }
         assert!(
-            matches!(app.world().resource::<RouterSnapshots>().request(router, request), RequestLookup::Found(request) if matches!(request.status(), RequestStatus::Failed(_)))
+            matches!(app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
         );
-        assert!(app.world().get_entity(escaped).is_ok());
+        assert!(app.world().get_entity(root).is_err());
+        for entity in targets {
+            assert!(app.world().get_entity(entity).is_err());
+        }
+    }
+
+    #[derive(Component, Clone, Copy)]
+    struct EscapeOnDespawn {
+        escaped: Entity,
+        application: Entity,
+    }
+
+    #[test]
+    fn public_replace_despawn_escape_gets_terminal_receipt_and_keeps_app_focus() {
+        use bevy_input_focus::{FocusCause, InputFocus};
+        let (mut app, _, frame) = active_native_frame();
+        let root = frame.native_root().unwrap();
+        let mut children = app.world().get::<Children>(root).unwrap().to_vec();
+        children.sort_by_key(|entity| entity.to_bits());
+        let trigger = children[0];
+        let escaped = children[1];
+        let application = app.world_mut().spawn(Node::default()).id();
+        app.init_resource::<InputFocus>();
+        app.world_mut()
+            .register_component_hooks::<EscapeOnDespawn>()
+            .on_despawn(|mut world, context| {
+                let EscapeOnDespawn {
+                    escaped,
+                    application,
+                } = *world.get::<EscapeOnDespawn>(context.entity).unwrap();
+                world.commands().queue(move |world: &mut World| {
+                    world.entity_mut(escaped).insert(ChildOf(application));
+                    world
+                        .resource_mut::<InputFocus>()
+                        .set(escaped, FocusCause::Navigated);
+                });
+            });
+        app.world_mut().entity_mut(trigger).insert(EscapeOnDespawn {
+            escaped,
+            application,
+        });
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].active =
+            Some(crate::branch_transaction::RealizedBranch::from_single_frame(frame));
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(
+                router,
+                RouteLocation::new("/").with_fragment("cleanup-escape"),
+            )
+            .unwrap();
+        for _ in 0..12 {
+            app.update();
+        }
+        assert!(
+            matches!(app.world().resource::<RouterSnapshots>().request(router, request),
+            RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+        );
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert!(snapshots.get(router).unwrap().running_request().is_none());
+        assert!(
+            !snapshots
+                .get(router)
+                .unwrap()
+                .cleanup()
+                .foreground_pending()
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+        );
+        assert!(app.world().get_entity(trigger).is_err());
         assert_eq!(
             app.world().get::<ChildOf>(escaped).map(ChildOf::parent),
             Some(application)
         );
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(escaped));
         assert!(
             app.world()
                 .resource::<RouteEntityRegistry>()
                 .record(escaped)
                 .is_none()
         );
-        assert_eq!(app.world().resource::<InputFocus>().get(), Some(escaped));
+        assert!(app.world().get::<FrameLifecycle>(escaped).is_none());
         assert!(
-            !app.world()
-                .resource::<RouterInputGate>()
-                .allows_keyboard(escaped)
+            app.world()
+                .resource::<QuarantineLeaseTable>()
+                .authority_lost_tombstone(escaped)
+                .is_some()
         );
         for _ in 0..3 {
             app.update();
         }
         assert_eq!(app.world().resource::<InputFocus>().get(), Some(escaped));
+    }
+
+    #[derive(Component, Clone, Copy)]
+    struct ProtectedOnDespawn {
+        target: Entity,
+        parent: Entity,
+        action: u8,
+    }
+    #[derive(Component)]
+    struct UnrelatedApplicationData;
+
+    fn cleanup_protected_hook_case(action: u8) {
+        let (mut app, host, frame) = active_native_frame();
+        let root = frame.native_root().unwrap();
+        let mut children = app.world().get::<Children>(root).unwrap().to_vec();
+        children.sort_by_key(|entity| entity.to_bits());
+        let trigger = children[0];
+        let remaining = children[1];
+        let application = app.world_mut().spawn(Node::default()).id();
+        let protected = app.world_mut().spawn((Node::default(), ChildOf(host))).id();
+        let target = if action == 1 { host } else { protected };
+        app.world_mut()
+            .register_component_hooks::<ProtectedOnDespawn>()
+            .on_despawn(|mut world, context| {
+                let fact = *world.get::<ProtectedOnDespawn>(context.entity).unwrap();
+                world
+                    .commands()
+                    .queue(move |world: &mut World| match fact.action {
+                        0 => {
+                            world.entity_mut(fact.target).insert(ChildOf(fact.parent));
+                        }
+                        1 => {
+                            world
+                                .entity_mut(fact.target)
+                                .remove::<RouterHostRegistration>();
+                        }
+                        2 => {
+                            world
+                                .entity_mut(fact.target)
+                                .insert(UnrelatedApplicationData);
+                            world.get_mut::<Node>(fact.target).unwrap().width = Val::Px(404.0);
+                        }
+                        _ => unreachable!(),
+                    });
+            });
+        app.world_mut()
+            .entity_mut(trigger)
+            .insert(ProtectedOnDespawn {
+                target,
+                parent: application,
+                action,
+            });
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].active =
+            Some(crate::branch_transaction::RealizedBranch::from_single_frame(frame));
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(
+                router,
+                RouteLocation::new("/").with_fragment("cleanup-protected"),
+            )
+            .unwrap();
+        for _ in 0..12 {
+            app.update();
+        }
+        assert!(
+            app.world().get_entity(trigger).is_err(),
+            "real despawn hook ran"
+        );
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let RequestLookup::Found(request) = snapshots.request(router, request) else {
+            panic!("request missing");
+        };
+        if action == 2 {
+            assert_eq!(request.status(), &RequestStatus::Succeeded);
+            assert!(app.world().get_entity(remaining).is_err());
+            assert_eq!(
+                app.world().get::<Node>(protected).unwrap().width,
+                Val::Px(404.0)
+            );
+            assert!(
+                app.world()
+                    .get::<UnrelatedApplicationData>(protected)
+                    .is_some()
+            );
+        } else {
+            // Publication already succeeded; protected drift retires authority without
+            // rewriting the original navigation result.
+            assert_eq!(request.status(), &RequestStatus::Succeeded);
+            assert!(
+                app.world().get_entity(remaining).is_ok(),
+                "no next destructive write after protected/source drift"
+            );
+            let navigation = app.world().resource::<RouterNavigation>();
+            let residual = navigation.entries[0]
+                .authority_protocol_residual
+                .as_ref()
+                .unwrap();
+            let ledger = residual.retained_cleanup_settlement_ledger().unwrap();
+            assert!(ledger.is_stopped());
+            assert!(!ledger.issued_attempt_present_for_test());
+            assert_eq!(
+                ledger.receipt_count(),
+                1,
+                "the real first removal receipt is retained"
+            );
+            assert_eq!(ledger.obligation_entities_for_test().len(), 4);
+            for target in [root, trigger, remaining] {
+                assert!(ledger.obligation_entities_for_test().contains(&target));
+            }
+            assert_eq!(ledger.leaving_frames().len(), 1);
+            assert_eq!(ledger.leaving_frames()[0].native_root(), Some(root));
+        }
+        assert!(snapshots.get(router).unwrap().running_request().is_none());
+        assert!(
+            !snapshots
+                .get(router)
+                .unwrap()
+                .cleanup()
+                .foreground_pending()
+        );
+        assert!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .cleanup_ledger
+                .is_none()
+        );
+        assert!(app.world().get_entity(host).is_ok());
+        assert!(app.world().get_entity(protected).is_ok());
+    }
+
+    #[test]
+    fn cleanup_protected_relationship_drift_stops_before_next_removal_and_terminates() {
+        cleanup_protected_hook_case(0);
+    }
+    #[test]
+    fn cleanup_host_registration_drift_stops_before_next_removal_and_terminates() {
+        cleanup_protected_hook_case(1);
+    }
+    #[test]
+    fn cleanup_unrelated_protected_component_change_remains_legal() {
+        cleanup_protected_hook_case(2);
+    }
+
+    #[derive(Component, Clone, Copy)]
+    struct ChangeContainedContentOnDespawn {
+        root: Entity,
+        target: Entity,
+        reorder: bool,
+    }
+
+    #[derive(Resource, Default)]
+    struct ContainedContentCallbackObservation {
+        calls: usize,
+        changed: bool,
+    }
+
+    fn cleanup_legal_contained_content_callback(reorder: bool) {
+        let (mut app, host, frame) = active_native_frame();
+        let root = frame.native_root().unwrap();
+        app.world_mut().spawn((Node::default(), ChildOf(root)));
+        let mut children = app.world().get::<Children>(root).unwrap().to_vec();
+        children.sort_by_key(|entity| entity.to_bits());
+        let trigger = children[0];
+        let target = children[1];
+        app.init_resource::<ContainedContentCallbackObservation>();
+        app.world_mut()
+            .register_component_hooks::<ChangeContainedContentOnDespawn>()
+            .on_despawn(|mut world, context| {
+                let fact = *world
+                    .get::<ChangeContainedContentOnDespawn>(context.entity)
+                    .unwrap();
+                world.commands().queue(move |world: &mut World| {
+                    assert!(world.get_entity(fact.target).is_ok());
+                    let changed = if fact.reorder {
+                        let before = world.get::<Children>(fact.root).unwrap().to_vec();
+                        assert!(
+                            before.len() >= 2,
+                            "reorder must affect two remaining live siblings"
+                        );
+                        world
+                            .get_mut::<Children>(fact.root)
+                            .unwrap()
+                            .sort_by_key(|entity| {
+                                std::cmp::Reverse(
+                                    before.iter().position(|old| old == entity).unwrap(),
+                                )
+                            });
+                        let after = world.get::<Children>(fact.root).unwrap().to_vec();
+                        assert_ne!(before, after);
+                        for child in &after {
+                            assert_eq!(
+                                world.get::<ChildOf>(*child).map(ChildOf::parent),
+                                Some(fact.root)
+                            );
+                        }
+                        true
+                    } else {
+                        world
+                            .entity_mut(fact.target)
+                            .insert(UnrelatedApplicationData);
+                        world.get_mut::<Node>(fact.target).unwrap().width = Val::Px(527.0);
+                        world.get::<UnrelatedApplicationData>(fact.target).is_some()
+                            && world.get::<Node>(fact.target).unwrap().width == Val::Px(527.0)
+                    };
+                    let mut observation =
+                        world.resource_mut::<ContainedContentCallbackObservation>();
+                    observation.calls += 1;
+                    observation.changed = changed;
+                });
+            });
+        app.world_mut()
+            .entity_mut(trigger)
+            .insert(ChangeContainedContentOnDespawn {
+                root,
+                target,
+                reorder,
+            });
+        let router = app.world().resource::<RouterNavigation>().entries[0].handle;
+        app.world_mut().resource_mut::<RouterNavigation>().entries[0].active =
+            Some(crate::branch_transaction::RealizedBranch::from_single_frame(frame));
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .replace(
+                router,
+                RouteLocation::new("/").with_fragment("legal-content-callback"),
+            )
+            .unwrap();
+        for _ in 0..16 {
+            app.update();
+        }
+        let observation = app
+            .world()
+            .resource::<ContainedContentCallbackObservation>();
+        assert_eq!(observation.calls, 1);
+        assert!(
+            observation.changed,
+            "the real callback must change a remaining target's observed facts"
+        );
+        for child in children {
+            assert!(app.world().get_entity(child).is_err());
+        }
+        assert!(app.world().get_entity(root).is_err());
+        assert!(app.world().get_entity(host).is_ok());
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert!(
+            matches!(snapshots.request(router, request), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
+        );
+        let snapshot = snapshots.get(router).unwrap();
+        assert!(snapshot.running_request().is_none());
+        assert!(!snapshot.cleanup().foreground_pending());
+        assert_eq!(snapshot.cleanup().quarantine_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_contained_target_component_and_style_change_remains_legal() {
+        cleanup_legal_contained_content_callback(false);
+    }
+
+    #[test]
+    fn cleanup_contained_sibling_order_change_remains_legal() {
+        cleanup_legal_contained_content_callback(true);
     }
 }

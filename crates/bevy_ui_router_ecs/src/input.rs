@@ -379,8 +379,6 @@ fn try_prepare_pointer_revocations(
 }
 
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
-    #[cfg(feature = "bsn")]
-    crate::presentation::native_frame::release_escaped_cleanup_content(world);
     let (allowed, grants, invalid_claims, ineligible_content) = {
         let navigation = world.resource::<crate::navigation::RouterNavigation>();
         let mut allowed = HashSet::new();
@@ -605,14 +603,6 @@ fn nearest_registry_boundary_is_inert(world: &World, focused: Entity) -> bool {
     loop {
         if !visited.insert(current) {
             return true;
-        }
-        #[cfg(feature = "bsn")]
-        if crate::presentation::native_frame::is_escaped_cleanup_content(world, current) {
-            let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
-                return false;
-            };
-            current = parent;
-            continue;
         }
         if let Some(record) = registry.record(current) {
             return record.lifecycle() != EntityLifecycle::Active;
@@ -917,14 +907,6 @@ fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
     let mut current = target;
     let mut visited = HashSet::new();
     while visited.insert(current) {
-        #[cfg(feature = "bsn")]
-        if crate::presentation::native_frame::is_escaped_cleanup_content(world, current) {
-            let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
-                return false;
-            };
-            current = parent;
-            continue;
-        }
         let claim = registry
             .record(current)
             .map(|record| record.claim())

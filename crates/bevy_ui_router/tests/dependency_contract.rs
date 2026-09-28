@@ -325,14 +325,20 @@ fn cargo_paths_override_checks_target_package_not_directory_name() {
 
 #[test]
 fn lock_policy_rejects_versions_outside_the_expected_release_line() {
-    for version in ["0.18.1", "0.19.0", "0.20.0"] {
+    for version in ["0.18.1", "0.20.0", "0.19.0-rc.1"] {
         let lock = parse(&format!(
             "[[package]]\nname = 'bevy_ecs'\nversion = '{version}'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'"
         ));
         assert_eq!(
             lock_violations(&lock),
-            vec!["bevy_ecs: must resolve to Bevy 0.19.1"]
+            vec!["bevy_ecs: must resolve to Bevy 0.19.x"]
         );
+    }
+    for version in ["0.19.0", "0.19.1"] {
+        let lock = parse(&format!(
+            "[[package]]\nname = 'bevy_ecs'\nversion = '{version}'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'"
+        ));
+        assert!(lock_violations(&lock).is_empty());
     }
     for source in ["", "source = 'git+https://example.invalid/fork'"] {
         let lock = parse(&format!(

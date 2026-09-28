@@ -109,9 +109,7 @@ fn classify(world: &World, target: Entity, denied: &[Entity]) -> Target {
         if !seen.insert(current) {
             return Target::Denied;
         }
-        if let Some(record) = registry.record(current).filter(|_| {
-            !crate::presentation::native_frame::is_escaped_cleanup_content(world, current)
-        }) {
+        if let Some(record) = registry.record(current) {
             if world.get::<RouteOwnershipSeal>(current)
                 != Some(&RouteOwnershipSeal::new(record.seal()))
             {

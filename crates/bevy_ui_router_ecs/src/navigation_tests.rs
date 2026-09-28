@@ -13933,7 +13933,7 @@ fn back_target_root_missing_driver_routes_pending_owner_before_generic_failure()
 }
 
 #[test]
-fn back_target_child_outlet_failure_does_not_escape_to_generic_with_driving_owner() {
+fn back_target_child_outlet_missing_driver_settles_and_allows_retry() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
     let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -13988,57 +13988,16 @@ fn back_target_child_outlet_failure_does_not_escape_to_generic_with_driving_owne
         );
     }
 
-    let world_before = authority_world_fingerprint(app.world());
-    let (active_before, history_before, protected_before) = {
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
-        let active = entry.active.as_ref().unwrap();
-        let frames = active
-            .frames()
-            .iter()
-            .map(|frame| frame.frame().clone())
-            .collect::<Vec<_>>();
-        let child_slots = active
-            .child_slots()
-            .iter()
-            .map(|slot| {
-                (
-                    slot.parent().clone(),
-                    slot.outlet().clone(),
-                    slot.slot_id(),
-                    slot.slot(),
-                    slot.slot_claim().clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut protected = active
-            .claims()
-            .map(|claim| claim.entity())
-            .collect::<Vec<_>>();
-        let host = entry.host.as_ref().unwrap();
-        protected.extend([host.host, host.top_slot]);
-        protected.sort_by_key(|entity| entity.to_bits());
-        protected.dedup();
+    let (history_before, host) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
         (
-            (frames, child_slots),
             entry.engine.history().clone(),
-            protected
-                .into_iter()
-                .map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)))
-                .collect::<Vec<_>>(),
+            entry.host.as_ref().unwrap().host,
         )
     };
-    let registry_before = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .to_vec();
-    let public_before = app
-        .world()
-        .resource::<RouterSnapshots>()
-        .get(router)
-        .unwrap()
-        .clone();
+    let app_child = app.world_mut().spawn((Node::default(), ChildOf(host))).id();
+    let protected_before =
+        [host, app_child].map(|entity| (entity, nested_protected_fingerprint(app.world(), entity)));
     let driver_calls_before = observed.lock().unwrap().clone();
     let removed_driver = app
         .world_mut()
@@ -14052,97 +14011,108 @@ fn back_target_child_outlet_failure_does_not_escape_to_generic_with_driving_owne
         .resource_mut::<ViewDriverStore>()
         .restore_for_test(removed_driver);
 
-    {
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
-        let stage = observe_back_target_driver_failure_stage(entry);
-        assert_eq!(
-            entry
-                .back_target_driver_failure_dispatch_calls
-                .load(Ordering::Relaxed),
-            1,
-            "the real ChildOutlet missing-driver failure must reach the target-aware dispatcher; observed {stage:?}"
-        );
-        assert!(
-            entry.pending_failed_branch.is_none(),
-            "a target-active ChildOutlet failure must not escape into generic failure cleanup"
-        );
-        assert_eq!(
-            stage,
-            Some(
-                BackTargetDriverFailureStageObservation::PreReportIndeterminate(
-                    BackTargetDriverUnverifiedObservation::Pending,
-                )
-            ),
-            "the complete Driving, task and Pending owners must safe-stop until the outlet action slice"
-        );
-        assert!(matches!(
-            entry.engine.request(back).unwrap().status(),
-            RequestStatus::Running(NavigationPhase::ApplyingFrame(1))
-        ));
+    for _ in 0..16 {
+        app.update();
+        if matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(back)
+                .unwrap()
+                .status(),
+            RequestStatus::Failed(_)
+        ) {
+            break;
+        }
     }
-
-    drive_navigation_system(app.world_mut());
-
     let navigation = app.world().resource::<RouterNavigation>();
     let entry = &navigation.entries[0];
-    assert_eq!(
-        entry
-            .back_target_driver_failure_dispatch_calls
-            .load(Ordering::Relaxed),
-        1,
-        "the saved ChildOutlet safe-stop must block redispatch"
+    assert!(
+        matches!(
+            entry.engine.request(back).unwrap().status(),
+            RequestStatus::Failed(_)
+        ),
+        "the real missing child driver must fail within sixteen ordinary updates"
     );
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_bound_back_resolution.is_none());
+    assert!(entry.pending_back_resolution_action.is_none());
     assert!(entry.pending_failed_branch.is_none());
-    assert_eq!(
-        observe_back_target_driver_failure_stage(entry),
-        Some(
-            BackTargetDriverFailureStageObservation::PreReportIndeterminate(
-                BackTargetDriverUnverifiedObservation::Pending,
-            )
-        )
+    assert!(entry.pending_frame_drive.is_none());
+    assert!(entry.pending_mount_frame_task.is_none());
+    assert!(entry.pending_mount_request.is_none());
+    assert!(entry.pending_commit.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert!(
+        entry
+            .back_capacity_reservations
+            .iter()
+            .all(|(request, _)| *request != back)
     );
-    assert_eq!(*observed.lock().unwrap(), driver_calls_before);
-    assert_eq!(authority_world_fingerprint(app.world()), world_before);
     assert_eq!(entry.engine.history(), &history_before);
-    assert_eq!(
-        app.world().resource::<RouteEntityRegistry>().records(),
-        registry_before
-    );
+    assert_eq!(entry.host.as_ref().unwrap().host, host);
     let active = entry.active.as_ref().unwrap();
+    assert_eq!(active.frames().len(), 1);
     assert_eq!(
-        active
-            .frames()
-            .iter()
-            .map(|frame| frame.frame().clone())
-            .collect::<Vec<_>>(),
-        active_before.0
+        active.frames()[0].frame().origin(),
+        &FrameOrigin::RouterFallback
     );
+    let mut calls_after_failure = driver_calls_before.clone();
+    calls_after_failure.push(RouteViewKey::new("fallback").unwrap());
     assert_eq!(
-        active
-            .child_slots()
-            .iter()
-            .map(|slot| {
-                (
-                    slot.parent().clone(),
-                    slot.outlet().clone(),
-                    slot.slot_id(),
-                    slot.slot(),
-                    slot.slot_claim().clone(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        active_before.1
+        *observed.lock().unwrap(),
+        calls_after_failure,
+        "failure cleanup may publish the configured fallback, but must not invoke the missing item driver"
     );
     for (entity, before) in &protected_before {
         assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
     }
-    let public_after = app.world().resource::<RouterSnapshots>();
-    assert_eq!(public_after.get(router).unwrap(), &public_before);
-    assert!(matches!(
-        public_after.request(router, back),
-        crate::snapshots::RequestLookup::Unknown
-    ));
+    let trace_after_failure = entry.engine.request(back).unwrap().trace().to_vec();
+    assert!(
+        matches!(app.world().resource::<RouterSnapshots>().request(router, back),
+        crate::snapshots::RequestLookup::Found(snapshot)
+            if matches!(snapshot.status(), RequestStatus::Failed(_)))
+    );
+    for _ in 0..3 {
+        app.update();
+    }
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(back)
+            .unwrap()
+            .trace(),
+        trace_after_failure
+    );
+    assert_eq!(*observed.lock().unwrap(), calls_after_failure);
+    let retry = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .unwrap();
+    run_updates_until_succeeded(&mut app, retry);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let mut expected_history = history_before.clone();
+    expected_history.back().unwrap();
+    assert_eq!(entry.engine.history(), &expected_history);
+    assert_eq!(
+        entry.engine.history().current(),
+        Some(&RouteLocation::new("/items/1"))
+    );
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    let mut expected_calls = calls_after_failure;
+    expected_calls.extend([RouteViewKey::new("layout").unwrap(), item]);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        expected_calls,
+        "the successful retry rebuilds the matched branch from the error presentation"
+    );
+    assert_eq!(entry.host.as_ref().unwrap().host, host);
+    for (entity, before) in &protected_before {
+        assert_eq!(&nested_protected_fingerprint(app.world(), *entity), before);
+    }
 }
 
 #[test]
@@ -15014,7 +14984,6 @@ fn assert_back_target_applied_staging_mismatch_zero_write(
                 assert!(
                     matches!(
                         route_back_target_applied_report(
-                            world,
                             entry,
                             pending,
                             task,
@@ -15244,7 +15213,6 @@ fn back_target_applied_report_existing_mismatch_is_bounded_and_zero_write() {
             assert!(entry.engine.is_current_root_back_frame_task(&task));
             assert!(matches!(
                 route_back_target_applied_report(
-                    world,
                     entry,
                     pending,
                     task,
@@ -15368,7 +15336,6 @@ fn stage_real_back_target_applied_commit(
                 .expect("the applied root target retains its final report task");
             assert!(matches!(
                 route_back_target_applied_report(
-                    world,
                     entry,
                     pending,
                     task,
@@ -17463,7 +17430,6 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
                 .expect("the older Back retains its real final report task");
             assert!(matches!(
                 route_back_target_applied_report(
-                    world,
                     entry,
                     pending,
                     task,
@@ -17703,7 +17669,6 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
                     task: returned_stale,
                     report,
                 } = route_back_target_applied_report(
-                    world,
                     entry,
                     pending,
                     stale_task,
@@ -26839,7 +26804,7 @@ fn back_target_atomic_applied_report_uses_real_dispatcher() {
 }
 
 #[test]
-fn back_target_atomic_applied_mount_request_whole_safe_stops_once() {
+fn back_target_atomic_applied_mount_request_completes_each_frame_once() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
     let router = install_deep_nested_router(&mut app);
@@ -26853,207 +26818,98 @@ fn back_target_atomic_applied_mount_request_whole_safe_stops_once() {
     commit_presentation_system(app.world_mut());
     settle_cleanup_system(app.world_mut());
     publish_snapshots_system(app.world_mut());
-
-    {
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
+    let (history_before, host) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
         assert_eq!(
             entry.engine.request(second).unwrap().status(),
             &RequestStatus::Succeeded
         );
-        assert_eq!(entry.engine.history().len(), 2);
-        assert_eq!(
-            entry.engine.history().current(),
-            Some(&RouteLocation::new("/sections/b/items/2"))
-        );
         assert_eq!(entry.active.as_ref().unwrap().frames().len(), 3);
-        assert_eq!(entry.active.as_ref().unwrap().child_slots().len(), 2);
-    }
-
+        (
+            entry.engine.history().clone(),
+            entry.host.as_ref().unwrap().host,
+        )
+    };
     let back = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
         .back(router)
-        .expect("the real deep nested history has one predecessor");
+        .unwrap();
     collect_navigation_system(app.world_mut());
     assert_eq!(
         app.world().resource::<RouterNavigation>().entries[0]
             .back_target_atomic_applied_dispatch_calls
             .load(Ordering::Relaxed),
-        0,
-        "the atomic applied dispatcher must remain untouched before the target action runs"
+        0
     );
-    let history_before_applied = app.world().resource::<RouterNavigation>().entries[0]
-        .engine
-        .history()
-        .clone();
-
-    drive_navigation_system(app.world_mut());
-
-    {
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
-        let observed_stage = match entry.pending_back_target_execution.as_ref() {
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::Start { .. },
-            )) => "ResumeBlocked::Start",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::PairingMismatch { .. },
-            )) => "ResumeBlocked::PairingMismatch",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::DrivingPairingMismatch { .. },
-            )) => "ResumeBlocked::DrivingPairingMismatch",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::DriverFailure(_),
-            )) => "ResumeBlocked::DriverFailure",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedPhysicalIndeterminate(_),
-            )) => "ResumeBlocked::AppliedPhysicalIndeterminate",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedReportMismatch(_),
-            )) => "ResumeBlocked::AppliedReportMismatch",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedMountRequestPending(_),
-            )) => "ResumeBlocked::AppliedMountRequestPending",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedMountRequestPairingMismatch(_),
-            )) => "ResumeBlocked::AppliedMountRequestPairingMismatch",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedCommitPending(_),
-            )) => "ResumeBlocked::AppliedCommitPending",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedCommitPairingMismatch(_),
-            )) => "ResumeBlocked::AppliedCommitPairingMismatch",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::AppliedCommitPermanent(_),
-            )) => "ResumeBlocked::AppliedCommitPermanent",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::Permanent { .. },
-            )) => "ResumeBlocked::Permanent",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::CapacityRejected { .. },
-            )) => "ResumeBlocked::CapacityRejected",
-            Some(PendingBackTargetExecution::ResumeBlocked(
-                PendingBackTargetResumeBlocked::ReceiverMismatch { .. },
-            )) => "ResumeBlocked::ReceiverMismatch",
-            Some(PendingBackTargetExecution::Driving(_)) => "Driving",
-            Some(PendingBackTargetExecution::Classifying(_)) => "Classifying",
-            Some(PendingBackTargetExecution::Prepared(_)) => "Prepared",
-            Some(PendingBackTargetExecution::CommitFailure(_)) => "CommitFailure",
-            Some(PendingBackTargetExecution::DriverFailureStagingMismatch(_)) => {
-                "DriverFailureStagingMismatch"
-            }
-            Some(PendingBackTargetExecution::AppliedReportStagingMismatch(_)) => {
-                "AppliedReportStagingMismatch"
-            }
-            Some(PendingBackTargetExecution::AppliedReportStagingConflict(_)) => {
-                "AppliedReportStagingConflict"
-            }
-            Some(PendingBackTargetExecution::DriverFailureStagingDrift(_)) => {
-                "DriverFailureStagingDrift"
-            }
-            None => "None",
-        };
+    run_updates_until_succeeded(&mut app, back);
+    let trace_after_terminal = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
         assert_eq!(
             entry
                 .back_target_atomic_applied_dispatch_calls
                 .load(Ordering::Relaxed),
-            1,
-            "the real entering section WithOutlets report must reach the atomic applied dispatcher exactly once; observed stage={observed_stage}, pending_commit={}, pending_frame_drive={}, pending_mount_frame_task={}, pending_mount_request={}",
-            entry.pending_commit.is_some(),
-            entry.pending_frame_drive.is_some(),
-            entry.pending_mount_frame_task.is_some(),
-            entry.pending_mount_request.is_some(),
+            2,
+            "the entering section and item must each report applied exactly once"
         );
-        let Some(PendingBackTargetExecution::ResumeBlocked(
-            PendingBackTargetResumeBlocked::AppliedMountRequestPending(owner),
-        )) = entry.pending_back_target_execution.as_ref()
-        else {
-            panic!(
-                "the returned target MountRequest must whole-safe-stop with its history, capacity and pending owner"
-            )
-        };
-        assert!(matches!(
-            entry.engine.validate_back_target_execution_pairing(
-                BackTargetExecutionOwnerRef::Driving {
-                    history: &owner.driving.history,
-                    continuation: &owner.driving.continuation,
-                },
-                BackTargetPhysicalOwnerRef::MountRequest(&owner.request),
-            ),
-            BackTargetExecutionPairingOutcome::Matched
-        ));
-        assert_eq!(owner.request.request(), back);
-        assert_eq!(owner.pending.branch.frames().len(), 1);
+        let request = entry.engine.request(back).unwrap();
+        let applied_frames = request
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::ViewApplied)
+            .map(|event| event.frame().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(applied_frames.len(), 2);
+        assert_ne!(applied_frames[0], applied_frames[1]);
+        let mut expected_history = history_before.clone();
+        expected_history.back().unwrap();
+        assert_eq!(entry.engine.history(), &expected_history);
         assert_eq!(
-            owner
-                .pending
-                .branch
-                .last_frame()
-                .expect("the entering section was realized before its outlet report")
-                .frame(),
-            owner.request.parent()
+            entry.engine.history().current(),
+            Some(&RouteLocation::new("/sections/a/items/1"))
         );
-        assert!(entry.pending_commit.is_none());
-        assert!(entry.pending_mount_request.is_none());
-        assert!(entry.pending_mount_frame_task.is_none());
-        assert_eq!(entry.engine.history(), &history_before_applied);
+        assert_eq!(entry.active.as_ref().unwrap().frames().len(), 3);
+        assert_eq!(entry.active.as_ref().unwrap().child_slots().len(), 2);
+        request.trace().to_vec()
+    };
+    for _ in 0..3 {
+        app.update();
     }
-
-    let world_before_safe_stop = authority_world_fingerprint(app.world());
-    let registry_before_safe_stop = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .to_vec();
-    let public_before_safe_stop = app
-        .world()
-        .resource::<RouterSnapshots>()
-        .get(router)
-        .unwrap()
-        .clone();
-
-    drive_navigation_system(app.world_mut());
-    commit_presentation_system(app.world_mut());
-
-    let navigation = app.world().resource::<RouterNavigation>();
-    let entry = &navigation.entries[0];
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
     assert_eq!(
         entry
             .back_target_atomic_applied_dispatch_calls
             .load(Ordering::Relaxed),
-        1,
-        "the saved target MountRequest owner must block atomic applied redispatch"
+        2,
+        "settled target frames must never redispatch their applied reports"
     );
-    assert!(matches!(
-        entry.pending_back_target_execution.as_ref(),
-        Some(PendingBackTargetExecution::ResumeBlocked(
-            PendingBackTargetResumeBlocked::AppliedMountRequestPending(_)
-        ))
-    ));
+    assert_eq!(
+        entry.engine.request(back).unwrap().trace(),
+        trace_after_terminal
+    );
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_bound_back_resolution.is_none());
+    assert!(entry.pending_back_resolution_action.is_none());
     assert!(entry.pending_commit.is_none());
     assert!(entry.pending_mount_request.is_none());
     assert!(entry.pending_mount_frame_task.is_none());
-    assert_eq!(entry.engine.history(), &history_before_applied);
-    assert_eq!(
-        authority_world_fingerprint(app.world()),
-        world_before_safe_stop
+    assert!(entry.pending_frame_drive.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert!(
+        entry
+            .back_capacity_reservations
+            .iter()
+            .all(|(request, _)| *request != back)
     );
-    assert_eq!(
-        app.world().resource::<RouteEntityRegistry>().records(),
-        registry_before_safe_stop
-    );
-    assert_eq!(
-        app.world()
-            .resource::<RouterSnapshots>()
-            .get(router)
-            .unwrap(),
-        &public_before_safe_stop
-    );
+    assert_eq!(entry.host.as_ref().unwrap().host, host);
+    assert!(app.world().get::<Node>(host).is_some());
+    assert!(app.world().get::<RouterHostRegistration>(host).is_some());
 }
 
 #[test]
-fn back_target_atomic_applied_mount_exhaustion_safe_stops_post_report_residual_once() {
+fn back_target_atomic_applied_mount_exhaustion_cleans_up_and_terminates_once() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
     let router = install_deep_nested_router(&mut app);
@@ -27067,129 +26923,101 @@ fn back_target_atomic_applied_mount_exhaustion_safe_stops_post_report_residual_o
     commit_presentation_system(app.world_mut());
     settle_cleanup_system(app.world_mut());
     publish_snapshots_system(app.world_mut());
-    assert_eq!(
-        app.world().resource::<RouterNavigation>().entries[0]
-            .engine
-            .request(second)
-            .unwrap()
-            .status(),
-        &RequestStatus::Succeeded
-    );
-
+    let (history_before, host) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(second).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        assert_eq!(entry.active.as_ref().unwrap().frames().len(), 3);
+        (
+            entry.engine.history().clone(),
+            entry.host.as_ref().unwrap().host,
+        )
+    };
     let back = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
         .back(router)
-        .expect("the real deep nested history has one predecessor");
+        .unwrap();
     collect_navigation_system(app.world_mut());
-    {
-        let mut navigation = app.world_mut().resource_mut::<RouterNavigation>();
-        let entry = &mut navigation.entries[0];
-        assert_eq!(
-            entry
-                .back_target_atomic_applied_dispatch_calls
-                .load(Ordering::Relaxed),
-            0
-        );
-        entry.engine.testing_exhaust_mount_sequence_counter();
-    }
-    let history_before_applied = app.world().resource::<RouterNavigation>().entries[0]
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .back_target_atomic_applied_dispatch_calls
+            .load(Ordering::Relaxed),
+        0
+    );
+    app.world_mut().resource_mut::<RouterNavigation>().entries[0]
         .engine
-        .history()
-        .clone();
-    let public_before_applied = app
-        .world()
-        .resource::<RouterSnapshots>()
-        .get(router)
-        .unwrap()
-        .clone();
-
-    drive_navigation_system(app.world_mut());
-
-    {
-        let navigation = app.world().resource::<RouterNavigation>();
-        let entry = &navigation.entries[0];
+        .testing_exhaust_mount_sequence_counter();
+    for _ in 0..16 {
+        app.update();
+        if matches!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(back)
+                .unwrap()
+                .status(),
+            RequestStatus::Failed(_)
+        ) {
+            break;
+        }
+    }
+    let trace_after_terminal = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            matches!(
+                entry.engine.request(back).unwrap().status(),
+                RequestStatus::Failed(_)
+            ),
+            "real mount counter exhaustion must terminate within sixteen normal updates"
+        );
         assert_eq!(
             entry
                 .back_target_atomic_applied_dispatch_calls
                 .load(Ordering::Relaxed),
             1,
-            "real mount.issue exhaustion must cross the atomic applied dispatcher once"
+            "the section report consumes the exhausted mount issuance exactly once"
         );
-        assert_eq!(
-                observe_back_target_driver_failure_stage(entry),
-                Some(
-                    BackTargetDriverFailureStageObservation::PostReportPhysicalIndeterminateFailureCleanup(
-                        BackTargetDriverUnverifiedObservation::Residual,
-                    ),
-                ),
-                "the post-report source, history, real residual and Core FailureCleanup owner must whole-safe-stop together"
-            );
-        assert!(entry.pending_failed_branch.is_none());
-        assert!(entry.pending_commit.is_none());
-        assert!(entry.pending_mount_request.is_none());
-        assert!(entry.pending_mount_frame_task.is_none());
-        assert_eq!(entry.engine.history(), &history_before_applied);
-        assert_eq!(
-            app.world()
-                .resource::<RouterSnapshots>()
-                .get(router)
-                .unwrap(),
-            &public_before_applied
-        );
+        assert_eq!(entry.engine.history(), &history_before);
+        entry.engine.request(back).unwrap().trace().to_vec()
+    };
+    // The exhausted counter is permanent; additional updates verify closure,
+    // rather than resetting production authority to manufacture a successful retry.
+    for _ in 0..3 {
+        app.update();
     }
-
-    let world_before_safe_stop = authority_world_fingerprint(app.world());
-    let registry_before_safe_stop = app
-        .world()
-        .resource::<RouteEntityRegistry>()
-        .records()
-        .to_vec();
-
-    drive_navigation_system(app.world_mut());
-    commit_presentation_system(app.world_mut());
-
-    let navigation = app.world().resource::<RouterNavigation>();
-    let entry = &navigation.entries[0];
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
     assert_eq!(
         entry
             .back_target_atomic_applied_dispatch_calls
             .load(Ordering::Relaxed),
-        1,
-        "post-report indeterminate must never dispatch the applied report again"
+        1
     );
     assert_eq!(
-        observe_back_target_driver_failure_stage(entry),
-        Some(
-            BackTargetDriverFailureStageObservation::PostReportPhysicalIndeterminateFailureCleanup(
-                BackTargetDriverUnverifiedObservation::Residual,
-            ),
-        )
+        entry.engine.request(back).unwrap().trace(),
+        trace_after_terminal
     );
-    assert!(entry.pending_failed_branch.is_none());
+    assert_eq!(entry.engine.history(), &history_before);
+    assert!(entry.pending_back_target_execution.is_none());
+    assert!(entry.pending_bound_back_resolution.is_none());
+    assert!(entry.pending_back_resolution_action.is_none());
     assert!(entry.pending_commit.is_none());
     assert!(entry.pending_mount_request.is_none());
     assert!(entry.pending_mount_frame_task.is_none());
-    assert_eq!(entry.engine.history(), &history_before_applied);
-    assert_eq!(
-        authority_world_fingerprint(app.world()),
-        world_before_safe_stop
+    assert!(entry.pending_frame_drive.is_none());
+    assert!(entry.pending_failed_branch.is_none());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(!entry.cleanup_summary().foreground_pending());
+    assert!(
+        entry
+            .back_capacity_reservations
+            .iter()
+            .all(|(request, _)| *request != back)
     );
-    assert_eq!(
-        app.world().resource::<RouteEntityRegistry>().records(),
-        registry_before_safe_stop
-    );
-    assert_eq!(
-        app.world()
-            .resource::<RouterSnapshots>()
-            .get(router)
-            .unwrap(),
-        &public_before_applied
-    );
-    assert_eq!(
-        entry.engine.request(back).unwrap().status(),
-        &RequestStatus::Running(NavigationPhase::CleanupPending)
-    );
+    assert_eq!(entry.host.as_ref().unwrap().host, host);
+    assert!(app.world().get::<Node>(host).is_some());
+    assert!(app.world().get::<RouterHostRegistration>(host).is_some());
 }
 
 #[test]
@@ -39042,7 +38870,9 @@ fn reconciliation_authority_loss_inner_content_seal_drift_retires_claim_without_
         .resource::<QuarantineLeaseTable>()
         .authority_lost_tombstone(inner_content)
         .unwrap()
-        .former_claim()
+        .source_identity()
+        .registered()
+        .expect("registered target fixture")
         .clone();
     let manifest = ComponentManifest::from_world(app.world(), inner_content).unwrap();
     let new_claim = app
@@ -39065,7 +38895,9 @@ fn reconciliation_authority_loss_inner_content_seal_drift_retires_claim_without_
             .resource::<QuarantineLeaseTable>()
             .authority_lost_tombstone(inner_content)
             .unwrap()
-            .former_claim(),
+            .source_identity()
+            .registered()
+            .expect("registered target fixture"),
         &former_claim
     );
 }

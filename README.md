@@ -6,7 +6,7 @@ MVP 已完成本地功能验收与 Linux/WSLg 窗口交互验证；以下使用�
 
 ## 运行示例
 
-需要满足官方 crates.io **Bevy 0.19.1** 要求的 Rust 工具链（`bevy_ecs` 声明最低 Rust 1.95.0，项目使用 2024 edition）；使用仓库 `Cargo.lock`，不使用 Bevy fork、patch 或替换源。从此 checkout 根目录运行：
+需要满足官方 crates.io **Bevy 0.19.x** 要求的 Rust 工具链（`bevy_ecs` 声明最低 Rust 1.95.0，项目使用 2024 edition）；依赖声明 `0.19`（`>=0.19.0, <0.20.0`），已验证官方 0.19.0 与 0.19.1；仓库 `Cargo.lock` 固定 0.19.1 作为默认测试基线，不使用 Bevy fork、patch 或替换源。从此 checkout 根目录运行：
 
 ```sh
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
@@ -26,6 +26,17 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
 [窗口示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/examples/windowed/src/main.rs)是独立的、`publish = false` 的应用 crate，配置 Winit、UI renderer、默认字体和相机；图形依赖不进入 Router 库的 feature。需要可用的桌面显示与图形驱动；Linux 示例选择 X11 后端，构建需要 X11/xkbcommon 开发库。
+
+自动化交互调试使用示例专用的 Bevy BRP 入口，不操作系统鼠标或焦点：
+
+```sh
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --features ui-debug
+python3 examples/windowed/ui_debug.py capture /tmp/router-ui.png
+python3 examples/windowed/ui_debug.py find "Layout counter"
+python3 examples/windowed/ui_debug.py key Digit2 --logical '{"Character":"2"}'
+```
+
+该入口仅在 debug 构建显式启用 `ui-debug` 时监听 `127.0.0.1:15703`；窗口启动不请求焦点。`snapshot` 提供实际布局/文本，`click X Y` 使用窗口内逻辑坐标，`rpc router/input` 可分别发送按下/释放来检查跨页手势。输入沿 Bevy 的 WindowEvent 与 typed message 管线，截图来自渲染器；这验证引擎交互，不代替 OS 或硬件输入验证。调试模式保持窗口连续更新，不能用于功耗或正式性能测量。
 
 - 点击 Overview / Settings 执行 push，Replace 替换为 overview，Back 返回。快捷键分别为 `1` / `2` / `R` / `B`。
 - 点击 Layout counter 后切换子页：布局 Entity 和计数保持，页面局部计数重新创建。
@@ -47,21 +58,21 @@ edition = "2024"
 
 [dependencies]
 bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", default-features = false, features = ["bsn"] }
-bevy_app = { version = "=0.19.1", default-features = false }
-bevy_asset = { version = "=0.19.1", default-features = false }
-bevy_ecs = { version = "=0.19.1", default-features = false }
-bevy_scene = { version = "=0.19.1", default-features = false }
-bevy_ui = { version = "=0.19.1", default-features = false }
+bevy_app = { version = "0.19", default-features = false }
+bevy_asset = { version = "0.19", default-features = false }
+bevy_ecs = { version = "0.19", default-features = false }
+bevy_scene = { version = "0.19", default-features = false }
+bevy_ui = { version = "0.19", default-features = false }
 ```
 
 在 `router-demo` 中执行 `cargo run`。若改用嵌套示例源码，再加入以下两项依赖；这些 feature 是该示例所需的真实布局和输入资源来源：
 
 ```toml
-bevy_input_focus = { version = "=0.19.1", default-features = false }
-bevy_internal = { version = "=0.19.1", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
+bevy_input_focus = { version = "0.19", default-features = false }
+bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
 ```
 
-独立 consumer 测试在单独 workspace 中编译并执行这两个**原样源文件**，显式声明上述依赖，不借用本仓库 dev-dependency 的 feature 合并。
+独立 consumer 测试在单独 workspace 中编译并执行这两个**原样源文件**，以 0.19.1 为固定基线显式声明上述依赖，不借用本仓库 dev-dependency 的 feature 合并。
 
 ## Runtime 与输入边界
 
@@ -81,7 +92,7 @@ cargo +stable bench -p bevy_ui_router --bench router_baseline --features bsn --l
 
 ## 发布状态
 
-当前先完成发布准备，尚未发布 crates.io。按项目所有者选择，暂不授予开源许可证；仓库没有许可证文件，manifest 也没有虚构的 `license` 字段。公开发布前仍需明确许可和发布版本。
+本项目是独立的通用路由库，计划开源发布，尚未发布 crates.io。具体许可证与发布版本待确定；当前仓库尚无许可证文件，manifest 尚未声明 `license`。
 
 CI 在单个 Linux 环境运行格式检查、完整 workspace 检查和测试（含独立消费者）；窗口交互验收单独记录在实施 plan，不由无显示的 CI 结果代替。
 

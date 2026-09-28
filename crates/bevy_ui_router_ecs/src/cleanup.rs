@@ -167,13 +167,21 @@ fn inject_unfinalized_boundary_drift(manifest: &mut FrozenCleanupManifest) {
         return;
     }
     let Some((frame, claim, mount_slot)) = manifest.obligations.iter().find_map(|obligation| {
-        let RegistryOwner::Committed(EntityOwner::FrameShell(frame)) = obligation.claim.owner()
+        let RegistryOwner::Committed(EntityOwner::FrameShell(frame)) = obligation
+            .identity
+            .registered()
+            .expect("registered test fixture")
+            .owner()
         else {
             return None;
         };
         Some((
             frame.clone(),
-            obligation.claim.clone(),
+            obligation
+                .identity
+                .registered()
+                .expect("registered test fixture")
+                .clone(),
             obligation.expected_parent,
         ))
     }) else {
@@ -600,13 +608,45 @@ impl RouterCleanupObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CleanupObligation {
-    claim: ExactRegistryClaim,
+    identity: CleanupTargetIdentity,
     manifest: ComponentManifest,
     expected_parent: Entity,
     unit_root: Entity,
     authorized_parent: Entity,
     allow_missing_components: bool,
     terminal_mode: CleanupTerminalMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupTargetIdentity {
+    Registered(ExactRegistryClaim),
+    ContainedContent {
+        entity: Entity,
+        root: ExactRegistryClaim,
+        shell: ExactRegistryClaim,
+    },
+}
+
+impl CleanupTargetIdentity {
+    pub(crate) fn entity(&self) -> Entity {
+        match self {
+            Self::Registered(claim) => claim.entity(),
+            Self::ContainedContent { entity, .. } => *entity,
+        }
+    }
+
+    pub(crate) fn registered(&self) -> Option<&ExactRegistryClaim> {
+        match self {
+            Self::Registered(claim) => Some(claim),
+            Self::ContainedContent { .. } => None,
+        }
+    }
+}
+
+impl CleanupObligation {
+    fn entity(&self) -> Entity {
+        self.identity.entity()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,6 +819,10 @@ struct FrozenCleanupMountParentDrift {
 
 #[derive(Debug)]
 enum CleanupSettlementPermanentCause {
+    RelatedProtectedPartition {
+        expected: Vec<CleanupProtectedEntity>,
+        targets: Vec<Entity>,
+    },
     DetachmentState {
         expected: FrozenCleanupQuarantineDetachment,
         consumed_projection_matches: bool,
@@ -1300,6 +1344,9 @@ impl CleanupSettlementPermanentEvidence {
                 .and_then(|count| count.checked_add(detachment.targets_after.len()))
         };
         let capacity = match &cause {
+            CleanupSettlementPermanentCause::RelatedProtectedPartition { expected, targets } => {
+                expected.len().checked_add(targets.len())
+            }
             CleanupSettlementPermanentCause::DetachmentState {
                 expected,
                 unconsumed_mount_parent_drifts,
@@ -1338,6 +1385,10 @@ impl CleanupSettlementPermanentEvidence {
                 entities.extend(detachment.targets_after.iter().map(|entity| entity.entity));
             };
         match &cause {
+            CleanupSettlementPermanentCause::RelatedProtectedPartition { expected, targets } => {
+                entities.extend(expected.iter().map(|fact| fact.observed.entity));
+                entities.extend(targets.iter().copied());
+            }
             CleanupSettlementPermanentCause::DetachmentState {
                 expected,
                 unconsumed_mount_parent_drifts,
@@ -1568,7 +1619,7 @@ impl FrozenFailureCleanupObservedEntity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FrozenFailureCleanupSource {
     manifest_digest: u64,
-    targets: Vec<ExactRegistryClaim>,
+    targets: Vec<CleanupTargetIdentity>,
     logical: FailureCleanupSourceProjection,
 }
 
@@ -1769,6 +1820,10 @@ enum PreparedBackNoTargetAuthorityTerminalPresence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PreparedBackNoTargetAuthorityTerminalAuthority {
     None,
+    Contained {
+        lease: QuarantineLeaseId,
+        record: crate::registry::ContainedResidualRecord,
+    },
     Quarantine {
         lease: QuarantineLeaseId,
         lease_entities: Vec<Entity>,
@@ -1818,7 +1873,7 @@ struct IdleHostRetainedTargetObservation {
     lifecycle: Option<ProvisionalSlotLifecycle>,
     lease: Option<crate::registry::QuarantineLease>,
     unresolved: Option<crate::registry::RouteEntityRecord>,
-    tombstone: Option<(ResidualLeaseId, u64, u64, ExactRegistryClaim)>,
+    tombstone: Option<(ResidualLeaseId, u64, u64, CleanupTargetIdentity)>,
     authority_matches: bool,
 }
 
@@ -1899,7 +1954,7 @@ impl IdleHostCompletedRetention {
                             tombstone.id(),
                             tombstone.generation(),
                             tombstone.operation_sequence(),
-                            tombstone.former_claim().clone(),
+                            tombstone.source_identity().clone(),
                         )
                     }),
                 authority_matches: terminal.authority_is_current(world),
@@ -2029,6 +2084,10 @@ impl PreparedBackNoTargetAuthorityTerminalProjection {
                     && table.unresolved_record(self.entity).is_none()
                     && table.authority_lost_tombstone(self.entity).is_none()
             }
+            PreparedBackNoTargetAuthorityTerminalAuthority::Contained { lease, record } =>
+                table.contained_record(self.entity).is_some_and(|(identity, observed)|
+                    matches!(identity, crate::registry::ContainedResidualLeaseIdentity::Verified { id, .. } if id == *lease)
+                        && observed == record && contained_terminal_scope_is_current(world, &record.terminal_identity)),
             PreparedBackNoTargetAuthorityTerminalAuthority::Quarantine {
                 lease,
                 lease_entities,
@@ -2064,7 +2123,7 @@ impl PreparedBackNoTargetAuthorityTerminalProjection {
                     && match &self.presence {
                         PreparedBackNoTargetAuthorityTerminalPresence::Absent => true,
                         PreparedBackNoTargetAuthorityTerminalPresence::Retained { .. } => {
-                            terminal_authority_lost_entity_is_inert(world, self.entity)
+                            lost_terminal_scope_is_current(world, projection.source_identity())
                         }
                     }
             }
@@ -2155,7 +2214,7 @@ impl FrozenBackNoTargetAuthorityPartition {
                     return true;
                 };
                 projection.obligation != index
-                    || projection.entity != obligation.claim.entity()
+                    || projection.entity != obligation.entity()
                     || !self.allowed.targets.contains(&projection.entity)
                     || projection.receipt_binding
                         != receipt_binding(
@@ -2251,7 +2310,7 @@ impl FrozenBackNoTargetAuthorityPartition {
                     return true;
                 };
                 projection.obligation != index
-                    || projection.entity != obligation.claim.entity()
+                    || projection.entity != obligation.entity()
                     || receipts
                         .get(index)
                         .and_then(Option::as_ref)
@@ -2270,7 +2329,7 @@ impl FrozenBackNoTargetAuthorityPartition {
                 receipts
                     .get(index)
                     .is_some_and(Option::is_none)
-                    .then_some(obligation.claim.entity())
+                    .then_some(obligation.entity())
             })
             .collect::<Vec<_>>();
         remaining.sort_by_key(|entity| entity.to_bits());
@@ -2375,7 +2434,7 @@ impl FrozenBackNoTargetAuthorityPartition {
                     .copied()
                     .filter(|child| {
                         !obligations.iter().enumerate().any(|(index, obligation)| {
-                            obligation.claim.entity() == *child
+                            obligation.entity() == *child
                                 && obligation.expected_parent == expected.entity
                                 && receipts.get(index).and_then(Option::as_ref).is_some_and(
                                     |receipt| {
@@ -2622,11 +2681,18 @@ impl FrozenCleanupManifest {
             .obligations
             .iter()
             .map(|obligation| {
-                world.get_entity(obligation.claim.entity()).is_err()
-                    || (registry
-                        .record(obligation.claim.entity())
-                        .is_some_and(|record| record.claim() == obligation.claim)
-                        && terminal_unresolved_root_is_inert(world, &obligation.claim, false))
+                world.get_entity(obligation.entity()).is_err()
+                    || match &obligation.identity {
+                        CleanupTargetIdentity::Registered(claim) => {
+                            registry
+                                .record(obligation.entity())
+                                .is_some_and(|record| record.claim() == *claim)
+                                && terminal_unresolved_root_is_inert(world, claim, false)
+                        }
+                        identity @ CleanupTargetIdentity::ContainedContent { .. } => {
+                            contained_terminal_scope_is_current(world, identity)
+                        }
+                    }
             })
             .collect();
         let edge_absent = world.get_entity(host.host).is_err()
@@ -2806,10 +2872,18 @@ impl FrozenCleanupManifest {
                 return None;
             }
         }
+        #[cfg(feature = "bsn")]
+        let obligation_count = obligation_count
+            + frames
+                .iter()
+                .map(|frame| {
+                    crate::presentation::native_frame::contained_cleanup_targets(frame).len()
+                })
+                .sum::<usize>();
         if obligations.len() != obligation_count
             || obligations
                 .iter()
-                .map(|obligation| obligation.claim.entity())
+                .map(|obligation| obligation.entity())
                 .collect::<HashSet<_>>()
                 .len()
                 != obligation_count
@@ -2922,7 +2996,7 @@ impl FrozenCleanupManifest {
             .or_else(|| ComponentManifest::from_world(world, host.top_slot))
             .unwrap_or_else(|| ComponentManifest::new([]));
         obligations.push(CleanupObligation {
-            claim: host.top_slot_claim.clone(),
+            identity: CleanupTargetIdentity::Registered(host.top_slot_claim.clone()),
             manifest,
             expected_parent: host.host,
             unit_root: host.top_slot,
@@ -3070,15 +3144,19 @@ impl FrozenCleanupManifest {
                 .ok_or(AuthoritySettlementManifestError::InvalidAuthority)?,
         );
         normalize_authority_obligations(&mut obligations)?;
-        if obligations.len() != projected_claims.len()
+        if obligations
+            .iter()
+            .filter(|obligation| obligation.identity.registered().is_some())
+            .count()
+            != projected_claims.len()
             || projected_claims.iter().any(|claim| {
                 !obligations
                     .iter()
-                    .any(|obligation| obligation.claim == *claim)
+                    .any(|obligation| obligation.identity.registered() == Some(claim))
             })
             || obligations
                 .iter()
-                .any(|obligation| obligation.claim.entity() == host.host)
+                .any(|obligation| obligation.entity() == host.host)
         {
             return Err(AuthoritySettlementManifestError::InvalidTopology);
         }
@@ -3136,7 +3214,9 @@ impl FrozenCleanupManifest {
                 let obligation = self
                     .obligations
                     .iter_mut()
-                    .find(|obligation| obligation.claim == binding.obligation)
+                    .find(|obligation| {
+                        obligation.identity.registered() == Some(&binding.obligation)
+                    })
                     .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
                 obligation.terminal_mode = CleanupTerminalMode::AuthorityLost;
                 for claim in [&binding.obligation, drift.expected.exact_claim()] {
@@ -3195,7 +3275,7 @@ impl FrozenCleanupManifest {
                 || !self
                     .obligations
                     .iter()
-                    .any(|obligation| obligation.claim.entity() == parent.removed_child)
+                    .any(|obligation| obligation.entity() == parent.removed_child)
         }) {
             return Err(AuthoritySettlementManifestError::InvalidTopology);
         }
@@ -3217,7 +3297,7 @@ impl FrozenCleanupManifest {
     pub(crate) fn obligation_entities(&self) -> Vec<Entity> {
         self.obligations
             .iter()
-            .map(|obligation| obligation.claim.entity())
+            .map(|obligation| obligation.entity())
             .collect()
     }
 
@@ -3270,20 +3350,23 @@ impl FrozenCleanupManifest {
     pub(crate) fn contains_exact_obligation(&self, claim: &ExactRegistryClaim) -> bool {
         self.obligations
             .iter()
-            .any(|obligation| obligation.claim == *claim)
+            .any(|obligation| obligation.identity.registered() == Some(claim))
     }
 
     pub(crate) fn contains_frame_obligation(&self, frame: &RouteFrameVersion) -> bool {
-        self.obligations.iter().any(|obligation| {
-            matches!(
-                obligation.claim.owner(),
-                RegistryOwner::Committed(
-                    EntityOwner::FrameShell(owner)
-                        | EntityOwner::FrameContentTarget(owner)
-                        | EntityOwner::FrameOutput { frame: owner, .. }
-                ) if owner == frame
-            )
-        })
+        self.obligations
+            .iter()
+            .filter_map(|obligation| obligation.identity.registered())
+            .any(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(
+                        EntityOwner::FrameShell(owner)
+                            | EntityOwner::FrameContentTarget(owner)
+                            | EntityOwner::FrameOutput { frame: owner, .. }
+                    ) if owner == frame
+                )
+            })
     }
 
     pub(crate) fn allows_pending_boundary_loss(&self, claim: &ExactRegistryClaim) -> bool {
@@ -3314,7 +3397,7 @@ impl FrozenCleanupManifest {
             let obligation = self
                 .obligations
                 .iter_mut()
-                .find(|obligation| obligation.claim == binding.obligation)
+                .find(|obligation| obligation.identity.registered() == Some(&binding.obligation))
                 .expect("prevalidated pending boundary retains its exact local obligation");
             obligation.terminal_mode = CleanupTerminalMode::AuthorityLost;
             for claim in [&binding.obligation, drift.expected.exact_claim()] {
@@ -3372,11 +3455,11 @@ impl FrozenCleanupManifest {
         let targets = self
             .obligations
             .iter()
-            .map(|obligation| obligation.claim.clone())
+            .map(|obligation| obligation.identity.clone())
             .collect::<Vec<_>>();
         let mut allowed_writes = targets
             .iter()
-            .map(ExactRegistryClaim::entity)
+            .map(CleanupTargetIdentity::entity)
             .collect::<Vec<_>>();
         let target_count = allowed_writes.len();
         allowed_writes.sort_by_key(|entity| entity.to_bits());
@@ -3498,7 +3581,7 @@ impl FrozenCleanupManifest {
     pub(crate) fn entities(&self) -> Vec<Entity> {
         self.obligations
             .iter()
-            .map(|obligation| obligation.claim.entity())
+            .map(|obligation| obligation.entity())
             .collect()
     }
 
@@ -3985,7 +4068,9 @@ impl<'a> FailedPreparedTopology<'a> {
             .frames
             .iter()
             .try_fold(self.slots.len(), |count, frame| {
-                count.checked_add(frame.frame.obligation_count())
+                count
+                    .checked_add(frame.frame.obligation_count())
+                    .and_then(|count| count.checked_add(contained_frame_target_count(frame.frame)))
             })
             .ok_or(FailedManifestBuildError::RetryableCapacity)?
             .checked_add(self.auxiliary_slots.len())
@@ -4515,6 +4600,75 @@ fn failed_claim_manifest_mode(
     )
 }
 
+fn contained_frame_target_count(frame: &RealizedFrame) -> usize {
+    #[cfg(feature = "bsn")]
+    {
+        crate::presentation::native_frame::contained_cleanup_targets(frame).len()
+    }
+    #[cfg(not(feature = "bsn"))]
+    {
+        let _ = frame;
+        0
+    }
+}
+
+fn append_contained_frame_obligations(
+    frame: &RealizedFrame,
+    claims: &[ExactRegistryClaim],
+    obligations: &mut Vec<CleanupObligation>,
+) -> Option<()> {
+    #[cfg(feature = "bsn")]
+    if let Some(root_entity) = frame.native_root() {
+        let targets = crate::presentation::native_frame::contained_cleanup_targets(frame);
+        if targets.is_empty() {
+            return Some(());
+        }
+        let root = claims
+            .iter()
+            .find(|claim| claim.entity() == root_entity)?
+            .clone();
+        let shell = claims
+            .iter()
+            .find(|claim| claim.entity() == frame.shell())?
+            .clone();
+        let source_modes = obligations
+            .iter()
+            .filter(|obligation| {
+                obligation.entity() == root_entity || obligation.entity() == frame.shell()
+            })
+            .map(|obligation| obligation.terminal_mode)
+            .collect::<Vec<_>>();
+        let mode = if source_modes.contains(&CleanupTerminalMode::AuthorityLost) {
+            CleanupTerminalMode::AuthorityLost
+        } else if source_modes.contains(&CleanupTerminalMode::ForceUnresolved) {
+            CleanupTerminalMode::ForceUnresolved
+        } else if source_modes.contains(&CleanupTerminalMode::AuthorityExact) {
+            CleanupTerminalMode::AuthorityExact
+        } else {
+            CleanupTerminalMode::Normal
+        };
+        obligations.try_reserve(targets.len()).ok()?;
+        for (entity, expected_parent, manifest) in targets {
+            obligations.push(CleanupObligation {
+                identity: CleanupTargetIdentity::ContainedContent {
+                    entity,
+                    root: root.clone(),
+                    shell: shell.clone(),
+                },
+                manifest,
+                expected_parent,
+                unit_root: frame.shell(),
+                authorized_parent: frame.top_slot(),
+                allow_missing_components: false,
+                terminal_mode: mode,
+            });
+        }
+    }
+    #[cfg(not(feature = "bsn"))]
+    let _ = (frame, claims, obligations);
+    Some(())
+}
+
 fn failed_frame_obligations(
     world: &World,
     registry: &RouteEntityRegistry,
@@ -4528,7 +4682,7 @@ fn failed_frame_obligations(
         let (manifest, terminal_mode, absent) =
             failed_claim_manifest_mode(world, registry, claim, !frame.prewrite_complete());
         obligations.push(CleanupObligation {
-            claim: claim.clone(),
+            identity: CleanupTargetIdentity::Registered(claim.clone()),
             manifest,
             expected_parent,
             unit_root: frame.shell(),
@@ -4537,6 +4691,12 @@ fn failed_frame_obligations(
             terminal_mode,
         });
     }
+    append_contained_frame_obligations(
+        frame,
+        &frame.claims().cloned().collect::<Vec<_>>(),
+        &mut obligations,
+    )
+    .ok_or(FailedManifestBuildError::RetryableCapacity)?;
     order_leaf_to_root(&mut obligations).ok_or(FailedManifestBuildError::InvalidTopology(
         FailedPreparedTopologyError::CycleOrRevisit,
     ))?;
@@ -4551,7 +4711,7 @@ fn failed_mounted_slot_obligation(
     let (manifest, terminal_mode, absent) =
         failed_claim_manifest_mode(world, registry, slot.slot_claim(), false);
     Ok(CleanupObligation {
-        claim: slot.slot_claim().clone(),
+        identity: CleanupTargetIdentity::Registered(slot.slot_claim().clone()),
         manifest,
         expected_parent: slot.anchor(),
         unit_root: slot.slot(),
@@ -4578,7 +4738,7 @@ fn failed_residual_slot_obligation(
         incomplete_physical_claim_is_allowed,
     );
     Ok(CleanupObligation {
-        claim: residual.claim().clone(),
+        identity: CleanupTargetIdentity::Registered(residual.claim().clone()),
         manifest: residual.authorized_manifest().clone(),
         expected_parent: residual.anchor(),
         unit_root: residual.entity(),
@@ -4606,7 +4766,7 @@ fn failed_rejected_slot_obligation(
         .map(|(anchor, _)| anchor)
         .unwrap_or_else(|| slot.anchor());
     Ok(CleanupObligation {
-        claim: slot.slot_claim().clone(),
+        identity: CleanupTargetIdentity::Registered(slot.slot_claim().clone()),
         manifest,
         expected_parent,
         unit_root: slot.slot(),
@@ -4631,7 +4791,7 @@ fn authority_host_obligation(
         .or_else(|| ComponentManifest::from_world(world, host.top_slot))
         .unwrap_or_else(|| ComponentManifest::new([]));
     CleanupObligation {
-        claim: host.top_slot_claim.clone(),
+        identity: CleanupTargetIdentity::Registered(host.top_slot_claim.clone()),
         manifest,
         expected_parent: host.host,
         unit_root: host.top_slot,
@@ -4710,7 +4870,7 @@ fn target_permanent_slot_role_obligation(
         return None;
     }
     Some(CleanupObligation {
-        claim: projected.clone(),
+        identity: CleanupTargetIdentity::Registered(projected.clone()),
         manifest: record.manifest().clone(),
         expected_parent: role.anchor(),
         unit_root: role.entity(),
@@ -4741,7 +4901,7 @@ fn target_permanent_host_obligation(
         return None;
     }
     Some(CleanupObligation {
-        claim: projected.clone(),
+        identity: CleanupTargetIdentity::Registered(projected.clone()),
         manifest: record.manifest().clone(),
         expected_parent: host.host,
         unit_root: host.top_slot,
@@ -4759,9 +4919,10 @@ fn normalize_authority_obligations(
         .try_reserve_exact(obligations.len())
         .map_err(|_| AuthoritySettlementManifestError::RetryableCapacity)?;
     for obligation in obligations.drain(..) {
-        if let Some(existing) = normalized.iter().find(|existing: &&CleanupObligation| {
-            existing.claim.entity() == obligation.claim.entity()
-        }) {
+        if let Some(existing) = normalized
+            .iter()
+            .find(|existing: &&CleanupObligation| existing.entity() == obligation.entity())
+        {
             if existing != &obligation {
                 return Err(AuthoritySettlementManifestError::InvalidTopology);
             }
@@ -5104,7 +5265,7 @@ fn authority_settlement_slot_obligation(
         .or_else(|| ComponentManifest::from_world(world, slot.slot()))
         .unwrap_or_else(|| ComponentManifest::new([]));
     CleanupObligation {
-        claim: slot.slot_claim().clone(),
+        identity: CleanupTargetIdentity::Registered(slot.slot_claim().clone()),
         manifest,
         expected_parent: slot.anchor(),
         unit_root: slot.slot(),
@@ -5134,7 +5295,7 @@ fn authority_lost_frame_obligations(
                 .or_else(|| ComponentManifest::from_world(world, claim.entity()))
                 .unwrap_or_else(|| ComponentManifest::new([]));
             CleanupObligation {
-                claim: claim.clone(),
+                identity: CleanupTargetIdentity::Registered(claim.clone()),
                 manifest,
                 expected_parent,
                 unit_root: frame.shell(),
@@ -5149,6 +5310,11 @@ fn authority_lost_frame_obligations(
             }
         })
         .collect::<Vec<_>>();
+    append_contained_frame_obligations(
+        frame,
+        &frame.claims().cloned().collect::<Vec<_>>(),
+        &mut obligations,
+    )?;
     order_leaf_to_root(&mut obligations)?;
     Some(obligations)
 }
@@ -5166,7 +5332,7 @@ fn current_exact_frame_obligations(
                 return None;
             }
             Some(CleanupObligation {
-                claim: claim.clone(),
+                identity: CleanupTargetIdentity::Registered(claim.clone()),
                 manifest: record.manifest().clone(),
                 expected_parent,
                 unit_root: frame.shell(),
@@ -5176,6 +5342,11 @@ fn current_exact_frame_obligations(
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    append_contained_frame_obligations(
+        frame,
+        &frame.claims().cloned().collect::<Vec<_>>(),
+        &mut obligations,
+    )?;
     order_leaf_to_root(&mut obligations)?;
     Some(obligations)
 }
@@ -5218,7 +5389,7 @@ fn frame_obligations(
                 return None;
             }
             Some(CleanupObligation {
-                claim: projected.clone(),
+                identity: CleanupTargetIdentity::Registered(projected.clone()),
                 manifest: record.manifest().clone(),
                 expected_parent,
                 unit_root: frame.shell(),
@@ -5228,6 +5399,7 @@ fn frame_obligations(
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    append_contained_frame_obligations(frame, projected_claims, &mut obligations)?;
     order_leaf_to_root(&mut obligations)?;
     Some(obligations)
 }
@@ -5508,7 +5680,7 @@ fn freeze_external_mount_parents_detailed(
 > {
     let obligation_entities = obligations
         .iter()
-        .map(|obligation| obligation.claim.entity())
+        .map(|obligation| obligation.entity())
         .collect::<HashSet<_>>();
     let mut parents = Vec::<CleanupMountParentSettlement>::new();
     let mut drifts = Vec::new();
@@ -6278,11 +6450,11 @@ impl FrozenFailureCleanupPartition {
     ) -> Result<(), FailureCleanupSettlementRefreezeEvidence> {
         let obligation_claims = obligations
             .iter()
-            .map(|obligation| obligation.claim.clone())
+            .map(|obligation| obligation.identity.clone())
             .collect::<Vec<_>>();
         let obligation_entities = obligation_claims
             .iter()
-            .map(ExactRegistryClaim::entity)
+            .map(CleanupTargetIdentity::entity)
             .collect::<Vec<_>>();
         if current_source != Some(&self.source.logical) {
             return Err(self.evidence(
@@ -6345,7 +6517,7 @@ impl FrozenFailureCleanupPartition {
         if let Some(transition_entity) = transition_entity {
             let Some(transition_index) = obligations
                 .iter()
-                .position(|obligation| obligation.claim.entity() == transition_entity)
+                .position(|obligation| obligation.entity() == transition_entity)
             else {
                 return Err(self.evidence(
                     stage,
@@ -6398,11 +6570,7 @@ impl FrozenFailureCleanupPartition {
         let mut removed = receipts
             .iter()
             .enumerate()
-            .filter_map(|(index, receipt)| {
-                receipt
-                    .is_some()
-                    .then_some(obligations[index].claim.entity())
-            })
+            .filter_map(|(index, receipt)| receipt.is_some().then_some(obligations[index].entity()))
             .collect::<Vec<_>>();
         if let FailureCleanupTransitionStage::PhysicalAbsent(entity) = stage {
             removed.push(entity);
@@ -6425,9 +6593,10 @@ impl FrozenFailureCleanupPartition {
                     FailureCleanupTransitionStage::PhysicalAbsent(entity)
                         if entity == expected.entity
                 ) {
-                    registry.record(expected.entity).is_some_and(|record| {
-                        Some(record.claim()) == expected.registry_claim.clone()
-                    })
+                    registry
+                        .record(expected.entity)
+                        .map(|record| record.claim())
+                        == expected.registry_claim
                 } else {
                     registry.record(expected.entity).is_none()
                 };
@@ -6654,7 +6823,7 @@ fn mounted_slot_obligation_with_claim(
         return None;
     }
     Some(CleanupObligation {
-        claim: projected.clone(),
+        identity: CleanupTargetIdentity::Registered(projected.clone()),
         manifest: record.manifest().clone(),
         expected_parent: slot.anchor(),
         unit_root: slot.slot(),
@@ -6667,7 +6836,7 @@ fn mounted_slot_obligation_with_claim(
 fn order_leaf_to_root(obligations: &mut [CleanupObligation]) -> Option<()> {
     let entities = obligations
         .iter()
-        .map(|obligation| obligation.claim.entity())
+        .map(|obligation| obligation.entity())
         .collect::<HashSet<_>>();
     let mut depths = Vec::with_capacity(obligations.len());
     for obligation in obligations.iter() {
@@ -6681,20 +6850,17 @@ fn order_leaf_to_root(obligations: &mut [CleanupObligation]) -> Option<()> {
             depth = depth.checked_add(1)?;
             parent = obligations
                 .iter()
-                .find(|candidate| candidate.claim.entity() == parent)?
+                .find(|candidate| candidate.entity() == parent)?
                 .expected_parent;
         }
-        depths.push((obligation.claim.entity(), depth));
+        depths.push((obligation.entity(), depth));
     }
     obligations.sort_by_key(|obligation| {
         let depth = depths
             .iter()
-            .find_map(|(entity, depth)| (*entity == obligation.claim.entity()).then_some(*depth))
+            .find_map(|(entity, depth)| (*entity == obligation.entity()).then_some(*depth))
             .unwrap_or_default();
-        (
-            std::cmp::Reverse(depth),
-            obligation.claim.entity().to_bits(),
-        )
+        (std::cmp::Reverse(depth), obligation.entity().to_bits())
     });
     Some(())
 }
@@ -6761,7 +6927,7 @@ pub(crate) struct AuthorityLostResidualProjectionFact {
     obligation: usize,
     obligation_binding: u64,
     terminal_receipt_binding: u64,
-    retired_claim: ExactRegistryClaim,
+    retired_identity: CleanupTargetIdentity,
     frozen_expected_manifest: ComponentManifest,
     observed_manifest: Option<ComponentManifest>,
     entity_present_at_receipt: bool,
@@ -6803,8 +6969,9 @@ impl AuthorityLostResidualProjectionFact {
     pub(crate) const fn terminal_receipt_binding(&self) -> u64 {
         self.terminal_receipt_binding
     }
-    pub(crate) const fn retired_claim(&self) -> &ExactRegistryClaim {
-        &self.retired_claim
+
+    pub(crate) fn source_identity(&self) -> &CleanupTargetIdentity {
+        &self.retired_identity
     }
     pub(crate) const fn frozen_expected_manifest(&self) -> &ComponentManifest {
         &self.frozen_expected_manifest
@@ -7108,24 +7275,23 @@ impl PreparedAuthorityRemoval {
         obligations: &[CleanupObligation],
         completed_removals: &[Entity],
     ) -> bool {
-        let Some(claim) = obligations
-            .get(self.index)
-            .map(|obligation| &obligation.claim)
-        else {
+        let Some(obligation) = obligations.get(self.index) else {
             return false;
         };
-        world
-            .resource::<RouteEntityRegistry>()
-            .record(claim.entity())
-            .is_some_and(|record| record.claim() == *claim)
-            && world.get::<ChildOf>(claim.entity()).map(ChildOf::parent) == self.expected_parent
+        let entity = obligation.entity();
+        obligation.identity.registered().is_none_or(|claim| {
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(entity)
+                .is_some_and(|record| record.claim() == *claim)
+        }) && world.get::<ChildOf>(entity).map(ChildOf::parent) == self.expected_parent
             && children_match_after_removals(
                 world,
-                claim.entity(),
+                entity,
                 &self.children_before,
                 completed_removals,
             )
-            && cleanup_claim_has_exact_authority(world, claim)
+            && cleanup_obligation_has_exact_authority(world, obligation)
     }
 }
 
@@ -7287,6 +7453,7 @@ pub(crate) struct CleanupLedger {
     issued_attempt: Option<CleanupAttempt>,
     completion_digest: Option<u64>,
     quarantine_event_observed: bool,
+    related_protected: Option<Vec<CleanupProtectedEntity>>,
     post_settlement_focus: Vec<PostSettlementFocusRoot>,
     authority_host_children: Option<Vec<Entity>>,
     back_no_target_authority_partition: Option<FrozenBackNoTargetAuthorityPartition>,
@@ -7294,6 +7461,151 @@ pub(crate) struct CleanupLedger {
     stopped: Option<CleanupStopReason>,
     quarantine_detachment: Option<FrozenCleanupQuarantineDetachment>,
     cleanup_settlement_permanent_pending: Option<Box<CleanupSettlementPermanentCause>>,
+}
+
+// Operation-local proof of the related protected partition. Ordinary authored
+// components are not ownership; source identity, topology and input facts are.
+#[derive(Clone, Debug)]
+struct CleanupProtectedEntity {
+    observed: FrozenFailureCleanupObservedEntity,
+    display: Option<bevy_ui::Display>,
+}
+
+impl CleanupLedger {
+    fn prepare_related_protected(&mut self, world: &World) -> bool {
+        if self.related_protected.is_some()
+            || !self
+                .obligations
+                .iter()
+                .any(|o| o.identity.registered().is_none())
+        {
+            return true;
+        }
+        let mut roots = HashSet::new();
+        for obligation in &self.obligations {
+            let mut root = obligation.unit_root;
+            let mut seen = HashSet::new();
+            while let Some(parent) = world.get::<ChildOf>(root).map(ChildOf::parent) {
+                if !seen.insert(root) {
+                    return false;
+                }
+                root = parent;
+            }
+            roots.insert(root);
+        }
+        let targets = self
+            .obligations
+            .iter()
+            .map(CleanupObligation::entity)
+            .collect::<HashSet<_>>();
+        let registry = world.resource::<RouteEntityRegistry>();
+        self.related_protected = Some(
+            observed_descendant_closure(world, roots.into_iter())
+                .into_iter()
+                .filter(|entity| !targets.contains(entity))
+                .map(|entity| CleanupProtectedEntity {
+                    observed: FrozenFailureCleanupObservedEntity::observe(world, registry, entity),
+                    display: world.get::<bevy_ui::Node>(entity).map(|node| node.display),
+                })
+                .collect(),
+        );
+        true
+    }
+
+    fn related_protected_is_current(&self, world: &World) -> bool {
+        let Some(protected) = &self.related_protected else {
+            return true;
+        };
+        let registry = world.resource::<RouteEntityRegistry>();
+        let removed = self
+            .obligations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, obligation)| {
+                self.receipts[index]
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        matches!(
+                            receipt.disposition,
+                            CleanupDisposition::Removed
+                                | CleanupDisposition::RemovedDetached
+                                | CleanupDisposition::AlreadyAbsent
+                        )
+                    })
+                    .then_some(obligation.entity())
+            })
+            .collect::<HashSet<_>>();
+        protected.iter().all(|fact| {
+            let expected = &fact.observed;
+            let entity = expected.entity;
+            world.get_entity(entity).is_ok() == expected.present
+                && world.get::<ChildOf>(entity).map(ChildOf::parent) == expected.parent
+                && world
+                    .get::<Children>(entity)
+                    .into_iter()
+                    .flat_map(|children| children.iter().copied())
+                    .eq(expected
+                        .children
+                        .iter()
+                        .filter(|entity| !removed.contains(entity))
+                        .copied())
+                && registry.record(entity).map(|record| record.claim()) == expected.registry_claim
+                && world.get::<RouteOwnershipSeal>(entity).copied() == expected.ownership_seal
+                && world.get::<Visibility>(entity).copied() == expected.visibility
+                && world
+                    .get::<Pickable>(entity)
+                    .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable))
+                    == expected.pickable
+                && world.get::<RouterInputBarrier>(entity).copied() == expected.barrier
+                && world.get::<FrameLifecycle>(entity).copied() == expected.frame_lifecycle
+                && world.get::<ChildSlotLifecycle>(entity).copied() == expected.child_slot_lifecycle
+                && world.get::<ChildSlotAuthority>(entity) == expected.child_slot_authority.as_ref()
+                && world.get::<ProvisionalSlotLifecycle>(entity).copied()
+                    == expected.provisional_slot_lifecycle
+                && world
+                    .get::<RouterHostRegistration>(entity)
+                    .map(|registration| (registration.router(), registration.incarnation()))
+                    == expected.host_registration
+                && world.get::<bevy_ui::Node>(entity).map(|node| node.display) == fact.display
+        })
+    }
+
+    fn retain_related_protected_drift(&mut self, world: &World) {
+        let Some(expected) = &self.related_protected else {
+            return;
+        };
+        self.cleanup_settlement_permanent_pending = Some(Box::new(
+            CleanupSettlementPermanentCause::RelatedProtectedPartition {
+                expected: expected.clone(),
+                targets: self
+                    .obligations
+                    .iter()
+                    .map(CleanupObligation::entity)
+                    .collect(),
+            },
+        ));
+        self.retain_cleanup_settlement_permanent_evidence(world);
+    }
+
+    fn current_focus_closure(&self, world: &World, closure: &[Entity]) -> Vec<Entity> {
+        let escaped = self
+            .obligations
+            .iter()
+            .filter_map(|obligation| match &obligation.identity {
+                CleanupTargetIdentity::ContainedContent { entity, root, .. }
+                    if !contained_target_is_inside(world, *entity, root.entity()) =>
+                {
+                    Some(*entity)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        closure
+            .iter()
+            .copied()
+            .filter(|entity| !escaped.contains(entity))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7317,13 +7629,17 @@ pub(crate) struct FrozenCleanupTerminalProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FrozenCleanupTerminalAuthority {
     Absent,
+    Contained {
+        lease: crate::registry::ContainedResidualLeaseIdentity,
+        record: crate::registry::ContainedResidualRecord,
+    },
     Quarantine(ExactRegistryClaim),
     Unresolved(ExactRegistryClaim),
     AuthorityLost {
         id: ResidualLeaseId,
         generation: u64,
         operation_sequence: u64,
-        former_claim: ExactRegistryClaim,
+        source_identity: CleanupTargetIdentity,
     },
 }
 
@@ -7916,7 +8232,7 @@ fn freeze_cleanup_terminal_projection(
 ) -> Option<FrozenCleanupTerminalProjection> {
     let registry = world.get_resource::<RouteEntityRegistry>()?;
     let table = world.get_resource::<QuarantineLeaseTable>()?;
-    let entity = obligation.claim.entity();
+    let entity = obligation.entity();
     let observed = FrozenPostCommitObservedEntity::observe(world, &registry, entity);
     let authority = match disposition {
         CleanupDisposition::Removed
@@ -7934,6 +8250,16 @@ fn freeze_cleanup_terminal_projection(
                 FrozenCleanupTerminalAuthority::Quarantine(record.claim())
             } else if let Some(record) = table.unresolved_record(entity) {
                 FrozenCleanupTerminalAuthority::Unresolved(record.claim())
+            } else if let Some((lease, record)) = table.contained_record(entity) {
+                if record.fact.identity != obligation.identity
+                    || record.fact.receipt_binding != receipt_binding
+                {
+                    return None;
+                }
+                FrozenCleanupTerminalAuthority::Contained {
+                    lease,
+                    record: record.clone(),
+                }
             } else {
                 return None;
             }
@@ -7944,7 +8270,7 @@ fn freeze_cleanup_terminal_projection(
                 id: tombstone.id(),
                 generation: tombstone.generation(),
                 operation_sequence: tombstone.operation_sequence(),
-                former_claim: tombstone.former_claim().clone(),
+                source_identity: tombstone.source_identity().clone(),
             }
         }
     };
@@ -7982,6 +8308,9 @@ fn cleanup_terminal_authority_is_current(
         FrozenCleanupTerminalAuthority::Absent => {
             world.get_entity(terminal.entity).is_err() && registry.record(terminal.entity).is_none()
         }
+        FrozenCleanupTerminalAuthority::Contained { lease, record } => table
+            .contained_record(terminal.entity)
+            .is_some_and(|(current_lease, current)| current_lease == *lease && current == record),
         FrozenCleanupTerminalAuthority::Quarantine(claim) => table
             .record(terminal.entity)
             .is_some_and(|record| record.claim() == *claim),
@@ -7992,14 +8321,14 @@ fn cleanup_terminal_authority_is_current(
             id,
             generation,
             operation_sequence,
-            former_claim,
+            source_identity,
         } => table
             .authority_lost_tombstone(terminal.entity)
             .is_some_and(|tombstone| {
                 tombstone.id() == *id
                     && tombstone.generation() == *generation
                     && tombstone.operation_sequence() == *operation_sequence
-                    && tombstone.former_claim() == former_claim
+                    && tombstone.source_identity() == source_identity
             }),
     }
 }
@@ -8008,7 +8337,7 @@ fn cleanup_terminal_authority_is_current(
 pub(crate) struct FrozenPostCommitAuthorityTarget {
     index: usize,
     entity: Entity,
-    claim: ExactRegistryClaim,
+    identity: CleanupTargetIdentity,
     obligation_binding: u64,
     physical_source_binding: u64,
     disposition: CleanupDisposition,
@@ -8041,8 +8370,8 @@ impl FrozenPostCommitAuthorityTarget {
         self.top_slot_dependency
     }
 
-    pub(crate) const fn claim(&self) -> &ExactRegistryClaim {
-        &self.claim
+    pub(crate) fn registered_claim(&self) -> Option<&ExactRegistryClaim> {
+        self.identity.registered()
     }
 }
 
@@ -8101,7 +8430,7 @@ impl FrozenPostCommitAuthorityPartition {
                 return false;
             };
             if receipt.observed
-                || obligation.claim != target.claim
+                || obligation.identity != target.identity
                 || cleanup_obligation_binding(obligation) != target.obligation_binding
                 || receipt.ledger_domain != ledger.ledger_domain
                 || receipt.obligation != target.index
@@ -8285,20 +8614,20 @@ enum TargetPreparationPermanentSettlementExpectation {
     },
     ExactObligation {
         index: usize,
-        claim: ExactRegistryClaim,
+        identity: CleanupTargetIdentity,
         expected_parent: Entity,
     },
     VacantReceiptSlot {
         index: usize,
-        claim: ExactRegistryClaim,
+        identity: CleanupTargetIdentity,
     },
     ExactRegistryRetirement {
         index: usize,
-        claim: ExactRegistryClaim,
+        identity: CleanupTargetIdentity,
     },
     RemovableObligation {
         index: usize,
-        claim: ExactRegistryClaim,
+        identity: CleanupTargetIdentity,
         expected_parent: Option<Entity>,
         expected_children: Vec<Entity>,
     },
@@ -8466,8 +8795,290 @@ struct PreparedTargetPreparationPermanentRemoval {
     entity: Entity,
     expected_parent: Option<Entity>,
     children_before: Vec<Entity>,
-    retirement: PreparedExactRegistryRetirement,
+    retirement: Option<PreparedExactRegistryRetirement>,
     receipt: PreparedCleanupReceiptBatch,
+}
+
+// This plan retains expectations, never a World-validity result. Every physical
+// write is followed by a fresh comparison of its complete remaining graph.
+struct PreparedCleanupRemovalPlan {
+    targets: Vec<PreparedCleanupRemovalTarget>,
+    entities: HashMap<Entity, usize>,
+    order: Vec<usize>,
+    sources: Vec<(ExactRegistryClaim, ExactRegistryClaim, Vec<usize>)>,
+    focus: HashSet<Entity>,
+    contained_focus_roots: HashMap<Entity, Entity>,
+}
+
+struct PreparedCleanupRemovalTarget {
+    index: usize,
+    entity: Entity,
+    absent: bool,
+    parent: Option<Entity>,
+    children: HashSet<Entity>,
+    normalized_manifest: Option<ComponentManifest>,
+    receipt: Option<PreparedCleanupReceiptBatch>,
+}
+
+impl PreparedCleanupRemovalPlan {
+    fn prepare(
+        world: &World,
+        ledger: &CleanupLedger,
+        attempt: &CleanupAttempt,
+        focus: &[Entity],
+    ) -> Option<Self> {
+        let mut targets = Vec::new();
+        targets.try_reserve_exact(attempt.evidence.len()).ok()?;
+        let mut entities = HashMap::new();
+        entities.try_reserve(attempt.evidence.len()).ok()?;
+        let mut sources: Vec<(ExactRegistryClaim, ExactRegistryClaim, Vec<usize>)> = Vec::new();
+        for (index, evidence) in &attempt.evidence {
+            let obligation = &ledger.obligations[*index];
+            let (absent, parent, normalized_manifest, disposition) = match evidence {
+                CleanupEvidence::AlreadyAbsent => {
+                    (true, None, None, CleanupDisposition::AlreadyAbsent)
+                }
+                CleanupEvidence::Exact {
+                    actual_parent,
+                    normalized_manifest,
+                    ..
+                } => (
+                    false,
+                    *actual_parent,
+                    obligation
+                        .identity
+                        .registered()
+                        .map(|_| normalized_manifest.clone()),
+                    if *actual_parent == Some(obligation.expected_parent) {
+                        CleanupDisposition::Removed
+                    } else {
+                        CleanupDisposition::RemovedDetached
+                    },
+                ),
+                _ => return None,
+            };
+            let row = targets.len();
+            if entities.insert(obligation.entity(), row).is_some() {
+                return None;
+            }
+            if let CleanupTargetIdentity::ContainedContent { root, shell, .. } =
+                &obligation.identity
+            {
+                if let Some((_, _, members)) =
+                    sources.iter_mut().find(|(r, s, _)| r == root && s == shell)
+                {
+                    members.push(row);
+                } else {
+                    sources.push((root.clone(), shell.clone(), vec![row]));
+                }
+            }
+            let receipt = ledger.prepare_receipt_batch(
+                attempt,
+                vec![CleanupReceipt::new(
+                    ledger.ledger_domain,
+                    attempt.revision,
+                    *index,
+                    disposition,
+                    obligation,
+                )],
+            )?;
+            targets.push(PreparedCleanupRemovalTarget {
+                index: *index,
+                entity: obligation.entity(),
+                absent,
+                parent,
+                children: if absent {
+                    HashSet::new()
+                } else {
+                    observed_children(world, obligation.entity())
+                        .into_iter()
+                        .collect()
+                },
+                normalized_manifest,
+                receipt: Some(receipt),
+            });
+        }
+        if targets.iter().any(|target| {
+            target
+                .children
+                .iter()
+                .any(|child| entities.get(child).is_none_or(|row| targets[*row].absent))
+        }) {
+            return None;
+        }
+        // Accepted roles exclude foreign descendants. Use actual direct edges,
+        // not the original expected-parent ordering, for non-recursive removal.
+        let mut depths = Vec::new();
+        depths.try_reserve_exact(targets.len()).ok()?;
+        for (row, target) in targets.iter().enumerate() {
+            let mut parent = target.parent;
+            let mut depth = 0usize;
+            while let Some(next) = parent.and_then(|entity| entities.get(&entity).copied()) {
+                depth += 1;
+                if depth > targets.len() {
+                    return None;
+                }
+                parent = targets[next].parent;
+            }
+            depths.push((row, depth));
+        }
+        depths.sort_by_key(|(row, depth)| {
+            (std::cmp::Reverse(*depth), targets[*row].entity.to_bits())
+        });
+        let order = depths.into_iter().map(|(row, _)| row).collect();
+        let contained_focus_roots = ledger
+            .obligations
+            .iter()
+            .filter_map(|obligation| {
+                if let CleanupTargetIdentity::ContainedContent { entity, root, .. } =
+                    &obligation.identity
+                {
+                    Some((*entity, root.entity()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Some(Self {
+            targets,
+            entities,
+            order,
+            sources,
+            focus: focus.iter().copied().collect(),
+            contained_focus_roots,
+        })
+    }
+
+    fn targets_are_current(&self, world: &World, ledger: &CleanupLedger) -> bool {
+        let registry = world.resource::<RouteEntityRegistry>();
+        let table = world.get_resource::<QuarantineLeaseTable>();
+        for (root, shell, members) in &self.sources {
+            if members.iter().any(|row| {
+                let target = &self.targets[*row];
+                !target.absent && ledger.receipts[target.index].is_none()
+            }) && (!contained_source_is_current(world, root, shell)
+                || !current_contained_target(world, root.entity(), root.entity(), shell.entity()))
+            {
+                return false;
+            }
+        }
+        let relationship_components = [
+            world.components().component_id::<ChildOf>(),
+            world.components().component_id::<Children>(),
+        ];
+        for target in &self.targets {
+            let obligation = &ledger.obligations[target.index];
+            if ledger.receipts[target.index].is_some() {
+                if world.get_entity(target.entity).is_ok()
+                    || registry.record(target.entity).is_some()
+                {
+                    return false;
+                }
+                continue;
+            }
+            if target.absent {
+                if world.get_entity(target.entity).is_ok()
+                    || registry.record(target.entity).is_some_and(|record| {
+                        obligation.identity.registered() != Some(&record.claim())
+                    })
+                {
+                    return false;
+                }
+                continue;
+            }
+            if world.get_entity(target.entity).is_err()
+                || world.get::<ChildOf>(target.entity).map(ChildOf::parent) != target.parent
+            {
+                return false;
+            }
+            let expected_children = target
+                .children
+                .iter()
+                .filter(|child| {
+                    self.entities
+                        .get(child)
+                        .is_none_or(|row| ledger.receipts[self.targets[*row].index].is_none())
+                })
+                .count();
+            let children = world.get::<Children>(target.entity);
+            if children.map_or(0, |children| children.len()) != expected_children
+                || children
+                    .into_iter()
+                    .flat_map(|children| children.iter())
+                    .any(|child| {
+                        !target.children.contains(child)
+                            || self.entities.get(child).is_some_and(|row| {
+                                ledger.receipts[self.targets[*row].index].is_some()
+                            })
+                    })
+            {
+                return false;
+            }
+            match &obligation.identity {
+                CleanupTargetIdentity::Registered(claim) => {
+                    if registry
+                        .record(target.entity)
+                        .is_none_or(|record| record.claim() != *claim)
+                        || !registered_cleanup_physical_claim_is_compatible(
+                            world, obligation, claim,
+                        )
+                    {
+                        return false;
+                    }
+                    let Some(actual) = ComponentManifest::from_world(world, target.entity) else {
+                        return false;
+                    };
+                    let Some(expected) = &target.normalized_manifest else {
+                        return false;
+                    };
+                    if !actual
+                        .component_ids()
+                        .iter()
+                        .filter(|component| !relationship_components.contains(&Some(**component)))
+                        .eq(expected.component_ids().iter())
+                    {
+                        return false;
+                    }
+                }
+                CleanupTargetIdentity::ContainedContent { .. } => {
+                    if registry.record(target.entity).is_some()
+                        || table.is_some_and(|table| {
+                            table.record(target.entity).is_some()
+                                || table.unresolved_record(target.entity).is_some()
+                        })
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn current_focus_targets(&self, world: &World) -> Vec<Entity> {
+        let mut targets = Vec::with_capacity(2);
+        for entity in [
+            world.get_resource::<InputFocus>().and_then(InputFocus::get),
+            world
+                .get_resource::<RouteFocusState>()
+                .and_then(RouteFocusState::focused),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !self.focus.contains(&entity) || targets.contains(&entity) {
+                continue;
+            }
+            let escaped = self
+                .contained_focus_roots
+                .get(&entity)
+                .is_some_and(|root| !contained_target_is_inside(world, entity, *root));
+            if !escaped {
+                targets.push(entity);
+            }
+        }
+        targets
+    }
 }
 
 struct PreparedFailureCleanupRemoval {
@@ -8490,14 +9101,20 @@ struct PreparedFailureCleanupMountParentExchanges {
 }
 
 impl PreparedTargetPreparationPermanentRemoval {
-    fn is_current(&self, world: &World, claim: &ExactRegistryClaim, completed: &[Entity]) -> bool {
-        world
-            .resource::<RouteEntityRegistry>()
-            .record(self.entity)
-            .is_some_and(|record| record.claim() == *claim)
-            && world.get::<ChildOf>(self.entity).map(ChildOf::parent) == self.expected_parent
+    fn is_current(
+        &self,
+        world: &World,
+        obligation: &CleanupObligation,
+        completed: &[Entity],
+    ) -> bool {
+        obligation.identity.registered().is_none_or(|claim| {
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(self.entity)
+                .is_some_and(|record| record.claim() == *claim)
+        }) && world.get::<ChildOf>(self.entity).map(ChildOf::parent) == self.expected_parent
             && children_match_after_removals(world, self.entity, &self.children_before, completed)
-            && cleanup_claim_has_exact_authority(world, claim)
+            && cleanup_obligation_has_exact_authority(world, obligation)
     }
 }
 
@@ -9101,7 +9718,7 @@ impl CleanupLedger {
         let targets = self
             .obligations
             .iter()
-            .map(|obligation| obligation.claim.entity())
+            .map(|obligation| obligation.entity())
             .collect::<Vec<_>>();
         let mut roots = targets.clone();
         roots.push(host.host);
@@ -9114,11 +9731,18 @@ impl CleanupLedger {
             .iter()
             .enumerate()
             .map(|(index, obligation)| {
-                world.get_entity(obligation.claim.entity()).is_err()
-                    || (registry
-                        .record(obligation.claim.entity())
-                        .is_some_and(|record| record.claim() == obligation.claim)
-                        && terminal_unresolved_root_is_inert(world, &obligation.claim, false))
+                world.get_entity(obligation.entity()).is_err()
+                    || match &obligation.identity {
+                        CleanupTargetIdentity::Registered(claim) => {
+                            registry
+                                .record(obligation.entity())
+                                .is_some_and(|record| record.claim() == *claim)
+                                && terminal_unresolved_root_is_inert(world, claim, false)
+                        }
+                        identity @ CleanupTargetIdentity::ContainedContent { .. } => {
+                            contained_terminal_scope_is_current(world, identity)
+                        }
+                    }
                     || self
                         .back_no_target_authority_partition
                         .as_ref()
@@ -9575,6 +10199,7 @@ impl CleanupLedger {
             issued_attempt: None,
             completion_digest,
             quarantine_event_observed: false,
+            related_protected: None,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
             back_no_target_authority_partition: None,
@@ -9611,6 +10236,7 @@ impl CleanupLedger {
             issued_attempt: None,
             completion_digest: Some(canonical_zero_completion_digest()),
             quarantine_event_observed: false,
+            related_protected: None,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
             back_no_target_authority_partition: None,
@@ -9891,7 +10517,9 @@ impl CleanupLedger {
     }
 
     pub(crate) fn exact_claims(&self) -> impl Iterator<Item = &ExactRegistryClaim> {
-        self.obligations.iter().map(|obligation| &obligation.claim)
+        self.obligations
+            .iter()
+            .filter_map(|obligation| obligation.identity.registered())
     }
 
     pub(crate) fn cleanup_settlement_permanent_evidence(
@@ -10171,12 +10799,12 @@ impl CleanupLedger {
         let top_slot_claim_count = self
             .obligations
             .iter()
-            .filter(|obligation| obligation.claim == *edge.top_slot_claim)
+            .filter(|obligation| obligation.identity.registered() == Some(edge.top_slot_claim))
             .count();
         let host_obligation_count = self
             .obligations
             .iter()
-            .filter(|obligation| obligation.claim.entity() == edge.host)
+            .filter(|obligation| obligation.entity() == edge.host)
             .count();
         let host_children = observed_children(world, edge.host);
         let top_slot_parent = world.get::<ChildOf>(edge.top_slot).map(ChildOf::parent);
@@ -10254,7 +10882,9 @@ impl CleanupLedger {
                             },
                             TargetPreparationPermanentSettlementExpectation::ExactObligation {
                                 index: *index,
-                                claim: edge.top_slot_claim.clone(),
+                                identity: CleanupTargetIdentity::Registered(
+                                    edge.top_slot_claim.clone(),
+                                ),
                                 expected_parent: edge.host,
                             },
                             TargetPreparationPermanentSettlementObservation::Obligation {
@@ -10265,7 +10895,7 @@ impl CleanupLedger {
                     ),
                 );
             };
-            let authority_exact = cleanup_claim_has_exact_authority(world, &obligation.claim);
+            let authority_exact = cleanup_obligation_has_exact_authority(world, obligation);
             let CleanupEvidence::Exact {
                 actual_parent,
                 foreign_descendants,
@@ -10281,11 +10911,11 @@ impl CleanupLedger {
                         Self::target_preparation_permanent_boundary(
                             TargetPreparationPermanentSettlementFailureStage::ObligationPreflight {
                                 index: *index,
-                                entity: obligation.claim.entity(),
+                                entity: obligation.entity(),
                             },
                             TargetPreparationPermanentSettlementExpectation::ExactObligation {
                                 index: *index,
-                                claim: obligation.claim.clone(),
+                                identity: obligation.identity.clone(),
                                 expected_parent: obligation.expected_parent,
                             },
                             TargetPreparationPermanentSettlementObservation::Obligation {
@@ -10309,11 +10939,11 @@ impl CleanupLedger {
                         Self::target_preparation_permanent_boundary(
                             TargetPreparationPermanentSettlementFailureStage::ObligationPreflight {
                                 index: *index,
-                                entity: obligation.claim.entity(),
+                                entity: obligation.entity(),
                             },
                             TargetPreparationPermanentSettlementExpectation::ExactObligation {
                                 index: *index,
-                                claim: obligation.claim.clone(),
+                                identity: obligation.identity.clone(),
                                 expected_parent: obligation.expected_parent,
                             },
                             TargetPreparationPermanentSettlementObservation::Obligation {
@@ -10346,35 +10976,34 @@ impl CleanupLedger {
                         Self::target_preparation_permanent_boundary(
                             TargetPreparationPermanentSettlementFailureStage::ReceiptPreparation {
                                 index: *index,
-                                entity: obligation.claim.entity(),
+                                entity: obligation.entity(),
                             },
                             TargetPreparationPermanentSettlementExpectation::VacantReceiptSlot {
                                 index: *index,
-                                claim: obligation.claim.clone(),
+                                identity: obligation.identity.clone(),
                             },
                             self.target_preparation_permanent_receipt_slot_observation(*index),
                         ),
                     )
                 })?;
-            let retirement = prepare_exact_registry_retirement(
-                world.resource::<RouteEntityRegistry>(),
-                vec![obligation.claim.clone()],
-            )
+            let retirement = obligation.identity.registered().map(|claim| prepare_exact_registry_retirement(
+                world.resource::<RouteEntityRegistry>(), vec![claim.clone()],
+            )).transpose()
             .map_err(|_| {
                 TargetPreparationPermanentSettlementError::SettlementRejected(
                     Self::target_preparation_permanent_boundary(
                         TargetPreparationPermanentSettlementFailureStage::RegistryRetirementPreparation {
                             index: *index,
-                            entity: obligation.claim.entity(),
+                            entity: obligation.entity(),
                         },
                         TargetPreparationPermanentSettlementExpectation::ExactRegistryRetirement {
                             index: *index,
-                            claim: obligation.claim.clone(),
+                            identity: obligation.identity.clone(),
                         },
                         TargetPreparationPermanentSettlementObservation::RegistryRetirementRejected {
                             observed_claim: world
                                 .resource::<RouteEntityRegistry>()
-                                .record(obligation.claim.entity())
+                                .record(obligation.entity())
                                 .map(|record| record.claim()),
                         },
                     ),
@@ -10382,13 +11011,13 @@ impl CleanupLedger {
             })?;
             removals.push(PreparedTargetPreparationPermanentRemoval {
                 index: *index,
-                entity: obligation.claim.entity(),
-                expected_parent: if obligation.claim == *edge.top_slot_claim {
+                entity: obligation.entity(),
+                expected_parent: if obligation.identity.registered() == Some(edge.top_slot_claim) {
                     None
                 } else {
                     *actual_parent
                 },
-                children_before: observed_children(world, obligation.claim.entity()),
+                children_before: observed_children(world, obligation.entity()),
                 retirement,
                 receipt,
             });
@@ -10432,7 +11061,9 @@ impl CleanupLedger {
                             },
                             TargetPreparationPermanentSettlementExpectation::RemovableObligation {
                                 index: removal.index,
-                                claim: edge.top_slot_claim.clone(),
+                                identity: CleanupTargetIdentity::Registered(
+                                    edge.top_slot_claim.clone(),
+                                ),
                                 expected_parent: removal.expected_parent,
                                 expected_children: removal.children_before.clone(),
                             },
@@ -10447,7 +11078,7 @@ impl CleanupLedger {
                     ),
                 );
             };
-            if !removal.is_current(world, &obligation.claim, &settled) {
+            if !removal.is_current(world, obligation, &settled) {
                 return Err(
                     TargetPreparationPermanentSettlementError::SettlementRejected(
                         target_preparation_permanent_removal_evidence(
@@ -10457,7 +11088,7 @@ impl CleanupLedger {
                                 entity: removal.entity,
                             },
                             removal.index,
-                            &obligation.claim,
+                            obligation,
                             removal.expected_parent,
                             &removal.children_before,
                         ),
@@ -10474,7 +11105,7 @@ impl CleanupLedger {
                                 entity: removal.entity,
                             },
                             removal.index,
-                            &obligation.claim,
+                            obligation,
                             removal.expected_parent,
                             &removal.children_before,
                         ),
@@ -10495,10 +11126,12 @@ impl CleanupLedger {
             )
             .map_err(TargetPreparationPermanentSettlementError::PostWriteRefreeze)?;
 
-            apply_prepared_exact_registry_retirement(
-                &mut world.resource_mut::<RouteEntityRegistry>(),
-                removal.retirement,
-            );
+            if let Some(retirement) = removal.retirement {
+                apply_prepared_exact_registry_retirement(
+                    &mut world.resource_mut::<RouteEntityRegistry>(),
+                    retirement,
+                );
+            }
             self.commit_receipt_batch(removal.receipt);
             settled.push(removal.entity);
             refreeze(
@@ -10700,6 +11333,15 @@ impl CleanupLedger {
             self.issued_attempt = None;
             return false;
         }
+        if !self.prepare_related_protected(world) {
+            self.issued_attempt = None;
+            return false;
+        }
+        if !self.related_protected_is_current(world) {
+            self.retain_related_protected_drift(world);
+            self.issued_attempt = None;
+            return false;
+        }
         let current_evidence = collect_evidence(world, &self.obligations, &self.receipts);
         if current_evidence != attempt.evidence
             || current_evidence
@@ -10742,7 +11384,7 @@ impl CleanupLedger {
             return self.completion_digest.is_some();
         }
 
-        release_cleanup_focus(world, &focus_closure);
+        release_cleanup_focus(world, &self.current_focus_closure(world, &focus_closure));
 
         if let Some(disposition) = inherited_quarantine
             .or_else(|| quarantine_disposition(&attempt.evidence, &self.obligations))
@@ -10766,7 +11408,7 @@ impl CleanupLedger {
                 self.issued_attempt = None;
                 return false;
             }
-            if !focus_is_released(world, &focus_closure) {
+            if !focus_is_released(world, &self.current_focus_closure(world, &focus_closure)) {
                 self.issued_attempt = None;
                 return false;
             }
@@ -10783,76 +11425,64 @@ impl CleanupLedger {
             return false;
         }
 
-        for (index, planned) in &attempt.evidence {
-            if self.receipts[*index].is_some() {
-                continue;
-            }
-            let current = classify_obligation(world, &self.obligations, &self.receipts, *index);
-            if &current != planned {
-                self.issued_attempt = None;
-                return false;
-            }
-            let disposition = match current {
-                CleanupEvidence::AlreadyAbsent => {
-                    let registry_has_exact = world
-                        .resource::<RouteEntityRegistry>()
-                        .record(self.obligations[*index].claim.entity())
-                        .is_some_and(|record| record.claim() == self.obligations[*index].claim);
-                    if registry_has_exact
-                        && !world
-                            .resource_mut::<RouteEntityRegistry>()
-                            .remove_exact(&self.obligations[*index].claim)
-                    {
-                        self.issued_attempt = None;
-                        return false;
-                    }
-                    CleanupDisposition::AlreadyAbsent
+        let Some(mut plan) =
+            PreparedCleanupRemovalPlan::prepare(world, self, &attempt, &focus_closure)
+        else {
+            self.issued_attempt = None;
+            return false;
+        };
+        if !self.related_protected_is_current(world) {
+            self.retain_related_protected_drift(world);
+            self.issued_attempt = None;
+            return false;
+        }
+        if !plan.targets_are_current(world, self)
+            || !self.mount_parents_physical_match(world)
+            || !plan.current_focus_targets(world).is_empty()
+        {
+            self.issued_attempt = None;
+            return false;
+        }
+        for position in 0..plan.order.len() {
+            let row_index = plan.order[position];
+            let row = &plan.targets[row_index];
+            let index = row.index;
+            if !row.absent {
+                if !world.despawn(row.entity) {
+                    self.issued_attempt = None;
+                    return false;
                 }
-                CleanupEvidence::Exact { actual_parent, .. } => {
-                    if !world.despawn(self.obligations[*index].claim.entity()) {
-                        self.issued_attempt = None;
-                        return false;
-                    }
-                    world.flush();
-                    release_cleanup_focus(world, &focus_closure);
-                    if !world
+                world.flush();
+                release_cleanup_focus(world, &plan.current_focus_targets(world));
+            }
+            if let Some(claim) = self.obligations[index].identity.registered() {
+                let registry_has_exact = world
+                    .resource::<RouteEntityRegistry>()
+                    .record(claim.entity())
+                    .is_some_and(|record| record.claim() == *claim);
+                if (!row.absent || registry_has_exact)
+                    && !world
                         .resource_mut::<RouteEntityRegistry>()
-                        .remove_exact(&self.obligations[*index].claim)
-                    {
-                        self.issued_attempt = None;
-                        return false;
-                    }
-                    if actual_parent == Some(self.obligations[*index].expected_parent) {
-                        CleanupDisposition::Removed
-                    } else {
-                        CleanupDisposition::RemovedDetached
-                    }
+                        .remove_exact(claim)
+                {
+                    self.issued_attempt = None;
+                    return false;
                 }
-                CleanupEvidence::AuthorityLostResidual { .. } => unreachable!(
-                    "authority-lost evidence must use residual settlement before removal"
-                ),
-                CleanupEvidence::StaleClaim => unreachable!(),
-            };
-            let receipt = CleanupReceipt::new(
-                self.ledger_domain,
-                attempt.revision,
-                *index,
-                disposition,
-                &self.obligations[*index],
+            }
+            self.commit_receipt_batch(
+                plan.targets[row_index]
+                    .receipt
+                    .take()
+                    .expect("each prepared removal is consumed once"),
             );
-            if !self.accept_receipt(&attempt, receipt) {
+            if !self.related_protected_is_current(world) {
+                self.retain_related_protected_drift(world);
                 self.issued_attempt = None;
                 return false;
             }
-            let expected_remaining = attempt
-                .evidence
-                .iter()
-                .filter(|(remaining, _)| self.receipts[*remaining].is_none())
-                .cloned()
-                .collect::<Vec<_>>();
-            if !focus_is_released(world, &focus_closure)
+            if !plan.current_focus_targets(world).is_empty()
                 || !self.mount_parents_physical_match(world)
-                || collect_evidence(world, &self.obligations, &self.receipts) != expected_remaining
+                || !plan.targets_are_current(world, self)
             {
                 self.issued_attempt = None;
                 return false;
@@ -10862,7 +11492,7 @@ impl CleanupLedger {
             self.issued_attempt = None;
             return false;
         }
-        if !focus_is_released(world, &focus_closure) {
+        if !plan.current_focus_targets(world).is_empty() {
             self.issued_attempt = None;
             return false;
         }
@@ -10907,7 +11537,7 @@ impl CleanupLedger {
             self.failure_cleanup_partition = Some(partition);
             return None;
         };
-        let first_entity = self.obligations[*first_index].claim.entity();
+        let first_entity = self.obligations[*first_index].entity();
         if let Err(evidence) = partition.refreeze(
             world,
             current_source,
@@ -10920,7 +11550,7 @@ impl CleanupLedger {
         ) {
             return Some(self.retain_failure_cleanup_refreeze_stop(partition, evidence));
         }
-        release_cleanup_focus(world, focus_closure);
+        release_cleanup_focus(world, &self.current_focus_closure(world, focus_closure));
         let Some(mount_parent_exchanges) =
             self.prepare_failure_cleanup_mount_parent_exchanges(world)
         else {
@@ -10940,12 +11570,14 @@ impl CleanupLedger {
                 CleanupEvidence::AlreadyAbsent => {
                     let retirement = match world
                         .resource::<RouteEntityRegistry>()
-                        .record(obligation.claim.entity())
+                        .record(obligation.entity())
                     {
-                        Some(record) if record.claim() == obligation.claim => {
+                        Some(record)
+                            if obligation.identity.registered() == Some(&record.claim()) =>
+                        {
                             match prepare_exact_registry_retirement(
                                 world.resource::<RouteEntityRegistry>(),
-                                vec![obligation.claim.clone()],
+                                vec![record.claim()],
                             ) {
                                 Ok(retirement) => Some(retirement),
                                 Err(_) => {
@@ -10974,21 +11606,25 @@ impl CleanupLedger {
                     } else {
                         CleanupDisposition::RemovedDetached
                     };
-                    let retirement = match prepare_exact_registry_retirement(
-                        world.resource::<RouteEntityRegistry>(),
-                        vec![obligation.claim.clone()],
-                    ) {
-                        Ok(retirement) => retirement,
-                        Err(_) => {
-                            self.issued_attempt = None;
-                            self.failure_cleanup_partition = Some(partition);
-                            return Some(false);
+                    let retirement = if let Some(claim) = obligation.identity.registered() {
+                        match prepare_exact_registry_retirement(
+                            world.resource::<RouteEntityRegistry>(),
+                            vec![claim.clone()],
+                        ) {
+                            Ok(retirement) => Some(retirement),
+                            Err(_) => {
+                                self.issued_attempt = None;
+                                self.failure_cleanup_partition = Some(partition);
+                                return Some(false);
+                            }
                         }
+                    } else {
+                        None
                     };
                     (
                         FailureCleanupRemovalAction::Despawn,
                         disposition,
-                        Some(retirement),
+                        retirement,
                     )
                 }
                 CleanupEvidence::AuthorityLostResidual { .. } | CleanupEvidence::StaleClaim => {
@@ -11011,7 +11647,7 @@ impl CleanupLedger {
             };
             removals.push(PreparedFailureCleanupRemoval {
                 index: *index,
-                entity: obligation.claim.entity(),
+                entity: obligation.entity(),
                 action,
                 retirement,
                 receipt,
@@ -11147,7 +11783,7 @@ impl CleanupLedger {
         let index = self
             .obligations
             .iter()
-            .position(|obligation| obligation.claim == *claim)
+            .position(|obligation| obligation.identity.registered() == Some(claim))
             .ok_or(())?;
         let evidence = attempt
             .evidence
@@ -11267,8 +11903,8 @@ impl CleanupLedger {
         {
             return Err(AuthorityCleanupFailureKind::Partition);
         }
-        release_cleanup_focus(world, &focus_closure);
-        if !focus_is_released(world, &focus_closure) {
+        release_cleanup_focus(world, &self.current_focus_closure(world, &focus_closure));
+        if !focus_is_released(world, &self.current_focus_closure(world, &focus_closure)) {
             return Err(AuthorityCleanupFailureKind::Focus);
         }
 
@@ -11291,9 +11927,9 @@ impl CleanupLedger {
         while let Some(removal) = removals.next() {
             let completed_count = prepared.removal_order.len() - removals.len() - 1;
             let completed_before = &prepared.removal_order[..completed_count];
-            let claim = &self.obligations[removal.index].claim;
+            let entity = self.obligations[removal.index].entity();
             if !removal.is_current(world, &self.obligations, completed_before)
-                || !world.despawn(claim.entity())
+                || !world.despawn(entity)
             {
                 return Err(AuthorityCleanupFailureKind::RemovalPreflight);
             }
@@ -11305,15 +11941,15 @@ impl CleanupLedger {
                     retirement,
                 );
             }
-            let removed_is_terminal = world.get_entity(claim.entity()).is_err()
-                && !world
+            let removed_is_terminal = world.get_entity(entity).is_err()
+                && world
                     .resource::<RouteEntityRegistry>()
-                    .record(claim.entity())
-                    .is_some_and(|record| record.claim() == *claim);
+                    .record(entity)
+                    .is_none();
             if !removed_is_terminal {
                 return Err(AuthorityCleanupFailureKind::RemovalTerminal);
             }
-            release_cleanup_focus(world, &focus_closure);
+            release_cleanup_focus(world, &self.current_focus_closure(world, &focus_closure));
             self.commit_receipt_batch(removal.receipt);
             if self.back_no_target_authority_partition.is_some()
                 && !self.back_no_target_authority_partition_is_current(world)
@@ -11321,7 +11957,7 @@ impl CleanupLedger {
                 return Err(AuthorityCleanupFailureKind::Partition);
             }
             let completed_after = &prepared.removal_order[..=completed_count];
-            if !focus_is_released(world, &focus_closure)
+            if !focus_is_released(world, &self.current_focus_closure(world, &focus_closure))
                 || !removals
                     .as_slice()
                     .iter()
@@ -11336,7 +11972,7 @@ impl CleanupLedger {
                 return Err(AuthorityCleanupFailureKind::ResidualPreflight);
             }
             let indices = residual.indices;
-            release_cleanup_focus(world, &focus_closure);
+            release_cleanup_focus(world, &self.current_focus_closure(world, &focus_closure));
             residual.presentation.apply(world);
             apply_authority_registry_transfers(world, residual.transfers);
             self.commit_receipt_batch(residual.receipts);
@@ -11350,7 +11986,7 @@ impl CleanupLedger {
             {
                 return Err(AuthorityCleanupFailureKind::Partition);
             }
-            if !focus_is_released(world, &focus_closure) {
+            if !focus_is_released(world, &self.current_focus_closure(world, &focus_closure)) {
                 return Err(AuthorityCleanupFailureKind::ResidualFocus);
             }
         }
@@ -11419,7 +12055,7 @@ impl CleanupLedger {
             let verified_claims = dispositions
                 .iter()
                 .filter(|plan| plan.action == AuthoritySettlementAction::VerifiedResidual)
-                .map(|plan| self.obligations[plan.index].claim.clone())
+                .filter_map(|plan| self.obligations[plan.index].identity.registered().cloned())
                 .collect::<Vec<_>>();
             let pickable_repair =
                 PreparedAuthorityPickableRepair::prepare(world, verified_claims.clone())
@@ -11437,9 +12073,7 @@ impl CleanupLedger {
                         let evidence = self
                             .obligations
                             .get(index)
-                            .is_some_and(|obligation| {
-                                pickable_repair.repairs(obligation.claim.entity())
-                            })
+                            .is_some_and(|obligation| pickable_repair.repairs(obligation.entity()))
                             .then(|| {
                                 project_cleanup_evidence_after_pickable_repair(
                                     evidence.clone(),
@@ -11455,7 +12089,7 @@ impl CleanupLedger {
             let removal_entities = dispositions
                 .iter()
                 .filter(|plan| plan.action == AuthoritySettlementAction::Remove)
-                .map(|plan| self.obligations[plan.index].claim.entity())
+                .map(|plan| self.obligations[plan.index].entity())
                 .collect::<HashSet<_>>();
 
             let mut absent = Vec::new();
@@ -11491,18 +12125,25 @@ impl CleanupLedger {
                 )?;
                 let registry_exact = world
                     .resource::<RouteEntityRegistry>()
-                    .record(obligation.claim.entity())
-                    .is_some_and(|record| record.claim() == obligation.claim);
-                let retirement = registry_exact
-                    .then(|| {
+                    .record(obligation.entity())
+                    .is_some_and(|record| {
+                        obligation.identity.registered() == Some(&record.claim())
+                    });
+                let retirement = obligation
+                    .identity
+                    .registered()
+                    .filter(|_| registry_exact)
+                    .and_then(|claim| {
                         prepare_exact_registry_retirement(
                             world.resource::<RouteEntityRegistry>(),
-                            vec![obligation.claim.clone()],
+                            vec![claim.clone()],
                         )
                         .ok()
-                    })
-                    .flatten();
-                if plan.action == AuthoritySettlementAction::Remove && retirement.is_none() {
+                    });
+                if plan.action == AuthoritySettlementAction::Remove
+                    && obligation.identity.registered().is_some()
+                    && retirement.is_none()
+                {
                     return None;
                 }
                 let expected_parent = if plan.action == AuthoritySettlementAction::Remove {
@@ -11519,7 +12160,7 @@ impl CleanupLedger {
                 let prepared = PreparedAuthorityRemoval {
                     index: plan.index,
                     expected_parent,
-                    children_before: observed_children(world, obligation.claim.entity()),
+                    children_before: observed_children(world, obligation.entity()),
                     receipt,
                     retirement,
                 };
@@ -11533,7 +12174,7 @@ impl CleanupLedger {
             removed.sort_by_key(|plan| {
                 std::cmp::Reverse(authority_observed_depth(
                     world,
-                    self.obligations[plan.index].claim.entity(),
+                    self.obligations[plan.index].entity(),
                 ))
             });
             let mut removal_order = Vec::new();
@@ -11546,7 +12187,7 @@ impl CleanupLedger {
             removal_order.extend(
                 removed
                     .iter()
-                    .map(|removal| self.obligations[removal.index].claim.entity()),
+                    .map(|removal| self.obligations[removal.index].entity()),
             );
 
             let mut residuals = Vec::new();
@@ -11609,7 +12250,7 @@ impl CleanupLedger {
                                 && plan.action == AuthoritySettlementAction::VerifiedResidual
                         })
                     })
-                    .map(|index| self.obligations[*index].claim.clone())
+                    .filter_map(|index| self.obligations[*index].identity.registered().cloned())
                     .collect::<Vec<_>>();
                 let manifests = claims
                     .iter()
@@ -11645,6 +12286,18 @@ impl CleanupLedger {
                 } else {
                     publication_capacity.verified_id(verified_ordinal)
                 };
+                let verified_indices = indices
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        dispositions.iter().any(|plan| {
+                            plan.index == *index
+                                && plan.action == AuthoritySettlementAction::VerifiedResidual
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let contained =
+                    self.contained_residual_facts(attempt, &receipts, &verified_indices);
                 let transfers = prepare_authority_registry_transfers(
                     world,
                     &publication_capacity,
@@ -11652,9 +12305,26 @@ impl CleanupLedger {
                     &mut lost_offset,
                     claims,
                     manifests.clone(),
+                    contained,
                     lost,
                     quarantine_facts(&group_evidence),
                 )?;
+                let mut manifests = manifests;
+                for index in verified_indices {
+                    let obligation = &self.obligations[index];
+                    if obligation.identity.registered().is_none() {
+                        manifests.push((
+                            obligation.entity(),
+                            authority_projected_manifest(
+                                world,
+                                obligation.entity(),
+                                &host_edge,
+                                &removal_entities,
+                                &pickable_repair,
+                            )?,
+                        ));
+                    }
+                }
                 residuals.push(PreparedAuthorityResidualGroup {
                     indices,
                     manifests,
@@ -11672,7 +12342,7 @@ impl CleanupLedger {
                     .iter()
                     .map(|plan| {
                         let obligation = self.obligations.get(plan.index)?;
-                        let entity = obligation.claim.entity();
+                        let entity = obligation.entity();
                         let receipt_binding = receipt_binding(
                             self.ledger_domain,
                             attempt.revision,
@@ -11703,7 +12373,7 @@ impl CleanupLedger {
                                                 candidate.action
                                                     == AuthoritySettlementAction::VerifiedResidual
                                             })
-                                            .then_some(self.obligations[*index].claim.entity())
+                                            .then_some(self.obligations[*index].entity())
                                     })
                                     .collect::<Vec<_>>();
                                 lease_entities.sort_by_key(|entity| entity.to_bits());
@@ -11717,26 +12387,51 @@ impl CleanupLedger {
                                     authority_projected_children(world, entity, &removal_entities);
                                 let ownership_seal =
                                     world.get::<RouteOwnershipSeal>(entity).copied();
+                                let authority =
+                                    if let CleanupTargetIdentity::ContainedContent { .. } =
+                                        &obligation.identity
+                                    {
+                                        let record = residual
+                                            .transfers
+                                            .verified
+                                            .as_ref()?
+                                            .contained_records()
+                                            .iter()
+                                            .find(|record| {
+                                                record.fact.identity == obligation.identity
+                                            })?
+                                            .clone();
+                                        PreparedBackNoTargetAuthorityTerminalAuthority::Contained {
+                                            lease,
+                                            record,
+                                        }
+                                    } else if let CleanupTargetIdentity::Registered(claim) =
+                                        &obligation.identity
+                                    {
+                                        PreparedBackNoTargetAuthorityTerminalAuthority::Quarantine {
+                                            lease,
+                                            lease_entities,
+                                            owner: claim.owner().clone(),
+                                            seal: claim.seal(),
+                                            registered_manifest: world
+                                                .resource::<RouteEntityRegistry>()
+                                                .record(entity)?
+                                                .manifest()
+                                                .clone(),
+                                            manifest: manifest.clone(),
+                                        }
+                                    } else {
+                                        return None;
+                                    };
                                 (
                                     None,
                                     PreparedBackNoTargetAuthorityTerminalPresence::Retained {
                                         parent,
                                         children,
                                         ownership_seal,
-                                        manifest: manifest.clone(),
-                                    },
-                                    PreparedBackNoTargetAuthorityTerminalAuthority::Quarantine {
-                                        lease,
-                                        lease_entities,
-                                        owner: obligation.claim.owner().clone(),
-                                        seal: obligation.claim.seal(),
-                                        registered_manifest: world
-                                            .resource::<RouteEntityRegistry>()
-                                            .record(entity)?
-                                            .manifest()
-                                            .clone(),
                                         manifest,
                                     },
+                                    authority,
                                 )
                             }
                             AuthoritySettlementAction::LostResidual => {
@@ -11755,7 +12450,7 @@ impl CleanupLedger {
                                     || projection.obligation_binding()
                                         != cleanup_obligation_binding(obligation)
                                     || projection.terminal_receipt_binding() != receipt_binding
-                                    || projection.retired_claim() != &obligation.claim
+                                    || projection.source_identity() != &obligation.identity
                                 {
                                     return None;
                                 }
@@ -12004,16 +12699,18 @@ impl CleanupLedger {
                     entity_present: false,
                     ..
                 } => {
-                    let registry_has_exact = world
-                        .resource::<RouteEntityRegistry>()
-                        .record(self.obligations[*index].claim.entity())
-                        .is_some_and(|record| record.claim() == self.obligations[*index].claim);
-                    if registry_has_exact
-                        && !world
-                            .resource_mut::<RouteEntityRegistry>()
-                            .remove_exact(&self.obligations[*index].claim)
-                    {
-                        return false;
+                    if let Some(claim) = self.obligations[*index].identity.registered() {
+                        let registry_has_exact = world
+                            .resource::<RouteEntityRegistry>()
+                            .record(claim.entity())
+                            .is_some_and(|record| record.claim() == *claim);
+                        if registry_has_exact
+                            && !world
+                                .resource_mut::<RouteEntityRegistry>()
+                                .remove_exact(claim)
+                        {
+                            return false;
+                        }
                     }
                     let receipt = CleanupReceipt::new(
                         self.ledger_domain,
@@ -12054,9 +12751,9 @@ impl CleanupLedger {
                             self.obligations[*index].terminal_mode,
                             CleanupTerminalMode::ForceUnresolved
                                 | CleanupTerminalMode::AuthorityLost
-                        ) || !cleanup_claim_has_exact_authority(
+                        ) || !cleanup_obligation_has_exact_authority(
                             world,
-                            &self.obligations[*index].claim,
+                            &self.obligations[*index],
                         )
                     }
                     _ => false,
@@ -12078,11 +12775,11 @@ impl CleanupLedger {
             .collect::<Vec<_>>();
         let verified_claims = verified_indices
             .iter()
-            .map(|index| self.obligations[*index].claim.clone())
+            .filter_map(|index| self.obligations[*index].identity.registered().cloned())
             .collect::<Vec<_>>();
         let unresolved_claims = unresolved_indices
             .iter()
-            .map(|index| self.obligations[*index].claim.clone())
+            .filter_map(|index| self.obligations[*index].identity.registered().cloned())
             .collect::<Vec<_>>();
         let facts = quarantine_facts(&attempt.evidence);
         let focus_closure = quarantine_focus_closure(world, &attempt.evidence, &self.obligations);
@@ -12134,6 +12831,10 @@ impl CleanupLedger {
         ) else {
             return false;
         };
+        let verified_content =
+            self.contained_residual_facts(attempt, &quarantine_receipts, &verified_indices);
+        let unresolved_content =
+            self.contained_residual_facts(attempt, &quarantine_receipts, &unresolved_indices);
         let repair_supported = verified_claims.is_empty()
             || repair_missing_pickable_for_cleanup_quarantine(world, &verified_claims);
         let expected_remaining = attempt
@@ -12175,6 +12876,8 @@ impl CleanupLedger {
                 world,
                 verified_claims,
                 unresolved_claims,
+                verified_content,
+                unresolved_content,
                 lost_facts,
                 facts,
                 focus_closure.clone(),
@@ -12214,10 +12917,6 @@ impl CleanupLedger {
         }
         closure.sort_by_key(|entity| entity.to_bits());
         closure.dedup();
-        #[cfg(feature = "bsn")]
-        closure.retain(|entity| {
-            !crate::presentation::native_frame::is_escaped_cleanup_content(world, *entity)
-        });
         closure
     }
 
@@ -12230,7 +12929,7 @@ impl CleanupLedger {
         let mut roots = Vec::new();
         for index in indices {
             let obligation = self.obligations.get(*index)?;
-            let entity = obligation.claim.entity();
+            let entity = obligation.entity();
             if self
                 .receipts
                 .get(*index)
@@ -12239,10 +12938,10 @@ impl CleanupLedger {
             {
                 if table
                     .authority_lost_tombstone(entity)
-                    .is_some_and(|tombstone| tombstone.former_claim() == &obligation.claim)
-                    || table
-                        .unresolved_record(entity)
-                        .is_some_and(|record| record.claim() == obligation.claim)
+                    .is_some_and(|tombstone| tombstone.source_identity() == &obligation.identity)
+                    || table.unresolved_record(entity).is_some_and(|record| {
+                        obligation.identity.registered() == Some(&record.claim())
+                    })
                 {
                     // A lost tombstone is not current authority and therefore
                     // must not become a post-settlement focus root.
@@ -12250,24 +12949,38 @@ impl CleanupLedger {
                 }
                 return None;
             }
+            let CleanupTargetIdentity::Registered(claim) = &obligation.identity else {
+                let (_, record) = table.contained_record(entity)?;
+                let receipt = self.receipts.get(*index)?.as_ref()?;
+                if record.fact.identity != obligation.identity
+                    || record.fact.receipt_binding != receipt.binding
+                    || !contained_terminal_scope_is_current(world, &record.terminal_identity)
+                {
+                    return None;
+                }
+                // The exact root/shell obligations carry the focus boundary.
+                continue;
+            };
             let root = match (table.record(entity), table.unresolved_record(entity)) {
                 (Some(record), None)
-                    if record.owner() == obligation.claim.owner()
-                        && record.seal() == obligation.claim.seal()
+                    if record.owner() == claim.owner()
+                        && record.seal() == claim.seal()
                         && record.lifecycle() == EntityLifecycle::Quarantined =>
                 {
                     PostSettlementFocusRoot {
                         obligation: *index,
-                        source_claim: obligation.claim.clone(),
+                        source_claim: claim.clone(),
                         terminal_claim: record.claim(),
                         authority: PostSettlementFocusAuthority::Quarantine,
                         allow_missing_components: obligation.allow_missing_components,
                     }
                 }
-                (None, Some(record)) if record.claim() == obligation.claim => {
+                (None, Some(record))
+                    if obligation.identity.registered() == Some(&record.claim()) =>
+                {
                     PostSettlementFocusRoot {
                         obligation: *index,
-                        source_claim: obligation.claim.clone(),
+                        source_claim: claim.clone(),
                         terminal_claim: record.claim(),
                         authority: if obligation.terminal_mode == CleanupTerminalMode::AuthorityLost
                         {
@@ -12369,6 +13082,37 @@ impl CleanupLedger {
         Some(PreparedCleanupReceiptBatch { receipts })
     }
 
+    fn contained_residual_facts(
+        &self,
+        attempt: &CleanupAttempt,
+        receipts: &PreparedCleanupReceiptBatch,
+        indices: &[usize],
+    ) -> Vec<crate::registry::ContainedResidualFact> {
+        indices
+            .iter()
+            .filter_map(|index| {
+                let obligation = &self.obligations[*index];
+                if obligation.identity.registered().is_some() {
+                    return None;
+                }
+                let receipt = receipts
+                    .receipts
+                    .iter()
+                    .find(|receipt| receipt.obligation == *index)?;
+                Some(crate::registry::ContainedResidualFact {
+                    identity: obligation.identity.clone(),
+                    expected_parent: obligation.expected_parent,
+                    ledger_domain: self.ledger_domain,
+                    manifest_digest: self.manifest_digest,
+                    attempt_revision: attempt.revision,
+                    obligation: *index,
+                    obligation_binding: cleanup_obligation_binding(obligation),
+                    receipt_binding: receipt.binding,
+                })
+            })
+            .collect()
+    }
+
     fn prepare_authority_lost_projection(
         &self,
         world: &World,
@@ -12427,9 +13171,9 @@ impl CleanupLedger {
             }
             let observed_registry_claim = world
                 .resource::<RouteEntityRegistry>()
-                .record(obligation.claim.entity())
+                .record(obligation.entity())
                 .map(|record| record.claim())
-                .filter(|claim| *claim != obligation.claim);
+                .filter(|claim| obligation.identity.registered() != Some(claim));
             facts.push(AuthorityLostResidualProjectionFact {
                 ledger_domain: self.ledger_domain,
                 manifest_digest: self.manifest_digest,
@@ -12437,9 +13181,9 @@ impl CleanupLedger {
                 obligation: *index,
                 obligation_binding: cleanup_obligation_binding(obligation),
                 terminal_receipt_binding: receipt.binding,
-                retired_claim: obligation.claim.clone(),
+                retired_identity: obligation.identity.clone(),
                 frozen_expected_manifest: obligation.manifest.clone(),
-                observed_manifest: ComponentManifest::from_world(world, obligation.claim.entity()),
+                observed_manifest: ComponentManifest::from_world(world, obligation.entity()),
                 entity_present_at_receipt: *entity_present,
                 observed_registry_claim,
                 actual_parent_at_receipt: *actual_parent,
@@ -12481,7 +13225,7 @@ impl CleanupLedger {
     pub(crate) fn obligation_entities_for_test(&self) -> Vec<Entity> {
         self.obligations
             .iter()
-            .map(|obligation| obligation.claim.entity())
+            .map(|obligation| obligation.entity())
             .collect()
     }
 
@@ -12642,7 +13386,7 @@ impl CleanupLedger {
             return Err(PostCommitOriginalFreezeFailure::OrdinarySettlementRequired);
         }
         for (index, obligation) in self.obligations.iter().enumerate() {
-            let entity = obligation.claim.entity();
+            let entity = obligation.entity();
             immutable_entities.push(entity);
             let obligation_binding = cleanup_obligation_binding(obligation);
             match self.receipts[index].as_ref() {
@@ -12908,13 +13652,13 @@ impl CleanupLedger {
             .ok_or(PostCommitAuthoritySettlementFailure::ReceiptCommitRejected)?;
         let observed_claim = world
             .get_resource::<RouteEntityRegistry>()
-            .and_then(|registry| registry.record(obligation.claim.entity()))
+            .and_then(|registry| registry.record(obligation.entity()))
             .map(|record| record.claim());
         let retirement = match observed_claim {
-            Some(claim) if claim == obligation.claim => Some(
+            Some(claim) if obligation.identity.registered() == Some(&claim) => Some(
                 prepare_exact_registry_retirement(
                     world.resource::<RouteEntityRegistry>(),
-                    vec![obligation.claim.clone()],
+                    vec![claim],
                 )
                 .map_err(|_| PostCommitAuthoritySettlementFailure::PrewriteDrift)?,
             ),
@@ -12926,8 +13670,8 @@ impl CleanupLedger {
             disposition,
             CleanupDisposition::Removed | CleanupDisposition::RemovedDetached
         ) {
-            if !cleanup_claim_has_exact_authority(world, &obligation.claim)
-                || !world.despawn(obligation.claim.entity())
+            if !cleanup_obligation_has_exact_authority(world, obligation)
+                || !world.despawn(obligation.entity())
             {
                 self.issued_attempt = None;
                 return Err(PostCommitAuthoritySettlementFailure::PhysicalWriteRejected);
@@ -12936,16 +13680,21 @@ impl CleanupLedger {
             let Some(original_removed) = frozen.removed_entities_for_authority_refreeze(
                 world,
                 self,
-                Some(obligation.claim.entity()),
+                Some(obligation.entity()),
             ) else {
                 self.issued_attempt = None;
                 return Err(PostCommitAuthoritySettlementFailure::PostwriteDrift);
             };
-            if world.get_entity(obligation.claim.entity()).is_ok()
+            if world.get_entity(obligation.entity()).is_ok()
                 || world
                     .resource::<RouteEntityRegistry>()
-                    .record(obligation.claim.entity())
-                    .is_none_or(|record| record.claim() != obligation.claim)
+                    .record(obligation.entity())
+                    .is_some_and(|record| obligation.identity.registered() != Some(&record.claim()))
+                || (obligation.identity.registered().is_some()
+                    && world
+                        .resource::<RouteEntityRegistry>()
+                        .record(obligation.entity())
+                        .is_none())
                 || !authority_partition.refreeze(
                     world,
                     settled_authority,
@@ -12959,7 +13708,7 @@ impl CleanupLedger {
                 return Err(PostCommitAuthoritySettlementFailure::PostwriteDrift);
             }
         } else if *disposition == CleanupDisposition::AlreadyAbsent
-            && world.get_entity(obligation.claim.entity()).is_ok()
+            && world.get_entity(obligation.entity()).is_ok()
         {
             self.issued_attempt = None;
             return Err(PostCommitAuthoritySettlementFailure::PrewriteDrift);
@@ -12971,7 +13720,7 @@ impl CleanupLedger {
             );
             if world
                 .resource::<RouteEntityRegistry>()
-                .record(obligation.claim.entity())
+                .record(obligation.entity())
                 .is_some()
             {
                 self.issued_attempt = None;
@@ -13036,7 +13785,7 @@ impl PreparedPostCommitAuthorityLedger {
         let mut target_entities = manifest
             .obligations
             .iter()
-            .map(|obligation| obligation.claim.entity())
+            .map(|obligation| obligation.entity())
             .collect::<Vec<_>>();
         target_entities.sort_by_key(|entity| entity.to_bits());
         target_entities.dedup();
@@ -13083,25 +13832,23 @@ impl PreparedPostCommitAuthorityLedger {
                 return Err(PostCommitAuthorityFreezeFailure::Permanent(
                     PostCommitAuthorityFreezePermanentEvidence::ClassificationMismatch {
                         index,
-                        entity: obligation.claim.entity(),
+                        entity: obligation.entity(),
                     },
                 ));
             };
-            if obligation.claim.entity() == host.top_slot
-                && disposition == CleanupDisposition::Removed
-            {
+            if obligation.entity() == host.top_slot && disposition == CleanupDisposition::Removed {
                 // H is an explicit predecessor of A-top, so the top receipt is
                 // frozen against the authorized post-H detached projection.
                 disposition = CleanupDisposition::RemovedDetached;
             }
-            if world.get_entity(obligation.claim.entity()).is_ok()
+            if world.get_entity(obligation.entity()).is_ok()
                 && (!matches!(observed, CleanupEvidence::Exact { .. })
-                    || !cleanup_claim_has_exact_authority(world, &obligation.claim))
+                    || !cleanup_obligation_has_exact_authority(world, obligation))
             {
                 return Err(PostCommitAuthorityFreezeFailure::Permanent(
                     PostCommitAuthorityFreezePermanentEvidence::ExactAuthorityMismatch {
                         index,
-                        entity: obligation.claim.entity(),
+                        entity: obligation.entity(),
                     },
                 ));
             }
@@ -13120,14 +13867,14 @@ impl PreparedPostCommitAuthorityLedger {
                 return Err(PostCommitAuthorityFreezeFailure::Permanent(
                     PostCommitAuthorityFreezePermanentEvidence::ProtectedClosureMismatch {
                         index,
-                        entity: obligation.claim.entity(),
+                        entity: obligation.entity(),
                     },
                 ));
             }
             targets.push(FrozenPostCommitAuthorityTarget {
                 index,
-                entity: obligation.claim.entity(),
-                claim: obligation.claim.clone(),
+                entity: obligation.entity(),
+                identity: obligation.identity.clone(),
                 obligation_binding: cleanup_obligation_binding(obligation),
                 physical_source_binding: post_commit_physical_source_binding(
                     manifest_digest,
@@ -13136,7 +13883,7 @@ impl PreparedPostCommitAuthorityLedger {
                     disposition,
                 ),
                 disposition,
-                top_slot_dependency: obligation.claim.entity() == host.top_slot,
+                top_slot_dependency: obligation.entity() == host.top_slot,
                 terminal: None,
             });
         }
@@ -13519,7 +14266,7 @@ impl FrozenPostCommitAuthorityPartition {
                             && expected
                                 .registry_claim
                                 .as_ref()
-                                .is_none_or(|claim| claim == &candidate.claim)
+                                .is_none_or(|claim| candidate.identity.registered() == Some(claim))
                     }))
         };
         self.target_observed
@@ -13587,7 +14334,7 @@ impl CleanupLedger {
         }
         if self.receipts.get(target.index).is_none_or(Option::is_some)
             || self.obligations.get(target.index).is_none_or(|obligation| {
-                obligation.claim != target.claim
+                obligation.identity != target.identity
                     || cleanup_obligation_binding(obligation) != target.obligation_binding
             })
             || !original_freeze.terminals_are_current(world, original)
@@ -13689,10 +14436,10 @@ impl CleanupLedger {
             .and_then(|registry| registry.record(target.entity))
             .map(|record| record.claim());
         let retirement = match observed_claim {
-            Some(claim) if claim == target.claim => Some(
+            Some(claim) if target.identity.registered() == Some(&claim) => Some(
                 prepare_exact_registry_retirement(
                     world.resource::<RouteEntityRegistry>(),
-                    vec![target.claim.clone()],
+                    vec![claim],
                 )
                 .map_err(|_| PostCommitAuthoritySettlementFailure::PrewriteDrift)?,
             ),
@@ -13701,7 +14448,7 @@ impl CleanupLedger {
         };
 
         if world.get_entity(target.entity).is_ok() {
-            if !cleanup_claim_has_exact_authority(world, &target.claim)
+            if !cleanup_obligation_has_exact_authority(world, obligation)
                 || !world.despawn(target.entity)
             {
                 self.issued_attempt = None;
@@ -13844,6 +14591,7 @@ fn prepare_authority_registry_transfers(
     lost_offset: &mut usize,
     verified_claims: Vec<ExactRegistryClaim>,
     verified_manifests: Vec<(Entity, ComponentManifest)>,
+    contained: Vec<crate::registry::ContainedResidualFact>,
     lost_facts: PreparedAuthorityLostResidualProjection,
     facts: QuarantineFacts,
 ) -> Option<PreparedAuthorityRegistryTransfers> {
@@ -13861,12 +14609,12 @@ fn prepare_authority_registry_transfers(
                             verified_manifests,
                             facts.clone(),
                         );
-                        Some(
-                            prepare_verified_authority_cleanup_quarantine_transfer(
-                                &mut table, &registry, transfer, id,
-                            )
-                            .ok()?,
+                        let mut prepared = prepare_verified_authority_cleanup_quarantine_transfer(
+                            &mut table, &registry, transfer, id,
                         )
+                        .ok()?;
+                        prepared.attach_contained(&registry, contained).ok()?;
+                        Some(prepared)
                     };
                     let lost = if lost_facts.is_empty() {
                         None
@@ -14153,6 +14901,8 @@ fn prepare_cleanup_quarantine_transfers(
     verified_manifests: Vec<(Entity, ComponentManifest)>,
     unresolved_claims: Vec<ExactRegistryClaim>,
     unresolved_manifests: Vec<(Entity, ComponentManifest)>,
+    verified_content: Vec<crate::registry::ContainedResidualFact>,
+    unresolved_content: Vec<crate::registry::ContainedResidualFact>,
     lost_facts: PreparedAuthorityLostResidualProjection,
     facts: QuarantineFacts,
 ) -> Option<PreparedCleanupQuarantineTransfers> {
@@ -14168,26 +14918,30 @@ fn prepare_cleanup_quarantine_transfers(
                             verified_manifests,
                             facts.clone(),
                         );
-                        Some(
-                            prepare_verified_cleanup_quarantine_transfer(
-                                &mut table, &registry, transfer,
-                            )
-                            .ok()?,
+                        let mut prepared = prepare_verified_cleanup_quarantine_transfer(
+                            &mut table, &registry, transfer,
                         )
+                        .ok()?;
+                        prepared
+                            .attach_contained(&registry, verified_content)
+                            .ok()?;
+                        Some(prepared)
                     };
                     let unresolved = if unresolved_claims.is_empty() {
                         None
                     } else {
-                        Some(
-                            prepare_unresolved_residual_transfer(
-                                &mut table,
-                                &registry,
-                                unresolved_claims,
-                                unresolved_manifests,
-                                facts.clone(),
-                            )
-                            .ok()?,
+                        let mut prepared = prepare_unresolved_residual_transfer(
+                            &mut table,
+                            &registry,
+                            unresolved_claims,
+                            unresolved_manifests,
+                            facts.clone(),
                         )
+                        .ok()?;
+                        prepared
+                            .attach_contained(&registry, unresolved_content)
+                            .ok()?;
+                        Some(prepared)
                     };
                     let lost = if lost_facts.is_empty() {
                         None
@@ -14245,6 +14999,8 @@ fn transfer_cleanup_quarantine(
     world: &mut World,
     verified_claims: Vec<ExactRegistryClaim>,
     unresolved_claims: Vec<ExactRegistryClaim>,
+    verified_content: Vec<crate::registry::ContainedResidualFact>,
+    unresolved_content: Vec<crate::registry::ContainedResidualFact>,
     lost_facts: PreparedAuthorityLostResidualProjection,
     facts: QuarantineFacts,
     focus_closure: Vec<Entity>,
@@ -14327,6 +15083,8 @@ fn transfer_cleanup_quarantine(
         verified_manifests,
         unresolved_claims,
         unresolved_manifests,
+        verified_content,
+        unresolved_content,
         lost_facts,
         facts,
     )?;
@@ -14607,16 +15365,6 @@ fn cleanup_authority_components_are_exact(
     seal: crate::registry::OwnershipSeal,
     lifecycle: EntityLifecycle,
 ) -> bool {
-    #[cfg(feature = "bsn")]
-    if let Some(content) =
-        world.get::<crate::presentation::native_frame::NativeCleanupContent>(entity)
-    {
-        if world.get::<ChildOf>(entity).map(ChildOf::parent) != Some(content.expected_parent)
-            || !crate::presentation::native_frame::cleanup_content_is_contained(world, entity)
-        {
-            return false;
-        }
-    }
     let seal_is_exact =
         world.get::<RouteOwnershipSeal>(entity) == Some(&RouteOwnershipSeal::new(seal));
     let lifecycle_is_exact = match owner {
@@ -14654,6 +15402,43 @@ fn terminal_quarantine_root_is_inert(world: &World, claim: &ExactRegistryClaim) 
         && world
             .get::<RouterInputBarrier>(claim.entity())
             .is_some_and(RouterInputBarrier::denies_all)
+}
+
+fn contained_terminal_scope_is_current(world: &World, identity: &CleanupTargetIdentity) -> bool {
+    let CleanupTargetIdentity::ContainedContent {
+        entity,
+        root,
+        shell,
+    } = identity
+    else {
+        return false;
+    };
+    #[cfg(feature = "bsn")]
+    {
+        crate::presentation::native_frame::current_containment(
+            world,
+            *entity,
+            root.entity(),
+            shell.entity(),
+        ) && crate::presentation::native_frame::content_scope_is_inert_for(world, root, shell)
+    }
+    #[cfg(not(feature = "bsn"))]
+    {
+        let _ = (world, entity, root, shell);
+        false
+    }
+}
+
+fn lost_terminal_scope_is_current(world: &World, identity: &CleanupTargetIdentity) -> bool {
+    match identity {
+        CleanupTargetIdentity::Registered(claim) => {
+            terminal_authority_lost_entity_is_inert(world, claim.entity())
+        }
+        CleanupTargetIdentity::ContainedContent { entity, root, .. } => {
+            !contained_target_is_inside(world, *entity, root.entity())
+                || contained_terminal_scope_is_current(world, identity)
+        }
+    }
 }
 
 fn terminal_authority_lost_entity_is_inert(world: &World, entity: Entity) -> bool {
@@ -14759,7 +15544,19 @@ pub(crate) fn failed_prepared_branch_roots_are_exact(
 }
 
 fn unresolved_obligation_is_isolated(world: &World, obligation: &CleanupObligation) -> bool {
-    let claim = &obligation.claim;
+    if let CleanupTargetIdentity::ContainedContent {
+        entity,
+        root,
+        shell,
+    } = &obligation.identity
+    {
+        return contained_source_is_current(world, root, shell)
+            && current_contained_target(world, *entity, root.entity(), shell.entity())
+            && terminal_unresolved_root_is_inert(world, shell, false);
+    }
+    let CleanupTargetIdentity::Registered(claim) = &obligation.identity else {
+        return false;
+    };
     let record_is_exact = world
         .get_resource::<RouteEntityRegistry>()
         .and_then(|registry| registry.record(claim.entity()))
@@ -15060,28 +15857,30 @@ fn target_preparation_permanent_removal_evidence(
     world: &World,
     stage: TargetPreparationPermanentSettlementFailureStage,
     index: usize,
-    claim: &ExactRegistryClaim,
+    obligation: &CleanupObligation,
     expected_parent: Option<Entity>,
     expected_children: &[Entity],
 ) -> TargetPreparationPermanentSettlementBoundaryEvidence {
     let observed_claim = world
         .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(claim.entity()))
+        .and_then(|registry| registry.record(obligation.entity()))
         .map(|record| record.claim());
     CleanupLedger::target_preparation_permanent_boundary(
         stage,
         TargetPreparationPermanentSettlementExpectation::RemovableObligation {
             index,
-            claim: claim.clone(),
+            identity: obligation.identity.clone(),
             expected_parent,
             expected_children: expected_children.to_vec(),
         },
         TargetPreparationPermanentSettlementObservation::Removal {
-            entity_exists: world.get_entity(claim.entity()).is_ok(),
+            entity_exists: world.get_entity(obligation.entity()).is_ok(),
             observed_claim,
-            parent: world.get::<ChildOf>(claim.entity()).map(ChildOf::parent),
-            children: observed_children(world, claim.entity()),
-            authority_exact: cleanup_claim_has_exact_authority(world, claim),
+            parent: world
+                .get::<ChildOf>(obligation.entity())
+                .map(ChildOf::parent),
+            children: observed_children(world, obligation.entity()),
+            authority_exact: cleanup_obligation_has_exact_authority(world, obligation),
         },
     )
 }
@@ -15124,6 +15923,177 @@ fn classify_obligation(
     )
 }
 
+fn cleanup_obligation_has_exact_authority(world: &World, obligation: &CleanupObligation) -> bool {
+    match &obligation.identity {
+        CleanupTargetIdentity::Registered(claim) => cleanup_claim_has_exact_authority(world, claim),
+        CleanupTargetIdentity::ContainedContent {
+            entity,
+            root,
+            shell,
+        } => {
+            contained_source_is_current(world, root, shell)
+                && current_contained_target(world, *entity, root.entity(), shell.entity())
+                && world.get::<ChildOf>(*entity).map(ChildOf::parent)
+                    == Some(obligation.expected_parent)
+        }
+    }
+}
+
+fn contained_source_is_current(
+    world: &World,
+    root: &ExactRegistryClaim,
+    shell: &ExactRegistryClaim,
+) -> bool {
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return false;
+    };
+    [root, shell].iter().all(|claim| {
+        registry
+            .record(claim.entity())
+            .is_some_and(|record| record.claim() == **claim)
+            && cleanup_claim_has_exact_authority(world, claim)
+    }) && world.get::<ChildOf>(root.entity()).map(ChildOf::parent) == Some(shell.entity())
+}
+
+fn current_contained_target(world: &World, entity: Entity, root: Entity, shell: Entity) -> bool {
+    #[cfg(feature = "bsn")]
+    {
+        crate::presentation::native_frame::current_containment(world, entity, root, shell)
+    }
+    #[cfg(not(feature = "bsn"))]
+    {
+        let _ = (world, entity, root, shell);
+        false
+    }
+}
+
+fn contained_target_is_inside(world: &World, entity: Entity, root: Entity) -> bool {
+    let mut current = entity;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        if current == root {
+            return true;
+        }
+        let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+            return false;
+        };
+        if world
+            .get::<Children>(parent)
+            .is_none_or(|children| !children.contains(&current))
+        {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn classify_contained_content(
+    world: &World,
+    obligations: &[CleanupObligation],
+    receipts: &[Option<CleanupReceipt>],
+    obligation: &CleanupObligation,
+    entity: Entity,
+    root: &ExactRegistryClaim,
+    shell: &ExactRegistryClaim,
+    unsettled: &std::cell::OnceCell<HashSet<Entity>>,
+) -> CleanupEvidence {
+    let present = world.get_entity(entity).is_ok();
+    let parent = world.get::<ChildOf>(entity).map(ChildOf::parent);
+    let registered = world
+        .resource::<RouteEntityRegistry>()
+        .record(entity)
+        .is_some();
+    if obligation.terminal_mode == CleanupTerminalMode::AuthorityLost {
+        return CleanupEvidence::AuthorityLostResidual {
+            actual_parent: parent,
+            registry_exact: false,
+            entity_present: present,
+        };
+    }
+    if !present && !registered {
+        return CleanupEvidence::AlreadyAbsent;
+    }
+    if !present
+        || registered
+        || !contained_source_is_current(world, root, shell)
+        || !current_contained_target(world, entity, root.entity(), shell.entity())
+        || parent != Some(obligation.expected_parent)
+    {
+        return CleanupEvidence::AuthorityLostResidual {
+            actual_parent: parent,
+            registry_exact: false,
+            entity_present: present,
+        };
+    }
+    let targets = unsettled.get_or_init(|| {
+        obligations
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| receipts[*i].is_none())
+            .map(|(_, obligation)| obligation.entity())
+            .collect::<HashSet<_>>()
+    });
+    let mut foreign_descendants = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cycle = false;
+    let mut stack = observed_children(world, entity);
+    while let Some(child) = stack.pop() {
+        if !seen.insert(child) {
+            cycle = true;
+            continue;
+        }
+        if !targets.contains(&child) {
+            foreign_descendants.push(child);
+        }
+        stack.extend(observed_children(world, child));
+    }
+    foreign_descendants.sort_by_key(|entity| entity.to_bits());
+    CleanupEvidence::Exact {
+        actual_parent: parent,
+        normalized_manifest: ComponentManifest::new([]),
+        foreign_descendants,
+        foreign_components: Vec::new(),
+        missing_components: Vec::new(),
+        protected_parent: None,
+        relationship_cycle: cycle,
+    }
+}
+
+fn registered_cleanup_physical_claim_is_compatible(
+    world: &World,
+    obligation: &CleanupObligation,
+    claim: &ExactRegistryClaim,
+) -> bool {
+    let actual_seal = world.get::<RouteOwnershipSeal>(obligation.entity());
+    let incomplete_obligation_can_lack_seal =
+        obligation.allow_missing_components && actual_seal.is_none();
+    let physical_claim_is_compatible = match claim.owner() {
+        RegistryOwner::Committed(
+            EntityOwner::FrameShell(_)
+            | EntityOwner::FrameContentTarget(_)
+            | EntityOwner::FrameOutput { .. },
+        ) => {
+            let lifecycle = world.get::<FrameLifecycle>(obligation.entity());
+            lifecycle == Some(&FrameLifecycle(claim.lifecycle()))
+                || (obligation.allow_missing_components && lifecycle.is_none())
+        }
+        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => world
+            .get::<ProvisionalSlotLifecycle>(obligation.entity())
+            .map(|lifecycle| lifecycle_is_exact(*lifecycle, claim.lifecycle()))
+            .unwrap_or(obligation.allow_missing_components),
+        _ => child_slot_components_are_compatible(
+            world.get::<ChildSlotLifecycle>(obligation.entity()),
+            world.get::<ChildSlotAuthority>(obligation.entity()),
+            claim,
+            obligation.allow_missing_components,
+        ),
+    };
+    (actual_seal == Some(&RouteOwnershipSeal::new(claim.seal()))
+        || incomplete_obligation_can_lack_seal)
+        && physical_claim_is_compatible
+}
+
 fn classify_obligation_with_unsettled(
     world: &World,
     obligations: &[CleanupObligation],
@@ -15132,18 +16102,37 @@ fn classify_obligation_with_unsettled(
     unsettled: &std::cell::OnceCell<HashSet<Entity>>,
 ) -> CleanupEvidence {
     let obligation = &obligations[index];
+    let claim = match &obligation.identity {
+        CleanupTargetIdentity::Registered(claim) => claim,
+        CleanupTargetIdentity::ContainedContent {
+            entity,
+            root,
+            shell,
+        } => {
+            return classify_contained_content(
+                world,
+                obligations,
+                receipts,
+                obligation,
+                *entity,
+                root,
+                shell,
+                unsettled,
+            );
+        }
+    };
     let authority_settlement = matches!(
         obligation.terminal_mode,
         CleanupTerminalMode::AuthorityExact | CleanupTerminalMode::AuthorityLost
     );
-    let entity_present = world.get_entity(obligation.claim.entity()).is_ok();
+    let entity_present = world.get_entity(obligation.entity()).is_ok();
     let registry_exact = world
         .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(obligation.claim.entity()))
-        .is_some_and(|record| record.claim() == obligation.claim);
+        .and_then(|registry| registry.record(obligation.entity()))
+        .is_some_and(|record| record.claim() == *claim);
     let lost_evidence = || CleanupEvidence::AuthorityLostResidual {
         actual_parent: world
-            .get::<ChildOf>(obligation.claim.entity())
+            .get::<ChildOf>(obligation.entity())
             .map(ChildOf::parent),
         registry_exact,
         entity_present,
@@ -15155,27 +16144,25 @@ fn classify_obligation_with_unsettled(
         if authority_settlement {
             let current = world
                 .get_resource::<RouteEntityRegistry>()
-                .and_then(|registry| registry.record(obligation.claim.entity()));
+                .and_then(|registry| registry.record(obligation.entity()));
             return match current {
                 None => CleanupEvidence::AlreadyAbsent,
-                Some(record) if record.claim() == obligation.claim => {
-                    CleanupEvidence::AlreadyAbsent
-                }
+                Some(record) if record.claim() == *claim => CleanupEvidence::AlreadyAbsent,
                 Some(_) => lost_evidence(),
             };
         }
         return match world
             .get_resource::<RouteEntityRegistry>()
-            .and_then(|registry| registry.record(obligation.claim.entity()))
+            .and_then(|registry| registry.record(obligation.entity()))
         {
             None => CleanupEvidence::AlreadyAbsent,
-            Some(record) if record.claim() == obligation.claim => CleanupEvidence::AlreadyAbsent,
+            Some(record) if record.claim() == *claim => CleanupEvidence::AlreadyAbsent,
             Some(_) => CleanupEvidence::StaleClaim,
         };
     }
     let Some(record) = world
         .get_resource::<RouteEntityRegistry>()
-        .and_then(|registry| registry.record(obligation.claim.entity()))
+        .and_then(|registry| registry.record(obligation.entity()))
     else {
         return if authority_settlement {
             lost_evidence()
@@ -15183,49 +16170,21 @@ fn classify_obligation_with_unsettled(
             CleanupEvidence::StaleClaim
         };
     };
-    if record.claim() != obligation.claim {
+    if record.claim() != *claim {
         return if authority_settlement {
             lost_evidence()
         } else {
             CleanupEvidence::StaleClaim
         };
     }
-    let actual_seal = world.get::<RouteOwnershipSeal>(obligation.claim.entity());
-    let incomplete_obligation_can_lack_seal =
-        obligation.allow_missing_components && actual_seal.is_none();
-    let physical_claim_is_compatible = match obligation.claim.owner() {
-        RegistryOwner::Committed(
-            EntityOwner::FrameShell(_)
-            | EntityOwner::FrameContentTarget(_)
-            | EntityOwner::FrameOutput { .. },
-        ) => {
-            let lifecycle = world.get::<FrameLifecycle>(obligation.claim.entity());
-            lifecycle == Some(&FrameLifecycle(obligation.claim.lifecycle()))
-                || (obligation.allow_missing_components && lifecycle.is_none())
-        }
-        RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => world
-            .get::<ProvisionalSlotLifecycle>(obligation.claim.entity())
-            .map(|lifecycle| lifecycle_is_exact(*lifecycle, obligation.claim.lifecycle()))
-            .unwrap_or(obligation.allow_missing_components),
-        _ => child_slot_components_are_compatible(
-            world.get::<ChildSlotLifecycle>(obligation.claim.entity()),
-            world.get::<ChildSlotAuthority>(obligation.claim.entity()),
-            &obligation.claim,
-            obligation.allow_missing_components,
-        ),
-    };
-    if (actual_seal != Some(&RouteOwnershipSeal::new(obligation.claim.seal()))
-        && !incomplete_obligation_can_lack_seal)
-        || !physical_claim_is_compatible
-    {
+    if !registered_cleanup_physical_claim_is_compatible(world, obligation, claim) {
         return if authority_settlement {
             lost_evidence()
         } else {
             CleanupEvidence::StaleClaim
         };
     }
-    let Some(actual_manifest) = ComponentManifest::from_world(world, obligation.claim.entity())
-    else {
+    let Some(actual_manifest) = ComponentManifest::from_world(world, obligation.entity()) else {
         return CleanupEvidence::AlreadyAbsent;
     };
     let relationship_components = [
@@ -15272,9 +16231,7 @@ fn classify_obligation_with_unsettled(
             .iter()
             .enumerate()
             .filter_map(|(candidate, obligation)| {
-                receipts[candidate]
-                    .is_none()
-                    .then_some(obligation.claim.entity())
+                receipts[candidate].is_none().then_some(obligation.entity())
             })
             .collect::<HashSet<_>>()
     });
@@ -15282,7 +16239,7 @@ fn classify_obligation_with_unsettled(
     let mut visited = HashSet::new();
     let mut relationship_cycle = false;
     let mut stack = world
-        .get::<Children>(obligation.claim.entity())
+        .get::<Children>(obligation.entity())
         .into_iter()
         .flat_map(|children| children.iter().copied())
         .collect::<Vec<_>>();
@@ -15302,12 +16259,12 @@ fn classify_obligation_with_unsettled(
     foreign_descendants.dedup();
 
     let actual_parent = world
-        .get::<ChildOf>(obligation.claim.entity())
+        .get::<ChildOf>(obligation.entity())
         .map(ChildOf::parent);
     let protected_parent = if authority_settlement {
         actual_parent.filter(|parent| {
             let retired_host_boundary = matches!(
-                obligation.claim.owner(),
+                claim.owner(),
                 RegistryOwner::Committed(EntityOwner::HostTopSlot { .. })
             ) && *parent == obligation.authorized_parent;
             let exact_batch_parent =
@@ -15316,10 +16273,10 @@ fn classify_obligation_with_unsettled(
                     .enumerate()
                     .any(|(candidate, parent_obligation)| {
                         receipts[candidate].is_none()
-                            && parent_obligation.claim.entity() == *parent
+                            && parent_obligation.entity() == *parent
                             && parent_obligation.terminal_mode
                                 == CleanupTerminalMode::AuthorityExact
-                            && cleanup_claim_has_exact_authority(world, &parent_obligation.claim)
+                            && cleanup_obligation_has_exact_authority(world, parent_obligation)
                     });
             !retired_host_boundary && !exact_batch_parent
         })
@@ -15503,7 +16460,7 @@ fn authority_settlement_dispositions(
             CleanupEvidence::StaleClaim => return Err(AuthorityCleanupFailureKind::Preparation),
         };
         if action != AuthoritySettlementAction::Remove {
-            retained_entities.insert(obligation.claim.entity());
+            retained_entities.insert(obligation.entity());
         }
         plans.push(AuthoritySettlementDisposition {
             index: *index,
@@ -15519,7 +16476,7 @@ fn authority_settlement_dispositions(
             .filter(|plan| {
                 authority_subtree_requires_retention(
                     world,
-                    obligations[plan.index].claim.entity(),
+                    obligations[plan.index].entity(),
                     &retained_entities,
                 )
             })
@@ -15535,7 +16492,7 @@ fn authority_settlement_dispositions(
                 .ok_or(AuthorityCleanupFailureKind::Preparation)?;
             plan.action = AuthoritySettlementAction::VerifiedResidual;
             plan.disposition = CleanupDisposition::QuarantinedForeignDescendant;
-            retained_entities.insert(obligations[index].claim.entity());
+            retained_entities.insert(obligations[index].entity());
         }
     }
     Ok(plans)
@@ -15593,14 +16550,12 @@ fn authority_residual_groups(
             let entity = obligations
                 .get(group[cursor])
                 .ok_or(AuthorityCleanupFailureKind::Preparation)?
-                .claim
                 .entity();
             let mut candidate = 0;
             while candidate < remaining.len() {
                 let other = obligations
                     .get(remaining[candidate])
                     .ok_or(AuthorityCleanupFailureKind::Preparation)?
-                    .claim
                     .entity();
                 if authority_entities_are_adjacent(world, entity, other) {
                     group.push(remaining.swap_remove(candidate));
@@ -15782,21 +16737,20 @@ fn quarantine_focus_closure(
                 foreign_descendants,
                 ..
             } => {
-                entities.push(obligations[*index].claim.entity());
+                entities.push(obligations[*index].entity());
                 entities.extend(foreign_descendants);
             }
             CleanupEvidence::AuthorityLostResidual { .. } => {
-                entities.push(obligations[*index].claim.entity());
+                entities.push(obligations[*index].entity());
             }
             _ => {}
         }
     }
     entities.sort_by_key(|entity| entity.to_bits());
     entities.dedup();
-    #[cfg(feature = "bsn")]
-    entities.retain(|entity| {
-        !crate::presentation::native_frame::is_escaped_cleanup_content(world, *entity)
-    });
+    entities.retain(|entity| !obligations.iter().any(|obligation|
+        matches!(&obligation.identity, CleanupTargetIdentity::ContainedContent { entity: target, root, .. }
+            if target == entity && !contained_target_is_inside(world, *entity, root.entity()))));
     entities
 }
 
@@ -15940,10 +16894,19 @@ impl StructuredDigest {
     }
 
     fn obligation(&mut self, obligation: &CleanupObligation) {
-        self.push(obligation.claim.entity().to_bits());
-        self.bytes(format!("{:?}", obligation.claim.owner()).as_bytes());
-        self.bytes(format!("{:?}", obligation.claim.seal()).as_bytes());
-        self.bytes(format!("{:?}", obligation.claim.lifecycle()).as_bytes());
+        self.push(obligation.entity().to_bits());
+        match &obligation.identity {
+            CleanupTargetIdentity::Registered(claim) => {
+                self.push(0);
+                self.bytes(format!("{:?}", claim.owner()).as_bytes());
+                self.bytes(format!("{:?}", claim.seal()).as_bytes());
+                self.bytes(format!("{:?}", claim.lifecycle()).as_bytes());
+            }
+            CleanupTargetIdentity::ContainedContent { root, shell, .. } => {
+                self.push(1);
+                self.bytes(format!("{root:?}/{shell:?}").as_bytes());
+            }
+        }
         self.push(obligation.manifest.component_ids().len() as u64);
         for component in obligation.manifest.component_ids() {
             self.push(component.index() as u64);

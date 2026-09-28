@@ -1,14 +1,16 @@
 # Current Architecture
 
-**类型**：实现事实与验证边界。**更新时间**：2026-09-23。**runtime 迁移**：从 `sys/structural-governance` 的 `0799098` 前向精简；idle host-loss 基线为 `8ce2b41`，Core 来源修正检查点为 `e7445a2`，native 联动为 `c203446`。独立/交叉审查、最终 fixture 差异审查、冻结版本完整验证及本地 `main` 快进后的公开 smoke 均通过；MVP 已在本地 main 验收。后台 reaper 与公开 audit/probe 已退出。
+**类型**：实现事实与验证边界。**更新时间**：2026-09-28。嵌套/query Back 缺陷已在官方 Bevy 基线上修复并通过完整回归；本库没有消费应用专用路由或状态。当前结论见统一 spec 文件头与实施 plan 的嵌套 Back 修复节。
+
+**runtime 迁移基线**：从 `sys/structural-governance` 的 `0799098` 前向精简；idle host-loss 基线为 `8ce2b41`，Core 来源修正检查点为 `e7445a2`，native 联动为 `c203446`。此前独立/交叉审查、fixture 差异审查、冻结版本完整验证及本地 `main` 公开 smoke 通过属于历史基线。后台 reaper 与公开 audit/probe 已退出。
 
 范围与验收以 [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 为准，后续工作见 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。
 
 ## 已接受基线
 
-`Cargo.lock` 已跟踪，直接 Bevy 依赖使用官方 crates.io `0.19.1`。MVP 结论另由实际产品验收与本地集成支持。
+依赖声明为官方 crates.io Bevy `0.19`（`>=0.19.0, <0.20.0`），已验证 `0.19.0` 与 `0.19.1`。`Cargo.lock` 保持 `0.19.1` 默认测试基线；最低版本证据见统一 plan。下表记录既有层级基线，当前跨层 MVP 验收因 Back 阻塞重新开放。
 
-| 层 | 已接受实现 | MVP 结论 |
+| 层 | 已接受实现 | 历史验证状态 |
 | --- | --- | --- |
 | Core | builder/matching、请求顺序、branch diff、frame/generation、history、recovery 和唯一逻辑 publication | MVP 已验收 |
 | View | renderer-neutral key、registry、descriptor、effect/input 合同 | MVP 已验收 |
@@ -33,6 +35,10 @@ BSN preparation 调用真实官方 `ScenePatch::load/resolve`：一次 factory �
 `QuarantineLeaseTable` 仍承担前台 cleanup/host 无法安全销毁的私有残留 ownership；verified、unresolved、authority-lost 转移、stale projection 和输入/focus 隔离仍使用它。旧残留不持有 terminal 请求的前台 capability，也不会因 blocker 消失自动回收；Entity/metadata 可能长期保留，不能清空 table 冒充完成 cleanup。
 
 普通 cleanup ledger 用一个停止原因保存原 refreeze/settlement 证据；永久停止通过现有隔离与终结入口移交整个 ledger，不另存一个永久等待的前台 holder。应用自有 host 的无关组件变更不再要求完整 manifest 相等；host staging 也不再冻结整个 World 的实体/组件清单，配套的资源载体回填白名单已删除。相关 host/slot 身份、关系、registry、quarantine 与输入事实仍需匹配，foreign target 内容仍隔离保全。Core 的普通 fail-closed 和三条 Back 终结路径复用私有记录准备/安装，分支的 source、owner 和结果分类保持独立；发布后的清理失败保留已发布的原请求结果与 history。
+
+2026-09-27 的原生内容清理迁移在同一 `CleanupLedger` / `CleanupOwner` 中区分 `Registered` 与 `ContainedContent`。结构和未完成 adoption 的创建期产物继续使用自己的 exact claim；已 adopt 普通内容只读冻结 Entity、source root/shell、关系和完整义务，不再为退出新增 registry record、marker、seal 或 lifecycle。真实写后仍校验当前 source、剩余目标及相关 protected 关系；新增登记祖先阻断删除，合法无关组件/样式变化不构成权限漂移。普通删除现采用一次操作内的 removal plan：按已接受的实际父子图稳定叶序准备动作与 receipt；每次真实写后重查全部剩余 direct edges、source、登记/隔离边界、protected、mount 和当前 focus，不缓存跨写有效性。完整直接边比较替代重复生成全部目标分类，允许 sibling 重排；漂移仍停止并交还原 ledger/owner。
+
+两类目标均进入 count/digest/receipt 和 terminal 校验。普通残留附着同一现有 lease，分别保留原 source/receipt 与终结时的结构隔离证据；逃逸 tombstone 只记录来源，不成为删除或焦点控制根。输入/focus 读取当前结构和 containment，不再修补已逃逸的临时 marker。真实销毁回调移走剩余内容时，原实现的永久 `PostCommitCleanup` 已由有界终结回归覆盖；发布后的成功结果保持，仍在原页面内的残留继续隔离。完整验证和性能边界统一记录在 plan 与性能记录，不把功能通过等同于大页面性能就绪。
 
 host trace 只保留最近 64 条事件，当前 top-slot 注册去重证据独立于日志保留，避免正常反复接纳导致诊断无限增长或日志淘汰改变 authority。
 
@@ -79,5 +85,7 @@ Root、Nested、Reconciliation、History、Recovery 的完成记录见 [历史�
 推荐 quick start 与普通内部 outlet 示例已交付，并把原文件作为独立 workspace consumer 编译运行。嵌套示例经真实 UI 布局验证 Push/Replace/Back、history 和 layout/toolbar/slot 保持；它是有限 headless 示例，不是窗口、GPU 或真实设备验收。
 
 2026-09-24 补充 `examples/windowed` 独立 workspace：Winit/UI renderer/font 由示例配置，不扩展库 feature。Linux/WSLg 软件渲染窗口经 OS 注入键鼠验证导航、布局计数保留、fallback/恢复、focus 释放和旧手势撤权；不等同于物理 GPU 或硬件设备验证。六包添加发布元数据和内部版本，标准 Cargo 打包及仅消费解压包的 BSN journey 通过；当前按用户选择暂不添加许可证或正式发布。
+
+2026-09-27 按用户要求补示例专用 `ui-debug`：使用 Bevy BRP 输入/截图方式，仅在 debug 构建显式启用 feature 时监听独立 localhost 端口。窗口启动不请求焦点，输入沿官方 WindowEvent 与 typed message 分发，截图来自 Bevy renderer；默认库/示例不启动此调试入口。当前 Linux/WSLg Vulkan/llvmpipe 实际验收通过布局状态保留、push/replace/back、页面输入、focus 释放、旧目标手势撤权、Build fallback/history 与恢复。该轮是进程内消息驱动的真实引擎/渲染验证，不称为 OS 或硬件输入验证；先前全局 X11 注入尝试未作为本轮交互通过证据。
 
 此前审查复现的三处接收端缺陷已修正并通过增量复审：混合 Router 诊断与去重共同维护 exact 保留关系；post-commit terminal 冻结原 attempt 结果；native 隔离预期只更新实际写入角色，严格保留 authored 内容观察。私有 fixture 减法的独立审查、完整 Core/ECS/facade/workspace 同版本验证及正常/fallback/bound-error 的普通更新后公开快照与单次终态均通过。本地 main 快进到 `7a34fcc`，合并后公开旅程与独立 consumer smoke 通过。后续局部重构见实施 plan；Windows 原生、最低 Rust 执行、物理 GPU 加速及真实硬件输入仍为 NOT_RUN。

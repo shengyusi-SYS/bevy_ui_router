@@ -11,20 +11,20 @@ default = []
 bsn = ["dep:bevy_ui_router_bsn", "dep:bevy_asset", "dep:bevy_scene", "dep:bevy_reflect", "bevy_input_focus/bevy_reflect"]
 
 [dependencies]
-bevy_app = { version = "0.19.1", default-features = false }
-bevy_asset = { version = "0.19.1", default-features = false, optional = true }
-bevy_camera = { version = "0.19.1", default-features = false }
-bevy_color = { version = "0.19.1", default-features = false }
-bevy_ecs = { version = "0.19.1", default-features = false }
-bevy_input_focus = { version = "0.19.1", default-features = false }
-bevy_picking = { version = "0.19.1", default-features = false }
-bevy_reflect = { version = "0.19.1", default-features = false, features = ["std"], optional = true }
-bevy_scene = { version = "0.19.1", default-features = false, optional = true }
-bevy_ui = { version = "0.19.1", default-features = false, features = ["bevy_picking"] }
+bevy_app = { version = "0.19", default-features = false }
+bevy_asset = { version = "0.19", default-features = false, optional = true }
+bevy_camera = { version = "0.19", default-features = false }
+bevy_color = { version = "0.19", default-features = false }
+bevy_ecs = { version = "0.19", default-features = false }
+bevy_input_focus = { version = "0.19", default-features = false }
+bevy_picking = { version = "0.19", default-features = false }
+bevy_reflect = { version = "0.19", default-features = false, features = ["std"], optional = true }
+bevy_scene = { version = "0.19", default-features = false, optional = true }
+bevy_ui = { version = "0.19", default-features = false, features = ["bevy_picking"] }
 bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0" }
 bevy_ui_router_bsn = { path = "../bevy_ui_router_bsn", version = "0.1.0", optional = true }
 bevy_ui_router_view = { path = "../bevy_ui_router_view", version = "0.1.0" }
 
 [dev-dependencies]
 bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0", features = ["test-support"] }
-bevy_internal = { version = "0.19.1", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
+bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }

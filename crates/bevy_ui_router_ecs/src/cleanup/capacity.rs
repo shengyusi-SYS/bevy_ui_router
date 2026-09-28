@@ -1277,6 +1277,7 @@ pub(super) fn prepared_installed_back_zero_completion(
         issued_attempt: None,
         completion_digest: Some(canonical_empty_completion_digest()),
         quarantine_event_observed: false,
+        related_protected: None,
         post_settlement_focus: Vec::new(),
         authority_host_children: None,
         back_no_target_authority_partition: None,

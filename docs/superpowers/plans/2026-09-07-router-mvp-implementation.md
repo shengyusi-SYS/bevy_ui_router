@@ -1,5 +1,148 @@
 # Bevy UI Router MVP Implementation Plan
 
+## 原生内容清理减法规划（2026-09-25；2026-09-27 完成 P1–P4）
+
+用户已批准执行本规划。2026-09-27 已完成 P1：有限纵向原型通过，正常导航两轮对照显示 128 子节点同场景 p50 均值降低约 24.9%，32 子节点降低约 13.5%，1 子节点无改善。P2 完整迁移与 P3 冻结版本验收已完成；正式 128 子节点正常导航 p50 均值降低约 22.6%，32 子节点降低约 12.3%。设计依据为统一 spec 第 13 节；历史已完成阶段不重开，现有合同不因实施启动自动失效。
+
+**目标**：在保留当前公开行为和真实清理责任的前提下，减少普通 BSN 内容退出时的转换、结构写入与重复证明。性能依据为 `55911d6` 及现有正式基线；不将“测试通过”当作性能就绪，不预设通用毫秒 SLA。
+
+**推荐路线**：先用同内容引擎对照及有界原型验证，再在同一 ledger/owner 模型内区分登记结构和普通内容授权，最后完成行为、成本与发布使用验证。Core/matcher/history 和 Scene 创建期未挂接产物的责任模型保持现有语义。
+
+### 投入、风险和收益排序
+
+以下为一名熟悉 Rust/Bevy 的工程师集中工作的工程日量级，包含调试和审查，不是模型运行时间或交付承诺。阶段互相依赖，不能按代理数量等比分摊。
+
+| 阶段 | 工作量 | 风险 | 收益 / ROI |
+| --- | --- | --- | --- |
+| P1 对照、接口盘点与有界原型 | 1–2 日 | 低至中；原型隔离，未证明前不接生产 | 最高确定性 ROI：用有限投入决定是否值得迁移 |
+| P2 同一 ledger 的内容授权重构 | 3–5 日 | 中高；涉及 owner、义务数量/digest、异常移交与输入消费者 | 最高潜在收益；取消额外逐节点注册/marker 写及对应复验，实际幅度由 P1 决定 |
+| P3 完整回归、正式基准和收尾 | 2–3 日 | 中；可能揭示 P2 漏迁的角色或回调事实 | 必需；防止用跳过工作、误清理或隐藏延迟换取提速 |
+| P4 操作内清理计划（条件项） | 另加 3–6 日，含复验 | 中高；预期状态更新与各角色语义必须准确 | P2 后重复分类仍为主热点时，直接减少分类/证据重建；不提前承诺收益 |
+
+推荐第一轮总量暂估 **6–10 工程日**；第一笔投入限制为 P1 的 1–2 日。若 P4 也值得实施，合计约 **9–16 工程日**，它不自动成为必做项。若 P1 暴露跨 Core/多协议扩张或无法保留必要行为，不把估算自动加码为无限重构。继续微调原分类器虽然便宜，但不改变重复次数；全库重写的范围与收益无法由现有证据支持，不安排工期。
+
+### P1：证明值得替换的最小路径
+
+**主要文件与职责**：`benches/router_baseline.rs` 保留现有公开导航测量；同目录的直接 BSN 对照（若保留为独立 bench，同时更新 facade `Cargo.toml`）只量化同内容创建/删除成本；`presentation/native_frame.rs`、`presentation.rs`、`cleanup.rs` 与 `branch_transaction.rs` 用于隔离原型和消费者盘点。运行结果归 `docs/performance.md`，不另建性能平台。
+
+- [x] 固定依赖、机器、优化配置、场景内容、请求完成终点和成功断言。直接对照使用相同 Scene 内容与基础 plugins，分别清楚记录 resolve/apply/despawn/update 的计时范围；它是成本参照，不是 Router 等价实现。
+- [x] 核对 `CleanupObligation.claim`、`RealizedFrame::cleanup_members/obligation_count`、`PreparedCleanupLedger` 的 digest/count、各 `CleanupOwner` 及 `NativeCleanupContent` 全部真实消费者。列出必须改动的唯一数据来源，排除以 root claim 伪装 child record、按存活数量推断完成或从快照重建 owner。
+- [x] 隔离验证普通已 adopt 内容的只读准备和原 owner 消费：不为删除新插 marker，不新增普通 child registry record，仍保持确切目标、叶到根顺序与真实 despawn 后复验。以正常 replace、动态 child、真实销毁 hook 移走剩余节点/改变 protected 关系、原始未挂接 apply failure 为最小正反证据。至少贯通一条真实残留/authority-loss 移交及完成出口，证明 `quarantine_residual`、`AuthorityLostResidualProjectionFact`、`FrozenCleanupTerminalAuthority` 不需要伪造 child claim 或重新登记普通内容。
+- [x] 临时计数记录准备期注册/结构写次数、分类/关系遍历次数和剩余分段时间；无插桩版本同机交替比较。计时必须完成相同公开工作，不能将 cleanup 移到计时外。原型缺失的异常路径明确标记，不能把该数字当生产收益。
+- [x] 输出 go/no-go：证明 owner/完成接缝可保持单一、没有扩张权限，并且成本下降足以支持迁移。只有个位数百分比或噪声收益、需要第二套正常状态机、必须取消真实写后复验时停止原路线；保留已证明有价值的独立小改动建议。
+
+2026-09-27 已完成的独立产物：直接 BSN 对照两轮优化运行和 smoke 均通过，128 子节点 p50 50.77–52.65 µs；未改运行时代码的 Router 重测仍为 16.39–17.09 ms。数据与边界归 `docs/performance.md`。补齐公开 facade 中仍在页面内的动态 child/grandchild 清理断言，完整 `bsn_facade_features` 6 项通过；主工作区 fmt 和 workspace all-target/all-feature check 通过。以上不证明新的内容清理实现已通过。
+
+随后新增普通应用 `On<Despawn>` observer 回归，在原始 `55911d6` 运行时代码上复现：首个内容节点删除时，回调将剩余节点移至应用父节点并设置应用焦点；32 次普通 update 后仍为 `Running(PostCommitCleanup)`，`foreground_pending=true`，回调恰好执行一次。该反例补足旧 marker-insert 逃逸测试的时序空白；该回归在原版本失败，在 P2 最终实现通过；原 owner/receipt 经同一终结通道有界收敛，没有增加重试次数或提前清空前台状态。
+
+隔离原型进展：同一 ledger 中两种目标身份已贯通 normal leaving 和逃逸 tombstone/receipt；真实 source/protected 漂移沿原永久失败接收器保留完整 ledger/原 Leaving owner，前台有界结束。5 条新增机制探针通过，完整公开 facade 7 项通过（包括上述在原始版本失败的 observer 反例）。完整 ECS 诊断 666 通过、8 失败：3 项是显式未迁移的 authority builder，5 项依赖旧 marker/逐 child 登记过程。原型不是生产实现，也不能将这次诊断称为完整回归通过；两轮优化交替对照、独立计数构建和独立复核完成，P1 决定 go；范围和原始数据见性能记录。原型仍每次执行 8,775 次分类（128 子节点），不可将转换减少等同于分类次数减少。
+
+消费者盘点确认：`RealizedFrame.entities/claims` 和 branch claim rebind 只应表示真正注册的结构，不能把普通内容加入后继续沿用 claims 数量等式；ledger 的完整义务数量、digest、receipt 则必须包含两类目标。native capture、normal/failed/authority 三类构造、classify/settle、focus、残留移交和 terminal 需要同一目标身份表达。`AuthorityLostResidualProjectionFact.retired_claim`、registry tombstone 与 `FrozenCleanupTerminalAuthority` 的逐目标 claim 耦合是实际迁移工作，不是必须逐节点登记的产品要求。未发现方案存在语义上的必然矛盾，P1 仅证明有限纵向接缝；P2 已迁移这些生产消费者并通过完整工作区。
+
+P1 产物是决定和证据；临时原型不直接作为成品合入。正式保留的 benchmark 增量独立验证，原生产样本与旧 CSV 不改写。
+
+### P2：一次迁移完整的内容清理责任
+
+**修改边界**：`presentation/native_frame.rs` 负责只读内容准备及角色事实；`presentation.rs`、`branch_transaction.rs` 负责原 frame/branch owner 和清理成员移交；`cleanup.rs` 负责两种授权证据、统一分类/执行/receipt/完成；`registry.rs` 仅保留实际登记 Entity 的 exact retirement。`frame_local.rs`、`input.rs`、`native_focus.rs`、`navigation/authority_isolation.rs` 与实际导航接收器迁移 marker 相关消费者。仅在职责明确且能局部封装时提取私有内容清理模块，不机械拆分全库。
+
+- [x] 在同一 ledger 内区分 Registered / ContainedContent 证据，原 `CleanupOwner` 继续线性持有实际权限；root/shell/slot、未 adopt 创建期产物继续原 exact registry 方式。内容义务的 Entity、source、关系、顺序、digest/count 和 receipt 全部进入真实完成校验。
+- [x] 成组退出普通后代的 cleanup 注册/marker 插入、只为该转换存在的 manifest CAS、逐 marker retry 和逃逸标记修补。迁移全部读取者后才能删除旧机制；不把私有 `NativeCleanupContent` observer 回归原样复制成新产品接口。
+- [x] 固定开始消费时的目标和 source；回调后重建观察用于验证与分类，不扩大原删除范围。保留提前移出内容、执行中移出内容、已缺失目标、child-frame barrier、保护对象关系改变的不同结果及原 owner。内容归还应用后不得继续保留其 Router 输入/焦点管理权限。
+- [x] 对普通内容和 app-owned protected 状态按实际授权目的校验，允许无关正常组件/样式变化；同 tick 身份替换、真实关系/隔离变化、错误 owner 和跨 frame/source 仍拒绝。共享只读事实与借用比较，不共享不同角色的失败结论，不跨 World 写入复用有效性判断。
+- [x] 贯通所有使用已 adopt 内容的 leaving、failed branch 中已实现 frame、host/authority loss、Back 和残留移交通道。原创建失败的未挂接义务继续保留；permanent/retry/source/原错误与发布后结果保持原分类。只读准备失败返还完整原 owner，永久停止不得新增无限等待前台 holder。
+- [x] terminal/quarantine 证明区分实际 child Entity、仍由原 owner 持有的 source shell/root 及其隔离状态；digest/count 与真实 structural claim 集合分别验证，不能简单删除旧 `claims.len() == obligation_count()` 检查而不提供对应一致性。无 registry record 不代表无清理义务，也不能用 root record 填补 child record。
+- [x] 保留输入与 focus 的真实授权来源和撤权范围；页面离场先撤权，历史手势不重新派发，移出内容和其它有效目标不被错误清焦。异常残留仍保持已有隔离责任，不把取消 marker 当成取消残留管理。
+- [x] 每个可独立验证的提交完成受影响测试和独立审查；正常 adopted 内容只有一条生产执行路线，不以新快速路径长期回退旧正常路径。Core 只接收原语义的 opaque 物理完成结果，不新增 Router 模式或公开 API。
+
+### P3：在同一冻结版本上验收和收口
+
+- [x] 现有 public journeys、独立 facade consumer、原样嵌套示例与 native input/focus 回归全部保留必要行为；新回归同时覆盖合法应用 hook 和确实改变权限/关系的反例。旧私有结构断言随实现退出，不能以减少断言掩盖用户结果变化。
+- [x] 根代理独占 Cargo/rustc，执行 fmt、workspace all-target/all-feature check、完整 workspace tests/doctests、完整 ECS BSN/no-default，以及受影响最高层 facade/consumer。提交前检查精确文件集合；保留当前两份 manifest 的用户改动，不顺手纳入。
+- [x] 两轮原样无插桩正式 benchmark 对比正常、失败/恢复、空闲与 soak；报告 p50/p95、实际 update 数、实体/history/请求保持及规模增长。若减少的仅是子阶段耗时而总导航未改善，不宣称产品提速；不从临时原型外推最终收益。
+- [x] 使用现有窗口示例检查导航、布局状态、fallback、焦点与旧手势撤权。使用 Bevy BRP 调试：示例独立 opt-in feature 在进程内投递 Bevy 输入消息并由渲染器截图，避免全局 OS 输入/焦点操作。该检查验证真实引擎管线，不冒充 OS/硬件输入或物理 GPU 性能；不新增平台测试矩阵。
+- [x] 独立实现/合同审查关闭实际问题后，更新 spec/plan 状态、current facts、性能记录和 roadmap。确认成本仍是否逼近整帧、收益是否与复杂度相称；尚未解决的热点如实记录，不自动开展下一轮优化。
+
+验证入口沿用：`cargo +stable fmt --all -- --check`、`cargo +stable check --workspace --all-targets --all-features --locked --offline`、`cargo +stable test --workspace --all-features --locked --offline`、`cargo +stable test -p bevy_ui_router_ecs --features bsn --locked --offline`、`cargo +stable test -p bevy_ui_router_ecs --no-default-features --locked --offline`；正式 benchmark 命令和环境使用 `docs/performance.md`。依赖来源保持当前 lock，未运行结果不预写 PASS。
+
+### P2/P3 交付与验收
+
+- 普通已 adopt 内容不再为退出登记 record 或插 marker/seal/lifecycle，capture 使用真实保留容器；删除转换专属 retry/cursor、逃逸修补与未被读取的 cleanup failure 副本。真实结构与创建期未挂接产物保持自己的 exact claim；普通内容仍计入统一完整 count/digest/receipt，不以登记结构数量推导清理完成。
+- leaving、failed、authority/host-loss、Back、postcommit、quarantine/terminal 和输入/focus 消费者全部迁移。普通残留进入同一现有 lease，分别保留原 source/receipt 和终结时的隔离身份；没有新正常 fast/fallback runtime、Core/public API 或 owner 类型扩张。独立实现/合同复核无未关闭阻断。
+- 新真实 hook/observer 回归覆盖动态 child/grandchild、执行中逃逸和应用 focus、逃逸旁仍 contained 的残留、protected/source 漂移、祖先变为登记边界，以及允许无关组件/Node 样式变化。原版本永久 Running 的公开反例在最终版本通过；永久停止保留原 ledger/owner，前台有界结束。
+- fmt、workspace all-target/all-feature check 通过；隔离实现与同步后的主工作区各完成全量 1,226 项单元/集成及 28 项 doctest，0 failed/ignored。ECS/BSN 最终 673+1 包含于完整工作区；无 BSN 的 ECS 单独 619+1 通过。主工作区保留用户的两份版本范围 manifest，lock 仍解析 Bevy 0.19.1。共享 target 曾重用含 worktree 路径的 Core consumer 测试产物，清理对应编译缓存后主工作区全量复验通过，未修改产品代码掩盖环境失败。
+- 原样无插桩正式 benchmark 两轮各 48 行全部断言通过，正常/失败/恢复分别保持 1/2/3 update。正式性能、连续使用、精确 hash 与原始 CSV 归性能记录；128 子节点 p50 为 12.586–13.328 ms，尚不含布局/渲染。有限 P1 的约 24.9% 不作为最终收益。
+- 用户要求避免其它窗口干扰后，停止全局 X11 输入方式，实现示例专用 BRP feature、窗口内消息和 renderer PNG 截图。实际 Linux/WSLg Vulkan/llvmpipe 验证布局 Entity/计数保持、push/replace/back、页面点击/Space、focus 释放、旧页面手势撤权、Build fallback 不改 history 及恢复。新悬停目标允许收到正常 release，旧目标不能收到 release/click，新页计数保持 0；未扩张为“所有新目标都禁止 release”。本轮不将进程内消息验证称为 OS/硬件验证。默认及调试示例构建/检查、CI 同命令的双 benchmark smoke 经实际运行，远端 CI 未触发。
+- 临时原型 bench 已退出，保留直接 BSN 对照和正式基线；spec、current facts、roadmap、性能记录与 README 已同步。P1–P3 至此收口；P4 保留为需重新 profile 与收益门槛的条件候选，本轮没有自动继续。未提交、发布或改变许可证决定。
+
+### P4：仅在剩余重复分类仍值得处理时统一操作内计划
+
+2026-09-27 用户继续授权推进 P4。当前 P2 冻结实现的隔离诊断确认：128 子节点场景中 collect/classify 占 settlement 的主要部分，当前 focus closure 的重复查找亦显著；决定验证单一 operation-local removal plan 候选。插桩仅在隔离副本，原样正式 benchmark 不改。
+
+- [x] 对当前 P2 而非历史原型重新 profile，保留未插桩 P2 对照可执行文件。
+- [x] 替换普通删除循环：一次接纳角色/目标/实际图与动作，逐真实写后重新核对完整相关事实；保留原失败分类和 owner/receipt，不留快慢双实现。
+- [x] 用真实回调验证允许的组件/样式与 sibling 重排，以及关系/source/foreign 边界变化的拒绝；独立审查当前图与删除顺序。
+- [x] 完整相关门禁、原样优化对照与 BRP 真实渲染/input 验收；收益不足或需要扩大需求时收口候选。
+
+P4 已完成并合入主工作区，随后按用户指令提交为 `b0dbc3b`。初始及逐写直接图比较保留全部 accepted target、source、registry/lease、protected、mount 与 focus 事实，漂移继续走原 ledger 分类/终结；不重建 owner，不保留旧普通循环作为另一 runtime。实际图叶序与每实体 receipt 有真实重挂/Despawn 回归，普通组件/样式及 sibling 重排有真实回调正向回归；独立交叉审查无必须修正项。
+
+冻结候选通过完整主工作区 1,229 项单元/集成与 28 项 doctest，ECS/BSN 676+1（已包含）、无 BSN 620+1；fmt、workspace all-target/all-feature check、原基准与直接 BSN 对照 smoke、窗口默认/可选调试配置检查及构建通过。三轮原样优化交替对照共 288 行全部断言通过：相对当前 P2，32/128 子节点正常 p50 均值分别降低 21.8%/35.6%，1 子节点无收益，恢复未改善；完整分位数和未删结果归性能记录。
+
+主工作区窗口使用 Bevy BRP 进程内 WindowEvent/typed message 输入和 renderer 截图完成真实 picking、Space、focus、Push/Replace/Back、布局状态保持、已按下手势跨页撤权、失败 history/fallback 与恢复验证。查看初始/失败/恢复图片，日志断言全部通过，随后关闭本次测试窗口。环境仍为 Linux/WSLg、llvmpipe 软件渲染；没有全局键鼠注入，不把结果表述为 Windows 原生或硬件输入/GPU 验收。
+
+以下为 P4 原进入门槛，现已满足：P3 后重新 profile。只有普通真实删除阶段仍主导总时间、总导航仍缺乏实际余量，并且收益足以支持额外迁移时采用。本阶段估算包含受影响的完整回归、独立审查和正式基准复测，不以新计划无限续期。
+
+主要接缝为 `CleanupLedger::settle_with_failure_source`、`collect_evidence` 及只读 partition 比较。冻结一次 accepted roles 与 leaf-to-root 删除列表；每次实际 mutation 后按已完成删除更新预期关系，再重建并比较完整相关 partition。证据失效即停止，不能因为已有删除列表继续写。重点是避免反复生成每个剩余目标的完整分类/分配，不是跨写缓存结论或每批末尾才验证。
+
+可参考既有 `PreparedFailureCleanupRemoval` 的准备/逐写检查分工，但只有目的、角色与失败语义相同时才共享代码。验收继续覆盖正常允许的回调与 target/protected 关系漂移；不把普通组件变化重新解释为 ownership 变化，不根据目标自身 hook flags 跳过 parent/relationship 回调复验。若最终只带来噪声级收益或形成另一套通用状态机，停止该候选。
+
+本轮不安排 Core/history 重写、全局缓存或 registry 索引、分帧清理调度、创建期协议重做、后台 reaper 或新公开配置。只有新证据能重新打开相应问题。发布仍按已有决定先准备、暂不授权开源许可证或正式发布。
+
+## 官方 Bevy 版本范围与独立发布（2026-09-28）
+
+依赖声明统一为 `0.19`（`>=0.19.0, <0.20.0`），不新增旧版本适配分支。默认 workspace 与窗口示例 lock 保持官方 `0.19.1`；独立 facade/打包 consumer 的精确 `0.19.1` 约束是该测试夹具的固定基线，不是库的最低版本要求。
+
+最低版本验证在隔离源码副本进行：将 Bevy 依赖固定为 `=0.19.0`，对默认 lock 中全部 47 个 Bevy 包补充不参与本机编译的精确版本约束，重新解析并核对它们全部来自 crates.io、版本均为 `0.19.0`。这避免只降低顶层版本、实际混用 `0.19.1` 子包。隔离副本使用独立 target，未污染生产 lock 或构建产物。
+
+官方 `0.19.0` 的 facade all-features 库编译、ECS 完整 676 + 1 项，以及 BSN facade 8、原生 focus 19、原生 input 18、公开导航 43 项均通过。focus 的实际运行验证覆盖 Reflect 观察和官方焦点事件管线，不能只用编译成功证明兼容。默认 `0.19.1` 的最终完整工作区复验通过 1,238 项单元/集成与 28 项 doctest，0 failed / 0 ignored，workspace 和独立窗口示例的 all-target/all-feature check、格式检查均通过；本轮没有以任一私有 fork 作为官方兼容性证据，也没有新增平台矩阵或硬件验收。
+
+本库文档仅保留通用缺陷、仓库内可复现验证和设计经验；外部应用的业务、日志与迁移状态已移出。项目面向独立开源发布，许可证另行确定。包含跨项目记录的未推送提交与这次清理合并，原始历史和工作区差异仅备份在仓库外，不发布这些中间提交。既有性能记录中的旧提交 ID 保留为测量时源码标识，不再作为发布历史中的可检出节点。
+
+## 嵌套 Back 挂载与失败收敛修复（2026-09-28，基线 b0dbc3b）
+
+**本次 Back 阻塞已修复。** 官方 Bevy 基线的公开 `history_back_restores_nested_location_after_search_rebuild` 在修复前独立复现了嵌套分支随 query 重建后 Back 无法结束：请求保持 Running(ApplyingFrame(0))，最后 trace 为 MountRequested。修复后完整回归通过。问题属于通用路由行为，不依赖外部项目、私有 Bevy fork 或业务页面。
+
+本节仅记录本库实现、可复现证据与可复用经验。外部应用的迁移、页面交互、日志和测试结果由相应项目维护，不纳入本库验收状态。
+
+根因：`dispatch_pending_back_target` 不接 initial MountRequest；applied 后的 MountRequest 被存为 `AppliedMountRequestPending` 而没有继续执行者。历史 plan 保留的阶段性 safe-stop 在当前实现及内部成功测试中仍存在。公共嵌套 Back 只改变 leaf 参数、保留 slot；search 用例仅 Replace，组合覆盖遗漏。独立只读交叉审查已确认这些路径与现行 MVP §4 合同冲突；不是新增需求，也不能用调整 query 语义或 Replace 冒充 Back 修复。
+
+修复范围与验证顺序：
+
+- [x] 在本库官方依赖基线上复现，补公开失败回归，更正验收结论。
+- [x] initial/applied MountRequest 统一进入受控 target mount continuation，复用已有物理挂载与 Core 算法；完整保留 history、continuation、pending owner。成功返回真实 FrameTask；拒绝、容量耗尽、写后失败转入对应 target cleanup，不能遗留 owner 或落入无关 generic failure 路径。
+- [x] 迁移内部“合法请求永久 safe-stop”阶段测试，保留单次消费、mismatch 返还与零写证明；补 initial mount、连续两层挂载、缺失 outlet/真实 apply 失败的有界终结。既有 preserved prefix 状态与 identity 保留必须继续成立。
+- [x] 相关 Core/ECS 完整 crate、最高层公开旅程、仓库内独立 facade consumer、fmt/check 与独立交叉复核通过；功能验证不替代性能验收。
+
+实现与经验：initial/applied MountRequest 现在沿同一物理挂载执行，原 history/continuation 继续持有；失败桥只在 Core 确认 exact receiver 后消费 continuation，完整物理 branch 交给既有 manifest/cleanup。嵌套失败不再套用单层零残留分类。成功报告原先使用的 root driver-failure freeze 在 cleanup-only 移交后已无消费者，连同专属阻断 holder 删除；挂载、commit、cleanup 各自的真实准备和写前/写后验证保留。
+
+普通 `App::update` 补充暴露两个单层假设：进入中的父页面可以与旧页面合法共槽；等待 MountRequest 的分支必须仍可被下一帧输入 Refresh 观察。父页面校验复用既有 exact reconciliation binding，Core 只读接口借用真实 held/pending MountRequest 对应的 projection，不消费 action、伪造 task 或新增路由状态来源。新增公开旅程覆盖 query 全分支重建、连续两层挂载、保留 root 并重建参数化 middle/leaf、保留父页面局部状态，以及缺失 outlet、真实 apply/build 失败的有界终结与重试。私有阶段测试改为最终成功/失败、单次报告、owner 释放和应用 host 保全断言。
+
+本项目经验：阶段性 safe-stop 必须标记为未交付，不能被永久接受停滞的测试转化为完成证据；覆盖按公开操作 × 分支形态组合检查，并使用真实 schedule 穿过 Refresh/drive/settle，连续手动调用 drive 不能替代。复用证明前先核对其目的和角色，失去消费者的中间证明应删除。现阶段不支持将问题归因于最近的 cleanup 性能迁移，也不据此重写整个 Core/history。
+
+验证结果：Back 定向 ECS 84 项、完整 workspace all-features 1,238 项单元/集成及 28 项 doctest 全部通过，0 failed / 0 ignored；其中公开导航旅程 43 项、Core 单元 433 项、ECS 单元 676 项，独立 facade consumer gate 同样通过。ECS no-default 620 + 1 项通过；fmt、workspace all-target/all-feature check 和 diff 检查均 exit 0，保留既有 warnings。沿用上文 2 jobs、关闭 incremental 和 dev/test debug info 的 offline/locked 配置。新增参数化 middle 回归曾错误要求叶页面继承父参数，已依据现有 route-local params 合同改为逐帧验证，未改变产品语义。最终 runtime 经独立静态复核未发现新增阻断。
+
+## P4 后性能验证（2026-09-27，基线 b0dbc3b）
+
+用户已批准限定范围：重新 profile 当前实现、补相同节点数的平铺/普通嵌套对照、测量真实窗口切换帧，再按证据至多选择一个主要热点。不新增平台矩阵、全局缓存、分帧清理或产品能力。保留两份用户原有依赖版本修改；主代理独占 Cargo 与正式计时。
+
+- [x] 隔离诊断当前 cleanup 的分类、计划准备、receipt、逐写目标/protected/mount/focus 检查及输入刷新，计数与时间分开，嵌套时间不相加。
+- [x] 原 benchmark 默认 flat 不变，增加显式 nested 形状；同 authored Entity/Node/Content 数量、同生产导航及断言（关系组件分布随拓扑改变），计时外校验实际深度和数量。原样 flat 与 nested 各至少两轮，保留全部结果。
+- [x] 一次性窗口探针在优化构建中通过 BRP 启动定向引擎输入批次，采样阶段不做 RPC 轮询/截图。分清主世界经过时间、帧间隔与不可据此推断的 GPU/显示延迟，保存实际环境和行为断言。
+- [x] 依据新 profile 选择零或一个实现候选；只有无插桩总时间有稳定收益且维持原语义时合入，并运行相称完整回归与独立复核。其余候选只记录，不连续叠加。
+
+结果见[性能记录](../../performance.md#2026-09-27-p4-后性能验证)及其原始 CSV。protected 事实读取成为剩余主要热点，但隔离的 EntityRef/借用 claim 比较候选未显示可保留收益，决定不合入；生产 runtime 保持 `b0dbc3b`。flat/nested 各三轮，两轮配对受宿主机其他构建干扰并明确标记，只有第一轮用于描述性比较，稳定形状差异仍未证明。32/128 节点 nested 真实深度为 4；真实窗口两轮共 80 次切换成功，保留全部 960 帧，未使用全局键鼠或窗口焦点操作。
+
+本轮交付限于形状 benchmark、nested CI smoke 和结果记录。共享 target 诊断产物复用问题已通过强制重编译与保存核对后的二进制修正，早期无效输出不进入正式数据。候选与临时窗口探针均未进入主源码，临时 release 窗口产物也已清理。已运行主 workspace fmt、all-target/all-feature check、两种形状优化 smoke 与完整 benchmark 的行为断言，均 exit 0；继续验证时也按 CI 环境执行本地 test profile 的 flat Router + 直接 BSN smoke、nested Router smoke，均 exit 0；未改生产 Rust，不重复冒称本轮运行了完整单测、远端 CI 或跨平台矩阵。既有 warnings 保留。后续只在宿主机空闲时复测形状/soak 的稳定性，或以真实产品页面帧预算触发进一步设计工作。
+
 ## 分类器剩余热点局部简化（2026-09-25）
 
 用户确认在 `f44089c` 上重新 profile，并按证据选择一项局部优化。延续已有合同、公开基准和验证范围；主代理独占 Cargo/rustc，独立代理只读复核，保留已有两份 manifest 改动。
@@ -107,7 +250,7 @@ Cargo/rustc 验证和 index 仍由主代理独占；独立代理负责元数据�
 
 ## 全局约束
 
-- 官方 crates.io Bevy `0.19.1`，无 Bevy fork、patch 或 source replacement；Core/View 和 facade 默认功能不依赖 Bevy。
+- 官方 crates.io Bevy `0.19.x`，默认锁文件为 `0.19.1`，最低 `0.19.0` 的补充验证见本计划版本范围节；无 Bevy fork、patch 或 source replacement，Core/View 和 facade 默认功能不依赖 Bevy。
 - 旧 data-only renderer API 无兼容义务；不取消 renderer-neutral 边界、最小独立测试替身或既有导航行为。
 - 每个 layout 一个 default outlet，可位于内容根或内部容器；不实现 multiple/named/dynamic outlets。
 - Router 只管理自身结构、Scene 创建期声明图分配义务及成功 adoption 后的当前 containment，不销毁或重建 app-owned host，不回滚任意应用副作用。
