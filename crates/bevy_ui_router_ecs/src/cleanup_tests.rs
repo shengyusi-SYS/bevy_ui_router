@@ -17,6 +17,311 @@ struct ExternalParentDriftMarker;
 #[derive(Component)]
 struct ForeignBoundaryMarker;
 
+fn ui_inheritance_detachment_fixture(
+    camera_source: bool,
+    render_target_inheritance: bool,
+) -> (bevy_app::App, Entity) {
+    use bevy_app::{App, HierarchyPropagatePlugin, Propagate, Update};
+
+    let mut app = App::new();
+    app.add_plugins((
+        HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(Update),
+        HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(Update),
+    ));
+    let parent = app
+        .world_mut()
+        .spawn(Propagate(ComputedUiTargetCamera::default()))
+        .id();
+    if render_target_inheritance {
+        app.world_mut()
+            .entity_mut(parent)
+            .insert(Propagate(ComputedUiRenderTargetInfo::default()));
+    }
+    let target = app
+        .world_mut()
+        .spawn((ChildOf(parent), ExternalParentDriftMarker))
+        .id();
+    if camera_source {
+        app.world_mut()
+            .entity_mut(target)
+            .insert(Propagate(ComputedUiTargetCamera::default()));
+    }
+    app.update();
+    assert!(
+        app.world()
+            .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(target)
+            .is_some()
+    );
+    assert_eq!(
+        app.world()
+            .get::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(target)
+            .is_some(),
+        render_target_inheritance,
+    );
+    (app, target)
+}
+
+#[test]
+fn authorized_ui_detachment_accepts_only_frozen_observer_removals() {
+    let (mut app, target) = ui_inheritance_detachment_fixture(false, true);
+    let before = ComponentManifest::from_world(app.world(), target).unwrap();
+    let detachment = DetachedUiInheritance::capture(app.world(), target);
+    assert_eq!(detachment.removed.iter().flatten().count(), 2);
+
+    app.world_mut().entity_mut(target).remove::<ChildOf>();
+    app.world_mut().flush();
+    assert!(observed_manifest_matches_relationship_projection(
+        app.world(),
+        target,
+        &before,
+        false,
+        true,
+        detachment,
+    ));
+    assert!(
+        !observed_manifest_differs_only_by_allowed_relationships(
+            app.world(),
+            target,
+            &before,
+            false,
+            true,
+        ),
+        "derived removal must require the frozen authorized detach"
+    );
+}
+
+#[test]
+fn authorized_ui_detachment_preserves_the_entities_own_propagate_source() {
+    let (mut app, target) = ui_inheritance_detachment_fixture(true, true);
+    let before = ComponentManifest::from_world(app.world(), target).unwrap();
+    let detachment = DetachedUiInheritance::capture(app.world(), target);
+    assert_eq!(detachment.removed.iter().flatten().count(), 1);
+
+    app.world_mut().entity_mut(target).remove::<ChildOf>();
+    app.world_mut().flush();
+    assert!(
+        app.world()
+            .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(target)
+            .is_some()
+    );
+    assert!(observed_manifest_matches_relationship_projection(
+        app.world(),
+        target,
+        &before,
+        false,
+        true,
+        detachment,
+    ));
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<bevy_app::Inherited<ComputedUiTargetCamera>>();
+    assert!(
+        !observed_manifest_matches_relationship_projection(
+            app.world(),
+            target,
+            &before,
+            false,
+            true,
+            detachment,
+        ),
+        "the source-owned inheritance is outside the permitted removal set"
+    );
+}
+
+#[test]
+fn authorized_ui_detachment_rejects_unknown_and_added_runtime_component_drift() {
+    let (mut app, target) = ui_inheritance_detachment_fixture(false, false);
+    let before = ComponentManifest::from_world(app.world(), target).unwrap();
+    let detachment = DetachedUiInheritance::capture(app.world(), target);
+    app.world_mut().entity_mut(target).remove::<ChildOf>();
+    app.world_mut().flush();
+    assert!(observed_manifest_matches_relationship_projection(
+        app.world(),
+        target,
+        &before,
+        false,
+        true,
+        detachment,
+    ));
+
+    app.world_mut()
+        .entity_mut(target)
+        .insert(bevy_app::Inherited(ComputedUiRenderTargetInfo::default()));
+    assert!(
+        !observed_manifest_matches_relationship_projection(
+            app.world(),
+            target,
+            &before,
+            false,
+            true,
+            detachment,
+        ),
+        "a runtime component absent at freeze cannot be added"
+    );
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>();
+    app.world_mut()
+        .entity_mut(target)
+        .insert(ForeignBoundaryMarker);
+    assert!(!observed_manifest_matches_relationship_projection(
+        app.world(),
+        target,
+        &before,
+        false,
+        true,
+        detachment,
+    ));
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<ForeignBoundaryMarker>();
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<ExternalParentDriftMarker>();
+    assert!(
+        !observed_manifest_matches_relationship_projection(
+            app.world(),
+            target,
+            &before,
+            false,
+            true,
+            detachment,
+        ),
+        "unknown component removal remains a contradiction"
+    );
+}
+
+fn retained_ui_root_additions_fixture() -> (
+    bevy_app::App,
+    Entity,
+    ComponentManifest,
+    FrozenRetainedUiRootAdditions,
+) {
+    let mut app = bevy_app::App::new();
+    app.add_plugins(bevy_internal::DefaultPlugins);
+    let parent = app.world_mut().spawn(Node::default()).id();
+    let target = app
+        .world_mut()
+        .spawn((Node::default(), ChildOf(parent), ExternalParentDriftMarker))
+        .id();
+    app.update();
+    let before = ComponentManifest::from_world(app.world(), target).unwrap();
+    let detachment = DetachedUiInheritance::capture(app.world(), target);
+    let child_of = app.world().components().component_id::<ChildOf>();
+    let projected =
+        ComponentManifest::new(
+            before.component_ids().iter().copied().filter(|component| {
+                Some(*component) != child_of && !detachment.removes(*component)
+            }),
+        );
+    let additions = FrozenRetainedUiRootAdditions::capture(app.world(), target, &projected);
+    app.world_mut().entity_mut(target).remove::<ChildOf>();
+    app.world_mut().flush();
+    assert!(additions.matches_for_admission(app.world(), target, &projected));
+    app.update();
+    (app, target, projected, additions)
+}
+
+#[test]
+fn retained_ui_root_admission_accepts_frozen_ui_plugin_additions_only_for_readonly_preservation() {
+    let (app, target, projected, additions) = retained_ui_root_additions_fixture();
+    assert!(
+        app.world()
+            .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(target)
+            .is_some()
+    );
+    assert!(
+        app.world()
+            .get::<bevy_app::Propagate<ComputedUiTargetCamera>>(target)
+            .is_some()
+    );
+    assert!(
+        app.world()
+            .get::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(target)
+            .is_some()
+    );
+    assert!(
+        app.world()
+            .get::<bevy_app::Propagate<ComputedUiRenderTargetInfo>>(target)
+            .is_some()
+    );
+    assert!(additions.matches_for_admission(app.world(), target, &projected));
+    assert!(
+        !FrozenRetainedUiRootAdditions::default().matches_for_admission(
+            app.world(),
+            target,
+            &projected
+        ),
+        "a terminal without the frozen authorized root transition stays exact",
+    );
+    assert!(
+        !observed_manifest_matches_relationship_projection(
+            app.world(),
+            target,
+            &projected,
+            false,
+            true,
+            DetachedUiInheritance::default(),
+        ),
+        "read-only preservation cannot widen the mutation/post-write contract",
+    );
+}
+
+#[test]
+fn retained_ui_root_admission_rejects_unknown_other_runtime_and_missing_original_components() {
+    let (mut app, target, projected, additions) = retained_ui_root_additions_fixture();
+    app.world_mut()
+        .entity_mut(target)
+        .insert(ForeignBoundaryMarker);
+    assert!(!additions.matches_for_admission(app.world(), target, &projected));
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<ForeignBoundaryMarker>();
+    app.world_mut()
+        .entity_mut(target)
+        .insert(bevy_app::Propagate(Visibility::Hidden));
+    assert!(
+        !additions.matches_for_admission(app.world(), target, &projected),
+        "other runtime propagation types remain outside this frozen delta",
+    );
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<bevy_app::Propagate<Visibility>>();
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<ComputedUiTargetCamera>();
+    assert!(
+        !additions.matches_for_admission(app.world(), target, &projected),
+        "a UI output already in the original manifest is still required",
+    );
+    app.world_mut()
+        .entity_mut(target)
+        .insert(ComputedUiTargetCamera::default());
+    assert!(additions.matches_for_admission(app.world(), target, &projected));
+    app.world_mut()
+        .entity_mut(target)
+        .remove::<ExternalParentDriftMarker>();
+    assert!(
+        !additions.matches_for_admission(app.world(), target, &projected),
+        "unknown component removal remains a contradiction",
+    );
+}
+
+#[test]
+fn retained_ui_root_admission_does_not_authorize_types_registered_after_freeze() {
+    let mut world = World::new();
+    let target = world.spawn(Node::default()).id();
+    let projected = ComponentManifest::from_world(&world, target).unwrap();
+    let additions = FrozenRetainedUiRootAdditions::capture(&world, target, &projected);
+    world
+        .entity_mut(target)
+        .insert(bevy_app::Propagate(ComputedUiTargetCamera::default()));
+    assert!(
+        !additions.matches_for_admission(&world, target, &projected),
+        "only component IDs already frozen for the authorized transition are allowed",
+    );
+}
+
 #[test]
 fn back_capacity_reclaimed_cell_advances_generation_and_rejects_aba() {
     let mut domains = BackCapacityDomainIssuer::new();

@@ -17,7 +17,7 @@ use bevy_ecs::{
 };
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
-use bevy_ui::Node;
+use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node};
 
 use crate::app_ext::{
     HostRegistrationIncarnationExhaustionEvidence, RouterHandle, RouterHostRegistration,
@@ -1312,12 +1312,84 @@ pub(crate) struct FrozenProvisionalStagingPartition {
     protected_quarantine: QuarantineLeaseTable,
 }
 
+/// Exact derived additions authorized by inserting the fresh slot's ChildOf.
+/// Presence and propagation stops come from the original host, before staging
+/// writes. Float bits retain an exact, Eq-compatible source projection.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FrozenHostUiInheritance {
+    camera: Option<Option<Entity>>,
+    camera_stopped: bool,
+    render_target: Option<([u32; 2], u32)>,
+    render_target_stopped: bool,
+}
+
+impl FrozenHostUiInheritance {
+    fn digest(self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().max(1)
+    }
+
+    fn capture(world: &World, host: Entity) -> Self {
+        Self {
+            camera: Self::camera(world, host),
+            camera_stopped: world
+                .get::<bevy_app::PropagateStop<ComputedUiTargetCamera>>(host)
+                .is_some(),
+            render_target: Self::render_target(world, host),
+            render_target_stopped: world
+                .get::<bevy_app::PropagateStop<ComputedUiRenderTargetInfo>>(host)
+                .is_some(),
+        }
+    }
+
+    fn camera(world: &World, entity: Entity) -> Option<Option<Entity>> {
+        world
+            .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(entity)
+            .map(|inherited| inherited.0.get())
+    }
+
+    fn render_target(world: &World, entity: Entity) -> Option<([u32; 2], u32)> {
+        world
+            .get::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(entity)
+            .map(|inherited| {
+                (
+                    inherited.0.physical_size().to_array(),
+                    inherited.0.scale_factor().to_bits(),
+                )
+            })
+    }
+
+    fn source_is_current(self, world: &World, host: Entity) -> bool {
+        Self::capture(world, host) == self
+    }
+
+    fn inherits_camera(self) -> bool {
+        self.camera.is_some() && !self.camera_stopped
+    }
+
+    fn inherits_render_target(self) -> bool {
+        self.render_target.is_some() && !self.render_target_stopped
+    }
+
+    fn slot_matches(self, world: &World, slot: Entity, edge_written: bool) -> bool {
+        let camera = (edge_written && !self.camera_stopped)
+            .then_some(self.camera)
+            .flatten();
+        let render_target = (edge_written && !self.render_target_stopped)
+            .then_some(self.render_target)
+            .flatten();
+        Self::camera(world, slot) == camera && Self::render_target(world, slot) == render_target
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct PreparedProvisionalStaging {
     partition: Arc<FrozenProvisionalStagingPartition>,
     failure_evidence: Arc<ProvisionalStagingFailureEvidence>,
     registry_manifest: Option<ComponentManifest>,
     staged_manifest: ComponentManifest,
+    ui_inheritance: FrozenHostUiInheritance,
 }
 
 impl PreparedProvisionalStaging {
@@ -1325,7 +1397,8 @@ impl PreparedProvisionalStaging {
         world: &mut World,
         candidate: &ValidatedHostCandidate,
     ) -> Result<Self, HostCandidateCapacityEvidence> {
-        let manifest = try_provisional_top_slot_manifest(world)
+        let ui_inheritance = FrozenHostUiInheritance::capture(world, candidate.host);
+        let manifest = try_provisional_top_slot_manifest(world, ui_inheritance)
             .map_err(|_| staging_capacity_evidence(world, candidate, 1))?;
         let registry_manifest = manifest.try_clone().map_err(|_| {
             staging_capacity_evidence(world, candidate, manifest.component_ids().len())
@@ -1337,12 +1410,15 @@ impl PreparedProvisionalStaging {
             stage: ProvisionalTopSlotSettlementStage::OwnershipRegistered,
             expected: None,
             observed: ProvisionalStagingPartitionObservation::Missing,
+            expected_ui: ui_inheritance,
+            observed_ui: ui_inheritance,
         });
         Ok(Self {
             partition,
             failure_evidence,
             registry_manifest: Some(registry_manifest),
             staged_manifest: manifest,
+            ui_inheritance,
         })
     }
 
@@ -1612,6 +1688,7 @@ pub(crate) struct StagedProvisionalTopSlot {
     entity: Entity,
     claim: ExactRegistryClaim,
     manifest: ComponentManifest,
+    ui_inheritance: FrozenHostUiInheritance,
     owner: ProvisionalTopSlotOwner,
     seal: crate::registry::OwnershipSeal,
     partition: Arc<FrozenProvisionalStagingPartition>,
@@ -1634,6 +1711,7 @@ impl StagedProvisionalTopSlot {
         evidence.stage = stage;
         evidence.observed =
             FrozenProvisionalStagingPartition::observe_live(world, candidate, self.entity);
+        evidence.observed_ui = FrozenHostUiInheritance::capture(world, candidate.host);
         ProvisionalHostSettlement {
             staged: self,
             authorized_host: candidate.host,
@@ -1719,6 +1797,8 @@ pub(crate) struct ProvisionalStagingFailureEvidence {
     stage: ProvisionalTopSlotSettlementStage,
     expected: Option<Arc<FrozenProvisionalStagingPartition>>,
     observed: ProvisionalStagingPartitionObservation,
+    expected_ui: FrozenHostUiInheritance,
+    observed_ui: FrozenHostUiInheritance,
 }
 
 impl ProvisionalStagingFailureEvidence {
@@ -1726,16 +1806,21 @@ impl ProvisionalStagingFailureEvidence {
         self.expected
             .as_ref()
             .map_or(1, |expected| expected.digest())
+            .wrapping_add(self.expected_ui.digest().rotate_left(7))
+            .max(1)
     }
 
     pub(crate) fn observed_digest(&self) -> u64 {
-        match &self.observed {
+        let partition = match &self.observed {
             ProvisionalStagingPartitionObservation::Observed(observed) => observed.digest(),
             ProvisionalStagingPartitionObservation::Missing => 1,
             ProvisionalStagingPartitionObservation::RetryableCapacity(evidence) => {
                 evidence.digest()
             }
-        }
+        };
+        partition
+            .wrapping_add(self.observed_ui.digest().rotate_left(7))
+            .max(1)
     }
 
     pub(crate) fn digest(&self) -> u64 {
@@ -2183,7 +2268,11 @@ fn stage_prepared_provisional_top_slot(
             settlement: None,
         });
     }
-    if !prepared.partition.prewrite_matches(world, spec.candidate) {
+    if !prepared.partition.prewrite_matches(world, spec.candidate)
+        || !prepared
+            .ui_inheritance
+            .source_is_current(world, spec.candidate.host)
+    {
         return Err(ProvisionalStageError {
             kind: ProvisionalStageErrorKind::StaleCandidate,
             entity: None,
@@ -2227,6 +2316,7 @@ fn stage_prepared_provisional_top_slot(
         entity: slot,
         claim: claim.clone(),
         manifest: prepared.staged_manifest,
+        ui_inheritance: prepared.ui_inheritance,
         owner: owner.clone(),
         seal,
         partition: prepared.partition,
@@ -2264,6 +2354,7 @@ fn stage_prepared_provisional_top_slot(
         seal,
         &claim,
         &staged.manifest,
+        staged.ui_inheritance,
         &staged.partition,
         ProvisionalTopSlotSettlementStage::BundleWritten,
     ) {
@@ -2292,6 +2383,7 @@ fn stage_prepared_provisional_top_slot(
         seal,
         &claim,
         &staged.manifest,
+        staged.ui_inheritance,
         &staged.partition,
         ProvisionalTopSlotSettlementStage::NodeWritten,
     ) {
@@ -2316,6 +2408,7 @@ fn stage_prepared_provisional_top_slot(
         seal,
         &claim,
         &staged.manifest,
+        staged.ui_inheritance,
         &staged.partition,
         ProvisionalTopSlotSettlementStage::HostEdgeWritten,
     ) {
@@ -2340,6 +2433,7 @@ fn stage_prepared_provisional_top_slot(
         seal,
         &claim,
         &staged.manifest,
+        staged.ui_inheritance,
         &staged.partition,
         ProvisionalTopSlotSettlementStage::ProbeWritten,
     ) {
@@ -2364,6 +2458,7 @@ fn stage_prepared_provisional_top_slot(
             seal,
             &claim,
             &staged.manifest,
+            staged.ui_inheritance,
         );
     if valid {
         return Ok(staged);
@@ -2398,6 +2493,7 @@ fn validate_provisional_staging_prefix(
     seal: crate::registry::OwnershipSeal,
     claim: &ExactRegistryClaim,
     manifest: &ComponentManifest,
+    ui_inheritance: FrozenHostUiInheritance,
     partition: &FrozenProvisionalStagingPartition,
     stage: ProvisionalTopSlotSettlementStage,
 ) -> bool {
@@ -2410,6 +2506,8 @@ fn validate_provisional_staging_prefix(
         return false;
     };
     if !candidate_is_current(world, candidate)
+        || !ui_inheritance.source_is_current(world, host)
+        || !ui_inheritance.slot_matches(world, slot, edge_written)
         || !partition.protected_matches(world, edge_written)
         || !record.matches_claim(claim)
         || record.owner()
@@ -2550,7 +2648,10 @@ pub(crate) fn validated_host_candidate_is_current(
     candidate_is_current(world, candidate)
 }
 
-fn try_provisional_top_slot_manifest(world: &mut World) -> Result<ComponentManifest, ()> {
+fn try_provisional_top_slot_manifest(
+    world: &mut World,
+    ui_inheritance: FrozenHostUiInheritance,
+) -> Result<ComponentManifest, ()> {
     let explicit = [
         world.register_component::<Visibility>(),
         world.register_component::<Pickable>(),
@@ -2562,6 +2663,14 @@ fn try_provisional_top_slot_manifest(world: &mut World) -> Result<ComponentManif
         world.register_component::<Node>(),
         world.register_component::<ChildOf>(),
     ];
+    let derived = [
+        ui_inheritance
+            .inherits_camera()
+            .then(|| world.register_component::<bevy_app::Inherited<ComputedUiTargetCamera>>()),
+        ui_inheritance
+            .inherits_render_target()
+            .then(|| world.register_component::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>()),
+    ];
     let required_count = explicit
         .iter()
         .filter_map(|component| world.get_required_components_by_id(*component))
@@ -2569,9 +2678,15 @@ fn try_provisional_top_slot_manifest(world: &mut World) -> Result<ComponentManif
         .sum::<usize>();
     let mut complete = Vec::new();
     complete
-        .try_reserve_exact(explicit.len().saturating_add(required_count))
+        .try_reserve_exact(
+            explicit
+                .len()
+                .saturating_add(required_count)
+                .saturating_add(derived.iter().flatten().count()),
+        )
         .map_err(|_| ())?;
     complete.extend_from_slice(&explicit);
+    complete.extend(derived.into_iter().flatten());
     for component in explicit {
         if let Some(required) = world.get_required_components_by_id(component) {
             complete.extend(required.iter_ids());
@@ -2589,11 +2704,14 @@ fn validate_provisional_slot(
     seal: crate::registry::OwnershipSeal,
     claim: &ExactRegistryClaim,
     manifest: &ComponentManifest,
+    ui_inheritance: FrozenHostUiInheritance,
 ) -> bool {
     let Some(record) = world.resource::<RouteEntityRegistry>().record(slot) else {
         return false;
     };
-    let registry_valid = record.matches_claim(claim)
+    let registry_valid = ui_inheritance.source_is_current(world, host)
+        && ui_inheritance.slot_matches(world, slot, true)
+        && record.matches_claim(claim)
         && record.owner()
             == &RegistryOwner::Provisional(ProvisionalOwner::HostTopSlot(owner.clone()))
         && record.seal() == seal
@@ -3527,6 +3645,166 @@ pub(crate) mod tests {
             panic!("expected unique")
         };
         candidate
+    }
+
+    fn ui_propagation_staging_fixture() -> (bevy_app::App, Entity) {
+        use bevy_app::{App, HierarchyPropagatePlugin, Propagate, Update};
+        use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera};
+
+        let mut app = App::new();
+        app.add_plugins((
+            HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(Update),
+            HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(Update),
+        ));
+        app.world_mut().insert_resource(RouteEntityRegistry::new());
+        app.world_mut().insert_resource(QuarantineLeaseTable::new());
+        app.world_mut().insert_resource(InputFocus::default());
+        app.world_mut().insert_resource(RouteFocusState::default());
+        let host = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                RouterHostRegistration::new(router()),
+                Propagate(ComputedUiTargetCamera::default()),
+                Propagate(ComputedUiRenderTargetInfo::default()),
+            ))
+            .id();
+        app.update();
+        (app, host)
+    }
+
+    #[test]
+    fn staging_accepts_exact_ui_inheritance_from_the_frozen_host_source() {
+        let (mut app, host) = ui_propagation_staging_fixture();
+        let mut revisions = HostCandidateRevisionState::default();
+        let candidate = unique_candidate(app.world(), &mut revisions);
+        let staged = stage_provisional_top_slot(
+            app.world_mut(),
+            SealedProvisionalTopSlotSpec::for_candidate(&candidate),
+        )
+        .expect("the real ChildOf observer's derived additions are authorized");
+        let world = app.world();
+        assert_eq!(
+            world.get::<ChildOf>(staged.entity()).map(ChildOf::parent),
+            Some(host)
+        );
+        assert_eq!(
+            world.get::<bevy_app::Inherited<bevy_ui::ComputedUiTargetCamera>>(staged.entity()),
+            world.get::<bevy_app::Inherited<bevy_ui::ComputedUiTargetCamera>>(host),
+        );
+        assert_eq!(
+            world.get::<bevy_app::Inherited<bevy_ui::ComputedUiRenderTargetInfo>>(staged.entity()),
+            world.get::<bevy_app::Inherited<bevy_ui::ComputedUiRenderTargetInfo>>(host),
+        );
+        assert!(
+            world
+                .resource::<RouteEntityRegistry>()
+                .record(staged.entity())
+                .unwrap()
+                .manifest()
+                .matches(world, staged.entity())
+        );
+    }
+
+    #[test]
+    fn staging_respects_the_frozen_host_propagation_stop() {
+        let (mut app, host) = ui_propagation_staging_fixture();
+        app.world_mut().entity_mut(host).insert((
+            bevy_app::PropagateStop::<bevy_ui::ComputedUiTargetCamera>::default(),
+            bevy_app::PropagateStop::<bevy_ui::ComputedUiRenderTargetInfo>::default(),
+        ));
+        let mut revisions = HostCandidateRevisionState::default();
+        let candidate = unique_candidate(app.world(), &mut revisions);
+        let staged = stage_provisional_top_slot(
+            app.world_mut(),
+            SealedProvisionalTopSlotSpec::for_candidate(&candidate),
+        )
+        .expect("a stopped source does not add inheritance to the slot");
+        assert!(
+            app.world()
+                .get::<bevy_app::Inherited<bevy_ui::ComputedUiTargetCamera>>(staged.entity())
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .get::<bevy_app::Inherited<bevy_ui::ComputedUiRenderTargetInfo>>(staged.entity())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn staging_with_ui_inheritance_still_rejects_unknown_postwrite_components() {
+        #[derive(Component)]
+        struct UnknownStagingComponent;
+        let (mut app, host) = ui_propagation_staging_fixture();
+        app.world_mut()
+            .register_component_hooks::<ProvisionalPostWriteProbe>()
+            .on_add(|mut world, HookContext { entity, .. }| {
+                world
+                    .commands()
+                    .entity(entity)
+                    .insert(UnknownStagingComponent);
+            });
+        let mut revisions = HostCandidateRevisionState::default();
+        let candidate = unique_candidate(app.world(), &mut revisions);
+        let error = stage_provisional_top_slot(
+            app.world_mut(),
+            SealedProvisionalTopSlotSpec::for_candidate(&candidate),
+        )
+        .expect_err("the frozen UI delta cannot admit an unknown hook addition");
+        assert_eq!(error.kind, ProvisionalStageErrorKind::PostWriteDrift);
+        let settlement = error
+            .settlement
+            .expect("rejection returns the original staging owner");
+        let slot = error.entity.unwrap();
+        assert_eq!(settlement.staged.entity(), slot);
+        assert!(app.world().get::<UnknownStagingComponent>(slot).is_some());
+        assert!(app.world().get::<RouterHostRegistration>(host).is_some());
+        assert_eq!(
+            app.world().get::<Visibility>(slot),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(app.world().get::<Pickable>(slot), Some(&Pickable::IGNORE));
+        assert!(
+            app.world()
+                .resource::<RouteEntityRegistry>()
+                .record(slot)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn staging_revalidates_the_host_ui_source_after_each_hook_write() {
+        #[derive(Resource)]
+        struct SourceHost(Entity);
+        let (mut app, host) = ui_propagation_staging_fixture();
+        app.world_mut().insert_resource(SourceHost(host));
+        app.world_mut()
+            .register_component_hooks::<ProvisionalStagingProbe>()
+            .on_add(|mut world, _| {
+                let host = world.resource::<SourceHost>().0;
+                world
+                    .commands()
+                    .entity(host)
+                    .insert(bevy_app::PropagateStop::<bevy_ui::ComputedUiTargetCamera>::default());
+            });
+        let mut revisions = HostCandidateRevisionState::default();
+        let candidate = unique_candidate(app.world(), &mut revisions);
+        let error = stage_provisional_top_slot(
+            app.world_mut(),
+            SealedProvisionalTopSlotSpec::for_candidate(&candidate),
+        )
+        .expect_err("source drift stops staging before the next physical write");
+        assert_eq!(error.kind, ProvisionalStageErrorKind::PostWriteDrift);
+        let slot = error.entity.unwrap();
+        let settlement = error
+            .settlement
+            .expect("source drift returns its original owner");
+        let evidence = settlement.failure_evidence();
+        assert_ne!(evidence.expected_ui, evidence.observed_ui);
+        assert_ne!(evidence.expected_digest(), evidence.observed_digest());
+        assert!(app.world().get::<Node>(slot).is_none());
+        assert!(app.world().get::<ChildOf>(slot).is_none());
     }
 
     #[test]

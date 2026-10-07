@@ -95,6 +95,58 @@ fn idle_host_loss_atomic_fixture(
     idle_host_loss_fixture_in_app(App::new(), label)
 }
 
+#[test]
+fn idle_host_loss_with_an_absent_top_slot_closes_and_readmits_the_surviving_host() {
+    let (mut app, router, request, host, top) =
+        idle_host_loss_atomic_fixture("idle-absent-top-slot");
+    let (history, version) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        (
+            entry.engine.history().clone(),
+            entry.host.as_ref().unwrap().version.clone(),
+        )
+    };
+    assert!(app.world_mut().despawn(top));
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    for _ in 0..12 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.idle_host_loss.is_none());
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(app.world().get_entity(host).is_ok());
+    assert!(app.world().get_entity(top).is_err());
+    assert!(
+        app.world()
+            .resource::<QuarantineLeaseTable>()
+            .record(top)
+            .is_none()
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..12 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_ne!(entry.host.as_ref().unwrap().version, version);
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(
+        app.world()
+            .resource::<RouterSnapshots>()
+            .get(router)
+            .unwrap()
+            .availability(),
+        &RouterAvailability::Ready
+    );
+}
+
 fn idle_host_loss_fixture_in_app(
     mut app: App,
     label: &str,
@@ -847,6 +899,58 @@ fn idle_host_loss_retained_success_admits_direct_protected_child_after_move_outs
         entry.engine.request(request).unwrap().status(),
         &RequestStatus::Succeeded
     );
+}
+
+#[test]
+fn idle_host_loss_retained_ui_root_allows_a_later_independent_host() {
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins);
+    let (mut app, router, request, _, retained_top, candidate) =
+        idle_host_loss_retained_success_fixture_in_app(app, false);
+    let history = app.world().resource::<RouterNavigation>().entries[0]
+        .engine
+        .history()
+        .clone();
+    // A detached Node becomes an ordinary UI root; normal UI propagation runs
+    // before the later host admission is considered.
+    for _ in 0..3 {
+        app.update();
+    }
+    assert!(app.world().get_entity(retained_top).is_ok());
+    app.world_mut().entity_mut(candidate).remove::<ChildOf>();
+    app.world_mut()
+        .entity_mut(candidate)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..12 {
+        app.update();
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let mut observation = HostCandidateRevisionState::default();
+    let rejection = match classify_host_candidate(app.world(), router, &mut observation) {
+        HostCandidateClassification::Unique(candidate) => {
+            entry.idle_host_terminal.as_ref().and_then(|terminal| {
+                idle_host_loss::admission_failure(
+                    app.world(),
+                    terminal,
+                    &PreparedEcsHostCandidateSource::prepare(candidate),
+                )
+            })
+        }
+        _ => None,
+    };
+    assert_eq!(
+        entry.engine.snapshot().availability(),
+        &RouterAvailability::Ready,
+        "{rejection:#?}"
+    );
+    assert_eq!(entry.host.as_ref().unwrap().host, candidate);
+    assert!(entry.active.is_none());
+    assert_eq!(entry.engine.history(), &history);
+    assert_eq!(
+        entry.engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(app.world().get_entity(retained_top).is_ok());
 }
 
 #[test]

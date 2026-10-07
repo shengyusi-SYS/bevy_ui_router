@@ -60,6 +60,8 @@ component、relationship 和销毁操作可能同步触发应用代码。目标�
 
 复用校验函数前先比较证明目的。只读 preservation 不应套用 mutation 的封闭 child-set 假设，否则合法的 protected extras 会被误拒绝。
 
+正常 UI propagation 也会在 relationship 写入时增删派生组件，或在脱离父级后为新 UI root 补充传播组件。mutation 应冻结具体操作的派生差异并写后复验；只读残留保护只接纳已证明的 root 转换，不能把这些类型加入全局宽松名单。
+
 原生输入同样存在历史状态。`Display::None` 阻止新命中，并不会自动撤销已经记录的 press/click/drag；撤权必须覆盖真实缓存和派发时序，并保护其它有效目标。
 
 焦点也不只是一个当前 Entity。pending AutoFocus、应用操作和延后 FocusGained/Lost 有顺序，必须经官方队列验证；无条件 clear 会丢掉应用后来的有效操作。

@@ -51,7 +51,7 @@ use crate::{
 use bevy_camera::visibility::Visibility;
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
-use bevy_ui::{Node, Val};
+use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
 
 const MANIFEST_DOMAIN: u64 = 0x4543_534d_414e_4946;
 const ATTEMPT_DOMAIN: u64 = 0x4543_5341_5454_454d;
@@ -1782,6 +1782,118 @@ pub(crate) struct FrozenBackNoTargetHostEdgeDelta {
     before: Vec<Entity>,
     after: Vec<Entity>,
     phase: BackNoTargetHostEdgePhase,
+    ui_detachment: DetachedUiInheritance,
+}
+
+/// Bevy's two UI propagation observers remove these derived components when
+/// ChildOf is removed, except when the entity supplies its own Propagate source.
+/// Freeze only components already present; this never permits runtime additions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DetachedUiInheritance {
+    removed: [Option<ComponentId>; 2],
+}
+
+impl DetachedUiInheritance {
+    fn capture(world: &World, entity: Entity) -> Self {
+        Self {
+            removed: [
+                (world
+                    .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(entity)
+                    .is_some()
+                    && world
+                        .get::<bevy_app::Propagate<ComputedUiTargetCamera>>(entity)
+                        .is_none())
+                .then(|| {
+                    world
+                        .components()
+                        .component_id::<bevy_app::Inherited<ComputedUiTargetCamera>>()
+                })
+                .flatten(),
+                (world
+                    .get::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(entity)
+                    .is_some()
+                    && world
+                        .get::<bevy_app::Propagate<ComputedUiRenderTargetInfo>>(entity)
+                        .is_none())
+                .then(|| {
+                    world
+                        .components()
+                        .component_id::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>()
+                })
+                .flatten(),
+            ],
+        }
+    }
+
+    fn removes(self, component: ComponentId) -> bool {
+        self.removed.contains(&Some(component))
+    }
+
+    fn is_applied(self, world: &World, entity: Entity) -> bool {
+        self.removed.iter().flatten().all(|component| {
+            world
+                .get_entity(entity)
+                .is_ok_and(|entity| !entity.contains_id(*component))
+        })
+    }
+}
+
+/// A retained Node detached by this cleanup becomes a UI root. The UI plugin
+/// may later add these four derived components. This projection is used only by
+/// read-only admission; the receipt and every mutation manifest remain exact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FrozenRetainedUiRootAdditions {
+    component_ids: [Option<ComponentId>; 4],
+}
+
+impl FrozenRetainedUiRootAdditions {
+    fn capture(world: &World, entity: Entity, projected: &ComponentManifest) -> Self {
+        if world.get::<Node>(entity).is_none() {
+            return Self::default();
+        }
+        let mut component_ids = [
+            world
+                .components()
+                .component_id::<bevy_app::Inherited<ComputedUiTargetCamera>>(),
+            world
+                .components()
+                .component_id::<bevy_app::Propagate<ComputedUiTargetCamera>>(),
+            world
+                .components()
+                .component_id::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(),
+            world
+                .components()
+                .component_id::<bevy_app::Propagate<ComputedUiRenderTargetInfo>>(),
+        ];
+        for component in &mut component_ids {
+            if component.is_some_and(|component| projected.component_ids().contains(&component)) {
+                *component = None;
+            }
+        }
+        Self { component_ids }
+    }
+
+    fn matches_for_admission(
+        self,
+        world: &World,
+        entity: Entity,
+        expected: &ComponentManifest,
+    ) -> bool {
+        let Some(current) = ComponentManifest::from_world(world, entity) else {
+            return false;
+        };
+        let child_of = world.components().component_id::<ChildOf>();
+        let children = world.components().component_id::<Children>();
+        let non_relationship = |component: &&ComponentId| {
+            Some(**component) != child_of && Some(**component) != children
+        };
+        current
+            .component_ids()
+            .iter()
+            .filter(non_relationship)
+            .filter(|component| !self.component_ids.contains(&Some(**component)))
+            .eq(expected.component_ids().iter().filter(non_relationship))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1848,6 +1960,7 @@ struct PreparedBackNoTargetAuthorityTerminalProjection {
     registry_claim: Option<ExactRegistryClaim>,
     presence: PreparedBackNoTargetAuthorityTerminalPresence,
     authority: PreparedBackNoTargetAuthorityTerminalAuthority,
+    admission_ui_root_additions: FrozenRetainedUiRootAdditions,
 }
 
 /// Receipt-complete physical responsibility. Quarantine tables own the content;
@@ -2055,20 +2168,12 @@ impl PreparedBackNoTargetAuthorityTerminalProjection {
                 manifest,
                 ..
             } => {
-                let Some(current) = ComponentManifest::from_world(world, self.entity) else {
-                    return false;
-                };
-                let child_of = world.components().component_id::<ChildOf>();
-                let children = world.components().component_id::<Children>();
-                let non_relationship = |component: &&ComponentId| {
-                    Some(**component) != child_of && Some(**component) != children
-                };
                 world.get::<RouteOwnershipSeal>(self.entity).copied() == *ownership_seal
-                    && current
-                        .component_ids()
-                        .iter()
-                        .filter(non_relationship)
-                        .eq(manifest.component_ids().iter().filter(non_relationship))
+                    && self.admission_ui_root_additions.matches_for_admission(
+                        world,
+                        self.entity,
+                        manifest,
+                    )
             }
         };
         presence_is_current && self.authority_is_current(world)
@@ -2195,6 +2300,11 @@ impl FrozenBackNoTargetAuthorityPartition {
                     before,
                     after,
                     phase: BackNoTargetHostEdgePhase::UnstartedBefore,
+                    ui_detachment: if parent == Some(host.host) {
+                        DetachedUiInheritance::capture(world, host.top_slot)
+                    } else {
+                        DetachedUiInheritance::default()
+                    },
                 },
             },
             terminal: None,
@@ -2464,16 +2574,23 @@ impl FrozenBackNoTargetAuthorityPartition {
                     && observed.children == projected_children
                     && observed.registry_claim == expected.registry_claim
                     && observed.ownership_seal == expected.ownership_seal
-                    && (observed.manifest == expected.manifest
-                        || expected.manifest.as_ref().is_some_and(|manifest| {
-                            observed_manifest_differs_only_by_allowed_relationships(
+                    && expected
+                        .manifest
+                        .as_ref()
+                        .map_or(observed.manifest.is_none(), |manifest| {
+                            observed_manifest_matches_relationship_projection(
                                 world,
                                 expected.entity,
                                 manifest,
                                 children_changed,
                                 child_of_changed,
+                                if child_of_changed {
+                                    self.allowed.host_edge.ui_detachment
+                                } else {
+                                    DetachedUiInheritance::default()
+                                },
                             )
-                        }))
+                        })
             })
     }
 }
@@ -6289,26 +6406,53 @@ fn observed_manifest_differs_only_by_allowed_relationships(
     allow_children: bool,
     allow_child_of: bool,
 ) -> bool {
+    observed_manifest_matches_relationship_projection(
+        world,
+        entity,
+        frozen,
+        allow_children,
+        allow_child_of,
+        DetachedUiInheritance::default(),
+    )
+}
+
+fn observed_manifest_matches_relationship_projection(
+    world: &World,
+    entity: Entity,
+    frozen: &ComponentManifest,
+    allow_children: bool,
+    allow_child_of: bool,
+    ui_detachment: DetachedUiInheritance,
+) -> bool {
+    if !ui_detachment.is_applied(world, entity)
+        || ui_detachment
+            .removed
+            .iter()
+            .flatten()
+            .any(|component| !frozen.component_ids().contains(component))
+    {
+        return false;
+    }
     let Ok(entity) = world.get_entity(entity) else {
         return false;
     };
     let actual = ComponentManifest::observed_component_ids(world, entity.archetype().components());
     let children = world.components().component_id::<Children>();
     let child_of = world.components().component_id::<ChildOf>();
+    let allowed_relationship = |component| {
+        (allow_children && Some(component) == children)
+            || (allow_child_of && Some(component) == child_of)
+    };
     actual
         .clone()
         .filter(|component| !frozen.component_ids().contains(component))
-        .chain(
-            frozen
-                .component_ids()
-                .iter()
-                .copied()
-                .filter(|component| !actual.clone().any(|actual| actual == *component)),
-        )
-        .all(|component| {
-            (allow_children && Some(component) == children)
-                || (allow_child_of && Some(component) == child_of)
-        })
+        .all(allowed_relationship)
+        && frozen
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| !actual.clone().any(|actual| actual == *component))
+            .all(|component| allowed_relationship(component) || ui_detachment.removes(component))
 }
 
 fn freeze_failure_cleanup_closure(
@@ -7019,6 +7163,7 @@ enum PreparedAuthorityHostEdge {
         children_after: Vec<Entity>,
         detach: bool,
         require_exact: bool,
+        ui_detachment: DetachedUiInheritance,
     },
     Missing {
         host: Entity,
@@ -7042,19 +7187,38 @@ impl PreparedAuthorityHostEdge {
 
     fn project_attempt(&self, attempt: &CleanupAttempt) -> Option<CleanupAttempt> {
         let mut projected = attempt.clone();
-        let Self::Existing { index, detach, .. } = self else {
+        let Self::Existing {
+            index,
+            detach,
+            ui_detachment,
+            ..
+        } = self
+        else {
             return Some(projected);
         };
         if *detach {
-            let (_, CleanupEvidence::Exact { actual_parent, .. }) =
-                projected
-                    .evidence
-                    .iter_mut()
-                    .find(|(candidate, _)| *candidate == *index)?
+            let (
+                _,
+                CleanupEvidence::Exact {
+                    actual_parent,
+                    normalized_manifest,
+                    ..
+                },
+            ) = projected
+                .evidence
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == *index)?
             else {
                 return None;
             };
             *actual_parent = None;
+            *normalized_manifest = ComponentManifest::new(
+                normalized_manifest
+                    .component_ids()
+                    .iter()
+                    .copied()
+                    .filter(|component| !ui_detachment.removes(*component)),
+            );
         }
         Some(projected)
     }
@@ -7081,6 +7245,7 @@ impl PreparedAuthorityHostEdge {
                 claim,
                 children_before,
                 detach,
+                ui_detachment,
                 ..
             } => {
                 if !*detach {
@@ -7089,6 +7254,7 @@ impl PreparedAuthorityHostEdge {
                 if world.get::<ChildOf>(*top_slot).map(ChildOf::parent) != Some(*host)
                     || !children_match(world, *host, children_before)
                     || !cleanup_claim_has_exact_authority(world, claim)
+                    || DetachedUiInheritance::capture(world, *top_slot) != *ui_detachment
                 {
                     return false;
                 }
@@ -7108,12 +7274,14 @@ impl PreparedAuthorityHostEdge {
                 claim,
                 children_after,
                 require_exact,
+                ui_detachment,
                 ..
             } => {
                 world.get_entity(*host).is_ok()
                     && world.get::<ChildOf>(*top_slot).map(ChildOf::parent) != Some(*host)
                     && children_match(world, *host, children_after)
                     && (!*require_exact || cleanup_claim_has_exact_authority(world, claim))
+                    && ui_detachment.is_applied(world, *top_slot)
             }
             Self::Missing { host } => world.get_entity(*host).is_err(),
             Self::RetainedLost {
@@ -7137,6 +7305,18 @@ impl PreparedAuthorityHostEdge {
                 ..
             } if *top_slot == entity
         )
+    }
+
+    fn ui_detachment_for(&self, entity: Entity) -> DetachedUiInheritance {
+        match self {
+            Self::Existing {
+                top_slot,
+                detach: true,
+                ui_detachment,
+                ..
+            } if *top_slot == entity => *ui_detachment,
+            _ => DetachedUiInheritance::default(),
+        }
     }
 }
 
@@ -7266,6 +7446,9 @@ struct PreparedAuthorityRemoval {
     children_before: Vec<Entity>,
     receipt: PreparedCleanupReceiptBatch,
     retirement: Option<PreparedExactRegistryRetirement>,
+    manifest_before: Option<ComponentManifest>,
+    parent_detached: bool,
+    ui_detachment: DetachedUiInheritance,
 }
 
 impl PreparedAuthorityRemoval {
@@ -7292,6 +7475,18 @@ impl PreparedAuthorityRemoval {
                 completed_removals,
             )
             && cleanup_obligation_has_exact_authority(world, obligation)
+            && self.manifest_before.as_ref().is_some_and(|manifest| {
+                observed_manifest_matches_relationship_projection(
+                    world,
+                    entity,
+                    manifest,
+                    self.children_before
+                        .iter()
+                        .any(|child| completed_removals.contains(child)),
+                    self.parent_detached,
+                    self.ui_detachment,
+                )
+            })
     }
 }
 
@@ -11810,6 +12005,7 @@ impl CleanupLedger {
                 children_after: expected_after,
                 detach: false,
                 require_exact: matches!(evidence, CleanupEvidence::Exact { .. }),
+                ui_detachment: DetachedUiInheritance::default(),
             });
         }
         if membership != 1 || observed_children(world, host) != *children_before {
@@ -11836,6 +12032,7 @@ impl CleanupLedger {
             children_after: expected_after,
             detach: true,
             require_exact: true,
+            ui_detachment: DetachedUiInheritance::capture(world, top_slot),
         })
     }
 
@@ -12163,6 +12360,9 @@ impl CleanupLedger {
                     children_before: observed_children(world, obligation.entity()),
                     receipt,
                     retirement,
+                    manifest_before: ComponentManifest::from_world(world, obligation.entity()),
+                    parent_detached: host_edge.removes_child_of(obligation.entity()),
+                    ui_detachment: host_edge.ui_detachment_for(obligation.entity()),
                 };
                 match plan.action {
                     AuthoritySettlementAction::AlreadyAbsent => absent.push(prepared),
@@ -12488,6 +12688,21 @@ impl CleanupLedger {
                         )
                             }
                         };
+                        let admission_ui_root_additions = if host_edge.removes_child_of(entity) {
+                            match &presence {
+                                PreparedBackNoTargetAuthorityTerminalPresence::Retained {
+                                    manifest,
+                                    ..
+                                } => {
+                                    FrozenRetainedUiRootAdditions::capture(world, entity, manifest)
+                                }
+                                PreparedBackNoTargetAuthorityTerminalPresence::Absent => {
+                                    FrozenRetainedUiRootAdditions::default()
+                                }
+                            }
+                        } else {
+                            FrozenRetainedUiRootAdditions::default()
+                        };
                         Some(PreparedBackNoTargetAuthorityTerminalProjection {
                             obligation: plan.index,
                             entity,
@@ -12498,6 +12713,7 @@ impl CleanupLedger {
                             registry_claim,
                             presence,
                             authority,
+                            admission_ui_root_additions,
                         })
                     })
                     .collect::<Option<Vec<_>>>()?
@@ -16595,6 +16811,7 @@ fn authority_projected_manifest(
     let children = world.components().component_id::<Children>();
     let pickable = world.components().component_id::<Pickable>();
     let removes_host_edge = host_edge.removes_child_of(entity);
+    let ui_detachment = host_edge.ui_detachment_for(entity);
     let retains_children_component = world.get::<Children>(entity).is_some_and(|children| {
         children
             .iter()
@@ -16606,6 +16823,7 @@ fn authority_projected_manifest(
             .iter()
             .copied()
             .filter(|component| !(removes_host_edge && Some(*component) == child_of))
+            .filter(|component| !ui_detachment.removes(*component))
             .filter(|component| Some(*component) != children || retains_children_component)
             .chain(
                 pickable
