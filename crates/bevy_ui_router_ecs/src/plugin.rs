@@ -1,4 +1,4 @@
-use bevy_app::{App, Plugin, PreUpdate, Update};
+use bevy_app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::{Resource, SystemSet};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_input_focus::InputFocus;
@@ -103,6 +103,10 @@ pub(crate) fn install_foundations(app: &mut App) {
             settle_cleanup_system.in_set(RouterLifecycleSet::SettleCleanup),
             publish_snapshots_system.in_set(RouterScheduleSet::PublishSnapshots),
         ),
+    )
+    .add_systems(
+        PostUpdate,
+        crate::scroll::settle_scroll_system.after(bevy_ui::UiSystems::Layout),
     )
     .add_systems(
         PreUpdate,

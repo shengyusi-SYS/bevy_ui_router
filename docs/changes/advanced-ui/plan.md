@@ -14,12 +14,12 @@
 
 ## 2. 独立可用的 entry 滚动恢复
 
-- [ ] ECS 新增私有 `scroll.rs`，提供显式容器 marker；记录关联 entry、route 复用身份与 frame-local key，位置采用实际布局的逻辑像素。公开 marker 经 ECS 与 facade/prelude 导出。
-- [ ] 在 normal 来源失去有效内容前捕获位置；覆盖 normal、Back、projectionless error/fallback 的 publication 路径。失败保留原页面时不恢复、不建立成功目标记录。
-- [ ] Back 对 fresh 与 preserved prefix 准备恢复；Push/Replace 保持实例当前值。先冻结 exact frame/generation、容器归属与写集合，再准备写入；publication tail 只执行已借用的不可失败原位 mutation，不插入组件或执行查询。
-- [ ] 在正常 `UiSystems::Layout` 后单次结算裁剪结果；失效请求丢弃，不通过固定延迟、额外 layout 或无限 polling 等待。缺少实际 layout、冲突 key 和非法归属给出有界诊断。
-- [ ] 按 canonical entry 保留集合回收记录；host loss 保留仍有效的访问记录。只为实际 restoration 请求保存短期 exact Entity 映射。
-- [ ] 公共旅程使用真实 UI layout 验证二维/多容器、重复访问、preserved prefix、等价 Back、缩放、内容缩短再增长、缺省/冲突 key、失败来源与 host 重新接纳。
+- [x] ECS 新增私有 `scroll.rs`，提供显式容器 marker；记录关联 entry、route 复用身份与 frame-local key，位置采用实际布局的逻辑像素。公开 marker 经 ECS 与 facade/prelude 导出。
+- [x] 在 normal 来源失去有效内容前捕获位置；覆盖 normal、Back、projectionless error/fallback 的 publication 路径。失败保留原页面时不恢复、不建立成功目标记录。
+- [x] Back 对 fresh 与 preserved prefix 准备恢复；Push/Replace 保持实例当前值。先冻结 exact frame/generation、容器归属与写集合，再准备写入；publication tail 只执行已借用的不可失败原位 mutation，不插入组件或执行查询。
+- [x] 在正常 `UiSystems::Layout` 后单次结算裁剪结果；失效请求丢弃，不通过固定延迟、额外 layout 或无限 polling 等待。缺少实际 layout、冲突 key 和非法归属给出有界诊断。
+- [x] 按 canonical entry 保留集合回收记录；host loss 保留仍有效的访问记录。只为实际 restoration 请求保存短期 exact Entity 映射。
+- [x] 公共旅程使用真实 UI layout 验证二维/多容器、重复访问、preserved prefix、等价 Back、缩放、内容缩短再增长、缺省/冲突 key、失败来源与 host 重新接纳。
 
 实现入口：ECS `navigation.rs` 的 normal/Back/projectionless publication、`presentation.rs` 的受控借用、`plugin.rs` 的布局后调度及新 `scroll.rs`；facade `lib.rs` 和公共旅程。此阶段独立完成，不等待缓存。
 

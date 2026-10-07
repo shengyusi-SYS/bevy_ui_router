@@ -12,6 +12,7 @@
 
 - builder-first 路由树，静态/参数/末尾 wildcard 匹配，index route、pathless layout，以及 raw location/search/fragment。
 - 单条嵌套路由链，每个 layout 一个 default outlet，common-prefix 保留、suffix 替换和 memory history。
+- 显式滚动容器按 history entry 保存二维位置，Back 恢复并由正常 UI 布局裁剪。
 - 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。
 - route-bound error view、router fallback、host loss/re-registration、stale 拒绝、局部 cleanup、输入与 focus 隔离。
 - facade、可运行示例、独立 consumer 和相称的跨层验证。

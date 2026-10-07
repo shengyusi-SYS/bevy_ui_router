@@ -55,7 +55,7 @@ pub mod view {
 pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouterConfig, RouterHandle,
+        NavigationRequestSnapshot, RequestLookup, RouteScroll, RouterConfig, RouterHandle,
         RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
         RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
         RouterSnapshots, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
@@ -103,7 +103,7 @@ pub mod prelude {
     #[cfg(feature = "ecs")]
     pub use crate::ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouterConfig, RouterHandle,
+        NavigationRequestSnapshot, RequestLookup, RouteScroll, RouterConfig, RouterHandle,
         RouterHostRegistration, RouterInputGate, RouterInstallError, RouterInstallErrorKind,
         RouterNavigation, RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
         ViewDriverRegistrationErrorKind,

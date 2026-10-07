@@ -234,6 +234,7 @@ fn assert_leaf(app: &mut App, item: &str, instance: usize) -> Entity {
     let leaf = app.world().get::<NativeLeaf>(entity).unwrap();
     assert_eq!(leaf.item, item);
     assert_eq!(leaf.instance, instance);
+    assert_eq!(app.world().get::<RouteScroll>(entity), Some(&RouteScroll::new("body")));
     assert!(
         app.world()
             .resource::<RouterInputGate>()
@@ -279,6 +280,7 @@ fn main() {
                     ..Node::default()
                 });
                 root.push_template(NativeLeaf { item, instance });
+                root.push_template(RouteScroll::new("body"));
             }))
         })
         .unwrap();

@@ -20,7 +20,7 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 | 某段 params 或复用身份变化 | 从该段起替换，保留此前 prefix |
 | raw search 变化 | 按上述精确比较重建整链 |
 | 仅 fragment 变化 | 保留祖先，重建最深 normal frame；frame/slot 身份保持，generation 推进 |
-| canonical path/search/fragment 全部等价 | normal presentation 可零物理 mutation，history 仍按命令语义提交 |
+| canonical path/search/fragment 全部等价 | normal presentation 保持原结构，history 仍按命令语义提交；显式滚动恢复可写入位置 |
 
 新建或重建 view 得到本次 input。保留 layout 不重新调用 factory，其局部内容维持原状态；active snapshot 的 location 更新不表示历史 factory input 被原位更新。
 
@@ -38,13 +38,25 @@ active error presentation 不走 normal 等价导航优化。复用判定包含�
 
 入队时已发布 `can_back=false`，同步返回 `NoBackEntry`，不生成 request。已成功入队但执行时无目标，请求失败为 `BackTargetUnavailable`，不调用 view，不改变 UI/history。
 
-normal success 统一发布 route presentation 与 history。error view/fallback 可以成为可见 presentation，但原导航仍失败，history 不推进。等价 location 的零物理写不取消 push/replace/back 的 history 语义。
+normal success 统一发布 route presentation 与 history。error view/fallback 可以成为可见 presentation，但原导航仍失败，history 不推进。未启用滚动恢复的等价 location 保持零物理写，不取消 push/replace/back 的 history 语义。
 
 presentation/history publication 和 request terminal 是两个时刻。发布后可仍处于 `PostCommitCleanup`；旧责任结算后才进入终态，不能据 `Running` 就推断新页面尚未发布。
 
 publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不改写此次发布确定的原始成功/失败分类。重试通过新的显式命令完成，不自动回放旧 request。
 
 上述事务语义属于生产 Router。独立 Core 的 `MemoryHistory` 是纯数据容器，其 `back()` 立即移动 cursor；它自身不执行 view、publication 或失败回滚。生产 history 权限由 Core 的 [history authority](../../crates/bevy_ui_router_core/src/history_authority.rs) 协议持有。
+
+## 按访问恢复滚动
+
+`RouteScroll::new(key)` 显式标记带有 `Node`、`ScrollPosition` 的容器。key 在一个 route frame 内唯一且稳定；不同 frame 可重复。未标记容器保持应用行为，同 frame 的冲突 key 全部排除并给出有界诊断。
+
+离开 normal 页面时保存最后一次有效布局显示的二维逻辑像素位置，关联 Core canonical history entry 和 route 复用身份。重复 URL 的不同访问独立，Replace 使用新 entry。normal 被 error/fallback 替换时仍保存原位置，失败呈现不覆盖成功访问记录；失败保留原页面时不恢复或重置。
+
+成功 Back 恢复目标 entry，包括仍存活的 preserved prefix 容器；Push/Replace 保持实例当前值，fresh Scene 使用初值。目标没有记录时保持当前值。位置在 publication 前准备，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
+
+容器或 frame 失效时丢弃恢复请求。缺少实际 UI 布局或有效相机时不保存伪造位置，放弃本次恢复并保留原值、给出有界诊断；不额外运行布局或延迟轮询。首版不自动追赶异步增长或延迟创建的容器。
+
+记录随 canonical entry 回收：Replace、forward 截断及 Router 移除释放对应记录；host loss 保留仍在 history 中的访问。接入方式见[集成指南](../guides/integration.md#滚动恢复)。
 
 ## Snapshots 与诊断
 

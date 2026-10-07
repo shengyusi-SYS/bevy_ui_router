@@ -2198,6 +2198,7 @@ pub(crate) struct RouterEntry {
     failure_cleanup_permanent: Option<FailureCleanupPermanentStableInertOwner>,
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
+    pub(crate) scroll: crate::scroll::ScrollState,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
@@ -5789,6 +5790,7 @@ impl RouterNavigation {
             failure_cleanup_permanent: None,
             projectionless_fail_close: None,
             active: None,
+            scroll: crate::scroll::ScrollState::default(),
             cleanup_ledger: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
@@ -10392,7 +10394,7 @@ pub(crate) enum ReconciliationPreparationOutcome {
     },
 }
 
-fn current_host_binding_is_exact(world: &World, host: &HostBinding) -> bool {
+pub(crate) fn current_host_binding_is_exact(world: &World, host: &HostBinding) -> bool {
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return false;
     };
@@ -14908,6 +14910,22 @@ fn publish_ready_back_target(
     };
 
     let splice = &owner.physical.classified.splice;
+    let scroll_eligible = crate::scroll::eligible_containers(world);
+    let scroll_observation = crate::scroll::ScrollObservation::capture(
+        world,
+        splice
+            .preserved()
+            .frames()
+            .iter()
+            .chain(splice.leaving().frames()),
+        splice
+            .preserved()
+            .frames()
+            .iter()
+            .chain(splice.entering().frames()),
+        &scroll_eligible,
+    );
+    let scroll_targets = scroll_observation.target_entities();
     let gate_before = splice.current_live_interactive_entities(world);
     let (targets, isolate_count) = splice.presentation_mutation_targets();
     let gate_after = splice.resulting_live_interactive_entities(world, &targets);
@@ -14992,7 +15010,12 @@ fn publish_ready_back_target(
         .revoked_targets()
         .to_vec();
         let (presentation, resources) =
-            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
+            crate::presentation::prepare_publication_access_with_scroll(
+                world,
+                &targets,
+                &pointer_targets,
+                &scroll_targets,
+            )?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -15150,6 +15173,10 @@ fn publish_ready_back_target(
                 None
             }
             BackTargetCommitPreparationOutcome::Validated(engine) => {
+                let scroll = entry
+                    .scroll
+                    .prepare(engine.history_publication(), scroll_observation);
+                let presentation_plan = presentation_plan.with_scroll(&scroll.writes);
                 let cleanup = ledger.bind_batch(engine.cleanup().clone());
                 drop(
                     ticket
@@ -15172,6 +15199,7 @@ fn publish_ready_back_target(
                 ));
                 let active_owner = &mut entry.active;
                 let cleanup_owner = &mut entry.cleanup_ledger;
+                let scroll_owner = &mut entry.scroll;
                 engine.publish(|| {
                     presentation_plan.apply_staged(
                         |_| focus_plan.apply(),
@@ -15184,6 +15212,7 @@ fn publish_ready_back_target(
                     );
                     *active_owner = next_active;
                     *cleanup_owner = next_cleanup;
+                    *scroll_owner = scroll.state;
                 });
                 Some(())
             }
@@ -15766,6 +15795,22 @@ fn publish_normal_work(
     focus_leaving.sort_by_key(|entity| entity.to_bits());
     focus_leaving.dedup();
     let logical_roots = logical_cleanup_roots(splice.leaving());
+    let scroll_eligible = crate::scroll::eligible_containers(world);
+    let scroll_observation = crate::scroll::ScrollObservation::capture(
+        world,
+        splice
+            .preserved()
+            .frames()
+            .iter()
+            .chain(splice.leaving().frames()),
+        splice
+            .preserved()
+            .frames()
+            .iter()
+            .chain(splice.entering().frames()),
+        &scroll_eligible,
+    );
+    let scroll_targets = scroll_observation.target_entities();
     let gate_before = splice.current_live_interactive_entities(world);
     let (targets, isolate_count) = splice.presentation_mutation_targets();
     let gate_after = splice.resulting_live_interactive_entities(world, &targets);
@@ -15844,7 +15889,12 @@ fn publish_normal_work(
         .revoked_targets()
         .to_vec();
         let (presentation, resources) =
-            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
+            crate::presentation::prepare_publication_access_with_scroll(
+                world,
+                &targets,
+                &pointer_targets,
+                &scroll_targets,
+            )?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -15940,6 +15990,10 @@ fn publish_normal_work(
                 return None;
             }
         };
+        let scroll = entry
+            .scroll
+            .prepare(engine.history_publication(), scroll_observation);
+        let presentation_plan = presentation_plan.with_scroll(&scroll.writes);
         let cleanup = engine.cleanup().clone();
         let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
         pending.ticket.take();
@@ -15960,6 +16014,7 @@ fn publish_normal_work(
         ));
         let active_owner = &mut entry.active;
         let cleanup_owner = &mut entry.cleanup_ledger;
+        let scroll_owner = &mut entry.scroll;
         engine.publish(|| {
             presentation_plan.apply_staged(
                 |_| focus_plan.apply(),
@@ -15972,6 +16027,7 @@ fn publish_normal_work(
             );
             *active_owner = next_active;
             *cleanup_owner = next_cleanup;
+            *scroll_owner = scroll.state;
         });
         Some(())
     })();
@@ -17120,17 +17176,35 @@ fn publish_projectionless_work(
         .get_resource_mut::<RouterInputGate>()
         .and_then(|gate| prepare_input_gate_mutation(gate, &gate_before, gate_after.clone()))
         .map(|plan| plan.revoked_targets().to_vec());
+    let scroll_eligible = crate::scroll::eligible_containers(world);
+    let scroll_observation = {
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == handle)
+            .unwrap();
+        crate::scroll::ScrollObservation::capture(
+            world,
+            entry.active.iter().flat_map(|branch| branch.frames()),
+            pending.branch.frames().iter(),
+            &scroll_eligible,
+        )
+    };
+    let scroll_targets = scroll_observation.target_entities();
     let mut branch_owners = None;
     let mut failure = None;
     let committed = (|| {
         if !frozen_is_exact {
             return None;
         }
-        let (presentation, resources) = crate::presentation::prepare_publication_access(
-            world,
-            &targets,
-            pointer_targets.as_ref()?,
-        )?;
+        let (presentation, resources) =
+            crate::presentation::prepare_publication_access_with_scroll(
+                world,
+                &targets,
+                pointer_targets.as_ref()?,
+                &scroll_targets,
+            )?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -17211,6 +17285,10 @@ fn publish_projectionless_work(
                 return None;
             }
         };
+        let scroll = entry
+            .scroll
+            .prepare(engine.history_publication(), scroll_observation);
+        let presentation_plan = presentation_plan.with_scroll(&scroll.writes);
         let cleanup = engine.cleanup().clone();
         let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
         pending.ticket.take();
@@ -17232,6 +17310,7 @@ fn publish_projectionless_work(
         ));
         let active_owner = &mut entry.active;
         let cleanup_owner = &mut entry.cleanup_ledger;
+        let scroll_owner = &mut entry.scroll;
         engine.publish(|| {
             presentation_plan.apply_staged(
                 |_| focus_plan.apply(),
@@ -17240,6 +17319,7 @@ fn publish_projectionless_work(
             );
             *active_owner = next_active;
             *cleanup_owner = next_cleanup;
+            *scroll_owner = scroll.state;
         });
         Some(())
     })();

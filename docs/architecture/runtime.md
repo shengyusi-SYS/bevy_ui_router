@@ -83,6 +83,8 @@ ECS 先将物理切换、输入/focus 和后续 cleanup owner 组合成准备好
 这时已发布页面和 history 已生效；清理失败不能回滚或改写原成功结果。
 snapshot 发布是每轮观察出口，与真正的 presentation publication 是不同步骤。
 
+显式滚动容器由 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 仅交接 opaque canonical entry key 及已准备 publication 的来源、目标和存活 entry 事实；位置记录不能签发路由权限。Back 的位置写入在原有 tail 前准备，正常 `PostUpdate` UI layout 后核对当前完整 branch 归属，再单次结算裁剪结果并采样实际逻辑像素位置。
+
 失败路径复用相同 Core 决策和 ECS ownership 边界：先处理该次失败的物理义务，
 再推进明确的 error boundary、fallback 或 authority settlement。
 cleanup target 与 protected closure 分开冻结，写后重新确认；无法安全删除的残留

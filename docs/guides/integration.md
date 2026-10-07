@@ -109,6 +109,12 @@ headless 程序应给等待设置边界并检查 `RequestStatus::Succeeded` / `F
 active 已切换而请求仍在 `PostCommitCleanup` 是合法状态；避免仅凭一次 phase
 或 factory 返回就把整个导航视为完成。
 
+## 滚动恢复
+
+在 Scene 的滚动容器上同时声明 `RouteScroll::new("body")`、Bevy 的 `ScrollPosition` 和配置了 scroll overflow 的 `Node`；`RouteScroll` 从 facade/prelude 导入。多个容器使用不同稳定 key，例如 `"body"` 和 `"sidebar"`，子页面可重复父布局的 key。
+
+应用需安装正常 UI layout 并配置有效 camera/render target。Router 在 Back 时恢复该次访问的位置，包含被保留的父布局容器；未标记容器保持现有行为。完整语义和缺省行为见[导航合同](../contracts/navigation.md#按访问恢复滚动)，真实布局接入可参考[公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs)。
+
 ## 输入与焦点接入
 
 标准 UI pointer 使用原生 UI picking。Router 在正常提交和后续输入刷新时维护

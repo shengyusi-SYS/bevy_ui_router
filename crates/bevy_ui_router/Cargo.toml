@@ -63,6 +63,11 @@ path = "tests/public_navigation_journeys.rs"
 required-features = ["bsn"]
 
 [[test]]
+name = "scroll_restoration"
+path = "tests/scroll_restoration.rs"
+required-features = ["bsn"]
+
+[[test]]
 name = "ecs_facade_features"
 path = "tests/ecs_facade_features.rs"
 required-features = ["ecs"]
