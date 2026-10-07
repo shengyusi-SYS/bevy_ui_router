@@ -21,6 +21,7 @@ pub(super) struct ReservingIdleHostLoss {
 
 struct UnreservedIdleHost {
     active: Option<RealizedBranch>,
+    retained: Vec<RealizedBranch>,
     host: RetiredHostBinding,
     frozen: FrozenCleanupManifest,
     partition: crate::cleanup::FrozenBackNoTargetAuthorityPartition,
@@ -343,6 +344,38 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     {
         return false;
     }
+    let retained_plan = if entry.retained.is_empty() {
+        None
+    } else {
+        let Some(inventory) = entry.retained.inventory() else {
+            return true;
+        };
+        let Ok(plan) = entry
+            .engine
+            .prepare_retained_idle_host_loss_plan(&host.lease, &inventory)
+        else {
+            return true;
+        };
+        Some(plan)
+    };
+    let retiring = retained_plan
+        .as_ref()
+        .map(|plan| plan.retiring().to_vec())
+        .unwrap_or_default();
+    let Some(retained_storage) = entry.retained.prepare_settlement(&retiring) else {
+        return true;
+    };
+    #[cfg(feature = "bsn")]
+    for projection in &retiring {
+        let Some(branch) = entry.retained.branch_mut(projection.id()) else {
+            return true;
+        };
+        if let Err(error) = branch.prepare_native_cleanup(world)
+            && error.is_retryable()
+        {
+            return true;
+        }
+    }
     #[cfg(feature = "bsn")]
     if let Some(active) = entry.active.as_mut()
         && let Err(error) = active.prepare_native_cleanup(world)
@@ -354,11 +387,19 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     // owner. The existing authority-loss partition classifies that residual;
     // it must not remint claims or retry the contradictory closure.
     let registry = world.resource::<RouteEntityRegistry>();
-    let Ok(frozen) = FrozenCleanupManifest::from_idle_host_authority(
+    let retired_branches = retiring
+        .iter()
+        .map(|projection| Some((projection, entry.retained.branch(projection.id())?)))
+        .collect::<Option<Vec<_>>>();
+    let Some(retired_branches) = retired_branches else {
+        return true;
+    };
+    let Ok(frozen) = FrozenCleanupManifest::from_idle_host_authority_with_retained(
         world,
         registry,
         entry.active.as_ref(),
         host,
+        &retired_branches,
     ) else {
         return true;
     };
@@ -366,19 +407,32 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     else {
         return true;
     };
+    let retained_boundaries = if retained_plan.is_some() {
+        let Ok(prepared) = registry.prepare_retained_boundaries(None, &retiring) else {
+            return true;
+        };
+        Some(prepared)
+    } else {
+        None
+    };
     let manifest = CleanupManifest::new(
-        entry
-            .active
+        retained_plan
             .as_ref()
-            .map(|active| {
-                active
-                    .frames()
-                    .iter()
-                    .rev()
-                    .map(|frame| frame.frame().clone())
-                    .collect()
-            })
-            .unwrap_or_default(),
+            .map(|plan| plan.logical_roots().to_vec())
+            .unwrap_or_else(|| {
+                entry
+                    .active
+                    .as_ref()
+                    .map(|active| {
+                        active
+                            .frames()
+                            .iter()
+                            .rev()
+                            .map(|frame| frame.frame().clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }),
         frozen.digest(),
         frozen.len(),
     );
@@ -388,6 +442,12 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         .as_ref()
         .map(|active| active.claims().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
+    claims.extend(
+        retired_branches
+            .iter()
+            .flat_map(|(_, branch)| branch.claims())
+            .cloned(),
+    );
     claims.push(host.top_slot_claim.clone());
     let isolation =
         match authority_isolation::prepare_idle_host_isolation(world, claims.iter(), targets) {
@@ -406,6 +466,10 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         .get::<Children>(host.host)
         .map(|children| children.iter().copied().collect())
         .unwrap_or_default();
+    let Ok(owners) = entry.retained.take_retiring_owners(&retiring) else {
+        return true;
+    };
+    let mut retained_payload = Some(entry.retained.take_settlement(retained_storage));
     let (host, lease) = entry
         .host
         .take()
@@ -415,26 +479,59 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     let mut physical = Some(UnreservedIdleHost {
         host,
         active,
+        retained: Vec::new(),
         frozen,
         partition,
         host_children,
     });
     let pending = &mut entry.idle_host_loss;
-    let result = entry.engine.begin_idle_host_loss(lease, &manifest, |core| {
+    let mut registry = world.resource_mut::<RouteEntityRegistry>();
+    let install = |core| {
+        let mut physical = physical.take().expect("single physical owner installation");
+        physical.retained = retained_payload
+            .take()
+            .expect("single retained physical holder")
+            .into_branches();
+        if let Some(boundaries) = retained_boundaries {
+            boundaries.apply(&mut registry);
+        }
         *pending = Some(IdleHostLoss::Reserving(ReservingIdleHostLoss {
             core,
-            physical: physical.take().expect("single physical owner installation"),
+            physical,
             permanent: None,
         }));
-    });
-    if let Err((_, lease)) = result {
+    };
+    let result = if let Some(plan) = retained_plan {
+        entry
+            .engine
+            .begin_idle_host_loss_with_retention(lease, plan, &manifest, owners, install)
+            .map_err(|error| {
+                let (lease, _plan, owners, _kind) = error.into_parts();
+                (lease, owners)
+            })
+    } else {
+        entry
+            .engine
+            .begin_idle_host_loss(lease, &manifest, install)
+            .map_err(|(_, lease)| (lease, owners))
+    };
+    if let Err((lease, owners)) = result {
         let physical = physical
             .take()
             .expect("rejected begin returns physical ownership");
+        entry.retained = retained_payload
+            .take()
+            .expect("rejected begin returns the original cache holder")
+            .restore();
+        assert!(
+            entry.retained.restore_owners(owners).is_ok(),
+            "rejected begin returns original owners to unchanged entries"
+        );
         entry.host = Some(physical.host.restore(lease));
         entry.active = physical.active;
         return true;
     }
+    drop(registry);
     drive(world, entry);
     true
 }
@@ -453,6 +550,7 @@ fn drive(world: &mut World, entry: &mut RouterEntry) {
             let ReservingIdleHostLoss { core, physical, .. } = pending;
             let UnreservedIdleHost {
                 active,
+                retained,
                 host,
                 frozen,
                 partition,
@@ -462,12 +560,13 @@ fn drive(world: &mut World, entry: &mut RouterEntry) {
             match CleanupLedger::reserve(frozen) {
                 Ok(reserved) => SettlingIdleHostLoss {
                     core,
-                    ledger: CleanupLedger::activate_idle_host_authority(
+                    ledger: CleanupLedger::activate_idle_host_authority_with_retained(
                         reserved,
                         active,
                         host,
                         host_children,
                         partition,
+                        retained,
                     ),
                     manifest,
                     failure: None,
@@ -480,6 +579,7 @@ fn drive(world: &mut World, entry: &mut RouterEntry) {
                         core,
                         physical: UnreservedIdleHost {
                             active,
+                            retained,
                             host,
                             frozen: error.into_manifest(),
                             partition,

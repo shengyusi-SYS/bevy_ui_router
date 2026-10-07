@@ -4,6 +4,12 @@
 
 按结果顺序交付。Core 决定 history 与 lifecycle，ECS 持有实体、滚动数据和物理 owner；沿用现有 publication/cleanup 协议。只在实际改动处拆分私有模块，不整体重写 navigation。默认关闭新增能力时保持现有行为。
 
+闲置 host loss 的完整缓存移交已闭合；接下来单独提交局部结构收敛，再扩展缓存策略：
+
+- Core 在 `engine/retained.rs` 统一 retained 库存核对和 preserve/retire 分区；normal、idle 与失败入口复用这些准备，保留各自已有 history/host owner 和 continuation，不为每种失败增加独立缓存状态机。
+- ECS 在 `retained.rs` 统一原 owner/physical payload 的准备、移交与返还；选定内容进入既有 cleanup manifest/physical forest。retained publication 编排移入私有模块，主 navigation 仅保留流程分派；不用机械拆文件代替职责收敛。
+- 验证围绕用户旅程及关键 owner 不变量，覆盖一次代表性准备拒绝和真实写后变化。相同语义不叠加多份低层反例矩阵；已有行为回归不因重组而删除。LRU 先用标准容器，避免手写链表或引入不能减少生命周期复杂度的依赖。
+
 ## 1. Canonical history 的受控只读交接
 
 - [x] 从现有私有 `HistoryEntryId` 投影 opaque entry key；在 integration 提供 canonical entries 和已准备 publication 的 source/target/保留 entries/Back 恢复事实。投影不签发 authority，不向 ECS 开放 history mutation。
@@ -31,7 +37,7 @@
 
 实现入口：Core `frame.rs`/`engine.rs`/`integration.rs`，ECS `registry.rs`、`mount.rs`、`frame_local.rs`、`presentation.rs`、`input.rs`、`cleanup.rs` 与 `branch_transaction.rs`。此阶段独立审查后进入缓存实现。
 
-已闭合连续多个 inactive leaf 与 active 共存、撤销输入/focus及离开父布局的完整清理旅程。当前先补长期 owner 在 host/authority 失效时的结算，再完成命中、LRU与组合验收。
+已闭合连续多个 inactive leaf 与 active 共存、撤销输入/focus、离开父布局以及闲置 host 丢失后清理并重新接纳的完整旅程。当前先收敛库存/移交准备，再补前台失败与 authority 失效时的结算，之后完成命中、LRU 与组合验收。
 
 ## 4. 同父 leaf 缓存与完整责任交接
 

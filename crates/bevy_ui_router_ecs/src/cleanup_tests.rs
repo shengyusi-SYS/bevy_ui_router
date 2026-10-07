@@ -757,6 +757,7 @@ fn back_no_target_zero_completion_max_generation_permanently_retires_cell() {
 enum CleanupOwnerSnapshot {
     IdleHostAuthority {
         active_claims: Option<Vec<ExactRegistryClaim>>,
+        retained_claims: Vec<Vec<ExactRegistryClaim>>,
         host: Entity,
         top_slot: Entity,
         top_slot_claim: ExactRegistryClaim,
@@ -788,6 +789,7 @@ fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot 
     match owner {
         Some(CleanupOwner::IdleHostAuthority(owner)) => CleanupOwnerSnapshot::IdleHostAuthority {
             active_claims: owner.active.as_ref().map(&claims),
+            retained_claims: owner.retained.iter().map(&claims).collect(),
             host: owner.host.host,
             top_slot: owner.host.top_slot,
             top_slot_claim: owner.host.top_slot_claim.clone(),
@@ -817,6 +819,194 @@ fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot 
             }
         }
     }
+}
+
+fn idle_retained_cleanup_fixture() -> bevy_app::App {
+    use crate::{navigation::RouterNavigation, plugin::BevyUiRouterPlugin};
+    use bevy_ui_router_core::request::RequestStatus;
+
+    let mut app = bevy_app::App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = crate::navigation::tests::install_retained_slice_router(&mut app, 2);
+    app.update();
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        for _ in 0..12 {
+            app.update();
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .is_some_and(|record| record.status() == &RequestStatus::Succeeded)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            &RequestStatus::Succeeded,
+        );
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert_eq!(entry.retained.len(), 2);
+    assert!(entry.engine.idle_host_loss_eligible());
+    app
+}
+
+#[test]
+fn idle_retained_manifest_includes_every_owner_before_its_active_parent_slot() {
+    use crate::navigation::RouterNavigation;
+
+    let app = idle_retained_cleanup_fixture();
+    let registry = app.world().resource::<RouteEntityRegistry>();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let inventory = entry.retained.inventory().unwrap();
+    let retiring = inventory
+        .iter()
+        .map(|owner| {
+            (
+                owner.projection(),
+                entry.retained.branch(owner.projection().id()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let active = entry.active.as_ref().unwrap();
+    let host = entry.host.as_ref().unwrap();
+    let manifest = FrozenCleanupManifest::from_idle_host_authority_with_retained(
+        app.world(),
+        registry,
+        Some(active),
+        host,
+        &retiring,
+    )
+    .unwrap();
+    let entities = manifest.entities();
+    let expected = active
+        .claims()
+        .chain(retiring.iter().flat_map(|(_, branch)| branch.claims()))
+        .map(ExactRegistryClaim::entity)
+        .chain(std::iter::once(host.top_slot))
+        .collect::<HashSet<_>>();
+    assert_eq!(entities.iter().copied().collect::<HashSet<_>>(), expected);
+    assert_eq!(entities.len(), expected.len());
+    for (projection, branch) in &retiring {
+        let parent_slot = active
+            .child_slots()
+            .iter()
+            .find(|slot| {
+                slot.parent() == projection.parent()
+                    && slot.outlet() == projection.outlet()
+                    && slot.slot_id() == projection.slot()
+            })
+            .unwrap();
+        let slot_index = entities
+            .iter()
+            .position(|entity| *entity == parent_slot.slot())
+            .unwrap();
+        assert!(branch.claims().all(|claim| {
+            entities
+                .iter()
+                .position(|entity| *entity == claim.entity())
+                .unwrap()
+                < slot_index
+        }));
+    }
+    assert_eq!(entities.last(), Some(&host.top_slot));
+    assert!(
+        manifest
+            .freeze_back_no_target_authority_partition(app.world(), registry, host)
+            .is_some()
+    );
+}
+
+#[test]
+fn idle_retained_manifest_rejects_duplicate_mismatched_and_parentless_sources() {
+    use crate::navigation::RouterNavigation;
+
+    let app = idle_retained_cleanup_fixture();
+    let registry = app.world().resource::<RouteEntityRegistry>();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let inventory = entry.retained.inventory().unwrap();
+    let first = inventory[0].projection();
+    let second = inventory[1].projection();
+    let first_branch = entry.retained.branch(first.id()).unwrap();
+    let second_branch = entry.retained.branch(second.id()).unwrap();
+    for (active, retiring) in [
+        (
+            entry.active.as_ref(),
+            vec![(first, first_branch), (first, first_branch)],
+        ),
+        (entry.active.as_ref(), vec![(first, second_branch)]),
+        (None, vec![(first, first_branch)]),
+    ] {
+        assert!(matches!(
+            FrozenCleanupManifest::from_idle_host_authority_with_retained(
+                app.world(),
+                registry,
+                active,
+                entry.host.as_ref().unwrap(),
+                &retiring,
+            ),
+            Err(AuthoritySettlementManifestError::InvalidTopology)
+        ));
+    }
+}
+
+#[test]
+fn idle_retained_manifest_classifies_real_seal_loss_without_readonly_authority() {
+    use crate::navigation::RouterNavigation;
+
+    let mut app = idle_retained_cleanup_fixture();
+    let (shell, projection) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let projection = entry.retained.inventory().unwrap()[0].projection().clone();
+        (
+            entry.retained.branch(projection.id()).unwrap().frames()[0].shell(),
+            projection,
+        )
+    };
+    let changed_seal = app
+        .world_mut()
+        .resource_mut::<RouteEntityRegistry>()
+        .issue_unregistered_seal_for_test();
+    app.world_mut()
+        .entity_mut(shell)
+        .insert(RouteOwnershipSeal::new(changed_seal));
+    let registry = app.world().resource::<RouteEntityRegistry>();
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let branch = entry.retained.branch(projection.id()).unwrap();
+    assert!(
+        !registry.retained_shell_is_current(app.world(), shell, branch.frames()[0].top_slot(),)
+    );
+    let inventory = entry.retained.inventory().unwrap();
+    let retiring = inventory
+        .iter()
+        .map(|owner| {
+            (
+                owner.projection(),
+                entry.retained.branch(owner.projection().id()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let manifest = FrozenCleanupManifest::from_idle_host_authority_with_retained(
+        app.world(),
+        registry,
+        entry.active.as_ref(),
+        entry.host.as_ref().unwrap(),
+        &retiring,
+    )
+    .expect("the original physical owner still requires authority-loss cleanup");
+    assert!(manifest.obligations.iter().any(|obligation| {
+        obligation.entity() == shell
+            && obligation.terminal_mode == CleanupTerminalMode::AuthorityLost
+    }));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

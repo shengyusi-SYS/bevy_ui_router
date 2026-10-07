@@ -2422,7 +2422,7 @@ fn install_deep_nested_router(app: &mut App) -> RouterHandle {
     router
 }
 
-fn install_retained_slice_router(app: &mut App, capacity: usize) -> RouterHandle {
+pub(crate) fn install_retained_slice_router(app: &mut App, capacity: usize) -> RouterHandle {
     let driver = ViewDriverKey::new("retained-slice").unwrap();
     app.register_ui_view_driver(NestedDriver {
         key: driver.clone(),
@@ -5285,6 +5285,116 @@ fn retained_leaves_coexist_through_later_mounts_and_close_before_parent_cleanup(
     assert!(entry.cleanup_ledger.is_none());
     assert!(entry.pending_commit.is_none());
     assert!(entry.engine.snapshot().running_request().is_none());
+}
+
+#[test]
+fn retained_idle_host_loss_clears_original_owners_and_readmits_without_changing_history() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_retained_slice_router(&mut app, 2);
+    app.update();
+    let mut requests = Vec::new();
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, request);
+        requests.push(request);
+    }
+    let (host, top, version, history, owned) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(entry.retained.len(), 2);
+        let host = entry.host.as_ref().unwrap();
+        let mut owned = entry
+            .active
+            .as_ref()
+            .unwrap()
+            .claims()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        for owner in entry.retained.inventory().unwrap() {
+            owned.extend(
+                entry
+                    .retained
+                    .branch(owner.projection().id())
+                    .unwrap()
+                    .claims()
+                    .map(ExactRegistryClaim::entity),
+            );
+        }
+        (
+            host.host,
+            host.top_slot,
+            host.version.clone(),
+            entry.engine.history().clone(),
+            owned,
+        )
+    };
+    let sentinel = app.world_mut().spawn(NestedAppHostSentinel(0x17_1e)).id();
+    app.world_mut().entity_mut(host).add_child(sentinel);
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    for _ in 0..12 {
+        app.update();
+    }
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(
+            entry.host.is_none(),
+            "retained leaves must not prevent idle host settlement"
+        );
+        assert!(entry.active.is_none());
+        assert!(entry.retained.is_empty());
+        assert!(entry.retained.inventory().unwrap().is_empty());
+        assert!(entry.idle_host_loss.is_none());
+        assert!(entry.engine.snapshot().running_request().is_none());
+        assert_eq!(entry.engine.history(), &history);
+        for request in &requests {
+            assert_eq!(
+                entry.engine.request(*request).unwrap().status(),
+                &RequestStatus::Succeeded
+            );
+        }
+    }
+    assert!(
+        owned
+            .iter()
+            .all(|entity| app.world().get_entity(*entity).is_err())
+    );
+    assert!(app.world().get_entity(top).is_err());
+    assert!(app.world().get_entity(host).is_ok());
+    assert_eq!(
+        app.world().get::<NestedAppHostSentinel>(sentinel),
+        Some(&NestedAppHostSentinel(0x17_1e))
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+        Some(host)
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..12 {
+        app.update();
+    }
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_ne!(entry.host.as_ref().unwrap().version, version);
+        assert_eq!(entry.engine.history(), &history);
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+    }
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/items/4"))
+        .unwrap();
+    run_updates_until_succeeded(&mut app, request);
 }
 
 #[test]

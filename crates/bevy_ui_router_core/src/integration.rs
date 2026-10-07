@@ -1844,7 +1844,38 @@ pub struct HostLease {
 
 pub use crate::engine::idle_host_loss::{
     IdleHostLossErrorKind, IdleHostLossPhysicalDisposition, IdleHostLossPhysicalFacts,
+    RetainedIdleHostLossPlan,
 };
+
+/// An unsuccessful idle begin returns the complete original transfer.
+pub struct BeginRetainedIdleHostLossError {
+    lease: HostLease,
+    plan: RetainedIdleHostLossPlan,
+    owners: Vec<RetainedLeafOwner>,
+    kind: IdleHostLossErrorKind,
+}
+
+impl std::fmt::Debug for BeginRetainedIdleHostLossError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BeginRetainedIdleHostLossError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BeginRetainedIdleHostLossError {
+    pub fn into_parts(
+        self,
+    ) -> (
+        HostLease,
+        RetainedIdleHostLossPlan,
+        Vec<RetainedLeafOwner>,
+        IdleHostLossErrorKind,
+    ) {
+        (self.lease, self.plan, self.owners, self.kind)
+    }
+}
 
 #[doc(hidden)]
 pub struct IdleHostLossOwner {
@@ -5964,6 +5995,49 @@ impl RouterEngine {
                 |inner| install(IdleHostLossOwner { inner }),
             )
             .map_err(|(kind, inner)| (kind, HostLease { inner }))
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_retained_idle_host_loss_plan(
+        &self,
+        lease: &HostLease,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedIdleHostLossPlan, IdleHostLossErrorKind> {
+        self.inner
+            .prepare_retained_idle_host_loss_plan(&lease.inner, inventory)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_idle_host_loss_with_retention<F>(
+        &mut self,
+        lease: HostLease,
+        plan: RetainedIdleHostLossPlan,
+        manifest: &CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+        install: F,
+    ) -> Result<(), BeginRetainedIdleHostLossError>
+    where
+        F: FnOnce(IdleHostLossOwner),
+    {
+        self.inner
+            .begin_idle_host_loss_with_retention(
+                &mut self.admission,
+                lease.inner,
+                plan,
+                &manifest.logical_roots,
+                manifest.manifest_digest,
+                manifest.obligation_count,
+                owners,
+                |inner| install(IdleHostLossOwner { inner }),
+            )
+            .map_err(
+                |(lease, plan, owners, kind)| BeginRetainedIdleHostLossError {
+                    lease: HostLease { inner: lease },
+                    plan,
+                    owners,
+                    kind,
+                },
+            )
     }
 
     #[doc(hidden)]

@@ -3256,7 +3256,107 @@ impl FrozenCleanupManifest {
         active: Option<&RealizedBranch>,
         host: &HostBinding,
     ) -> Result<Self, AuthoritySettlementManifestError> {
+        Self::from_idle_host_authority_with_retained(world, registry, active, host, &[])
+    }
+
+    pub(crate) fn from_idle_host_authority_with_retained(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        active: Option<&RealizedBranch>,
+        host: &HostBinding,
+        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+    ) -> Result<Self, AuthoritySettlementManifestError> {
+        let mut primary_entities = HashSet::new();
+        let primary_count = active
+            .map_or(Some(1), |branch| branch.obligation_count().checked_add(1))
+            .and_then(|count| {
+                retiring.iter().try_fold(count, |count, (_, branch)| {
+                    count.checked_add(branch.obligation_count())
+                })
+            })
+            .ok_or(AuthoritySettlementManifestError::RetryableCapacity)?;
+        primary_entities
+            .try_reserve(primary_count)
+            .map_err(|_| AuthoritySettlementManifestError::RetryableCapacity)?;
+        primary_entities.insert(host.top_slot);
+        if let Some(active) = active {
+            primary_entities.extend(active.claims().map(ExactRegistryClaim::entity));
+        }
+        for (index, (projection, branch)) in retiring.iter().enumerate() {
+            let [frame] = branch.frames() else {
+                return Err(AuthoritySettlementManifestError::InvalidTopology);
+            };
+            let active = active.ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+            let mut parents = active
+                .frames()
+                .iter()
+                .filter(|frame| frame.frame() == projection.parent());
+            let parent = parents
+                .next()
+                .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+            let mut slots = active.child_slots().iter().filter(|slot| {
+                slot.parent() == projection.parent()
+                    && slot.outlet() == projection.outlet()
+                    && slot.slot_id() == projection.slot()
+            });
+            let slot = slots
+                .next()
+                .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+            let mount = frame.mount_binding();
+            if parents.next().is_some()
+                || slots.next().is_some()
+                || projection.host() != &host.version
+                || frame.frame() != projection.frame()
+                || !mount.matches_retained_scope(projection)
+                || mount.slot() != slot.slot()
+                || mount.slot_claim().entity() != slot.slot_claim().entity()
+                || mount.slot_claim().owner() != slot.slot_claim().owner()
+                || mount.slot_claim().seal() != slot.slot_claim().seal()
+                || !matches!(
+                    mount.slot_claim().lifecycle(),
+                    EntityLifecycle::Active | EntityLifecycle::PreparedInert
+                )
+                || !matches!(
+                    slot.slot_claim().lifecycle(),
+                    EntityLifecycle::Active | EntityLifecycle::PreparedInert
+                )
+                || mount.physical_parent().0 != slot.anchor()
+                || mount.outlet_binding() != Some(slot.anchor_binding())
+                || !parent.outlet(slot.outlet()).is_some_and(|outlet| {
+                    outlet.anchor() == slot.anchor()
+                        && outlet.anchor_claim() == slot.anchor_claim()
+                        && parent.claims().any(|claim| claim == slot.anchor_claim())
+                })
+                || branch
+                    .child_slots()
+                    .iter()
+                    .any(|slot| slot.parent() != frame.frame())
+                || branch
+                    .claims()
+                    .any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
+                || retiring[..index].iter().any(|(prior, _)| {
+                    prior.id() == projection.id() || prior.frame() == projection.frame()
+                })
+                || branch
+                    .claims()
+                    .any(|claim| !primary_entities.insert(claim.entity()))
+            {
+                return Err(AuthoritySettlementManifestError::InvalidTopology);
+            }
+        }
         let mut obligations = Vec::new();
+        // Core has already transferred these exact retained instances. Their
+        // current physical facts use the same authority-loss classification as
+        // the active branch; a read-only preservation proof grants no cleanup.
+        for (_, branch) in retiring {
+            append_exact_authority_branch(
+                world,
+                registry,
+                branch.frames(),
+                branch.child_slots(),
+                &mut obligations,
+            )?;
+        }
         if let Some(active) = active {
             append_exact_authority_branch(
                 world,
@@ -9933,6 +10033,7 @@ pub(crate) enum CleanupOwner {
 
 pub(crate) struct IdleHostAuthorityCleanupOwner {
     active: Option<RealizedBranch>,
+    retained: Vec<RealizedBranch>,
     pub(crate) host: RetiredHostBinding,
 }
 
@@ -10366,10 +10467,32 @@ impl CleanupLedger {
         host_children: Vec<Entity>,
         partition: FrozenBackNoTargetAuthorityPartition,
     ) -> Self {
+        Self::activate_idle_host_authority_with_retained(
+            prepared,
+            active,
+            host,
+            host_children,
+            partition,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn activate_idle_host_authority_with_retained(
+        prepared: PreparedCleanupLedger,
+        active: Option<RealizedBranch>,
+        host: RetiredHostBinding,
+        host_children: Vec<Entity>,
+        partition: FrozenBackNoTargetAuthorityPartition,
+        retained: Vec<RealizedBranch>,
+    ) -> Self {
         let mut ledger = Self::activate_owner(
             prepared,
             Some(CleanupOwner::IdleHostAuthority(
-                IdleHostAuthorityCleanupOwner { active, host },
+                IdleHostAuthorityCleanupOwner {
+                    active,
+                    retained,
+                    host,
+                },
             )),
         );
         ledger.authority_host_children = Some(host_children);

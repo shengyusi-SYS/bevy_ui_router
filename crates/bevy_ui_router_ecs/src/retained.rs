@@ -83,7 +83,63 @@ pub(crate) struct PreparedRetiredPayloads {
     payloads: Vec<RealizedBranch>,
 }
 
+pub(crate) struct RetainedSettlementStorage {
+    branches: Vec<RealizedBranch>,
+}
+
+/// Keeps the original physical holder intact until Core accepts the idle
+/// settlement. A rejected begin restores this same holder and its owners.
+pub(crate) struct RetainedSettlementPayload {
+    leaves: RetainedLeaves,
+    branches: Vec<RealizedBranch>,
+}
+
+impl RetainedSettlementPayload {
+    pub(crate) fn restore(self) -> RetainedLeaves {
+        self.leaves
+    }
+
+    pub(crate) fn into_branches(mut self) -> Vec<RealizedBranch> {
+        for entry in self.leaves.entries {
+            self.branches.push(entry.branch);
+        }
+        self.branches
+    }
+}
+
 impl RetainedLeaves {
+    pub(crate) fn prepare_settlement(
+        &self,
+        retiring: &[RetainedLeafProjection],
+    ) -> Option<RetainedSettlementStorage> {
+        if retiring.len() != self.entries.len()
+            || retiring.iter().enumerate().any(|(index, projection)| {
+                retiring[index + 1..].contains(projection)
+                    || self
+                        .entries
+                        .iter()
+                        .filter(|entry| &entry.projection == projection && entry.owner.is_some())
+                        .count()
+                        != 1
+            })
+        {
+            return None;
+        }
+        let mut branches = Vec::new();
+        branches.try_reserve_exact(retiring.len()).ok()?;
+        Some(RetainedSettlementStorage { branches })
+    }
+
+    pub(crate) fn take_settlement(
+        &mut self,
+        storage: RetainedSettlementStorage,
+    ) -> RetainedSettlementPayload {
+        RetainedSettlementPayload {
+            leaves: std::mem::take(self),
+            branches: storage.branches,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

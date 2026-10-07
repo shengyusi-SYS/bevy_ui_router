@@ -103,6 +103,16 @@ pub(super) struct RetainedRegistryEntry {
     retirement: Option<CleanupBatchToken>,
 }
 
+impl RetainedRegistryEntry {
+    pub(super) const fn projection(&self) -> &RetainedLeafProjection {
+        &self.projection
+    }
+
+    pub(super) fn is_live(&self) -> bool {
+        self.retirement.is_none()
+    }
+}
+
 // Transit responsibility is independent of CurrentWork and survives discarded
 // prepared handles and rejected publication. Neither this holder nor its owners is Clone.
 pub(super) struct PreparedRetainedTransfer {
@@ -510,7 +520,7 @@ pub(super) fn publication_slots(current: &CurrentWork) -> Vec<LogicalChildSlotBi
     }
 }
 
-fn scope_survives(
+pub(super) fn scope_survives(
     projection: &RetainedLeafProjection,
     host: &HostVersion,
     frames: &[RouteFrameVersion],

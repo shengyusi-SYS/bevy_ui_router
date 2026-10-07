@@ -433,3 +433,193 @@ fn retained_leaf_same_source_rejection_returns_original_owners_after_authority_s
     assert_eq!(cleanup.obligation_count(), count);
     drop((prepared, cleanup, returned));
 }
+
+fn retained_idle_fixture() -> (RouterEngine, HostLease, Vec<RetainedLeafOwner>) {
+    let (mut engine, lease) = engine_with_lease(2, true);
+    let mut owners = Vec::new();
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        navigate(&mut engine, path, &mut owners);
+    }
+    assert_eq!(owners.len(), 2);
+    (engine, lease, owners)
+}
+
+#[test]
+fn retained_idle_host_loss_transfers_original_owners_and_readmits_without_changing_history() {
+    let (mut engine, lease, mut owners) = retained_idle_fixture();
+    let history = engine.history().clone();
+    let entry_keys = engine.canonical_history();
+    let original = owners
+        .iter()
+        .map(|owner| owner.projection().clone())
+        .collect::<Vec<_>>();
+    assert!(engine.idle_host_loss_eligible());
+    let current_roots = engine
+        .active()
+        .frames()
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    let (_, lease) = engine
+        .begin_idle_host_loss(
+            lease,
+            &CleanupManifest::new(current_roots.clone(), 0x8170, 3),
+            |_| panic!("the old entry must not bypass live retained owners"),
+        )
+        .unwrap_err();
+    let plan = engine
+        .prepare_retained_idle_host_loss_plan(&lease, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let mut roots = current_roots;
+    roots.extend(original.iter().map(|projection| projection.frame().clone()));
+    assert_eq!(plan.logical_roots(), roots);
+    assert_eq!(plan.retiring(), original);
+    let manifest = CleanupManifest::new(roots, 0x8170, 5);
+    let mut owner = None;
+    engine
+        .begin_idle_host_loss_with_retention(
+            lease,
+            plan,
+            &manifest,
+            std::mem::take(&mut owners),
+            |value| owner = Some(value),
+        )
+        .unwrap();
+    assert!(!engine.idle_host_loss_eligible());
+    let facts = IdleHostLossPhysicalFacts {
+        manifest_digest: 0x8170,
+        obligation_count: 5,
+        disposition: IdleHostLossPhysicalDisposition::Settled {
+            completion_digest: 0x8171,
+            settled_count: 5,
+        },
+    };
+    let terminal = engine
+        .complete_idle_host_loss(owner.unwrap(), facts, |terminal| terminal)
+        .unwrap_or_else(|_| panic!("the exact retained idle owner must complete"));
+    assert_eq!(terminal.physical_facts(), facts);
+    assert_eq!(engine.history(), &history);
+    assert_eq!(engine.canonical_history(), entry_keys);
+    assert!(engine.snapshot().running_request().is_none());
+
+    let HostAdmissionSourcePermitOutcome::Ineligible { source, .. } =
+        engine.issue_host_admission_source_permit()
+    else {
+        panic!("settled loss waits for a changed candidate observation")
+    };
+    let observation = HostAdmissionUnavailableEvidenceProjection::host_lost(
+        &source,
+        Some(0x8172),
+        0x8173,
+        0x8174,
+    );
+    let HostAdmissionUnavailableCauseBindOutcome::Bound(cause) =
+        engine.bind_host_admission_unavailable_cause(source, &observation, ())
+    else {
+        panic!("the actual HostLost source binds a changed candidate")
+    };
+    assert!(matches!(
+        engine.complete_observed_host_admission_unavailable(cause, || {}),
+        HostAdmissionUnavailableObservedOutcome::Published(_)
+    ));
+    let HostAdmissionSourcePermitOutcome::Issued(permit) =
+        engine.issue_host_admission_source_permit()
+    else {
+        panic!("the changed observation permits admission")
+    };
+    let token = engine
+        .request_source_bound_host_admission(permit)
+        .ok()
+        .unwrap();
+    let grant = engine
+        .grant_source_bound_host_admission(token)
+        .ok()
+        .unwrap();
+    engine
+        .record_source_bound_top_slot_registered(&grant)
+        .ok()
+        .unwrap();
+    let HostConfirmationPreparationOutcome::Prepared(prepared) =
+        engine.prepare_host_confirmation(bind_granted_host_admission_source(grant, ()))
+    else {
+        panic!("the new exact grant prepares confirmation")
+    };
+    let HostAdmissionConfirmationCoreOutcome::Ready {
+        installed: lease, ..
+    } = engine.confirm_host_admission_with_binding(prepared, |(), lease| lease)
+    else {
+        panic!("the new exact grant confirms one real host lease")
+    };
+    navigate(&mut engine, "/other/1", &mut owners);
+    navigate(&mut engine, "/other/2", &mut owners);
+    assert_eq!(
+        owners.len(),
+        1,
+        "idle completion releases the retired host's capacity"
+    );
+    drop(lease);
+}
+
+#[test]
+fn retained_idle_source_drift_returns_the_complete_original_responsibility() {
+    let (mut engine, lease, owners) = retained_idle_fixture();
+    let original = owners
+        .iter()
+        .map(|owner| owner.projection().clone())
+        .collect::<Vec<_>>();
+    let history = engine.history().clone();
+    let plan = engine
+        .prepare_retained_idle_host_loss_plan(&lease, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let roots = plan.logical_roots().to_vec();
+    let manifest = CleanupManifest::new(roots.clone(), 0x8270, 5);
+    engine = engine.with_keep_alive_capacity(1);
+    let (lease, plan, owners, kind) = engine
+        .begin_idle_host_loss_with_retention(lease, plan, &manifest, owners, |_| {
+            panic!("source drift must not install a physical idle owner")
+        })
+        .unwrap_err()
+        .into_parts();
+    assert_eq!(kind, IdleHostLossErrorKind::ReceiverMismatch);
+    assert_eq!(plan.logical_roots(), roots);
+    assert_eq!(
+        owners
+            .iter()
+            .map(|owner| owner.projection().clone())
+            .collect::<Vec<_>>(),
+        original
+    );
+    assert_eq!(engine.history(), &history);
+    assert!(engine.idle_host_loss_eligible());
+    drop(plan);
+    let plan = engine
+        .prepare_retained_idle_host_loss_plan(&lease, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let mut installed = None;
+    engine
+        .begin_idle_host_loss_with_retention(lease, plan, &manifest, owners, |owner| {
+            installed = Some(owner)
+        })
+        .unwrap();
+    let facts = IdleHostLossPhysicalFacts {
+        manifest_digest: 0x8270,
+        obligation_count: 5,
+        disposition: IdleHostLossPhysicalDisposition::SafeResidual {
+            observation_digest: 0x8271,
+        },
+    };
+    engine = engine.with_keep_alive_capacity(2);
+    let owner = engine
+        .complete_idle_host_loss(installed.unwrap(), facts, |_| -> () {
+            panic!("completion source drift must return the original idle owner")
+        })
+        .unwrap_err();
+    assert_eq!(engine.history(), &history);
+    engine = engine.with_keep_alive_capacity(1);
+    let terminal = engine
+        .complete_idle_host_loss(owner, facts, |terminal| terminal)
+        .unwrap_or_else(|_| panic!("restored exact source must accept the original owner"));
+    assert_eq!(terminal.physical_facts(), facts);
+    assert_eq!(engine.history(), &history);
+}
