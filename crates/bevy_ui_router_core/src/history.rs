@@ -55,6 +55,10 @@ pub struct MemoryHistory {
 }
 
 impl MemoryHistory {
+    pub(crate) const fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

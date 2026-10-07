@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::HostVersion;
 use crate::cleanup::CleanupBatchToken;
-use crate::fingerprint::RouteBranchFingerprint;
+use crate::fingerprint::{RouteBranchFingerprint, RouteSegmentReuseKey};
 use crate::frame::{FrameOrigin, LogicalChildSlotBinding, RouteFrameVersion};
 use crate::history::{HistorySnapshot, MemoryHistory};
 use crate::ids::{
@@ -10,15 +10,124 @@ use crate::ids::{
     RouteGeneration, RouteHostId, RouteSlotId, RouterIdentity, TransactionId,
 };
 use crate::location::RouteLocation;
-use crate::presentation::ActivePresentation;
+use crate::presentation::{ActivePresentation, ActivePresentationKind};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct HistoryIncarnation(RouterIdentity);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct HistoryEntryId {
     incarnation: HistoryIncarnation,
     creator: NavigationRequestId,
+}
+
+/// Read-only identity of one canonical history entry, scoped to its Router.
+///
+/// A key cannot create history or authorize publication or lifecycle mutation.
+///
+/// ```compile_fail
+/// use bevy_ui_router_core::integration::HistoryEntryKey;
+/// let _ = HistoryEntryKey(1);
+/// ```
+///
+/// ```compile_fail
+/// use bevy_ui_router_core::integration::HistoryEntryKey;
+/// let _ = HistoryEntryKey::new(1);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HistoryEntryKey(HistoryEntryId);
+
+/// An owned read-only projection of canonical entry identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalHistoryView {
+    entry_keys: Vec<HistoryEntryKey>,
+    current_entry: Option<HistoryEntryKey>,
+}
+
+impl CanonicalHistoryView {
+    pub fn entry_keys(&self) -> &[HistoryEntryKey] {
+        &self.entry_keys
+    }
+
+    pub const fn current_entry(&self) -> Option<HistoryEntryKey> {
+        self.current_entry
+    }
+}
+
+/// Exact normal frame and its route reuse identity; this is not authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryFrameFact {
+    frame: RouteFrameVersion,
+    segment_reuse_key: RouteSegmentReuseKey,
+}
+
+impl HistoryFrameFact {
+    pub(crate) fn new(frame: RouteFrameVersion, segment_reuse_key: RouteSegmentReuseKey) -> Self {
+        Self {
+            frame,
+            segment_reuse_key,
+        }
+    }
+
+    pub const fn frame(&self) -> &RouteFrameVersion {
+        &self.frame
+    }
+
+    pub const fn segment_reuse_key(&self) -> &RouteSegmentReuseKey {
+        &self.segment_reuse_key
+    }
+}
+
+/// History facts frozen before a prepared presentation can publish.
+///
+/// Keeping or cloning these facts does not commit history or carry authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPublicationFacts {
+    source_entry: Option<HistoryEntryKey>,
+    target_entry: Option<HistoryEntryKey>,
+    surviving_entries: Vec<HistoryEntryKey>,
+    restores_back: bool,
+    source_frames: Vec<HistoryFrameFact>,
+    target_frames: Vec<HistoryFrameFact>,
+}
+
+impl HistoryPublicationFacts {
+    /// The prior entry only when its normal presentation is still the source.
+    pub const fn source_entry(&self) -> Option<HistoryEntryKey> {
+        self.source_entry
+    }
+
+    /// The successful normal target; error and fallback publication have none.
+    pub const fn target_entry(&self) -> Option<HistoryEntryKey> {
+        self.target_entry
+    }
+
+    pub fn surviving_entries(&self) -> &[HistoryEntryKey] {
+        &self.surviving_entries
+    }
+
+    /// Whether this publication successfully selects an existing Back entry.
+    pub const fn restores_back(&self) -> bool {
+        self.restores_back
+    }
+
+    pub fn source_frames(&self) -> &[HistoryFrameFact] {
+        &self.source_frames
+    }
+
+    pub fn target_frames(&self) -> &[HistoryFrameFact] {
+        &self.target_frames
+    }
+
+    pub(crate) fn with_frames(
+        mut self,
+        source_frames: Vec<HistoryFrameFact>,
+        target_frames: Vec<HistoryFrameFact>,
+    ) -> Self {
+        self.source_frames = source_frames;
+        self.target_frames = target_frames;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1606,6 +1715,27 @@ pub(crate) struct PreparedHistoryPublication {
 }
 
 impl PreparedHistoryPublication {
+    pub(crate) fn publication_facts(
+        &self,
+        source_presentation: &ActivePresentation,
+    ) -> HistoryPublicationFacts {
+        HistoryPublicationFacts {
+            source_entry: (source_presentation.kind() == ActivePresentationKind::Route)
+                .then(|| {
+                    self.source
+                        .cursor
+                        .and_then(|cursor| self.source.entry_ids.get(cursor).copied())
+                        .map(HistoryEntryKey)
+                })
+                .flatten(),
+            target_entry: self.next.current_entry_key(),
+            surviving_entries: self.next.entry_keys(),
+            restores_back: matches!(self.destination, FrozenHistoryDestination::Back(_)),
+            source_frames: Vec::new(),
+            target_frames: Vec::new(),
+        }
+    }
+
     pub(crate) fn matches_canonical_source(&self, history: &CanonicalHistory) -> bool {
         self.source == history.freeze_source()
     }
@@ -1842,6 +1972,44 @@ impl CanonicalHistory {
                 incarnation,
                 committed_by: None,
             },
+        }
+    }
+
+    pub(crate) fn entry_key_projection(&self) -> CanonicalHistoryView {
+        CanonicalHistoryView {
+            entry_keys: self.entry_keys(),
+            current_entry: self.current_entry_key(),
+        }
+    }
+
+    fn entry_keys(&self) -> Vec<HistoryEntryKey> {
+        self.entry_ids
+            .iter()
+            .copied()
+            .map(HistoryEntryKey)
+            .collect()
+    }
+
+    fn current_entry_key(&self) -> Option<HistoryEntryKey> {
+        self.projection
+            .cursor()
+            .and_then(|cursor| self.entry_ids.get(cursor).copied())
+            .map(HistoryEntryKey)
+    }
+
+    pub(crate) fn unchanged_publication_facts(
+        &self,
+        source_presentation: &ActivePresentation,
+    ) -> HistoryPublicationFacts {
+        HistoryPublicationFacts {
+            source_entry: (source_presentation.kind() == ActivePresentationKind::Route)
+                .then(|| self.current_entry_key())
+                .flatten(),
+            target_entry: None,
+            surviving_entries: self.entry_keys(),
+            restores_back: false,
+            source_frames: Vec::new(),
+            target_frames: Vec::new(),
         }
     }
 

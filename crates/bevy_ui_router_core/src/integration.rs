@@ -176,10 +176,11 @@ pub use crate::history_authority::{
     BackResolutionContradiction, BackResolutionEvidence, BackResolutionEvidenceClassification,
     BackResolutionOwnerHandoff, BackResolutionScopeView, BackResolutionVerifyOutcome,
     BackTargetExecutionOwner, BackTargetPermanentOwner, BackTargetPermanentTerminalEvidence,
-    EnqueueBackErrorKind, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
-    PrepareBackAdmissionErrorKind, VerifiedBackNoTargetCandidate,
-    VerifiedBackResolutionContradiction, VerifiedBackResolutionHandoff,
-    VerifiedBackResolutionOwnerHandoff, VerifiedBackTargetExecutionOwner,
+    CanonicalHistoryView, EnqueueBackErrorKind, HistoryAdmissionStamp, HistoryAdmissionWorldSeal,
+    HistoryEntryKey, HistoryFrameFact, HistoryPublicationFacts, PrepareBackAdmissionErrorKind,
+    VerifiedBackNoTargetCandidate, VerifiedBackResolutionContradiction,
+    VerifiedBackResolutionHandoff, VerifiedBackResolutionOwnerHandoff,
+    VerifiedBackTargetExecutionOwner,
 };
 use crate::history_authority::{
     BackResolutionScopeProjection, ClaimHistoryAdmissionWorldError,
@@ -4014,6 +4015,10 @@ pub struct PreparedCommit {
 }
 
 impl PreparedCommit {
+    pub fn history_publication(&self) -> &HistoryPublicationFacts {
+        self.publication.history_publication()
+    }
+
     pub fn cleanup(&self) -> &CleanupBatch {
         &self.cleanup
     }
@@ -4026,6 +4031,10 @@ pub struct ValidatedCommit<'a> {
 }
 
 impl ValidatedCommit<'_> {
+    pub fn history_publication(&self) -> &HistoryPublicationFacts {
+        self.publication.history_publication()
+    }
+
     pub fn cleanup(&self) -> &CleanupBatch {
         &self.cleanup
     }
@@ -9348,6 +9357,11 @@ impl RouterEngine {
             .ok_or(IntegrationError::Stale)
     }
 
+    /// Read-only canonical identities; these keys cannot authorize history mutation.
+    pub fn canonical_history(&self) -> CanonicalHistoryView {
+        self.inner.canonical_history()
+    }
+
     pub fn history(&self) -> &MemoryHistory {
         self.inner.history()
     }
@@ -11858,6 +11872,324 @@ mod tests {
     enum HistoryFixtureCommand {
         Push,
         Replace,
+    }
+
+    fn prepare_history_action(
+        engine: &mut RouterEngine,
+        mut first: Option<EngineAction>,
+    ) -> PreparedCommit {
+        loop {
+            match first
+                .take()
+                .or_else(|| engine.action())
+                .expect("real history action")
+            {
+                EngineAction::FrameTask(task) => {
+                    let outlets = engine
+                        .expected_child_outlet(&task)
+                        .unwrap()
+                        .into_iter()
+                        .collect();
+                    engine.report_applied_with_outlets(task, outlets).unwrap();
+                }
+                EngineAction::MountRequest(mount) => {
+                    let receipt = engine.resolve_mount(mount).unwrap().attest_receipt(0x61);
+                    let completion = engine.accept_mount_receipt(receipt).unwrap().complete(0x63);
+                    engine.complete_mount_registration(completion).unwrap();
+                }
+                EngineAction::Commit(ticket) => {
+                    let roots = match engine.reconciliation_projection_for_commit(&ticket) {
+                        Ok(projection) => projection
+                            .leaving()
+                            .map(|frame| frame.version().clone())
+                            .collect::<Vec<_>>(),
+                        Err(_) => engine.active().frames().iter().rev().cloned().collect(),
+                    };
+                    let manifest = if roots.is_empty() {
+                        CleanupManifest::empty()
+                    } else {
+                        let count = roots.len();
+                        CleanupManifest::new(roots, 0x6163, count)
+                    };
+                    return engine.prepare_commit(&ticket, manifest).unwrap();
+                }
+                EngineAction::FailureCleanup(_) | EngineAction::BackResolution(_) => {
+                    panic!("fixture expects a resolved successful presentation")
+                }
+            }
+        }
+    }
+
+    fn prepare_history_command(
+        engine: &mut RouterEngine,
+        command: HistoryFixtureCommand,
+        location: RouteLocation,
+    ) -> PreparedCommit {
+        match command {
+            HistoryFixtureCommand::Push => engine.push(location).unwrap(),
+            HistoryFixtureCommand::Replace => engine.replace(location).unwrap(),
+        };
+        engine.collect();
+        prepare_history_action(engine, None)
+    }
+
+    fn publish_history_facts(
+        engine: &mut RouterEngine,
+        prepared: PreparedCommit,
+    ) -> HistoryPublicationFacts {
+        let facts = prepared.history_publication().clone();
+        let cleanup = prepared.cleanup().clone();
+        let count = cleanup.obligation_count();
+        let validated = engine.validate_publication(prepared).unwrap();
+        assert_eq!(validated.history_publication(), &facts);
+        validated.publish(|| {});
+        let completion = if count == 0 {
+            cleanup.complete_empty()
+        } else {
+            cleanup.complete(0x6567, count)
+        };
+        engine.complete_cleanup(completion).unwrap();
+        facts
+    }
+
+    #[test]
+    fn canonical_history_keys_distinguish_duplicate_urls_and_routers() {
+        let mut engine = confirmed_engine();
+        assert!(engine.canonical_history().entry_keys().is_empty());
+        assert_eq!(engine.canonical_history().current_entry(), None);
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/"),
+        );
+        assert_eq!(prepared.history_publication().source_entry(), None);
+        assert!(prepared.history_publication().source_frames().is_empty());
+        let first = publish_history_facts(&mut engine, prepared)
+            .target_entry()
+            .unwrap();
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/"),
+        );
+        let second_facts = publish_history_facts(&mut engine, prepared);
+        let second = second_facts.target_entry().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second_facts.source_entry(), Some(first));
+        assert!(!second_facts.restores_back());
+        assert_eq!(second_facts.surviving_entries(), &[first, second]);
+        assert_eq!(engine.canonical_history().entry_keys(), &[first, second]);
+        assert_eq!(engine.canonical_history().current_entry(), Some(second));
+        assert_eq!(second_facts.source_frames(), second_facts.target_frames());
+
+        let mut foreign = confirmed_engine();
+        settle_push(&mut foreign, RouteLocation::new("/"));
+        let foreign_key = foreign.canonical_history().current_entry().unwrap();
+        assert_ne!(foreign_key, first);
+        assert_ne!(foreign_key, second);
+        let mut keys = std::collections::HashSet::new();
+        keys.extend([first, second, foreign_key]);
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn canonical_history_equivalent_replace_reclaims_old_entry_without_rebuilding_frames() {
+        let mut engine = confirmed_engine();
+        settle_push(&mut engine, RouteLocation::new("/"));
+        let old = engine.canonical_history().current_entry().unwrap();
+        let frames = engine.active().frames().to_vec();
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Replace,
+            RouteLocation::new("/"),
+        );
+        let facts = publish_history_facts(&mut engine, prepared);
+        let replacement = facts.target_entry().unwrap();
+        assert_eq!(facts.source_entry(), Some(old));
+        assert_ne!(replacement, old);
+        assert_eq!(facts.surviving_entries(), &[replacement]);
+        assert_eq!(engine.canonical_history().entry_keys(), &[replacement]);
+        assert_eq!(engine.active().frames(), frames);
+        assert!(!facts.restores_back());
+    }
+
+    #[test]
+    fn canonical_history_back_reuses_entry_and_subsequent_push_truncates_forward_facts() {
+        let mut engine = confirmed_engine();
+        for _ in 0..3 {
+            settle_push(&mut engine, RouteLocation::new("/"));
+        }
+        let keys = engine.canonical_history().entry_keys().to_vec();
+        let owner = take_verified_back_target(&mut engine);
+        let resume = match engine.resume_back_target_with_retirement(owner, || {}) {
+            BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+            _ => panic!("unchanged history resolves its real Back target"),
+        };
+        let (action, _history, _continuation) = resume.into_parts();
+        let BackTargetResumeAction::Commit(ticket) = action else {
+            panic!("equivalent Back reuses the active branch")
+        };
+        let prepared = prepare_history_action(&mut engine, Some(EngineAction::Commit(ticket)));
+        let back = publish_history_facts(&mut engine, prepared);
+        assert_eq!(back.source_entry(), Some(keys[2]));
+        assert_eq!(back.target_entry(), Some(keys[1]));
+        assert_eq!(back.surviving_entries(), keys);
+        assert!(back.restores_back());
+        assert_eq!(engine.canonical_history().current_entry(), Some(keys[1]));
+
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/"),
+        );
+        let pushed = publish_history_facts(&mut engine, prepared);
+        let new = pushed.target_entry().unwrap();
+        assert_ne!(new, keys[2]);
+        assert_eq!(pushed.surviving_entries(), &[keys[0], keys[1], new]);
+        assert!(!pushed.surviving_entries().contains(&keys[2]));
+        assert!(!pushed.restores_back());
+    }
+
+    #[test]
+    fn canonical_history_fallback_saves_only_normal_source_and_has_no_successful_target() {
+        let mut engine = confirmed_engine();
+        settle_push(&mut engine, RouteLocation::new("/"));
+        let before = engine.canonical_history();
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/missing"),
+        );
+        let fallback = publish_history_facts(&mut engine, prepared);
+        assert_eq!(fallback.source_entry(), before.current_entry());
+        assert_eq!(fallback.source_frames().len(), 1);
+        assert_eq!(fallback.target_entry(), None);
+        assert!(fallback.target_frames().is_empty());
+        assert!(!fallback.restores_back());
+        assert_eq!(fallback.surviving_entries(), before.entry_keys());
+        assert_eq!(engine.canonical_history(), before);
+        assert_eq!(engine.active().kind(), ActivePresentationKind::Error);
+
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/"),
+        );
+        let from_error = publish_history_facts(&mut engine, prepared);
+        assert_eq!(from_error.source_entry(), None);
+        assert!(from_error.source_frames().is_empty());
+        assert!(from_error.target_entry().is_some());
+        assert_eq!(from_error.surviving_entries().len(), 2);
+    }
+
+    #[test]
+    fn canonical_history_failed_recovery_retains_normal_source_without_advancing_history() {
+        let mut engine = confirmed_engine();
+        settle_push(&mut engine, RouteLocation::new("/"));
+        let before = engine.canonical_history();
+        let active = engine.active().clone();
+        let request = engine.push(RouteLocation::new("/missing")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(fallback) = engine.action().unwrap() else {
+            panic!("unmatched route issues real fallback")
+        };
+        let failure = engine
+            .report_failed(fallback, ViewFailureKind::Build, "fallback failed")
+            .unwrap()
+            .unwrap();
+        let cleanup = engine
+            .prepare_failure_cleanup(failure, CleanupManifest::empty())
+            .unwrap();
+        engine.complete_cleanup(cleanup.complete_empty()).unwrap();
+        assert!(matches!(
+            engine.request(request).unwrap().status(),
+            RequestStatus::Failed(_)
+        ));
+        assert_eq!(engine.canonical_history(), before);
+        assert_eq!(engine.active(), &active);
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/"),
+        );
+        assert_eq!(
+            prepared.history_publication().source_entry(),
+            before.current_entry()
+        );
+        publish_history_facts(&mut engine, prepared);
+    }
+
+    #[test]
+    fn canonical_history_abandoned_preparation_never_publishes_projected_entry() {
+        let mut engine = confirmed_engine();
+        settle_push(&mut engine, RouteLocation::new("/"));
+        let before = engine.canonical_history();
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Replace,
+            RouteLocation::new("/"),
+        );
+        let replacement = prepared.history_publication().target_entry().unwrap();
+        assert_ne!(Some(replacement), before.current_entry());
+        assert_eq!(engine.canonical_history(), before);
+        drop(prepared);
+        assert_eq!(engine.canonical_history(), before);
+    }
+
+    #[test]
+    fn canonical_history_normal_frame_facts_bind_exact_route_and_preserved_parent() {
+        let mut engine = confirmed_nested_engine();
+        settle_nested_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items/1"),
+        );
+        let source_frames = engine.active().frames().to_vec();
+        let prepared = prepare_history_command(
+            &mut engine,
+            HistoryFixtureCommand::Push,
+            RouteLocation::new("/items/2"),
+        );
+        let facts = prepared.history_publication();
+        assert_eq!(facts.source_frames().len(), 2);
+        assert_eq!(facts.target_frames().len(), 2);
+        for frame in &source_frames {
+            assert_eq!(
+                facts
+                    .source_frames()
+                    .iter()
+                    .filter(|fact| fact.frame() == frame)
+                    .count(),
+                1
+            );
+        }
+        let parent = facts
+            .source_frames()
+            .iter()
+            .find(|fact| fact.frame() == &source_frames[0])
+            .unwrap();
+        let retained_parent = facts
+            .target_frames()
+            .iter()
+            .find(|fact| fact.frame() == parent.frame())
+            .unwrap();
+        assert_eq!(
+            retained_parent.segment_reuse_key(),
+            parent.segment_reuse_key()
+        );
+        let old_leaf = facts
+            .source_frames()
+            .iter()
+            .find(|fact| fact.frame() == &source_frames[1])
+            .unwrap();
+        let new_leaf = facts
+            .target_frames()
+            .iter()
+            .find(|fact| fact.frame().origin() == old_leaf.frame().origin())
+            .unwrap();
+        assert_ne!(new_leaf.frame(), old_leaf.frame());
+        assert_ne!(new_leaf.segment_reuse_key(), old_leaf.segment_reuse_key());
+        publish_history_facts(&mut engine, prepared);
     }
 
     fn settle_nested_history_command(

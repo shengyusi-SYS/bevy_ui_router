@@ -37,6 +37,7 @@ use crate::history_authority::{
     PrepareBackAdmissionErrorKind, PreparedHistoryPublication, PreparedPresentationBinding,
     VerifiedBackNoTargetCandidate, VerifiedBackTargetExecutionOwner,
 };
+use crate::history_authority::{CanonicalHistoryView, HistoryFrameFact, HistoryPublicationFacts};
 #[cfg(test)]
 use crate::history_authority::{
     HistoryAuthoritySnapshot, HistoryCapabilitySnapshot, HistoryDriftEvidenceSnapshot,
@@ -1987,6 +1988,7 @@ impl std::fmt::Debug for SealedCommit {
 struct PublicationPlan {
     state: RouterNavigationState,
     history: Option<PreparedHistoryPublication>,
+    history_publication: HistoryPublicationFacts,
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     record_index: usize,
@@ -1996,6 +1998,13 @@ struct PublicationPlan {
 
 pub(crate) struct PreparedPublication {
     evidence: SealedCommitEvidence,
+    history_publication: HistoryPublicationFacts,
+}
+
+impl PreparedPublication {
+    pub(crate) const fn history_publication(&self) -> &HistoryPublicationFacts {
+        &self.history_publication
+    }
 }
 
 pub(crate) struct ValidatedPublication<'a> {
@@ -2004,6 +2013,10 @@ pub(crate) struct ValidatedPublication<'a> {
 }
 
 impl ValidatedPublication<'_> {
+    pub(crate) const fn history_publication(&self) -> &HistoryPublicationFacts {
+        self.prepared.history_publication()
+    }
+
     pub(crate) fn publish<F>(self, mutation: F)
     where
         F: FnOnce(),
@@ -12864,8 +12877,12 @@ impl RouterEngine {
             return Err(self.retain_rejected_publication(sealed, error));
         }
         let evidence = sealed.evidence.clone();
+        let history_publication = sealed.publication.history_publication.clone();
         self.prepared_publication_authority = Some(PreparedPublicationAuthority::Ready(sealed));
-        Ok(PreparedPublication { evidence })
+        Ok(PreparedPublication {
+            evidence,
+            history_publication,
+        })
     }
 
     fn validate_prepared_publication_owner(
@@ -13234,6 +13251,7 @@ impl RouterEngine {
         let PublicationPlan {
             state,
             history,
+            history_publication: _,
             active_branch,
             active_child_slots,
             record_index,
@@ -13831,6 +13849,10 @@ impl RouterEngine {
             Some(RequestStatus::Queued | RequestStatus::Succeeded | RequestStatus::Failed(_))
             | None => None,
         }
+    }
+
+    pub(crate) fn canonical_history(&self) -> CanonicalHistoryView {
+        self.history.entry_key_projection()
     }
 
     pub(crate) const fn history(&self) -> &MemoryHistory {
@@ -16012,6 +16034,17 @@ impl RouterEngine {
             None => None,
         };
 
+        let source_frames =
+            normal_history_frame_facts(self.state.active(), self.active_branch.as_ref());
+        let target_frames = normal_history_frame_facts(state.active(), active_branch.as_ref());
+        let history_publication = match &history {
+            Some(history) => history.publication_facts(self.state.active()),
+            None => self
+                .history
+                .unchanged_publication_facts(self.state.active()),
+        }
+        .with_frames(source_frames, target_frames);
+
         current.stage = WorkStage::PostCommitCleanup {
             outstanding: cleanup,
         };
@@ -16019,6 +16052,7 @@ impl RouterEngine {
         Ok(PublicationPlan {
             state,
             history,
+            history_publication,
             active_branch,
             active_child_slots,
             record_index,
@@ -16866,6 +16900,31 @@ fn mount_failure(rejection: MountRejectionKind) -> (PendingFailureKind, Navigati
             ),
         ),
     }
+}
+
+fn normal_history_frame_facts(
+    presentation: &ActivePresentation,
+    branch: Option<&MatchedBranch>,
+) -> Vec<HistoryFrameFact> {
+    if presentation.kind() != crate::presentation::ActivePresentationKind::Route {
+        return Vec::new();
+    }
+    let branch = branch.expect("normal presentation retains its canonical matched branch");
+    presentation
+        .frames()
+        .iter()
+        .map(|frame| {
+            let FrameOrigin::MatchedRoute(route) = frame.origin() else {
+                unreachable!("normal presentation contains only matched route frames")
+            };
+            let matched = branch
+                .routes()
+                .iter()
+                .find(|matched| matched.route() == *route)
+                .expect("normal frame belongs to its exact matched route");
+            HistoryFrameFact::new(frame.clone(), matched.segment_reuse_key().clone())
+        })
+        .collect()
 }
 
 fn committed_history_digest(entries: &[RouteLocation], cursor: Option<usize>) -> u64 {

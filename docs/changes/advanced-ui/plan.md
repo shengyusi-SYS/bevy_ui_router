@@ -6,9 +6,9 @@
 
 ## 1. Canonical history 的受控只读交接
 
-- [ ] 从现有私有 `HistoryEntryId` 投影 opaque entry key；在 integration 提供 canonical entries 和已准备 publication 的 source/target/保留 entries/Back 恢复事实。投影不签发 authority，不向 ECS 开放 history mutation。
-- [ ] Push 新建、Replace 换身份、Back 选择既有身份；error/fallback 无成功目标 entry。所有交接事实来自原 history capability 和已准备 publication，不能从提交后 cursor、URL 或 Entity 重建。
-- [ ] 回归重复 URL、等价 Replace、Back、forward 截断、失败不推进、跨 Router 身份与放弃 preparation 不改变 history。
+- [x] 从现有私有 `HistoryEntryId` 投影 opaque entry key；在 integration 提供 canonical entries 和已准备 publication 的 source/target/保留 entries/Back 恢复事实。投影不签发 authority，不向 ECS 开放 history mutation。
+- [x] Push 新建、Replace 换身份、Back 选择既有身份；error/fallback 无成功目标 entry。所有交接事实来自原 history capability 和已准备 publication，不能从提交后 cursor、URL 或 Entity 重建。
+- [x] 回归重复 URL、等价 Replace、Back、forward 截断、失败不推进、跨 Router 身份与放弃 preparation 不改变 history。
 
 实现入口：Core `history_authority.rs`、`engine.rs`、`integration.rs`。验证先运行相关 history/integration 回归，再运行完整 Core crate。
 
