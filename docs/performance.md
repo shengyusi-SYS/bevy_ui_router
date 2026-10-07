@@ -1,308 +1,83 @@
-# Router 性能基线
+# 性能基线
 
-这是 MVP 的小规模诊断工具，不定义新的 API 合同或性能 SLA。实现位于 [`router_baseline.rs`](../crates/bevy_ui_router/benches/router_baseline.rs)，只调用 facade 公开入口。方法依据见[同类项目调研](06-Router-performance-benchmarks.md)。
+性能工具用于判断真实导航与清理成本，不定义 SLA。入口是公开 facade benchmark：[router_baseline.rs](../crates/bevy_ui_router/benches/router_baseline.rs) 与直接引擎对照 [bsn_content_control.rs](../crates/bevy_ui_router/benches/bsn_content_control.rs)。同类路由项目的方法阅读见[参考](reference/router-benchmarks.md)。
 
-最新结果见 [2026-09-27 P4 后性能验证](#2026-09-27-p4-后性能验证)；下文保留历次基线，供同条件对比。
+## 运行与比较
 
-## 运行
-
-从仓库根目录执行，默认每个场景 128 个样本：
+从仓库根目录执行优化构建：
 
 ```sh
-cargo +stable bench -p bevy_ui_router --bench router_baseline --features bsn --locked > baseline.csv
+cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > flat.csv
+ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > nested.csv
+cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-需要更多样本时设置环境变量 `ROUTER_BENCH_SAMPLES`（正整数），例如 Bash：
+默认每个普通场景 128 个样本，可用 `ROUTER_BENCH_SAMPLES` 正整数调整。默认 shape 是 `flat`；`nested` 保持 authored 内容数相同，32/128 节点形成四层浅树，但关系组件分布不同。输出文件需区分形状和版本。
+
+只检查行为夹具，不用于耗时结论：
 
 ```sh
-ROUTER_BENCH_SAMPLES=512 cargo +stable bench -p bevy_ui_router --bench router_baseline --features bsn --locked > baseline.csv
+cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
+ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-对照普通嵌套内容时显式设置树形，默认 `flat` 不变；CSV schema 相同，stderr 标记形状，结果文件必须区分：
+固定机器、依赖、工具链、features 和优化参数，至少重复两轮；测量期间避免并行编译和其它重负载。插桩/profile 使用独立 target，返回正式计时前核对实际二进制身份、shape、样本数、三种规模和完整输出；Router 每轮 48 行汇总。保存全部配对与离群值，受干扰整组标记，不挑选较快结果。
 
-```sh
-ROUTER_BENCH_SHAPE=nested cargo +stable bench -p bevy_ui_router --bench router_baseline --features bsn --locked > nested.csv
-```
+先比较相同工作下的绝对 p50/p95、update 数与波动，再决定 profile 或重构。CI 仅运行上述 smoke，不设置共享机器上的耗时阈值。
 
-节点数量、到 Page 的父链和最大深度在计时外检查；不能把形状导致的实际工作差异误写成相同实现的性能优化。
+## 计时边界
 
-只验证夹具和断言、不给出性能结论：
+Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `App::update` 和 snapshots 驱动。路由树固定为父布局及两个子路由，页面含 1/32/128 个 authored `Node + Content` 子节点，另有布局、工具栏和内部 outlet。它不测路由表规模。
 
-```sh
-cargo +stable test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-```
+时间为 `Instant` 的 CPU 侧 wall-clock，包含调度抢占，不是线程 CPU 计数器或屏幕显示延迟。**不含 UI layout、原生 picking、GPU、窗口、I/O 或异步加载**；Router 输入授权刷新在内。
 
-隔离插桩副本应使用独立 target，或在返回生产计时前强制重建被插桩的包及 benchmark，并保存确认过的独立可执行文件；仅看到 Cargo 报告 fresh 不足以证明运行文件身份。正式输出必须核对 shape、样本数、全部 48 行和 1/32/128 三种规模，禁止混入 profiler 输出。
-
-CI 运行 smoke 检查，不做耗时门禁。正式比较使用优化构建，固定机器、依赖、工具链、feature 与构建参数，避免同时编译或运行其他重负载；至少重复运行两次。结果写到不同文件，以免覆盖基线。不要把 debug smoke 与 bench 数据比较。
-
-## 测量范围
-
-夹具安装 `TaskPoolPlugin`、`AssetPlugin`、`ScenePlugin`，注册真实 BSN 工厂与嵌套 Router，创建 app-owned host、布局、工具栏、内部 outlet 和页面。通过 `RouterNavigation` 提交请求，以普通 `App::update` 驱动，并经 `RouterSnapshots` 判断完成。页面分别包含 1、32、128 个 authored Node + Content 节点，默认平铺；显式 nested 对照保持相同数量和 authored 组件，32/128 节点组成四层浅树（关系组件分布随树形改变）。路由树固定为一个父路由和两个子路由，不测路由表规模。
-
-没有安装 UI layout、原生 picking、GPU renderer、窗口、I/O 或异步加载。这里的时间是 `Instant` 测得的 **CPU 侧工作经过时间（wall-clock）**，包括调度和抢占，并不是线程 CPU 计数器，也不是屏幕显示延迟。运行时输入授权刷新在内，真实设备输入管线不在内。
-
-| CSV 场景 | 初始状态与计时边界 |
+| 场景 | 计时工作与解释 |
 | --- | --- |
-| `idle_control` | 同样 authored Node 内容、同样基础插件，不安装 Router；不含 Router wrappers。预热 64 帧后测普通 update，作为应用调度对照，不能精确分解单个 Router 系统 |
-| `idle_one_request` | 首次导航后，无请求提交；一个保留请求，history 一项 |
-| `idle_retained` | 32 轮 replace b / replace a 后，无请求提交；实际验证发生请求淘汰，与上一项保持相同当前页面和一项 history。差值是整个 Router 的保留状态影响，不是某个系统的独立计时 |
-| `push` / `replace` / `back` | 每轮从 a 出发，push b、replace c、back a；history 始终至多两项。计时从提交请求前到请求终结、无 running request 且 foreground cleanup 清空；包含公开完成轮询 |
-| `failure` / `recover` | 工厂主动返回 Build 错误，发布 fallback，再 replace a；失败不得改 history，恢复后 fallback 实体消失。单独预热 32 轮，不代表所有 Apply/异步失败类型 |
-| `soak_cycle_operations` | 新夹具正常导航预热后，连续八批相同的 push/replace/back，每批报告所有三种操作的样本分布；检查活实体数和实际保留请求数稳定。不能将混合分布解读为某种操作的 p95 |
+| `idle_control` | 同样内容和基础插件，无 Router/wrappers；预热后普通 update 的调度对照 |
+| `idle_one_request` | 首次导航后空闲，history 一项、保留请求一项 |
+| `idle_retained` | 多轮 replace 后的相同页面与一项 history，验证请求淘汰确已发生 |
+| `push` / `replace` / `back` | 从提交前到请求终态、无 running 且前台 cleanup 清空；每轮 a→push b→replace c→back a，history 至多两项 |
+| `failure` / `recover` | factory 主动 Build error，发布 fallback，再 replace a；分别计时，失败不改 history |
+| `soak_cycle_operations` | 独立夹具预热后连续八批 push/replace/back；每批统计三种操作的混合分布，并检查活实体/保留请求稳定 |
 
-导航样本不计 App/路由初始化、目标字符串构造、详细断言和 CSV 输出；BSN 构建、内部校验、publication、旧页面清理和 snapshot 发布都在计时内。每次正常导航在计时后验证目标页面、history、旧实体消失、父布局与工具栏状态保留、输入授权、内容数量和活实体数。失败和恢复分别验证错误来源、fallback 授权及 history/实体约束。32 次 update 的完成上限是夹具防挂起断言，不是性能阈值。
+导航包含 factory 构建、resolve/apply、内部校验、publication、旧内容清理与公开完成轮询/snapshot。初始化、目标字符串构造、详细断言和 CSV 输出在计时外。不能把导航 cleanup 移到计时外当作 fixture teardown。
 
-空闲帧每个样本连续运行 32 个 update，再除以 32；其 p50/p95 是**批次均值**分布，不能当成逐帧尾延迟。导航的 p50/p95 使用逐次操作的 nearest-rank 分位数。`max_us` 保留调度噪声，不自动剔除离群值；`min_updates/max_updates` 记录完成所需 update 次数。CSV 的数量列在计时外读取，表示场景组结束时的稳定状态，不是峰值；failure 行的数量在对应恢复完成后读取。时间单位为微秒。
+每步断言目标、history、旧内容消失、父布局/工具栏身份与局部状态、输入资格、内容数量及活实体。32 update 的完成上限是防挂起断言，不是时间阈值。有限 soak 稳定不证明全部长期行为或堆内存无泄漏。
 
-重复使用仅检查公开可见的实体、history 和请求保留，**不等于已测堆分配或证明无泄漏**。夹具自身保留本次运行的请求 ID 以经公开接口统计保留数量，这些测试记录不属于 Router 存活内存。需要诊断内存时再单独使用分配 profiler，避免插桩污染耗时结果。
+导航分位数是逐操作 nearest-rank；idle 每个样本连续 32 update 后取均值，其 p95 是批次均值的分布，不能当成单帧 p95。多轮同场景 p50 的算术均值也不是合并样本分位数。CSV 数量列在场景组结束后、计时外读取，表示稳定状态而非峰值；failure 行的数量在对应 recover 完成后读取。
 
-## 如何使用结果
+直接 BSN 对照保留 host/layout/toolbar/outlet，测 fresh Scene 构造、resolve/apply、旧页递归删除、flush 和普通 update。它没有 Router history、授权、隔离、失败/残留或写后复验，两者差值不构成严格 Router 开销归因。
 
-先比较同场景的绝对耗时、update 数和重复运行波动；再观察节点数量、请求保留及连续使用的趋势。只有稳定、相关的成本出现后，才对相应 Router 系统做 profiling，决定局部重构或专项微基准。不要以一次测量推断复杂度、以空闲调度对照推断全应用 FPS，或为追求数字删掉 lifecycle 校验。
+## 已有结果与含义
 
-本工具不增加全平台性能矩阵、跨框架排名、共享 CI 百分比阈值或性能服务。测量范围之外的 GPU、真实输入、异步等待、路由数量及多个 Router 并发成本未验证。
+以下是既有优化构建测量，环境/源码身份归[数据说明](data/performance/README.md)。这些数据绑定历史测量构建，不代表当前发布树的新结果。
 
-## 2026-09-24 初始结果
+最近采用的操作内 removal plan 对照，三轮 push/replace/back 的范围为：
 
-两轮完整优化构建运行均正常退出，所有行为断言通过。每轮每个普通场景 128 个样本；每个 soak 批次 128 轮 push/replace/back，共 384 个操作样本。两轮共 96 行汇总数据，保存于[原始 CSV](performance-baseline-2026-09-24.csv)；保留了所有最大值，没有剔除调度离群值。
-
-补充验证：优化构建与 debug 构建的 `--test` smoke 均完整通过，`public_navigation_journeys` 36 项测试通过（0 failed / 0 ignored）。独立审查核对了公开入口、计时边界、状态可比性和 CSV 汇总。CI 步骤已配置并在本地执行对应命令，远端 CI 未触发。
-
-环境与复现信息：
-
-- Linux WSL2，`6.18.33.2-microsoft-standard-WSL2`，`x86_64-unknown-linux-gnu`；宿主报告 AMD Ryzen 9 9950X，当前环境可见 24 个逻辑 CPU。未固定 CPU affinity/频率，也未测其他机器或平台。
-- `rustc 1.98.1 (48a229cea 2026-09-01)`，LLVM 22.1.8，官方 Bevy 0.19.1；Cargo 默认优化 `bench` profile，没有自定义优化参数。
-- 运行时代码基于 `741070c`，此次只增加 benchmark、CI smoke 与文档，没有性能修补。
-- `Cargo.lock` SHA-256：`1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`。
-- benchmark 源码 SHA-256：`12f68e697757957e6afd13c6d7eea3552e4e7a97cee7b10fe95025bc5ce35dbd`。
-- 两轮分别执行 `CARGO_BUILD_JOBS=2 cargo +stable bench -p bevy_ui_router --bench router_baseline --features bsn --locked --offline`，在构建完成后顺序运行，未同时执行其他 Cargo 验证。两轮使用同一可执行文件。
-
-下表为两轮 p50 的范围；导航范围同时涵盖 push、replace、back，单位均为毫秒。空闲数据是批次均值的 p50：
-
-| 页面子节点数 | 无 Router 空闲对照 | 一个保留请求的空闲帧 | 64 个保留请求的空闲帧 | 正常导航 | 正常导航 p95 范围 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 约 0.0034 | 0.0168–0.0174 | 0.0294–0.0298 | 0.178–0.252 | 0.258–0.353 |
-| 32 | 约 0.0035 | 0.0384–0.0391 | 0.0618–0.0639 | 2.201–2.610 | 2.386–3.087 |
-| 128 | 约 0.0034 | 0.0999–0.1016 | 0.1521–0.1552 | 37.006–38.591 | 38.880–40.807 |
-
-正常导航均在一个 update 完成；Build 失败到 fallback 需要两个 update，恢复需要三个。128 节点的失败 p50 为 34.253–35.960 ms，恢复 p50 为 6.961–7.562 ms；恢复路径比正常切换便宜，但这些操作完成的工作不同，不能混成一个导航指标。
-
-连续使用八批的平均操作耗时如下。每个大小分别保持相同活实体数（52 / 83 / 179）、两项 history 与 64 个保留请求，所有旧页面清理及布局保留断言均通过：
-
-| 子节点数 | 第一轮：第 1 批 → 第 8 批 | 第二轮：第 1 批 → 第 8 批 |
-| --- | --- | --- |
-| 1 | 0.225 → 0.257 ms（+14.2%） | 0.218 → 0.247 ms（+13.5%） |
-| 32 | 2.477 → 3.717 ms（+50.0%） | 2.186 → 3.338 ms（+52.7%） |
-| 128 | 37.904 → 56.119 ms（+48.1%） | 36.803 → 55.761 ms（+51.5%） |
-
-**初始结论（修正前）：功能验收通过不能等同于性能就绪。** 128 个平铺子节点的单次导航从提交到一次 update 完成已花费约 37–39 ms，尚不含 UI 布局和渲染；对要求流畅帧率的应用，这是应优先处理的实际风险。连续使用的首末批差异在两轮均出现，值得继续定位。环境噪声仍可影响具体数字；这些数据不构成跨平台 SLA、复杂度证明或堆内存泄漏结论。
-
-当时源码检查提供了两个 profiling 候选，初次基线尚未量化各自贡献：
-
-1. [`RouteEntityRegistry::register`](../crates/bevy_ui_router_ecs/src/registry.rs) 对持续追加的 `consumed_seal_sequences: Vec<u64>` 调用 `contains`。删除 live record 不会删除历史 seal。BSN 离场清理也逐个注册内容实体，因此实体数、history、保留请求稳定并不能保证这个内部历史集合稳定。
-2. [`prepare_content_cleanup_inner`](../crates/bevy_ui_router_ecs/src/presentation/native_frame.rs) 在每个内容节点登记、写入后重新验证 protected 集合和完整 cleanup projection；其中 registry record 查询为线性搜索。正常切换和 back 都经由此生产清理路径，存在随内容规模放大的重复工作。
-
-后续定位与修正见下节；这两个候选不能直接当作贡献比例。
-
-## 2026-09-25 局部修正
-
-临时插桩和单变量对照确认了两个原因：
-
-1. cleanup 的每轮只读 evidence collection 对每个 obligation 重新构造同一份未结算实体集合；逐个结算时又会重采集整轮。128 子节点的临时分段计时中，settlement 约占 67%，native cleanup preparation 约占 14%。将该集合限定在一轮只读采集中惰性共享后，独立对照的总耗时下降约 46–48%。这是移除重复计算，所有 World/receipt 写入后的重新采集仍保留。
-2. seal 的发行与注册分离，使注册需要扫描永久增长的已消费序号列表。临时分段计时中，经过 512 轮相同导航后，每次导航累计注册耗时从约 0.75 ms 增至 9.16 ms，注册调用数量不变。现在由唯一生产注册入口私下发行新 seal 并直接返回 exact claim；单调计数保证失败、删除、quarantine 后身份不复用，因此删除历史列表及相应查询、复制。protected projection 仍保存 domain、序号和 exact records，旧 claim 的 CAS 拒绝、容量预留和写后复验保持不变。
-
-临时插桩只用于定位，不计入下方正式结果，也未保留在生产代码中。最终实现不增加公开 API、全局缓存、Entity 索引或新的状态机；仅测试中保留制造 seal 漂移事实的分配入口。初始候选中，protected registry 历史列表的复制只出现在 host provisional staging，不能把它归因成普通导航的主要热点。
-
-最终源码在相同机器、Rust 1.98.1、Bevy 0.19.1 和默认优化 profile 下运行两轮完整基准。每轮仍为 128 个普通样本、每个 soak 批次 384 个操作，共 96 行汇总，见[原始 CSV](performance-baseline-2026-09-25.csv)。运行时代码为 `087b99c` 加本节两项修正；benchmark 和 Cargo.lock 的 SHA-256 均与初始基线一致。ECS/BSN manifest 已有的版本范围修改没有改变此次锁定的实际依赖。两轮顺序运行同一可执行文件，命令与初始基线相同，没有同时进行其它 Cargo 验证，所有行为断言通过。
-
-下表均为两轮 push/replace/back 的范围，单位为毫秒。降幅按六个同场景 p50 的算术均值比较，不能解释为合并样本后的分位数：
-
-| 页面子节点数 | 修正前导航 p50 | 修正后导航 p50 | p50 均值降幅 | 修正后导航 p95 |
-| --- | --- | --- | --- | --- |
-| 1 | 0.178–0.252 | 0.177–0.254 | 约 0%，没有明显收益 | 0.246–0.344 |
-| 32 | 2.201–2.610 | 1.676–1.870 | 约 26% | 1.827–2.118 |
-| 128 | 37.006–38.591 | 17.579–18.302 | 约 53% | 18.237–18.988 |
-
-128 子节点的 Build 失败 p50 从 34.253–35.960 ms 降至 13.528–13.648 ms，恢复从 6.961–7.562 ms 降至 4.396–4.435 ms。正常导航、失败和恢复仍分别需要 1、2、3 个 update。128 子节点、64 个保留请求的空闲 p50 为 0.151–0.152 ms，与初始结果接近；本轮没有针对空闲帧做优化。
-
-连续使用八批的平均操作耗时如下。每个大小仍保持相同活实体数（52 / 83 / 179）、两项 history 和 64 个保留请求：
-
-| 子节点数 | 第一轮：第 1 批 → 第 8 批 | 第二轮：第 1 批 → 第 8 批 |
-| --- | --- | --- |
-| 1 | 0.226 → 0.240 ms（+6.0%） | 0.219 → 0.226 ms（+3.6%） |
-| 32 | 1.790 → 1.779 ms（−0.6%） | 1.769 → 1.762 ms（−0.4%） |
-| 128 | 17.974 → 17.821 ms（−0.9%） | 17.964 → 17.977 ms（+0.1%） |
-
-原先 32/128 子节点约 50% 的持续退化在两轮复测中均未出现；历史 seal 集合也已从实现中删除。1 子节点仍有约 8–14 μs 的首末差异，不能据此宣称所有时间漂移已消除，或把有限时长测试当作所有长期行为的证明。
-
-冻结源码验证：工作区 all-target/all-feature check；完整 workspace 的 1,220 项单元/集成测试和 28 项 doctest；无 BSN 的 ECS 619 项单元测试及 1 项公开 API 测试，均为 0 failed / 0 ignored。完整 workspace 包含独立 facade consumer、36 项公开导航以及原生输入/focus 管线回归。两项改动及全部 fixture 迁移经独立静态审查，未发现阻断；Rust 格式和 diff 检查通过。未重新运行图形窗口或扩展平台矩阵，之前的窗口证据不充当本次性能测量。
-
-**第一轮修正后的判断：两项局部修正收益成立，但大页面仍有实测成本。** 128 子节点约 18 ms 的 CPU 侧导航已超过 60 Hz 单帧的 16.7 ms，且不含布局、GPU 和真实设备输入；不能宣称这一规模已满足流畅帧预算。后续按这一证据重新定位 cleanup，结果见下节。
-
-## 2026-09-25 分类器局部简化
-
-以 `f44089c` 为起点重新计时，128 子节点夹具的每次导航约有 8 ms 花在 settlement，其中分类约 6.4 ms；native cleanup preparation 约 5 ms。分段时间包含嵌套调用，不能相加。每次导航平均调用分类函数约 8,775 次，该函数反复构造仅含 `ChildOf`、`Children` 两个 ComponentId 的 HashSet，随后只做三处成员判断，没有集合遍历或计数消费者。
-
-本轮仅将该 HashSet 改为 `[Option<ComponentId>; 2]`，通过 `contains(&Some(id))` 判断成员，移除小集合的分配和哈希。未注册的 ComponentId 仍为 `None`，与原先 flatten 后的成员判断一致。初始化位置、提前返回、manifest 归一化、foreign/missing component 分类以及每次 World 写入后的完整复验都不变。
-
-方案选择使用临时隔离副本：复用 registry 查询及避免 claim 克隆的单变量对照，整体收益约 3%；固定数组的插桩对照约 6–10%。去掉全部插桩后，用同一对可执行文件按 A-B-A-B 交替运行；每次执行各测两组 192 个混合导航样本，128 子节点控制组平均耗时为 18.74–19.55 ms、固定数组组为 15.92–16.89 ms，配对执行均下降约 14–15%。这个短程序只运行正常混合导航，其 main 和采样流程与正式基准不同，数据仅用于方案选择，不是正式版本分位数。本轮没有采用查询复用、索引、跨调用缓存或批量 cleanup 重写。
-
-最终工作区使用未修改的正式 benchmark 连续运行两轮，均正常退出并通过全部行为断言；每轮普通场景 128 样本、每个 soak 批次 384 操作，共 96 行，见[原始 CSV](performance-baseline-2026-09-25-classification.csv)。运行时代码为 `f44089c` 加本节固定数组替换。机器、Rust 1.98.1、Bevy 0.19.1、默认 bench profile 和命令与前轮一致，benchmark/Cargo.lock 的 SHA-256 均未改变；测量时没有并行编译。
-
-下表为两轮 push/replace/back 的范围，单位为毫秒；变化仍按六个同场景 p50 的算术均值计算：
-
-| 页面子节点数 | 上一版导航 p50 | 本轮导航 p50 | p50 均值变化 | 本轮导航 p95 |
-| --- | --- | --- | --- | --- |
-| 1 | 0.177–0.254 | 0.175–0.267 | +1.3%，无明显改善 | 0.260–0.343 |
-| 32 | 1.676–1.870 | 1.563–1.810 | −5.6% | 1.741–2.284 |
-| 128 | 17.579–18.302 | 16.318–16.982 | −7.2% | 16.894–18.366 |
-
-128 子节点的 Build 失败 p50 为 11.777–11.865 ms（上一版 13.528–13.648 ms）。恢复为 4.542–4.584 ms、64 个保留请求的空闲 p50 为 0.154–0.160 ms，均未改善；32 子节点的 p95 上界也高于上一版。不同场景与分位数的变化不能混成一个总提速结论。正常导航、失败和恢复仍分别需要 1、2、3 个 update。
-
-连续使用首末批的平均操作耗时如下；活实体数仍为 52 / 83 / 179，两项 history 和 64 个保留请求保持稳定：
-
-| 子节点数 | 第一轮：第 1 批 → 第 8 批 | 第二轮：第 1 批 → 第 8 批 |
-| --- | --- | --- |
-| 1 | 0.219 → 0.219 ms（+0.1%） | 0.219 → 0.222 ms（+1.5%） |
-| 32 | 1.644 → 1.658 ms（+0.8%） | 1.721 → 1.802 ms（+4.7%） |
-| 128 | 16.577 → 16.944 ms（+2.2%） | 16.483 → 17.222 ms（+4.5%） |
-
-本轮没有重现最初约 50% 的连续使用退化，但保留上述实际波动，不宣称耗时完全恒定。短对照与正式基准的收益幅度不同，发布评估采用正式基准的完整结果。
-
-最终源码验证：fmt、workspace all-target/all-feature check、1,220 项单元/集成测试、28 项 doctest，以及无 BSN 的 ECS 619 + 1 项测试全部通过（0 failed / 0 ignored）。独立审查确认三处成员谓词和 `None` 语义等价；原有缺失/额外组件、关系、protected parent 和 observer drift 回归保留，没有添加仅验证容器形状的测试。未重跑窗口/GPU或新增平台矩阵。
-
-**当前判断：采用这一小幅减法，收益成立；本轮到此收口。** 128 子节点导航 p50 仍接近 16.7 ms 的整帧预算，p95 可超过它，且尚不含布局与渲染。剩余重复分类和 native cleanup 校验仍需依据真实页面规模判断是否继续优化；现有证据不支持直接重写状态机或引入全局索引。
-
-## 2026-09-27 直接 BSN 内容成本对照（P1）
-
-新增 [`bsn_content_control.rs`](../crates/bevy_ui_router/benches/bsn_content_control.rs)。基础插件与原导航基准相同，保留 app-owned host、layout、toolbar 和 outlet；页面同样是 `Node + Page(String)`，含 1/32/128 个 `Node + Content` 子节点。该对照不安装 Router。计时从 Scene 构造开始，包含官方 resolve、root 分配、apply、resolved scene 释放、旧页递归 despawn、flush 和一次普通 `App::update`；每次在计时外核对旧页及内容消失、布局身份/关系/toolbar 状态、当前内容数和存活实体数。
-
-```sh
-cargo +stable bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked --offline
-cargo +stable bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked --offline -- --test
-```
-
-默认每组 128 样本，支持 `ROUTER_BENCH_SAMPLES`。每种规模先预热 64 次替换，记录 batch 0，再记录 8 批连续替换；CSV 的 batch 0 是初始分布，1–8 是连续使用分布。每批 128 次替换，不与 Router soak 的每批 384 个混合操作直接比较。`--test` 每组 2 样本，仅验证夹具。p50/p95 为逐次操作的 nearest-rank 分位数；诊断使用 `count_spawned` 统计当前存活实体，查询成本在计时外。
-
-两轮优化运行均正常退出，所有断言通过；原始结果见 [CSV](performance-bsn-control-2026-09-27.csv)，共 54 行数据。环境、工具链、lock 和原 Router benchmark 源码与 2026-09-25 基线一致。构建完成后顺序运行同一直接对照可执行文件，测量期间没有其它 Cargo 构建。优化 smoke 也已通过，独立静态审查未发现必须修改项。
-
-| 页面子节点数 | 直接 BSN replace p50（batch 0，两轮） | p95（batch 0，两轮） | 稳定存活实体 |
-| --- | --- | --- | --- |
-| 1 | 4.60–4.71 µs | 4.69–5.76 µs | 36 |
-| 32 | 15.73–15.83 µs | 17.67–21.05 µs | 67 |
-| 128 | 50.77–52.65 µs | 70.70–75.33 µs | 163 |
-
-128 子节点的连续批次平均值首末分别为 54.70→56.08 µs、53.99→53.09 µs，存活实体保持稳定。另一次未改运行时代码的[完整 Router 重测](performance-baseline-2026-09-27.csv)中，128 子节点 push/replace/back p50 为 16.39–17.09 ms，与原基线量级一致。
-
-**结论范围**：相同简单内容的引擎创建/删除本身没有复现 Router 导航的毫秒级成本，继续调查 Router 清理协议的额外工作有依据。但本对照使用直接递归删除，没有 Router 的 history、授权校验、输入隔离、失败/残留责任和回调后逐写复验；两者差值不是精确的 Router 开销，也不能据此承诺重构后接近这个数字。该阶段尚未取得 ContainedContent 完整原型通过或可交付性能收益的结论；后续原型及正式结果分别记录于下文。
-
-### P1 隔离原型：有限 normal 路径对照
-
-在同一 `CleanupLedger` 内将普通内容目标与真实 registry claims 分开，取消普通内容为退出而新增的登记/marker，保持原 owner、全部义务/receipt 和真实写后复验。原型同时修复了新公开回归揭示的旧行为：despawn observer 移出剩余内容后，原版本反复得到 `StaleClaim`，32 次普通 update 后仍停留 `PostCommitCleanup`；原型能归还应用内容与焦点并完成前台。
-
-优化构建后按原型／原版本／原型／原版本顺序运行，每轮 128 个普通样本。原版本为 `55911d6`，原型为本次隔离实验，不是生产版本。原型测量入口从原 benchmark 仅移除未迁移的 failure/recovery 场景；normal push/replace/back、idle、独立新夹具的 soak、完成终点和详细断言保持相同。测量期间没有 Cargo 构建，四次进程正常退出，原始数据见 [P1 对照 CSV](performance-cleanup-prototype-2026-09-27.csv)。原版本数据仍含 failure/recovery 行，原型没有对应行，不能比较这些场景。
-
-| 子节点 | 原版本 normal p50 | 原型 normal p50 | 原型 normal p95 | 同场景 p50 均值变化 |
-| --- | --- | --- | --- | --- |
-| 1 | 0.171–0.256 ms | 0.182–0.253 ms | 0.258–0.365 ms | +2.8%，无改善 |
-| 32 | 1.562–1.804 ms | 1.346–1.560 ms | 1.391–1.660 ms | −13.5% |
-| 128 | 16.302–17.082 ms | 12.070–13.018 ms | 12.477–13.907 ms | −24.9% |
-
-范围涵盖两轮 push/replace/back 的 batch 0；变化按六个同场景 p50 的算术均值计算，不是合并样本分位数。正常导航仍在一次 update 结束，活实体数为 52/83/179，soak 的 history/请求保持和旧页面消失断言通过。
-
-另在冻结原型的独立计数构建中运行 smoke（计数构建的时间不用于上表）：1/32/128 子节点对应 3/34/130 项清理义务，每次分别调用分类器 12/663/8,775 次；临时内容桥接注册均为 0。128 子节点每次还检查 17,947 个 protected 事实项、经过 67,200 次当前 containment 父链步进。这些计数只覆盖插桩点，不等于全部 World 查询数。它直接说明本轮移除了登记转换，但没有降低分类次数；后续优化必须针对重复证明，而不能继续把收益归因于 marker 删除。
-
-**P1 判断：支持进入完整迁移，不支持发布原型。** 128 子节点仍需约 12–13 ms，不含布局/渲染，重复分类仍在；这不是最终性能或上线验收。原型只证明 normal cleanup、两子节点中一个被删除另一个逃逸时的 receipt，以及 protected/source 漂移后原完整 ledger 转交私有残留。它尚不支持仍在原边界内的普通内容 quarantine，也未迁移完整 failure/authority 通道。5 条机制探针和公开 facade 7 项通过；完整 ECS 诊断为 666 通过、8 失败。必须完成 P2/P3 后用原样完整 benchmark 重新验收，不能将本表外推为生产收益。
-
-
-## 2026-09-27 内容清理迁移正式结果
-
-P2 将正常、失败、authority/host-loss、Back、postcommit 和残留出口迁到同一 ledger 的 Registered/ContainedContent 身份。普通已 adopt 内容不再为退出新增 registry record、marker、seal 或 lifecycle；结构和创建期责任保持原合同。临时 P1 benchmark 已删除，以下使用原样完整 `router_baseline.rs`，不是有限原型外推。
-
-两轮优化运行各 48 行，均正常退出、全部断言通过，数据归[正式 CSV](performance-cleanup-2026-09-27.csv)。每普通场景 128 个样本，每 soak 批次 384 个操作；未删离群值。基线比较使用同日 `55911d6` 的两轮完整运行（保存在[原型对照 CSV](performance-cleanup-prototype-2026-09-27.csv)的 baseline 行）。正式新实现两轮顺序运行，同机、同 lock、同原样 benchmark 和默认优化 profile，计时期间没有同时执行 Cargo 构建。环境沿用本页前述 Linux/WSL2、Ryzen 9950X、Rust 1.98.1、Bevy 0.19.1；未固定频率/affinity。
-
-| 子节点数 | 正式正常导航 p50（ms） | p95（ms） | 相对同日基线的同场景 p50 均值变化 |
-| --- | --- | --- | --- |
-| 1 | 0.179–0.247 | 0.261–0.319 | +0.9%，无改善 |
-| 32 | 1.380–1.556 | 1.427–1.696 | −12.3% |
-| 128 | 12.586–13.328 | 13.124–14.685 | −22.6% |
-
-变化比例比较两轮各 push/replace/back 共六个 p50 的算术均值，不是混合原始样本的分位数。P1 的约 24.9% 不能替代完整迁移后的 22.6%。正常导航仍为 1 update，失败为 2、恢复为 3；稳定 Entity 数仍为 52/83/179，保留请求为 64。history、布局/工具栏 identity 与状态、旧内容删除及最终结果断言全部保留。
-
-128 子节点 Build 失败 p50 10.034–10.040 ms（较基线均值约 −15.6%），恢复 4.327–4.331 ms（约 −7.5%）。两种 idle 的 p50 分别为 0.098–0.099 ms 和 0.148–0.152 ms，变化较小，不将其作为本轮主要收益。128 子节点 soak 首末批次 mean 分别为 12.895→12.857 ms、12.889→12.694 ms；32 子节点为 1.501→1.430 ms、1.464→1.429 ms，未重现之前约 50% 的连续使用退化。
-
-功能证据包含新增公开真实 Despawn observer：移走剩余内容并交还应用 focus 时，旧实现会永久停在 PostCommitCleanup，新实现有界终结并保留已发布成功结果；同页面其他残留仍隔离。完整工作区 1,226 项单元/集成及 28 项文档测试、ECS/BSN 673+1（包含于工作区）、ECS 无 BSN 619+1、独立消费者和原生输入/focus均通过，另有 fmt 与 all-target/all-feature check。验证和窗口边界归统一 plan。
-
-本轮证明转换减法有稳定收益，也修复了真实回调下的永久等待，但**不能称 128 节点 UI 的性能已就绪**：12.6–13.3 ms 仍不含布局和渲染，已占 60 Hz 整帧参考的多数。P1 独立计数的 8,775 次分类揭示的重复全体分类结构仍存在；没有将原型计数冒充最终版本的新测量。若继续优化，下一候选应是 P4 操作内清理计划，保留每次真实写后的完整复验而减少重新分类/证据分配；不继续堆叠局部容器微调，不自动扩张为全库重写、全局缓存或分帧调度。需要重新 profile 和独立收益门槛后再实施。
-
-可复现标识：基于 `55911d6` 的本轮内容清理迁移；`Cargo.lock` SHA-256 仍为 `1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`，正式 benchmark SHA-256 仍为 `12f68e697757957e6afd13c6d7eea3552e4e7a97cee7b10fe95025bc5ce35dbd`。直接 BSN 对照不承担 Router 语义，不能用两者差值宣称精确 Router 开销。
-
-
-## 2026-09-27 操作内清理计划结果
-
-用户继续授权后，先对已完成 P2/P3 的当前实现重新 profile。隔离诊断的 128 子节点全场景样本中，settle 累计 2,971.9 ms，collect 为 1,341.1 ms（45.1%），focus closure 为 736.1 ms（24.8%）；collect 内的 classify 为 1,315.6 ms。计时有嵌套，不能相加，也不是正式导航延迟。native capture 仅 10.8 ms。证据指向反复分类/生成证据与扫描整个 focus closure，支持实施已规划 P4。
-
-普通删除现在一次准备 accepted targets、实际父子图稳定叶序与各自 receipt，每次真实写后直接核对完整剩余边、source、登记/隔离边界、protected、mount 和当前焦点。只读取最多两个实际焦点，再核查它们是否仍在原内容内。未缓存跨写有效性，未扩大删除范围，失败/authority/quarantine 的原角色与 owner 仍独立。合法样式变化、sibling 重排继续允许；同批登记目标在冻结后合法重挂时，以真实叶序逐个删除，不能让递归父删和 AlreadyAbsent 掩盖缺失动作。
-
-采用原样无插桩正式 benchmark，保存 P2 基线和 P4 候选二进制后交替运行。两轮中微小页面波动促使增加第三轮；全部六次各 48 行均保留，未删离群值，见[原始对照 CSV](performance-cleanup-plan-2026-09-27.csv)。计时期间无并行 Cargo 构建；机器、工具链、lock、样本和语义断言与前节一致，仍未固定频率/affinity。三轮各 push/replace/back 共九个 p50 取算术均值比较，不是混合原始样本分位数。
-
-| 子节点数 | P4 正常导航 p50（ms） | p95（ms） | 相对当前 P2 的同场景 p50 均值变化 |
+| 页面子节点数 | 导航 p50（ms） | p95（ms） | 相对前一内容迁移版本的同场景 p50 均值变化 |
 | --- | --- | --- | --- |
 | 1 | 0.179–0.284 | 0.253–0.371 | +2.2%，无收益 |
 | 32 | 1.068–1.251 | 1.137–1.351 | −21.8% |
 | 128 | 7.976–9.176 | 8.199–10.656 | −35.6% |
 
-128 子节点失败 p50 为 3.620–4.371 ms，对照为 10.061–10.292 ms，均值降低 61.9%；恢复 4.364–5.265 ms，对照 4.412–4.600 ms，均值增加 4.3%，没有证明恢复收益。小页面与恢复均存在轮间波动，不隐去较慢结果。正常/失败/恢复仍分别为 1/2/3 update，Entity 数 52/83/179，保留请求 64；所有 history、状态保留、旧内容清理、结果及 soak 断言通过。128 节点 soak 首末批次 mean 为 8.053→8.128、8.172→8.117、8.459→8.484 ms，未出现持续使用累积退化。
+[原始对照](data/performance/performance-cleanup-plan-2026-09-27.csv)中的 candidate 是已采用版本。正常、失败、恢复分别为 1/2/3 update。小页面和恢复未证明收益；128 节点仍约 8–9 ms 且不含布局/渲染，不能称大型页面性能就绪。
 
-P4 收益足以保留，但 128 子节点仍约 8–9 ms 且不含布局/渲染，不能宣称大型页面性能就绪。完整逐写校验仍有重复扫描；本轮没有证明全库线性复杂度，也没有据此新增全局缓存、分帧调度或另一套 runtime。后续性能工作应由实际产品页面的帧预算和新 profile 决定。
+后续 flat/nested [形状对照](data/performance/performance-shape-2026-09-27.csv)只有第一轮配对无干扰：128 节点 normal p50 为 flat 8.552–9.170 ms、nested 8.129–8.924 ms。它没有出现数量级恶化，但不足以证明稳定形状差异或任意深树。第二/三轮 `contended_pair` 不用于收益估算。该文件的读取合并 candidate 未显示值得保留的收益，**未采用**。
 
-完整主工作区通过 1,229 项单元/集成和 28 项文档测试，ECS/BSN 676+1（包含于工作区）、无 BSN 620+1；新增真实回调组件/样式变化、兄弟顺序变化及冻结后同批重挂的逐实体删除回归通过。独立静态交叉复核无必须修正项，格式与全目标/全特性检查通过；窗口验收归统一 plan。原始 benchmark 与主 Cargo.lock 的 SHA-256 与前节相同。
+最近定位的主要剩余工作是每次真实写后对完整 target/protected 事实的扫描。此前清理分类、普通内容临时登记和历史 seal 列表造成的重复工作已减去；逐写复验仍保留。性能增长不能仅靠几个点推导全库复杂度，后续应先测代表页面的真实切换帧及 cleanup 占比，再判断局部重构是否值得做。
 
+当前没有真实页面预算支持新增全局缓存、分帧销毁、第二套 runtime、全平台 benchmark 或更多容器微优化。60 Hz 的 16.7 ms 是整个帧的参考预算，不是 Router 可独占的预算。
 
-## 2026-09-27 P4 后性能验证
+## 窗口诊断的边界
 
-本轮基线为 `b0dbc3b`，先验证热点和真实使用成本，再决定是否接受一项局部优化。未修改匹配、history、加载或平台能力。
+[窗口 CSV](data/performance/performance-window-2026-09-27.csv)来自简单交互示例、两轮优化构建的临时诊断副本：暖机后 BRP 发送真实 WindowEvent/KeyboardInput，交替导航，采样期间不截图或轮询。每次在输入帧观察成功、正确路径、正尺寸布局与相同 layout Entity；最终截图只验证最终页面。
 
-隔离诊断在 128 节点全场景 smoke 中记录 settle 1,029.6 ms；protected 419.3 ms，其中事实读取 344.4 ms、removed 集合构造 70.5 ms；目标图复验 188.9 ms；计划准备 171.1 ms（含 receipt 准备 86.9 ms）；collect 44.0 ms；focus targets 5.8 ms。计时有嵌套且受插桩影响，不相加，不作为正式导航延迟。P4 后分类与焦点扫描已明显收缩，主要剩余工作是逐写检查目标与 protected 事实。
-
-### 相同内容数量的平铺与普通嵌套
-
-基准新增 `ROUTER_BENCH_SHAPE=nested`，32/128 个 authored 内容节点形成最深 4 层的浅树；1 节点仍为一层。与 flat 相同的是内容 Entity、Node、Content 数量及导航语义，不是所有关系组件的分布。默认 flat 构造路径保留；计时外验证真实深度、节点数与页面归属。正常导航、失败、恢复、输入资格、布局/工具栏保留、旧内容删除和 soak 的原断言均保留。CI 增加 nested smoke，不设置时间阈值。
-
-[原始形状对照 CSV](performance-shape-2026-09-27.csv)保存三轮、两种形状、base/candidate 的全部 576 行，每普通场景 128 个样本。第一轮未发现并行构建；第二轮后段及第三轮遇到宿主机其他项目的高负载 Rust 构建，将整组配对标为 `contended_pair`，不用于收益估算（第二轮 flat/base 结束在构建开始前，也不单独挑选与受干扰候选比较）。未删样本或离群值。下表只报告第一轮 base 的正常 push/replace/back 范围，因此是单轮观察，尚不足以证明形状间的稳定差异。
-
-| 内容节点数 | flat p50（ms） | nested p50（ms） | flat / nested p95（ms） |
-| --- | --- | --- | --- |
-| 1 | 0.184–0.247 | 0.179–0.251 | 0.257–0.318 / 0.264–0.325 |
-| 32 | 1.075–1.262 | 1.126–1.288 | 1.263–1.522 / 1.187–1.364 |
-| 128 | 8.552–9.170 | 8.129–8.924 | 9.139–9.752 / 8.811–10.089 |
-
-该轮普通嵌套未出现数量级恶化，但不能据此声称任意深树都已验证。128 节点失败 p50 为 flat 4.182 ms、nested 3.939 ms；恢复分别为 4.865 ms、4.337 ms。正常/失败/恢复仍为 1/2/3 update。第一轮 128 节点 soak 首末批次 mean 为 flat 8.770→8.149 ms、nested 8.351→8.932 ms；nested 的约 7% 增长需要同机空闲复测才能区分运行波动与退化，未把它当作已定位问题。
-
-### 候选判定与后续边界
-
-唯一候选在隔离副本中将 protected 事实的多次 `World::get` 合并为同次 `EntityRef` 读取，并用现有借用式 `matches_claim` 替代 claim clone 比较。原字段、Children 顺序、missing 语义、removed 集合及逐写复验时机不变，独立静态复核未发现语义偏差。第一轮 flat 的 1/32/128 节点正常场景 p50 均值变化为 +17.6%/+0.2%/−0.2%，nested 为 +3.0%/+2.7%/+7.3%。这些是三个场景 p50 的算术均值变化，不是混合样本分位数；没有显示值得保留的收益，且受干扰轮不能用来确认回退幅度。**不采用候选，生产 runtime 保持 `b0dbc3b`，本轮只保留基准与验证记录。**
-
-剩余主要成本仍是每次真实写后扫描完整目标与 protected 事实；减少单次读取没有减少总证明工作。32→128 内容节点增加 4 倍，第一轮正常导航均值增长约 7 倍，仍不宜宣称大页面性能就绪。下一项高价值验证是实际产品代表页面的优化构建切换帧与 cleanup 占比；若真实帧预算确实不满足，再评估逐写证明的局部重构。暂不增加全局缓存、分帧销毁、任意深度矩阵或更多容器微优化。形状稳定差异和 nested soak 复测留待宿主机空闲，不将当前干扰数据包装成结论。
-
-测量中发现共享 Cargo target 曾复用诊断二进制；早期插桩输出已作废，未进入上述 CSV。正式 base 强制重编译 ECS 与 facade，核对主工作区编译来源、48 行/三种规模/shape 标签及无插桩标记后保存二进制；正式对照均直接执行已核对的副本。base/candidate 二进制 SHA-256 分别为 `fa2e63a4f89db794577aa04a43050ddd07e0a2605f4713d730881e35ea542f0b` / `8d82769f351ecd8ca269f116179fc5ccc13e281fbc4bb34f95c8e1413c2504bf`。当前 benchmark SHA-256 为 `8c10b384191ee02304212075e8a0697efe5b2e5b538dd17a7d3f56ea64afe042`，Cargo.lock 与前节相同；环境仍为同机优化 profile，未固定频率/affinity。
-
-补充行为验证：按 CI 相同环境变量在本机执行 test profile 的 flat Router + 直接 BSN smoke，以及 nested Router smoke（额外使用 `--offline`），均 exit 0。Router 每种形状各 48 行，覆盖三种规模、正常/失败/恢复与全部 soak 批次；这些 debug 时间不进入性能 CSV。正式计时复测仍受宿主机并行构建限制，未取得新的无干扰数据。现有窗口例页只有标题、说明和一个按钮，实际产品页面及其预算尚未指定，不能把它外推为复杂页面验收。
-
-### 优化构建的真实窗口观察
-
-使用该基线的现有 960×640 交互示例，在临时副本显式开启 release BRP，原库及示例默认配置不变。每轮独立进程，先暖机 120 帧，再由一次 BRP 指令启动 40 次 Overview/Settings 交替 Push，每次相隔 12 帧。通过真实 `KeyboardInput` 和 `WindowEvent` 驱动现有应用系统，没有直接调用 navigate；采样期间不轮询 BRP、不截图、不并行构建。最终 renderer 截图另行检查，两轮窗口均已关闭。
-
-[原始窗口 CSV](performance-window-2026-09-27.csv)保留两轮全部 960 帧和 80 次成功观察。每次在输入所在帧取得 Succeeded、正确 active path、非零页面布局和保持的 Layout Entity。该观察证明主世界状态与布局，不证明该时刻已在屏幕呈现；最终截图只验证最终页面。
-
-| 指标（两轮分别报告） | p50（ms） | p95（ms） |
+| 指标 | 两轮 p50（ms） | 两轮 p95（ms） |
 | --- | --- | --- |
 | 切换帧 First→Last 主世界经过时间 | 5.342 / 4.872 | 6.040 / 6.081 |
-| 距切换至少 4 帧的同批对照主世界时间 | 3.836 / 3.577 | 4.798 / 4.392 |
-| 切换帧之后的 First→First 间隔 | 10.323 / 10.004 | 12.809 / 11.056 |
-| offset≥4 的同批对照帧间隔 | 10.263 / 9.682 | 11.929 / 10.948 |
+| 同批距输入至少四帧的对照 | 3.836 / 3.577 | 4.798 / 4.392 |
+| 切换帧之后 First→First 间隔 | 10.323 / 10.004 | 12.809 / 11.056 |
 
-First→Last 的时间戳位于探针系统入口，不含 render 子应用或 GPU 呈现；它是 wall time，不是线程 CPU 计数器。校验/JSON 记录在结束时间戳后，故不计入 main 时间，但计入下一帧间隔；少量输入/请求捕获探针工作和示例日志仍在 main 内。CSV 的 interval 属于前一帧之后的间隔，输入所在行 offset=0 的 interval 发生在输入前，必须用 offset=1 观察切换后的间隔。分位数采用 nearest-rank，未删最大值。
+该观察使用 Linux/WSLg llvmpipe 软件渲染和 continuous 更新，未测硬件 GPU。First→Last 不含 render 子应用/GPU 呈现；记录工作在结束时间戳后，仍影响下一帧间隔。CSV 行的 interval 对应前一帧之后，切换后的间隔需读 offset=1，不能读输入行 offset=0。
 
-环境为同机 Linux/WSLg、Vulkan llvmpipe（Mesa 26.0.8、LLVM 21.1.8）软件渲染，continuous 调试更新模式。这是小示例的诊断性观察，不能外推为 128 节点复杂页面、硬件 GPU、Windows 原生的性能或 FPS；也不能把切换和对照帧的差值当成严格 Router 开销。
+这不是复杂页面验收、屏幕首帧延迟、FPS 承诺或严格 Router 开销。当前可复现的窗口交互方法见[调试指南](guides/debugging.md)，不需要把临时测量探针变成生产 API。

@@ -1,0 +1,23 @@
+# 输入与焦点合同
+
+本页定义应用消费输入的边界、非活动内容撤权和焦点操作顺序。调度与执行位置见[运行机制](../architecture/runtime.md#bevy-调度与输入)，source owner 与发布边界见[生命周期](lifecycle.md)。
+
+## 输入资格、pointer 与 focus
+
+标准 UI pointer 使用原生 picking；keyboard/gamepad 的 target-addressed 集成显式消费 `RouterInputGate`。应用在 `PreUpdate` 的 `RouterInputSet::Ready` 后消费输入，在 `Refresh` 前提交动态拓扑变动。
+
+Refresh 根据 active roots 的当前 frame-local Children closure 计算权限，下一 Ready 边界接纳新增内容、撤销移出内容。无 World 的 gate 是该边界快照，不是任意时刻实时 ancestry 查询。
+
+Router 生命周期切换在同次 publication/隔离内撤权，不能等下一帧。hidden、pending、leaving、failed、retained/residual 内容不保留集成输入或 active focus；其它有效目标不被无理由清除。
+
+原生 pointer 撤权同时清除目标的当前/前次 hover、press/click/drag 和祖先缓存，保留其它目标状态。在真实 hover 生成后、dispatch 前过滤非活动 owned scope；不能只依赖 Display、最新命中或修改 Pickable，也不能全局清空 pointer 状态。
+
+原生 `TabNavigationPlugin`/`InputDispatchPlugin` 不会因 Router 安装而自动遵守 gate；使用它们须另接目标过滤。手动触发事件、绕过 gate 读原始设备输入或直接改 World 属于可信应用代码责任。
+
+pending Scene 的 `InputFocus::set`/AutoFocus 只形成候选，不授予权限。只保留最后未被后发操作覆盖的候选；原 owner 成功发布且目标仍属于该 source 的可获焦 active 内容时，同次 publication 兑现。
+
+后发合法 set/clear 优先，包括同值 set、已空时 clear；后发 pending 候选也替代前一个。候选失败、stale、取消、隐藏或移出 source 时丢弃，不复活早先候选，不重放整段 pending focus 历史。
+
+无显式意图时，不自动选择首控件或恢复历史焦点。无操作的可变借用不是 focus 操作。保持应用原 focus queue、cause 与延后事件顺序；不能向从未 active 的 pending/failed 目标派发延后 FocusGained/Lost，也不能仅 clear focus 就宣称派发已隔离。
+
+实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs) 与 [公开调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。

@@ -1,28 +1,36 @@
-# Bevy UI Router 文档索引
+# 文档与开发入口
 
-**更新时间**：2026-09-28。本项目是独立的通用 Bevy UI Router，面向开源发布。嵌套分支因 query/search 变化重建后的 Back 缺陷已修复，并通过官方 Bevy 基线的完整回归；当前范围与验收见 [MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) 和 [实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md)。本库验收以仓库内可复现的测试、示例和发布检查为依据，不依赖特定消费应用的业务、测试状态或发布流程。Linux/WSLg 窗口使用软件渲染；Windows 原生、最低 Rust、物理 GPU 加速与硬件设备输入未验证。尚未正式发布，具体许可证待确定。
+文档围绕后续功能开发组织：先确认需求和模块边界，再按主题读取合同、定位实现与验证。当前基线由多个层级共同组成；同一条规则有明确归属，不限制 spec 的文件数量。
 
-## 当前依据
+## 从哪里开始
 
-已确认用户决策和 [AGENTS.md](../AGENTS.md) 优先。文档分别承担不同职责：
+| 目的 | 入口 | 职责 |
+| --- | --- | --- |
+| 了解核心需求与当前范围 | [产品概览](overview.md) | 产品要解决什么，当前交付到哪里 |
+| 理解系统关系和定位模块 | [架构总览](architecture/README.md) | crate 依赖、职责、状态维度和源码地图 |
+| 理解物理结构与执行顺序 | [运行机制](architecture/runtime.md) | frame/outlet 结构、导航时序、Bevy 调度 |
+| 修改跨层生命周期机制 | [生命周期执行协议](architecture/lifecycle.md) | action/owner 交接、准备分流与内部模块定位 |
+| 查阅当前行为和边界 | [专题合同](contracts/README.md) | 导航、Scene、生命周期、输入/focus，按变化原因划分 |
+| 开发或修改功能 | [开发指南](development/README.md) | 按功能定位合同、源码、测试；组织新设计与计划 |
+| 接入应用、运行示例 | [接入指南](guides/integration.md) | 实际装配步骤与可运行示例 |
+| 调试窗口交互 | [窗口调试](guides/debugging.md) | 应用内 BRP 输入、布局查询和 renderer 截图 |
+| 选择验证及发布检查 | [验证指南](development/verification.md) | 检查入口与已验证/未验证边界 |
+| 分析性能 | [性能基线](performance.md) | 计时方法、已有结果与测量局限 |
+| 理解设计原因和经验 | [工程经验](development/design-lessons.md) | 可复用因果与取舍；不另立产品要求 |
+| 确认发布与后续安排 | [路线图](roadmap.md) | 当前待办与选题依据；不复制合同 |
 
-| 文档 | 职责 |
-| --- | --- |
-| [统一 MVP spec](superpowers/specs/2026-09-07-router-mvp-design.md) | 产品范围、架构、公共语义、设计理由与验收结果；状态以文件头为准 |
-| [唯一实施 plan](superpowers/plans/2026-09-07-router-mvp-implementation.md) | 迁移依赖、结果阶段、验证、审查和提交边界 |
-| [Current Architecture](current-architecture.md) | 当前代码事实与缺口，不把目标写成已实现 |
-| [Roadmap](roadmap.md) | Now / Next / Post-MVP，不复制合同 |
-| [性能基线](performance.md) | 最小 benchmark 的运行方式、计时边界与测量结果；不是性能 SLA |
-| [历史证据索引](superpowers/README.md) | 已完成阶段、研究和审查的追溯入口 |
+首次了解项目可按“概览 → 架构 → 相关专题”阅读；修复或开发某项功能直接从开发指南进入，无需通读全部文档。
 
-## 历史协议（原位归档）
+## 当前基线与未来设计
 
-旧 [Target](target-architecture.md)、[Matrix](authority-transition-matrix.md)、[Fixture](facade-contract-fixture.md)、[Allowlist](facade-export-allowlist.md)、[Golden](facade-associated-api-golden.txt)、[Journeys](mvp-acceptance-journeys.md) 与 [Goals](implementation-goals.md) 已原位归档，不再独立定义新增 MVP 范围。必要语义已迁入统一 spec，测试不再解析这些文件；保留原路径与正文供历史追溯，不再维护多表/API 同步。其“canonical”或 Authority closure 前置表述均属于历史。
+概览定义范围，架构解释当前实现，专题合同定义现行行为；使用指南与验证提供操作和证据入口。明确的用户决策与 [AGENTS.md](../AGENTS.md) 的优先级保持不变。
 
-[Root profile](root-push-contract-profile.md)、[Nested profile](nested-push-contract-profile.md) 和已完成 History/Recovery profiles 同样属于旧阶段证据，相关 parser 已删除。固定 catalogue、public audit/probe、background reaper/fairness 不因旧表存在而成为新 MVP 验收门。
+未来功能可按职责建立多份设计/spec 和实施计划，具体组织见[开发指南](development/README.md#新增功能与文档演进)。未实施方案明确标记状态并独立存放，不因进入仓库而成为当前合同。设计落地后同步相关主题，不把新行为散落在补充日志中。
 
-## 参考与证据口径
+公共 API 的精确签名以源码/rustdoc 为准，示例引用实际编译运行的源文件。跨主题通过链接说明依赖，不复制整份协议或建立互相证明的 Markdown/API 清单。
 
-[全局工程决策指导](global-architecture-engineering-decision-guide.md) 和编号研究资料是非规范参考，不能另立范围或完成标准；引用旧依赖/API 时核对当前官方版本。
+## 历史与参考
 
-实现存在、生产集成、推荐 facade 可达和真实用户旅程通过分别记录。当前 MVP 结论以统一 spec/plan 的最新修复与验收记录为据；历史 MVP/Recovery PASS、探针与单个检查点不能证明新组合已通过。未运行的平台项目继续按 NOT_RUN 记录。
+已完成阶段的 plan、review log、旧 Target/Matrix/Fixture/Allowlist/Golden/Profile 和过时研究已退出工作树。必要语义和经验归入对应主题；历史过程通过 `git log -- docs` 与 `git show <revision>:<path>` 追溯，不作为新开发的默认输入。
+
+[参考研究](reference/router-benchmarks.md)是有版本边界的材料，不定义当前需求；[性能数据](data/performance/README.md)保留原型、候选与比较质量，不冒充当前源码的新验收。文档描述独立、通用的 Bevy UI Router，不混入其它项目的状态。

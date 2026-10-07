@@ -552,8 +552,8 @@ fn facade_native_root_publishes_and_refreshes_dynamic_content() {
     assert!(app.world().get_entity(host).is_ok());
 }
 
-// Declaration compatibility only. Native Router registration/publication is
-// validated separately when the phase C realization path is enabled.
+// This test checks the outlet declaration in an official Scene. Native Router
+// registration/publication is covered by the facade and public navigation tests.
 #[test]
 fn facade_outlet_declaration_is_usable_in_an_official_scene() {
     let mut app = App::new();
