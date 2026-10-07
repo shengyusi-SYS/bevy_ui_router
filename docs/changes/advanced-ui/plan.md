@@ -25,11 +25,13 @@
 
 ## 3. Retained 共存机制验证
 
-- [ ] 沿现有 slot/mount/frame-local/registry 边界验证独立 retained role 与 exact claim 能在同一 child slot 下和 active 共存；原请求不持有长期 outstanding capability。
+- [x] 沿现有 slot/mount/frame-local/registry 边界验证独立 retained role 与 exact claim 能在同一 child slot 下和 active 共存；原请求不持有长期 outstanding capability。
 - [ ] 覆盖 active 正向输入、retained 拒绝、无关缓存 protected、hook 写后 drift 拒绝和 parent cleanup 责任交接。机制证据必须经过生产 predicate，不能直接注入分类结论。
 - [ ] 若探针揭示设计不可行，先收敛到有证据的 owner/角色协议再继续完整缓存；不通过放宽所有 child-set 检查获得通过。
 
 实现入口：Core `frame.rs`/`engine.rs`/`integration.rs`，ECS `registry.rs`、`mount.rs`、`frame_local.rs`、`presentation.rs`、`input.rs`、`cleanup.rs` 与 `branch_transaction.rs`。此阶段独立审查后进入缓存实现。
+
+已闭合连续多个 inactive leaf 与 active 共存、撤销输入/focus及离开父布局的完整清理旅程。当前先补长期 owner 在 host/authority 失效时的结算，再完成命中、LRU与组合验收。
 
 ## 4. 同父 leaf 缓存与完整责任交接
 

@@ -14,6 +14,7 @@ pub struct RouterConfig {
     routes: RouteTree,
     views: RouteViewRegistry,
     fallback: RouteViewKey,
+    keep_alive_capacity: usize,
 }
 
 impl RouterConfig {
@@ -22,11 +23,24 @@ impl RouterConfig {
             routes,
             views,
             fallback,
+            keep_alive_capacity: 0,
         }
     }
 
-    fn into_parts(self) -> (RouteTree, RouteViewRegistry, RouteViewKey) {
-        (self.routes, self.views, self.fallback)
+    /// Sets the maximum number of inactive opted-in leaf instances.
+    /// The default and zero disable retention.
+    pub fn with_keep_alive_capacity(mut self, capacity: usize) -> Self {
+        self.keep_alive_capacity = capacity;
+        self
+    }
+
+    fn into_parts(self) -> (RouteTree, RouteViewRegistry, RouteViewKey, usize) {
+        (
+            self.routes,
+            self.views,
+            self.fallback,
+            self.keep_alive_capacity,
+        )
     }
 }
 
@@ -349,7 +363,7 @@ impl TestAppRouterExt for App {
 impl AppRouterExt for App {
     fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError> {
         crate::plugin::install_foundations(self);
-        let (routes, views, fallback) = config.into_parts();
+        let (routes, views, fallback, keep_alive_capacity) = config.into_parts();
         let drivers = self.world().resource::<ViewDriverStore>();
         let mut binding_error = None;
         #[cfg(feature = "bsn")]
@@ -420,7 +434,7 @@ impl AppRouterExt for App {
         let handle = self
             .world_mut()
             .resource_mut::<crate::navigation::RouterNavigation>()
-            .install(routes, views, fallback)
+            .install(routes, views, fallback, keep_alive_capacity)
             .map_err(|_| RouterInstallError::new(RouterInstallErrorKind::UnknownRouteView))?;
         let projection = self
             .world()

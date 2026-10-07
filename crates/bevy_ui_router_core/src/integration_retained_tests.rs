@@ -1,0 +1,435 @@
+use super::*;
+use crate::prelude::*;
+
+fn engine(capacity: usize, opt_in: bool) -> RouterEngine {
+    engine_with_lease(capacity, opt_in).0
+}
+
+fn engine_with_lease(capacity: usize, opt_in: bool) -> (RouterEngine, HostLease) {
+    let mut builder = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/:section").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+        )
+        .unwrap();
+    let parent = builder.root_id().unwrap();
+    builder
+        .route_with_options(
+            parent,
+            RoutePattern::path(":id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("leaf").unwrap())
+                .with_keep_alive(opt_in),
+        )
+        .unwrap();
+    let mut engine = RouterEngine::install(
+        builder.build().unwrap(),
+        RouteViewKey::new("fallback").unwrap(),
+    )
+    .unwrap()
+    .with_keep_alive_capacity(capacity);
+    let token = engine.request_host_admission().unwrap();
+    let grant = engine.grant_host_admission(&token).unwrap();
+    engine.record_top_slot_registered(&grant).unwrap();
+    let lease = engine.confirm_host(grant);
+    (engine, lease)
+}
+
+fn ticket(engine: &mut RouterEngine, path: &str) -> CommitTicket {
+    engine.push(RouteLocation::new(path)).unwrap();
+    engine.collect();
+    loop {
+        match engine.action().expect("real navigation action") {
+            EngineAction::FrameTask(task) => {
+                let outlets = engine
+                    .expected_child_outlet(&task)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                engine.report_applied_with_outlets(task, outlets).unwrap();
+            }
+            EngineAction::MountRequest(mount) => {
+                let receipt = engine.resolve_mount(mount).unwrap().attest_receipt(0x61);
+                let completion = engine.accept_mount_receipt(receipt).unwrap().complete(0x63);
+                engine.complete_mount_registration(completion).unwrap();
+            }
+            EngineAction::Commit(ticket) => return ticket,
+            _ => panic!("normal route must reach commit"),
+        }
+    }
+}
+
+fn prepare(
+    engine: &mut RouterEngine,
+    ticket: &CommitTicket,
+    owners: &mut Vec<RetainedLeafOwner>,
+) -> PreparedRetainedCommit {
+    let inventory = owners.iter().collect::<Vec<_>>();
+    let plan = engine
+        .prepare_retained_commit_plan(ticket, &inventory)
+        .unwrap();
+    let mut retiring = Vec::new();
+    let mut preserved = Vec::new();
+    for owner in std::mem::take(owners) {
+        if plan
+            .retiring()
+            .iter()
+            .any(|projection| projection.id() == owner.projection().id())
+        {
+            retiring.push(owner);
+        } else {
+            preserved.push(owner);
+        }
+    }
+    *owners = preserved;
+    let roots = plan.disposable_roots().to_vec();
+    let count = roots.len();
+    let manifest = CleanupManifest::new(roots, 0x6163, count);
+    match engine.prepare_commit_with_retention(ticket, plan, manifest, retiring) {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("exact retention partition must prepare"),
+    }
+}
+
+fn publish(
+    engine: &mut RouterEngine,
+    prepared: PreparedRetainedCommit,
+    owners: &mut Vec<RetainedLeafOwner>,
+) {
+    let cleanup = prepared.cleanup().clone();
+    let count = cleanup.obligation_count();
+    let validated = match engine.validate_retained_publication(prepared) {
+        Ok(validated) => validated,
+        Err(_) => panic!("exact retained publication must validate"),
+    };
+    validated.publish(|owner| owners.extend(owner));
+    let completion = if count == 0 {
+        cleanup.complete_empty()
+    } else {
+        cleanup.complete(0x6567, count)
+    };
+    engine.complete_cleanup(completion).unwrap();
+    assert!(
+        engine.action().is_none(),
+        "the prior request must not own the cache"
+    );
+}
+
+fn navigate(engine: &mut RouterEngine, path: &str, owners: &mut Vec<RetainedLeafOwner>) {
+    let ticket = ticket(engine, path);
+    let prepared = prepare(engine, &ticket, owners);
+    publish(engine, prepared, owners);
+}
+
+#[test]
+fn retained_leaf_defaults_and_capacity_are_real_policy_inputs() {
+    assert!(!RouteNodeOptions::new().keep_alive());
+    for (capacity, opt_in) in [(0, true), (2, false)] {
+        let mut engine = engine(capacity, opt_in);
+        let mut owners = Vec::new();
+        navigate(&mut engine, "/items/1", &mut owners);
+        navigate(&mut engine, "/items/2", &mut owners);
+        assert!(owners.is_empty());
+    }
+}
+
+#[test]
+fn retained_leaf_two_transfers_terminate_old_requests_and_parent_loss_disposes_exact_owners() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    let first = engine.active().frames().last().unwrap().clone();
+    navigate(&mut engine, "/items/2", &mut owners);
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].projection().frame(), &first);
+    navigate(&mut engine, "/items/3", &mut owners);
+    assert_eq!(owners.len(), 2);
+    assert_ne!(owners[0].projection().id(), owners[1].projection().id());
+    assert_eq!(
+        owners[0].projection().parent(),
+        owners[1].projection().parent()
+    );
+    assert_eq!(owners[0].projection().slot(), owners[1].projection().slot());
+    assert_eq!(owners[0].projection().host(), owners[1].projection().host());
+    let ticket = ticket(&mut engine, "/outside");
+    let plan = engine
+        .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert!(plan.retained().is_none());
+    assert_eq!(plan.retiring().len(), 2);
+    for owner in &owners {
+        assert!(plan.disposable_roots().contains(owner.projection().frame()));
+    }
+    drop(plan);
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    assert!(owners.is_empty());
+    publish(&mut engine, prepared, &mut owners);
+    assert!(owners.is_empty());
+    navigate(&mut engine, "/other/1", &mut owners);
+    navigate(&mut engine, "/other/2", &mut owners);
+    assert_eq!(
+        owners.len(),
+        1,
+        "completed disposal releases the real capacity"
+    );
+}
+
+#[test]
+fn retained_leaf_capacity_does_not_grow_without_eviction_support() {
+    let mut engine = engine(1, true);
+    let mut owners = Vec::new();
+    for path in ["/items/1", "/items/2", "/items/3", "/items/4"] {
+        navigate(&mut engine, path, &mut owners);
+        assert!(owners.len() <= 1);
+    }
+    assert_eq!(owners.len(), 1);
+}
+
+#[test]
+fn retained_leaf_inventory_and_disposable_roots_are_exact() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    navigate(&mut engine, "/items/2", &mut owners);
+    let ticket = ticket(&mut engine, "/outside");
+    assert!(engine.prepare_retained_commit_plan(&ticket, &[]).is_err());
+    assert!(
+        engine
+            .prepare_retained_commit_plan(&ticket, &[&owners[0], &owners[0]])
+            .is_err()
+    );
+    assert!(
+        engine
+            .prepare_commit(&ticket, CleanupManifest::empty())
+            .is_err()
+    );
+    let plan = engine
+        .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let expected = plan.disposable_roots().to_vec();
+    let returned = match engine.prepare_commit_with_retention(
+        &ticket,
+        plan,
+        CleanupManifest::empty(),
+        std::mem::take(&mut owners),
+    ) {
+        Err(error) => error.into_parts(),
+        Ok(_) => panic!("retiring roots cannot be omitted"),
+    };
+    let (plan, _, returned_owners, error) = returned;
+    assert_eq!(error, IntegrationError::InvalidManifest);
+    assert_eq!(returned_owners.len(), 1);
+    assert_eq!(plan.disposable_roots(), expected);
+    owners = returned_owners;
+    drop(plan);
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    publish(&mut engine, prepared, &mut owners);
+}
+
+#[test]
+fn retained_leaf_foreign_router_owner_cannot_form_inventory() {
+    let mut first = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut first, "/items/1", &mut owners);
+    navigate(&mut first, "/items/2", &mut owners);
+    let mut second = engine(2, true);
+    let ticket = ticket(&mut second, "/items/1");
+    assert!(
+        second
+            .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
+            .is_err()
+    );
+}
+
+#[test]
+fn retained_leaf_cancel_returns_original_retiring_owner_and_never_publishes_new_history() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    navigate(&mut engine, "/items/2", &mut owners);
+    let original = owners[0].projection().clone();
+    let history = engine.history().clone();
+    let ticket = ticket(&mut engine, "/outside");
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    let returned = match engine.cancel_prepared_retained_commit_for_authority_settlement(prepared) {
+        Ok(returned) => returned,
+        Err(_) => panic!("exact unpublished transfer must cancel"),
+    };
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].projection(), &original);
+    assert_eq!(engine.history(), &history);
+}
+
+#[test]
+fn retained_leaf_abandoned_prepared_handle_preserves_the_unique_core_holder() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    navigate(&mut engine, "/items/2", &mut owners);
+    let original = owners[0].projection().clone();
+    let history = engine.history().clone();
+    let ticket = ticket(&mut engine, "/outside");
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    drop(prepared);
+    assert_eq!(engine.history(), &history);
+    assert_eq!(
+        engine.inner.testing_retained_transfer_owners(),
+        vec![original]
+    );
+}
+
+#[test]
+fn retained_leaf_validation_rejection_returns_handle_and_preserves_original_owner() {
+    let mut source = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut source, "/items/1", &mut owners);
+    navigate(&mut source, "/items/2", &mut owners);
+    let original = owners[0].projection().clone();
+    let ticket = ticket(&mut source, "/outside");
+    let prepared = prepare(&mut source, &ticket, &mut owners);
+    let mut foreign = engine(2, true);
+    let (prepared, _) = match foreign.validate_retained_publication(prepared) {
+        Err(returned) => returned,
+        Ok(_) => panic!("foreign receiver cannot validate this transfer"),
+    };
+    let returned = source
+        .cancel_prepared_retained_commit_for_authority_settlement(prepared)
+        .unwrap();
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].projection(), &original);
+}
+
+#[test]
+fn retained_leaf_abandoned_validated_handle_preserves_owners_without_history_publication() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    navigate(&mut engine, "/items/2", &mut owners);
+    let original = owners[0].projection().clone();
+    let history = engine.history().clone();
+    let ticket = ticket(&mut engine, "/outside");
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    let validated = engine.validate_retained_publication(prepared).unwrap();
+    drop(validated);
+    assert_eq!(engine.history(), &history);
+    assert_eq!(
+        engine.inner.testing_retained_transfer_owners(),
+        vec![original]
+    );
+}
+
+#[test]
+fn retained_leaf_another_publication_invalidates_the_full_old_plan_in_the_same_tick() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    let ticket = ticket(&mut engine, "/items/2");
+    let old = engine.prepare_retained_commit_plan(&ticket, &[]).unwrap();
+    let old_id = old.retained().unwrap().id();
+    let roots = old.disposable_roots().to_vec();
+    let manifest = CleanupManifest::new(roots.clone(), 0x6163, roots.len());
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    publish(&mut engine, prepared, &mut owners);
+    assert_ne!(owners[0].projection().id(), old_id);
+    let error = engine
+        .prepare_commit_with_retention(&ticket, old, manifest, Vec::new())
+        .unwrap_err();
+    let (_, _, returned, error) = error.into_parts();
+    assert_eq!(error, IntegrationError::Stale);
+    assert!(returned.is_empty());
+    assert_eq!(owners.len(), 1);
+}
+
+#[test]
+fn retained_leaf_capacity_change_invalidates_an_unconsumed_plan() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    let ticket = ticket(&mut engine, "/items/2");
+    let plan = engine.prepare_retained_commit_plan(&ticket, &[]).unwrap();
+    let roots = plan.disposable_roots().to_vec();
+    let manifest = CleanupManifest::new(roots.clone(), 0x6163, roots.len());
+    engine = engine.with_keep_alive_capacity(0);
+    let error = engine
+        .prepare_commit_with_retention(&ticket, plan, manifest, Vec::new())
+        .unwrap_err();
+    assert_eq!(error.into_parts().3, IntegrationError::Stale);
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    assert!(prepared.retained_leaf().is_none());
+    publish(&mut engine, prepared, &mut owners);
+    assert!(owners.is_empty());
+}
+
+#[test]
+fn retained_leaf_same_source_rejection_returns_original_owners_after_authority_settlement() {
+    let (mut engine, lease) = engine_with_lease(2, true);
+    let mut owners = Vec::new();
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        navigate(&mut engine, path, &mut owners);
+    }
+    let original = owners
+        .iter()
+        .map(|owner| owner.projection().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(original.len(), 2);
+    let history = engine.history().clone();
+    let ticket = ticket(&mut engine, "/outside");
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    assert!(owners.is_empty());
+
+    // This real configuration input changes the frozen Core source. Validation
+    // must retain a Rejected publication rather than publish its prepared history.
+    engine = engine.with_keep_alive_capacity(1);
+    let (prepared, error) = match engine.validate_retained_publication(prepared) {
+        Err(returned) => returned,
+        Ok(_) => panic!("same-source drift must reject the prepared publication"),
+    };
+    assert_eq!(error, IntegrationError::Stale);
+    assert_eq!(engine.history(), &history);
+    assert_eq!(engine.inner.testing_retained_transfer_owners(), original);
+    assert!(matches!(
+        engine.take_unpublished_retained_owners_for_settlement(),
+        Err(IntegrationError::Stale)
+    ));
+    let (prepared, error) = engine
+        .cancel_prepared_retained_commit_for_authority_settlement(prepared)
+        .unwrap_err();
+    assert_eq!(error, IntegrationError::Stale);
+    assert_eq!(engine.inner.testing_retained_transfer_owners(), original);
+
+    // Consume the original host lease through the production authority path.
+    // Its publication retires the rejected history owner; only then may the
+    // independent transit holder return every original retained owner.
+    let roots = engine.authority_settlement_logical_roots();
+    let count = roots.len();
+    let mut authority_published = false;
+    let cleanup = engine
+        .begin_authority_settlement_retaining(
+            lease,
+            CleanupManifest::new(roots, 0x7163, count),
+            |_| authority_published = true,
+        )
+        .unwrap();
+    assert!(authority_published);
+    let returned = engine
+        .take_unpublished_retained_owners_for_settlement()
+        .unwrap();
+    assert_eq!(
+        returned
+            .iter()
+            .map(|owner| owner.projection().clone())
+            .collect::<Vec<_>>(),
+        original
+    );
+    assert!(engine.inner.testing_retained_transfer_owners().is_empty());
+    assert_eq!(engine.history(), &history);
+    assert!(matches!(
+        engine.take_unpublished_retained_owners_for_settlement(),
+        Err(IntegrationError::Stale)
+    ));
+
+    // Returning a unique owner does not settle its physical cleanup. The
+    // authority batch and the returned owners remain separate responsibilities.
+    assert_eq!(cleanup.obligation_count(), count);
+    drop((prepared, cleanup, returned));
+}

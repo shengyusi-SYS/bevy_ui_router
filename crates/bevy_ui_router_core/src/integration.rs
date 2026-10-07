@@ -4009,6 +4009,94 @@ pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> 
     },
 }
 
+pub use crate::engine::retained::{
+    RetainedCommitPlan, RetainedLeafId, RetainedLeafOwner, RetainedLeafProjection,
+};
+
+/// Preparation rejection returns the complete original physical responsibility.
+pub struct RetainedCommitPreparationError {
+    plan: RetainedCommitPlan,
+    manifest: CleanupManifest,
+    owners: Vec<RetainedLeafOwner>,
+    error: IntegrationError,
+}
+
+impl std::fmt::Debug for RetainedCommitPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedCommitPreparationError")
+            .field("plan", &self.plan)
+            .field("manifest", &self.manifest.projection())
+            .field("owners", &self.owners)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl RetainedCommitPreparationError {
+    pub fn into_parts(
+        self,
+    ) -> (
+        RetainedCommitPlan,
+        CleanupManifest,
+        Vec<RetainedLeafOwner>,
+        IntegrationError,
+    ) {
+        (self.plan, self.manifest, self.owners, self.error)
+    }
+}
+
+/// A prepared handle. The unique transit owners remain held by the issuing Core.
+pub struct PreparedRetainedCommit {
+    publication: PreparedPublication,
+    cleanup: CleanupBatch,
+    retained: Option<RetainedLeafProjection>,
+}
+
+impl std::fmt::Debug for PreparedRetainedCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedRetainedCommit")
+            .field("history", self.publication.history_publication())
+            .field("retained", &self.retained)
+            .field("manifest_digest", &self.cleanup.manifest_digest)
+            .field("obligation_count", &self.cleanup.obligation_count)
+            .finish()
+    }
+}
+
+impl PreparedRetainedCommit {
+    pub fn history_publication(&self) -> &HistoryPublicationFacts {
+        self.publication.history_publication()
+    }
+    pub fn cleanup(&self) -> &CleanupBatch {
+        &self.cleanup
+    }
+    pub fn retained_leaf(&self) -> Option<&RetainedLeafProjection> {
+        self.retained.as_ref()
+    }
+}
+
+pub struct ValidatedRetainedCommit<'a> {
+    publication: crate::engine::retained::ValidatedRetainedPublication<'a>,
+    cleanup: CleanupBatch,
+}
+
+impl ValidatedRetainedCommit<'_> {
+    pub fn history_publication(&self) -> &HistoryPublicationFacts {
+        self.publication.history_publication()
+    }
+    pub fn cleanup(&self) -> &CleanupBatch {
+        &self.cleanup
+    }
+    pub fn publish<F>(self, mutation: F)
+    where
+        F: FnOnce(Option<RetainedLeafOwner>),
+    {
+        self.publication.publish(mutation);
+    }
+}
+
 pub struct PreparedCommit {
     publication: PreparedPublication,
     cleanup: CleanupBatch,
@@ -5841,6 +5929,16 @@ pub struct RouterEngine {
 }
 
 impl RouterEngine {
+    /// Maximum inactive normal leaf instances. Zero disables keep-alive.
+    pub fn with_keep_alive_capacity(mut self, capacity: usize) -> Self {
+        self.inner = self.inner.with_keep_alive_capacity(capacity);
+        self
+    }
+
+    pub const fn keep_alive_capacity(&self) -> usize {
+        self.inner.keep_alive_capacity()
+    }
+
     #[doc(hidden)]
     pub fn idle_host_loss_eligible(&self) -> bool {
         self.inner.idle_host_loss_eligible()
@@ -8391,6 +8489,111 @@ impl RouterEngine {
                 evidence: FailureCleanupZeroTerminalMismatchView { inner: evidence },
             },
         }
+    }
+
+    /// Freezes the exact current/next partition and complete live retained inventory.
+    pub fn prepare_retained_commit_plan(
+        &mut self,
+        ticket: &CommitTicket,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedCommitPlan, IntegrationError> {
+        self.inner
+            .prepare_retained_commit_plan(&ticket.inner, inventory)
+            .map_err(map_commit_error)
+    }
+
+    pub fn prepare_commit_with_retention(
+        &mut self,
+        ticket: &CommitTicket,
+        plan: RetainedCommitPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+    ) -> Result<PreparedRetainedCommit, RetainedCommitPreparationError> {
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(manifest.manifest_digest),
+            manifest.obligation_count,
+        );
+        // All owner/projection composition precedes installation of Ready.
+        let retained = plan.retained().cloned();
+        match self
+            .inner
+            .prepare_retained_publication(&ticket.inner, &plan, seal, owners)
+        {
+            Ok((publication, token)) => Ok(PreparedRetainedCommit {
+                publication,
+                cleanup: CleanupBatch {
+                    inner: token,
+                    manifest_digest: manifest.manifest_digest,
+                    obligation_count: manifest.obligation_count,
+                },
+                retained,
+            }),
+            Err((owners, error)) => Err(RetainedCommitPreparationError {
+                plan,
+                manifest,
+                owners,
+                error: map_commit_error(error),
+            }),
+        }
+    }
+
+    pub fn validate_retained_publication(
+        &mut self,
+        prepared: PreparedRetainedCommit,
+    ) -> Result<ValidatedRetainedCommit<'_>, (PreparedRetainedCommit, IntegrationError)> {
+        let PreparedRetainedCommit {
+            publication,
+            cleanup,
+            retained,
+        } = prepared;
+        match self.inner.validate_retained_publication(publication) {
+            Ok(publication) => Ok(ValidatedRetainedCommit {
+                publication,
+                cleanup,
+            }),
+            Err((publication, error)) => Err((
+                PreparedRetainedCommit {
+                    publication,
+                    cleanup,
+                    retained,
+                },
+                map_commit_error(error),
+            )),
+        }
+    }
+
+    pub fn cancel_prepared_retained_commit_for_authority_settlement(
+        &mut self,
+        prepared: PreparedRetainedCommit,
+    ) -> Result<Vec<RetainedLeafOwner>, (PreparedRetainedCommit, IntegrationError)> {
+        let PreparedRetainedCommit {
+            publication,
+            cleanup,
+            retained,
+        } = prepared;
+        self.inner
+            .cancel_prepared_retained_publication_for_authority_settlement(publication)
+            .map_err(|(publication, error)| {
+                (
+                    PreparedRetainedCommit {
+                        publication,
+                        cleanup,
+                        retained,
+                    },
+                    map_commit_error(error),
+                )
+            })
+    }
+
+    /// Recovers original owners only after the unpublished authority has been
+    /// moved to its existing failure/authority settlement path.
+    pub fn take_unpublished_retained_owners_for_settlement(
+        &mut self,
+    ) -> Result<Vec<RetainedLeafOwner>, IntegrationError> {
+        self.inner
+            .take_unpublished_retained_owners_for_settlement()
+            .map_err(map_commit_error)
     }
 
     pub fn prepare_commit(
@@ -16647,3 +16850,7 @@ mod tests {
         assert!(matches!(engine.action(), Some(EngineAction::FrameTask(_))));
     }
 }
+
+#[cfg(test)]
+#[path = "integration_retained_tests.rs"]
+mod retained_tests;

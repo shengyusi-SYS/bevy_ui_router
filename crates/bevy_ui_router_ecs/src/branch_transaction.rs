@@ -3,7 +3,8 @@ use bevy_ui_router_core::{
     ids::{NavigationRequestId, RouteFrameId, RouteGeneration, RouteHostId, RouteSlotId},
     integration::{
         CommitTicket, FrameMountTarget, ReconciliationChildSlotRoleKind,
-        ReconciliationEnteringSlotKind, ReconciliationProjectionView, RootFrameTask,
+        ReconciliationEnteringSlotKind, ReconciliationProjectionView, RetainedLeafProjection,
+        RootFrameTask,
     },
     slot::RouteSlotKey,
 };
@@ -253,6 +254,16 @@ pub(crate) fn seal_reconciliation_staging_mount<'a>(
     entering: &'a PreparedBranch,
     task: &RootFrameTask,
 ) -> Option<SealedReconciliationStagingMount<'a>> {
+    seal_reconciliation_staging_mount_with_retained(projection, active, entering, task, &[])
+}
+
+pub(crate) fn seal_reconciliation_staging_mount_with_retained<'a>(
+    projection: &ReconciliationProjectionView<'_>,
+    active: Option<&'a RealizedBranch>,
+    entering: &'a PreparedBranch,
+    task: &RootFrameTask,
+    retained_shells: &[ExactRegistryClaim],
+) -> Option<SealedReconciliationStagingMount<'a>> {
     let root = active
         .and_then(RealizedBranch::first_frame)
         .or_else(|| entering.first_frame())?;
@@ -331,7 +342,7 @@ pub(crate) fn seal_reconciliation_staging_mount<'a>(
             return None;
         }
     };
-    let allowed_existing_shells: Vec<ExactRegistryClaim> = active
+    let mut allowed_existing_shells: Vec<ExactRegistryClaim> = active
         .into_iter()
         .flat_map(RealizedBranch::frames)
         .filter(|frame| {
@@ -356,6 +367,20 @@ pub(crate) fn seal_reconciliation_staging_mount<'a>(
                 .cloned()
         })
         .collect();
+    for claim in retained_shells {
+        if claim.lifecycle() != EntityLifecycle::Retained
+            || !matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameShell(frame))
+                if frame.slot() == slots[0].slot_id()
+                    && frame.host() == parent.host()
+                    && bevy_ui_router_core::integration::frame_versions_share_router(frame, &parent))
+            || allowed_existing_shells
+                .iter()
+                .any(|existing| existing.entity() == claim.entity())
+        {
+            return None;
+        }
+        allowed_existing_shells.push(claim.clone());
+    }
     (slots[0].slot_claim().lifecycle() == expected_slot_lifecycle).then_some(
         SealedReconciliationStagingMount {
             parent: parents[0],
@@ -689,6 +714,7 @@ pub(crate) struct SealedReconciliationSplice {
     entering: RealizedBranch,
     leaving: RealizedBranch,
     slot_roles: Vec<SealedReconciliationSlotRole>,
+    retained: Option<RetainedLeafProjection>,
 }
 
 pub(crate) struct ReconciliationSpliceOutcome {
@@ -696,6 +722,7 @@ pub(crate) struct ReconciliationSpliceOutcome {
     entering: RealizedBranch,
     leaving: RealizedBranch,
     slot_roles: Vec<SealedReconciliationSlotRole>,
+    retained: Option<RetainedLeafProjection>,
 }
 
 pub(crate) struct PreparedReconciliationClaimRebind {
@@ -749,22 +776,172 @@ impl ReconciliationSpliceOutcome {
     }
 
     pub(crate) fn into_active_and_leaving(self) -> (RealizedBranch, RealizedBranch) {
+        assert!(
+            self.retained.is_none(),
+            "retained payload must have a linear recipient"
+        );
+        let (active, leaving, retained) = self.into_active_leaving_and_retained();
+        debug_assert!(retained.is_none());
+        (active, leaving)
+    }
+
+    pub(crate) fn into_active_leaving_and_retained(
+        self,
+    ) -> (RealizedBranch, RealizedBranch, Option<RealizedBranch>) {
         let mut active = self.preserved;
         let mut entering = self.entering;
         active.frames.append(&mut entering.frames);
         active.child_slots.append(&mut entering.child_slots);
         sort_child_slots(&mut active);
-        (active, self.leaving)
+        let mut leaving = self.leaving;
+        let retained = self.retained.map(|projection| {
+            let frame_index = leaving
+                .frames
+                .iter()
+                .position(|frame| frame.frame() == projection.frame())
+                .expect("sealed retained leaf remains in its leaving partition");
+            let frame = leaving.frames.remove(frame_index);
+            let mut retained = RealizedBranch::from_single_frame(frame);
+            let mut index = 0;
+            while index < leaving.child_slots.len() {
+                if leaving.child_slots[index].parent() == projection.frame() {
+                    retained.child_slots.push(leaving.child_slots.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            retained
+        });
+        (active, leaving, retained)
     }
 }
 
 impl SealedReconciliationSplice {
+    fn leaf_retention_is_exact(&self, frame: &RouteFrameVersion) -> bool {
+        let Some(candidate) = self
+            .leaving
+            .frames
+            .iter()
+            .find(|candidate| candidate.frame() == frame)
+        else {
+            return false;
+        };
+        candidate.mount_binding().is_child_outlet()
+            && matches!(frame.origin(), FrameOrigin::MatchedRoute(_))
+            && self
+                .leaving
+                .frames
+                .iter()
+                .filter(|candidate| candidate.frame() == frame)
+                .count()
+                == 1
+            && !self
+                .leaving
+                .frames
+                .iter()
+                .chain(&self.preserved.frames)
+                .chain(&self.entering.frames)
+                .any(|child| {
+                    self.leaving.child_slots.iter().any(|slot| {
+                        slot.parent() == frame
+                            && child.mount_binding().matches_mounted_child_slot(slot)
+                    })
+                })
+            && candidate
+                .claims()
+                .all(|claim| claim.lifecycle() == EntityLifecycle::Active)
+            && self
+                .leaving
+                .child_slots
+                .iter()
+                .filter(|slot| slot.parent() == frame)
+                .all(|slot| {
+                    matches!(
+                        slot.slot_claim().lifecycle(),
+                        EntityLifecycle::PreparedInert | EntityLifecycle::Active
+                    )
+                })
+    }
+
+    pub(crate) fn retain_leaf(&mut self, projection: &RetainedLeafProjection) -> bool {
+        if self.retained.is_some()
+            || !self.leaf_retention_is_exact(projection.frame())
+            || self
+                .preserved
+                .frames
+                .iter()
+                .filter(|frame| frame.frame() == projection.parent())
+                .count()
+                != 1
+        {
+            return false;
+        }
+        let frame = self
+            .leaving
+            .frames
+            .iter()
+            .find(|frame| frame.frame() == projection.frame())
+            .expect("exact leaf checked");
+        if !frame.mount_binding().matches_retained_scope(projection) {
+            return false;
+        }
+        self.retained = Some(projection.clone());
+        true
+    }
+
+    pub(crate) fn retained_frame(&self) -> Option<&RouteFrameVersion> {
+        self.retained.as_ref().map(RetainedLeafProjection::frame)
+    }
+
+    pub(crate) fn disposable_frames(&self) -> impl Iterator<Item = &RealizedFrame> {
+        self.leaving
+            .frames
+            .iter()
+            .filter(|frame| self.retained_frame() != Some(frame.frame()))
+    }
+
+    pub(crate) fn disposable_child_slots(&self) -> impl Iterator<Item = &MountedChildSlot> {
+        self.leaving
+            .child_slots
+            .iter()
+            .filter(|slot| self.retained_frame() != Some(slot.parent()))
+    }
+
+    pub(crate) fn prepare_retained_boundary(
+        &self,
+        claims: &[ExactRegistryClaim],
+    ) -> Option<crate::presentation::RetainedBoundaryProof> {
+        let projection = self.retained.as_ref()?;
+        let frame = self
+            .leaving
+            .frames
+            .iter()
+            .find(|frame| frame.frame() == projection.frame())?;
+        crate::presentation::RetainedBoundaryProof::prepare(
+            projection,
+            frame,
+            self.leaving
+                .child_slots
+                .iter()
+                .filter(|slot| slot.parent() == projection.frame()),
+            claims,
+        )
+    }
     #[cfg(feature = "bsn")]
     pub(crate) fn prepare_native_cleanup(
         &mut self,
         world: &mut bevy_ecs::world::World,
     ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
-        self.leaving.prepare_native_cleanup(world)
+        for frame in &mut self.leaving.frames {
+            if self
+                .retained
+                .as_ref()
+                .is_none_or(|projection| projection.frame() != frame.frame())
+            {
+                crate::presentation::native_frame::prepare_content_cleanup(world, frame)?;
+            }
+        }
+        Ok(())
     }
     pub(crate) const fn preserved(&self) -> &RealizedBranch {
         &self.preserved
@@ -862,6 +1039,15 @@ impl SealedReconciliationSplice {
         let mut transitions = self
             .leaving
             .lifecycle_transitions(EntityLifecycle::Leaving, true);
+        if let Some(frame) = self.retained_frame() {
+            for (claim, next) in &mut transitions {
+                if matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameShell(owner) | EntityOwner::FrameContentTarget(owner)) if owner == frame)
+                    || matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameOutput { frame: owner, .. } | EntityOwner::ChildSlot { parent: owner, .. }) if owner == frame)
+                {
+                    *next = EntityLifecycle::Retained;
+                }
+            }
+        }
         transitions.extend(self.slot_roles.iter().filter_map(|role| {
             matches!(
                 role.kind(),
@@ -896,23 +1082,23 @@ impl SealedReconciliationSplice {
     pub(crate) fn presentation_mutation_targets(&self) -> (Vec<FrameMutationTarget>, usize) {
         let mut targets = Vec::new();
         for frame_index in (0..self.leaving.frames.len()).rev() {
+            let next = if self.retained_frame() == Some(self.leaving.frames[frame_index].frame()) {
+                EntityLifecycle::Retained
+            } else {
+                EntityLifecycle::Leaving
+            };
             targets.extend(
                 self.leaving
                     .child_slots
                     .iter()
                     .filter(|slot| slot.parent() == self.leaving.frames[frame_index].frame())
                     .map(|slot| {
-                        child_slot_mutation_target(
-                            slot,
-                            slot.slot_claim().lifecycle(),
-                            EntityLifecycle::Leaving,
-                            false,
-                        )
+                        child_slot_mutation_target(slot, slot.slot_claim().lifecycle(), next, false)
                     }),
             );
             targets.extend(self.leaving.frames[frame_index].mutation_targets(
                 EntityLifecycle::Active,
-                EntityLifecycle::Leaving,
+                next,
                 false,
             ));
         }
@@ -1187,6 +1373,7 @@ impl SealedReconciliationSplice {
             entering: self.entering,
             leaving: self.leaving,
             slot_roles: self.slot_roles,
+            retained: self.retained,
         }
     }
 
@@ -1399,6 +1586,7 @@ impl SealedExistingReconciliation {
             entering: entering.into_realized(),
             leaving: self.leaving,
             slot_roles: self.slot_roles,
+            retained: None,
         })
     }
 
@@ -2376,6 +2564,125 @@ impl RealizedBranch {
         (targets.len() == self.obligation_count()).then_some(targets)
     }
 
+    pub(crate) fn retained_leaving_mutation_targets(&self) -> Option<Vec<FrameMutationTarget>> {
+        if self.frames.len() != 1
+            || self
+                .frames
+                .iter()
+                .flat_map(RealizedFrame::claims)
+                .any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
+            || self.child_slots.iter().any(|slot| {
+                slot.parent() != self.frames[0].frame()
+                    || slot.slot_claim().lifecycle() != EntityLifecycle::Retained
+            })
+        {
+            return None;
+        }
+        let frame = &self.frames[0];
+        let mut targets = self
+            .child_slots
+            .iter()
+            .map(|slot| {
+                child_slot_mutation_target(
+                    slot,
+                    EntityLifecycle::Retained,
+                    EntityLifecycle::Leaving,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        targets.extend(frame.mutation_targets(
+            EntityLifecycle::Retained,
+            EntityLifecycle::Leaving,
+            false,
+        ));
+        Some(targets)
+    }
+
+    pub(crate) fn prepare_retained_claim_rebind(
+        &self,
+        claims: &[ExactRegistryClaim],
+        expected_next: EntityLifecycle,
+    ) -> Option<PreparedBranchClaimRebind> {
+        if self.frames.len() != 1
+            || self
+                .child_slots
+                .iter()
+                .any(|slot| slot.parent() != self.frames[0].frame())
+            || claims.iter().enumerate().any(|(index, claim)| {
+                claims[index + 1..]
+                    .iter()
+                    .any(|other| other.entity() == claim.entity())
+            })
+        {
+            return None;
+        }
+        let exact_projection = |source: &ExactRegistryClaim| -> Option<ExactRegistryClaim> {
+            claims
+                .iter()
+                .find(|next| next.entity() == source.entity())
+                .filter(|next| {
+                    claim_rebind_is_exact(source, next, EntityLifecycle::Retained, expected_next)
+                })
+                .cloned()
+        };
+        let frame_claims = self
+            .frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .claims()
+                    .map(exact_projection)
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if self
+            .child_slots
+            .iter()
+            .any(|slot| exact_projection(slot.slot_claim()).is_none())
+        {
+            return None;
+        }
+        let alias_is_exact = |alias: &ExactRegistryClaim| {
+            claims
+                .iter()
+                .find(|next| next.entity() == alias.entity())
+                .is_none_or(|next| {
+                    alias.entity() == next.entity()
+                        && alias.owner() == next.owner()
+                        && alias.seal() == next.seal()
+                        && next.lifecycle() == expected_next
+                })
+        };
+        if self.frames.iter().any(|frame| {
+            !alias_is_exact(frame.mount_binding().slot_claim())
+                || frame
+                    .mount_binding()
+                    .physical_parent()
+                    .1
+                    .is_some_and(|claim| !alias_is_exact(claim))
+                || frame
+                    .outlets()
+                    .iter()
+                    .any(|outlet| !alias_is_exact(outlet.anchor_claim()))
+        }) || self
+            .child_slots
+            .iter()
+            .any(|slot| !alias_is_exact(slot.anchor_claim()))
+        {
+            return None;
+        }
+        Some(PreparedBranchClaimRebind {
+            frame_claims,
+            all_claims: claims.to_vec(),
+            expected_current: self
+                .claims()
+                .map(|claim| (claim.entity(), claim.lifecycle()))
+                .collect(),
+            expected_next,
+        })
+    }
+
     pub(crate) fn entering_mutation_targets(
         &self,
         current: EntityLifecycle,
@@ -2612,6 +2919,12 @@ impl RealizedBranch {
             frames: vec![frame],
             child_slots: Vec::new(),
         }
+    }
+
+    /// Consumes the original physical owners without making a new branch or
+    /// conferring authority on a collection assembled by the recipient.
+    pub(crate) fn into_owned_parts(self) -> (Vec<RealizedFrame>, Vec<MountedChildSlot>) {
+        (self.frames, self.child_slots)
     }
 }
 
@@ -3006,6 +3319,73 @@ mod tests {
         branch.pop_frame_for_test();
         transition_slot_claims(&mut branch, EntityLifecycle::PreparedInert);
         branch
+    }
+
+    #[test]
+    fn leaf_retention_uses_exact_leaving_identity_and_returns_original_owners_on_reject() {
+        let (mut app, branch, _, _, _) = failed_nested_branch_fixture();
+        let mut branch = branch.into_realized_for_test();
+        activate_branch(&mut app, &mut branch);
+        let parent = branch.frames()[0].frame().clone();
+        let leaf = branch.frames()[1].frame().clone();
+        let original = branch.claims().cloned().collect::<Vec<_>>();
+        let existing =
+            reconciliation_existing_projection(&branch, ReconciliationSlotRoleKind::RetainEmpty);
+        let splice = SealedExistingReconciliation::prepare(branch, existing)
+            .unwrap()
+            .bind_entering(PreparedBranch::empty())
+            .unwrap();
+        assert!(splice.leaf_retention_is_exact(&leaf));
+        assert!(!splice.leaf_retention_is_exact(&parent));
+        let (restored, entering, _) = splice.reject().into_parts();
+        assert!(entering.frames().is_empty());
+        assert_eq!(restored.claims().cloned().collect::<Vec<_>>(), original);
+    }
+
+    #[test]
+    fn retained_disposal_keeps_external_active_mount_alias_and_rejects_stale_owned_claim() {
+        let (mut app, branch, _, _, _) = failed_nested_branch_fixture();
+        let mut branch = branch.into_realized_for_test();
+        activate_branch(&mut app, &mut branch);
+        let leaf = branch.frames.pop().unwrap();
+        let mut retained = RealizedBranch::from_single_frame(leaf);
+        transition_frame_claims(&mut retained, EntityLifecycle::Retained);
+        assert_eq!(
+            retained.frames()[0]
+                .mount_binding()
+                .slot_claim()
+                .lifecycle(),
+            EntityLifecycle::Active
+        );
+        assert!(retained.retained_leaving_mutation_targets().is_some());
+        let projected = retained
+            .claims()
+            .map(|claim| claim.with_lifecycle_for_test(EntityLifecycle::Leaving))
+            .collect::<Vec<_>>();
+        let mut stale = projected.clone();
+        stale[0] = stale[0].with_seal_for_test(branch.frames()[0].claims().next().unwrap().seal());
+        assert!(
+            retained
+                .prepare_retained_claim_rebind(&stale, EntityLifecycle::Leaving)
+                .is_none()
+        );
+        let rebind = retained
+            .prepare_retained_claim_rebind(&projected, EntityLifecycle::Leaving)
+            .unwrap();
+        retained.apply_claim_rebind(rebind);
+        assert!(
+            retained
+                .claims()
+                .all(|claim| claim.lifecycle() == EntityLifecycle::Leaving)
+        );
+        assert_eq!(
+            retained.frames()[0]
+                .mount_binding()
+                .slot_claim()
+                .lifecycle(),
+            EntityLifecycle::Active
+        );
+        assert!(retained.retained_leaving_mutation_targets().is_none());
     }
 
     #[test]

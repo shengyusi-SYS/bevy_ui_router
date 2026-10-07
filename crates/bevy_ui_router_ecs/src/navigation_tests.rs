@@ -2422,6 +2422,49 @@ fn install_deep_nested_router(app: &mut App) -> RouterHandle {
     router
 }
 
+fn install_retained_slice_router(app: &mut App, capacity: usize) -> RouterHandle {
+    let driver = ViewDriverKey::new("retained-slice").unwrap();
+    app.register_ui_view_driver(NestedDriver {
+        key: driver.clone(),
+        observed: Default::default(),
+        declare_outlet: true,
+    })
+    .unwrap();
+    let layout = RouteViewKey::new("layout").unwrap();
+    let item = RouteViewKey::new("item").unwrap();
+    let fallback = RouteViewKey::new("fallback").unwrap();
+    let mut views = RouteViewRegistry::new();
+    for view in [&layout, &item, &fallback] {
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver.clone()))
+            .unwrap();
+    }
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/:section").unwrap(),
+            RouteNodeOptions::new().with_view(layout),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path(":id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(item)
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let router = app
+        .add_ui_router(
+            RouterConfig::new(routes.build().unwrap(), views, fallback)
+                .with_keep_alive_capacity(capacity),
+        )
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    router
+}
+
 fn install_failing_deep_pending_router(app: &mut App) -> RouterHandle {
     let key = ViewDriverKey::new("fail-deep-pending-driver").unwrap();
     app.register_ui_view_driver(FailDeepPendingDriver {
@@ -5151,6 +5194,97 @@ fn nested_branch_drives_parent_mount_and_child_before_commit() {
     assert_eq!(pending.branch.child_slots().len(), 1);
     assert!(pending.final_task.is_some());
     assert!(entry.active.is_none());
+}
+
+#[test]
+fn retained_leaves_coexist_through_later_mounts_and_close_before_parent_cleanup() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let router = install_retained_slice_router(&mut app, 2);
+    app.update();
+    let mut old = Vec::new();
+    let mut parent = None;
+    let mut child_slot = None;
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, request);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(entry.engine.snapshot().running_request().is_none());
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.pending_frame_drive.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert_eq!(entry.retained.len(), old.len());
+        assert_eq!(entry.retained.inventory().unwrap().len(), old.len());
+        let active = entry.active.as_ref().unwrap();
+        let current_parent = active.frames()[0].shell();
+        let slot = active.child_slots()[0].slot();
+        assert_eq!(*parent.get_or_insert(current_parent), current_parent);
+        assert_eq!(*child_slot.get_or_insert(slot), slot);
+        let leaf = active.frames().last().unwrap();
+        let current = leaf.interactive_entities()[0];
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(gate.allows_pointer(current));
+        assert!(gate.allows_keyboard(current));
+        assert!(gate.allows_gamepad(current));
+        for &(shell, output, seal) in &old {
+            assert!(
+                app.world().get_entity(shell).is_ok(),
+                "opted-in inactive leaf was destroyed at {path}"
+            );
+            assert_eq!(
+                app.world().get::<ChildOf>(shell).map(ChildOf::parent),
+                Some(slot)
+            );
+            assert_eq!(
+                app.world()
+                    .get::<RouteOwnershipSeal>(shell)
+                    .map(|s| s.seal()),
+                Some(seal)
+            );
+            assert_eq!(
+                app.world().get::<Visibility>(shell),
+                Some(&Visibility::Hidden)
+            );
+            assert!(!gate.allows_pointer(output));
+            assert!(!gate.allows_keyboard(output));
+            assert!(!gate.allows_gamepad(output));
+            assert_ne!(app.world().resource::<InputFocus>().get(), Some(output));
+        }
+        let seal = app
+            .world()
+            .get::<RouteOwnershipSeal>(leaf.shell())
+            .unwrap()
+            .seal();
+        old.push((leaf.shell(), current, seal));
+        let children = app.world().get::<Children>(slot).unwrap();
+        assert_eq!(children.len(), old.len());
+        assert!(old.iter().all(|(shell, _, _)| children.contains(shell)));
+        // A real focus input must be released when this leaf becomes retained.
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(current, bevy_input_focus::FocusCause::Navigated);
+    }
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/outside"))
+        .unwrap();
+    run_updates_until_succeeded(&mut app, request);
+    assert!(app.world().get_entity(parent.unwrap()).is_err());
+    assert!(app.world().get_entity(child_slot.unwrap()).is_err());
+    assert!(old.iter().all(|(shell, output, _)| {
+        app.world().get_entity(*shell).is_err() && app.world().get_entity(*output).is_err()
+    }));
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(entry.retained.is_empty());
+    assert!(entry.retained.inventory().unwrap().is_empty());
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(entry.pending_commit.is_none());
+    assert!(entry.engine.snapshot().running_request().is_none());
 }
 
 #[test]
@@ -8290,6 +8424,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         projectionless_fail_close: None,
         active: None,
         scroll: crate::scroll::ScrollState::default(),
+        retained: crate::retained::RetainedLeaves::default(),
         cleanup_ledger: None,
         post_commit_compound: None,
         settled_retired_host_evidence: None,
@@ -8364,7 +8499,7 @@ fn back_capacity_order_observer_same_domain_unknown_is_zero_write() {
         .unwrap();
     let mut navigation = RouterNavigation::new();
     let router = navigation
-        .install(routes, RouteViewRegistry::new(), fallback)
+        .install(routes, RouteViewRegistry::new(), fallback, 0)
         .unwrap();
     let unknown = RouterHandle::fixture(navigation.domain, u64::MAX);
     let entry_count_before = navigation.entries.len();
@@ -21476,7 +21611,9 @@ fn back_target_physical_permanent_current_isolation_is_exact_and_nonsettling() {
                     );
                 }
                 EntityLifecycle::Leaving => assert_eq!(observed.entity, top_slot),
-                EntityLifecycle::Active | EntityLifecycle::Quarantined => {
+                EntityLifecycle::Active
+                | EntityLifecycle::Retained
+                | EntityLifecycle::Quarantined => {
                     panic!("Current isolation must project only Leaving or PreparedInert targets")
                 }
             }
@@ -42593,11 +42730,20 @@ fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
         commit
             .match_indices(".validate_publication(prepared)")
             .count(),
-        2,
-        "splice and projectionless paths exact-refreeze before consuming ECS owners"
+        1,
+        "projectionless publication exact-refreezes before consuming ECS owners"
     );
+    assert_eq!(
+        commit
+            .matches("prepared.validate(&mut entry.engine)")
+            .count(),
+        1
+    );
+    let retained = include_str!("retained.rs");
+    assert!(retained.contains(".validate_publication(prepared)"));
+    assert!(retained.contains(".validate_retained_publication(prepared)"));
     let publish_tails = commit
-        .match_indices("engine.publish(|| {")
+        .match_indices("engine.publish(")
         .map(|(start, _)| {
             let tail = &commit[start..];
             let end = tail

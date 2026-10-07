@@ -21,7 +21,8 @@ use bevy_ui::{
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     integration::{
-        FrameMountTarget, FrameTask, frame_versions_share_router, host_version_matches_frame,
+        FrameMountTarget, FrameTask, RetainedLeafProjection, frame_versions_share_router,
+        host_version_matches_frame,
     },
 };
 
@@ -193,6 +194,19 @@ enum FrameMountBindingKind {
 }
 
 impl FrameMountBinding {
+    pub(crate) fn matches_retained_scope(&self, projection: &RetainedLeafProjection) -> bool {
+        self.slot_claim.owner()
+            == &RegistryOwner::Committed(EntityOwner::ChildSlot {
+                parent: projection.parent().clone(),
+                outlet: projection.outlet().clone(),
+                slot: projection.slot(),
+            })
+            && matches!(&self.kind, FrameMountBindingKind::ChildOutlet { parent, outlet, .. }
+            if parent == projection.parent() && outlet == projection.outlet())
+            && projection.frame().slot() == projection.slot()
+            && host_version_matches_frame(projection.host(), projection.frame())
+            && frame_versions_share_router(projection.parent(), projection.frame())
+    }
     fn host_top(slot: Entity, slot_claim: ExactRegistryClaim, host: Entity) -> Self {
         Self {
             slot,
@@ -392,7 +406,6 @@ impl FrameMountBinding {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn is_child_outlet(&self) -> bool {
         matches!(self.kind, FrameMountBindingKind::ChildOutlet { .. })
     }
@@ -464,7 +477,9 @@ impl FrameOutput {
             }
         };
         let (visibility, pickable, input_allowed) = match lifecycle {
-            EntityLifecycle::PreparedInert => (Visibility::Hidden, Pickable::IGNORE, false),
+            EntityLifecycle::PreparedInert | EntityLifecycle::Retained => {
+                (Visibility::Hidden, Pickable::IGNORE, false)
+            }
             EntityLifecycle::Active => (
                 Visibility::Visible,
                 if interactive {
@@ -503,7 +518,7 @@ enum RealizedRole {
     SolidRect,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RealizedEntity {
     entity: Entity,
     claim: ExactRegistryClaim,
@@ -575,6 +590,371 @@ pub(crate) struct RealizedFrame {
     native: Option<native_frame::NativeFrameContent>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedEmptySlotBoundary {
+    claim: ExactRegistryClaim,
+    parent: RouteFrameVersion,
+    outlet: bevy_ui_router_core::slot::RouteSlotKey,
+    slot: bevy_ui_router_core::ids::RouteSlotId,
+    anchor_binding: OutletBinding,
+    expected_anchor_children: Vec<Entity>,
+}
+
+/// A preservation proof, never a physical or logical lifecycle capability.
+/// Authored native descendants stay open and are re-observed on every use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedBoundaryProof {
+    projection: RetainedLeafProjection,
+    host_candidate: ValidatedHostCandidate,
+    mount: FrameMountBinding,
+    shell: Entity,
+    native_root: Option<Entity>,
+    entities: Vec<RealizedEntity>,
+    empty_slots: Vec<RetainedEmptySlotBoundary>,
+}
+
+impl RetainedBoundaryProof {
+    pub(crate) fn prepare<'a>(
+        projection: &RetainedLeafProjection,
+        frame: &RealizedFrame,
+        slots: impl Iterator<Item = &'a MountedChildSlot>,
+        projected: &[ExactRegistryClaim],
+    ) -> Option<Self> {
+        if frame.frame() != projection.frame() || !frame.mount.matches_retained_scope(projection) {
+            return None;
+        }
+        let project = |source: &ExactRegistryClaim| -> Option<ExactRegistryClaim> {
+            let next = projected
+                .iter()
+                .find(|next| next.entity() == source.entity())
+                .unwrap_or(source);
+            (source.entity() == next.entity()
+                && source.owner() == next.owner()
+                && source.seal() == next.seal())
+            .then(|| next.clone())
+        };
+        let mut entities = frame.entities.clone();
+        for entity in &mut entities {
+            entity.claim = project(&entity.claim)?;
+            if entity.claim.lifecycle() != EntityLifecycle::Retained {
+                return None;
+            }
+        }
+        if entities
+            .iter()
+            .filter(|entity| {
+                entity.entity == frame.shell()
+                    && entity.role == RealizedRole::Shell
+                    && entity.claim.owner()
+                        == &RegistryOwner::Committed(EntityOwner::FrameShell(
+                            projection.frame().clone(),
+                        ))
+            })
+            .count()
+            != 1
+            || entities.iter().enumerate().any(|(index, entity)| {
+                entities[index + 1..]
+                    .iter()
+                    .any(|other| entity.entity == other.entity)
+            })
+        {
+            return None;
+        }
+        let mut mount = frame.mount.clone();
+        mount.slot_claim = project(&mount.slot_claim)?;
+        if let FrameMountBindingKind::ChildOutlet {
+            anchor_binding,
+            allowed_existing_shells,
+            ..
+        } = &mut mount.kind
+        {
+            *anchor_binding.source_claim_mut() = project(anchor_binding.source_claim())?;
+            // Old staging peers are not an authority source for later retention.
+            allowed_existing_shells.clear();
+        }
+        let mut empty_slots = Vec::new();
+        for slot in slots {
+            if slot.parent() != projection.frame() {
+                return None;
+            }
+            let claim = project(slot.slot_claim())?;
+            if claim.lifecycle() != EntityLifecycle::Retained
+                || claim.owner()
+                    != &RegistryOwner::Committed(EntityOwner::ChildSlot {
+                        parent: projection.frame().clone(),
+                        outlet: slot.outlet().clone(),
+                        slot: slot.slot_id(),
+                    })
+                || empty_slots
+                    .iter()
+                    .any(|prior: &RetainedEmptySlotBoundary| prior.claim.entity() == claim.entity())
+            {
+                return None;
+            }
+            let mut anchor_binding = slot.anchor_binding().clone();
+            *anchor_binding.source_claim_mut() = project(anchor_binding.source_claim())?;
+            empty_slots.push(RetainedEmptySlotBoundary {
+                claim,
+                parent: slot.parent().clone(),
+                outlet: slot.outlet().clone(),
+                slot: slot.slot_id(),
+                anchor_binding,
+                expected_anchor_children: slot.expected_anchor_children().to_vec(),
+            });
+        }
+        Some(Self {
+            projection: projection.clone(),
+            host_candidate: frame.host_candidate.clone(),
+            mount,
+            shell: frame.shell(),
+            native_root: frame.native_root(),
+            entities,
+            empty_slots,
+        })
+    }
+
+    pub(crate) const fn projection(&self) -> &RetainedLeafProjection {
+        &self.projection
+    }
+    pub(crate) const fn shell(&self) -> Entity {
+        self.shell
+    }
+    pub(crate) const fn slot_entity(&self) -> Entity {
+        self.mount.slot
+    }
+    pub(crate) fn shell_claim(&self) -> &ExactRegistryClaim {
+        &self
+            .entities
+            .iter()
+            .find(|entity| entity.entity == self.shell)
+            .expect("prepared retained boundary has its exact shell")
+            .claim
+    }
+
+    pub(crate) fn is_current(&self, world: &World) -> bool {
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        let frame = self.projection.frame();
+        if !self.mount.matches_retained_scope(&self.projection)
+            || !validated_host_candidate_is_current(world, &self.host_candidate)
+        {
+            return false;
+        }
+        let FrameMountBindingKind::ChildOutlet {
+            parent,
+            outlet,
+            anchor,
+            anchor_binding,
+            expected_anchor_children,
+            ..
+        } = &self.mount.kind
+        else {
+            return false;
+        };
+        let Some(slot_record) = registry.record(self.mount.slot) else {
+            return false;
+        };
+        // The shared parent slot can independently become empty or active
+        // while this leaf remains inactive. Its instance identity is frozen;
+        // its two permitted current roles are checked against the World.
+        if slot_record.entity() != self.mount.slot_claim.entity()
+            || slot_record.owner() != self.mount.slot_claim.owner()
+            || slot_record.seal() != self.mount.slot_claim.seal()
+        {
+            return false;
+        }
+        let slot_claim = slot_record.claim();
+        let slot_lifecycle = slot_claim.lifecycle();
+        let (slot_component, slot_visibility) = match slot_lifecycle {
+            EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+            EntityLifecycle::PreparedInert => {
+                (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
+            }
+            EntityLifecycle::Retained | EntityLifecycle::Leaving | EntityLifecycle::Quarantined => {
+                return false;
+            }
+        };
+        if validate_child_mount_slot(
+            world,
+            &self.host_candidate,
+            self.mount.slot,
+            &slot_claim,
+            parent,
+            outlet,
+            *anchor,
+            anchor_binding,
+            expected_anchor_children,
+            frame,
+            &[],
+            true,
+            slot_lifecycle,
+            slot_component,
+            slot_visibility,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        for entity in &self.entities {
+            if !registry.record(entity.entity).is_some_and(|record| {
+                record.claim() == entity.claim
+                    && record.lifecycle() == EntityLifecycle::Retained
+                    && (self.native_root.is_some()
+                        || manifest_contains_expected(world, entity.entity, record.manifest()))
+            }) || world.get::<RouteOwnershipSeal>(entity.entity)
+                != Some(&RouteOwnershipSeal::new(entity.claim.seal()))
+                || world.get::<FrameLifecycle>(entity.entity)
+                    != Some(&FrameLifecycle(EntityLifecycle::Retained))
+                || world.get::<ChildOf>(entity.entity).map(ChildOf::parent) != Some(entity.parent)
+            {
+                return false;
+            }
+            let role_matches = match entity.role {
+                RealizedRole::Shell => {
+                    world.get::<FrameShell>(entity.entity) == Some(&FrameShell(frame.clone()))
+                        && world.get::<Node>(entity.entity)
+                            == Some(&Node {
+                                display: bevy_ui::Display::None,
+                                width: Val::Percent(100.0),
+                                height: Val::Percent(100.0),
+                                ..Node::default()
+                            })
+                }
+                RealizedRole::ContentTarget if self.native_root.is_some() => {
+                    world.get::<FrameContentTarget>(entity.entity)
+                        == Some(&FrameContentTarget(frame.clone()))
+                }
+                _ => realized_values_match(world, entity, frame),
+            };
+            if !role_matches {
+                return false;
+            }
+            if self.native_root.is_none() || entity.entity == self.shell {
+                if world.get::<Visibility>(entity.entity) != Some(&Visibility::Hidden)
+                    || world.get::<Pickable>(entity.entity) != Some(&Pickable::IGNORE)
+                    || !world
+                        .get::<RouterInputBarrier>(entity.entity)
+                        .is_some_and(RouterInputBarrier::denies_all)
+                {
+                    return false;
+                }
+            }
+        }
+        if self.native_root.is_some()
+            && !world.get::<Children>(self.shell).is_some_and(|children| {
+                children.len() == 1 && Some(children[0]) == self.native_root
+            })
+        {
+            return false;
+        }
+        #[cfg(feature = "bsn")]
+        if self
+            .native_root
+            .is_some_and(|root| native_frame::collect_content(world, frame, root).is_err())
+        {
+            return false;
+        }
+        for slot in &self.empty_slots {
+            if !registry.record(slot.claim.entity()).is_some_and(|record| {
+                record.claim() == slot.claim
+                    && record.manifest().matches(world, slot.claim.entity())
+            }) || world.get::<RouteOwnershipSeal>(slot.claim.entity())
+                != Some(&RouteOwnershipSeal::new(slot.claim.seal()))
+                || world.get::<ChildSlotLifecycle>(slot.claim.entity())
+                    != Some(&ChildSlotLifecycle::Retained)
+                || world.get::<Visibility>(slot.claim.entity()) != Some(&Visibility::Hidden)
+                || world.get::<Pickable>(slot.claim.entity()) != Some(&Pickable::IGNORE)
+                || !world
+                    .get::<RouterInputBarrier>(slot.claim.entity())
+                    .is_some_and(RouterInputBarrier::denies_all)
+                || world
+                    .get::<ChildOf>(slot.claim.entity())
+                    .map(ChildOf::parent)
+                    != Some(slot.anchor_binding.anchor())
+                || !world
+                    .get::<ChildSlotAuthority>(slot.claim.entity())
+                    .is_some_and(|authority| {
+                        authority.parent() == &slot.parent
+                            && authority.outlet() == &slot.outlet
+                            && authority.slot() == slot.slot
+                    })
+                || !slot.anchor_binding.is_current_with_manifest_policy(
+                    world,
+                    &slot.parent,
+                    true,
+                    true,
+                )
+                || !slot.anchor_binding.children_are_current(
+                    world,
+                    slot.claim.entity(),
+                    &slot.expected_anchor_children,
+                )
+            {
+                return false;
+            }
+        }
+        let mut pending = vec![self.shell];
+        let mut seen = HashSet::new();
+        while let Some(entity) = pending.pop() {
+            if !seen.insert(entity) || world.get_entity(entity).is_err() {
+                return false;
+            }
+            if let Some(record) = registry.record(entity) {
+                if !self
+                    .entities
+                    .iter()
+                    .any(|binding| binding.entity == entity && record.claim() == binding.claim)
+                    && !self
+                        .empty_slots
+                        .iter()
+                        .any(|slot| slot.claim.entity() == entity && record.claim() == slot.claim)
+                {
+                    return false;
+                }
+            } else if world
+                .get_resource::<QuarantineLeaseTable>()
+                .is_some_and(|table| {
+                    table.record(entity).is_some() || table.unresolved_record(entity).is_some()
+                })
+            {
+                return false;
+            }
+            if world
+                .get_resource::<crate::input::RouterInputGate>()
+                .is_some_and(|gate| {
+                    gate.allows_pointer(entity)
+                        || gate.allows_keyboard(entity)
+                        || gate.allows_gamepad(entity)
+                })
+                || world
+                    .get_resource::<InputFocus>()
+                    .is_some_and(|focus| focus.get() == Some(entity))
+                || world
+                    .get_resource::<RouteFocusState>()
+                    .is_some_and(|focus| focus.focused() == Some(entity))
+            {
+                return false;
+            }
+            if let Some(children) = world.get::<Children>(entity) {
+                for child in children.iter().copied() {
+                    if world.get::<ChildOf>(child).map(ChildOf::parent) != Some(entity) {
+                        return false;
+                    }
+                    pending.push(child);
+                }
+            }
+        }
+        self.entities
+            .iter()
+            .all(|entity| seen.contains(&entity.entity))
+            && self
+                .empty_slots
+                .iter()
+                .all(|slot| seen.contains(&slot.claim.entity()))
+    }
+}
+
 pub(crate) struct PreparedFrameMountRebase {
     prior_mount_children: Vec<Entity>,
 }
@@ -629,6 +1009,7 @@ pub(crate) struct FrameMutationTarget {
 #[derive(Clone, Copy)]
 enum PresentationTargetKind {
     Frame,
+    Shell,
     NativeShell,
     NativeContent,
     ChildSlot,
@@ -702,7 +1083,9 @@ fn record_test_commit_mutation(entity: Entity, next: EntityLifecycle) {
             return;
         };
         match next {
-            EntityLifecycle::Leaving => trace.push(TestCommitMutation::Leaving(entity)),
+            EntityLifecycle::Leaving | EntityLifecycle::Retained => {
+                trace.push(TestCommitMutation::Leaving(entity))
+            }
             EntityLifecycle::Active => trace.push(TestCommitMutation::Entering(entity)),
             EntityLifecycle::PreparedInert => {
                 trace.push(TestCommitMutation::PreparedInert(entity));
@@ -844,8 +1227,9 @@ impl<'w> PreparedPresentationMutation<'w> {
                                 (entity.current, entity.next),
                                 (
                                     EntityLifecycle::Active | EntityLifecycle::PreparedInert,
-                                    EntityLifecycle::Leaving
-                                ) | (EntityLifecycle::Active, EntityLifecycle::PreparedInert)
+                                    EntityLifecycle::Leaving | EntityLifecycle::Retained
+                                ) | (EntityLifecycle::Retained, EntityLifecycle::Leaving)
+                                    | (EntityLifecycle::Active, EntityLifecycle::PreparedInert)
                             ) && !entity.active_after
                         } else {
                             entity.current == EntityLifecycle::PreparedInert
@@ -941,6 +1325,7 @@ const fn child_slot_lifecycle(lifecycle: EntityLifecycle) -> ChildSlotLifecycle 
     match lifecycle {
         EntityLifecycle::PreparedInert => ChildSlotLifecycle::RegisteredInert,
         EntityLifecycle::Active => ChildSlotLifecycle::Active,
+        EntityLifecycle::Retained => ChildSlotLifecycle::Retained,
         EntityLifecycle::Leaving => ChildSlotLifecycle::Leaving,
         EntityLifecycle::Quarantined => ChildSlotLifecycle::Quarantined,
     }
@@ -1225,7 +1610,11 @@ impl RealizedFrame {
                         PresentationTargetKind::NativeContent
                     }
                 } else {
-                    PresentationTargetKind::Frame
+                    if entity.role == RealizedRole::Shell {
+                        PresentationTargetKind::Shell
+                    } else {
+                        PresentationTargetKind::Frame
+                    }
                 },
             })
             .collect()
@@ -1278,6 +1667,13 @@ impl RealizedFrame {
     ) {
         self.apply_primary_claim_rebind(primary_claims);
         self.mount.apply_internal_claim_rebind(all_claims);
+        if let FrameMountBindingKind::ChildOutlet {
+            allowed_existing_shells,
+            ..
+        } = &mut self.mount.kind
+        {
+            allowed_existing_shells.retain(|claim| claim.lifecycle() != EntityLifecycle::Retained);
+        }
         for outlet in &mut self.outlets {
             outlet.apply_claim_rebind(all_claims);
         }
@@ -1810,7 +2206,9 @@ fn validate_mount_binding_allowing_additions(
                     (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
                 }
                 EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
-                EntityLifecycle::Leaving | EntityLifecycle::Quarantined => {
+                EntityLifecycle::Retained
+                | EntityLifecycle::Leaving
+                | EntityLifecycle::Quarantined => {
                     return Err(RealizationError::InvalidMount);
                 }
             };
@@ -2762,14 +3160,14 @@ fn prepare_presentation_access<'w>(
         };
         let pickable_valid = *pickable == expected_pickable;
         let lifecycle = match target.kind {
-            PresentationTargetKind::Frame | PresentationTargetKind::NativeShell => {
-                match (frame_lifecycle, slot_lifecycle) {
-                    (Some(lifecycle), None) if lifecycle.0 == target.current => {
-                        PreparedLifecycleMutation::Frame(lifecycle)
-                    }
-                    _ => return None,
+            PresentationTargetKind::Frame
+            | PresentationTargetKind::Shell
+            | PresentationTargetKind::NativeShell => match (frame_lifecycle, slot_lifecycle) {
+                (Some(lifecycle), None) if lifecycle.0 == target.current => {
+                    PreparedLifecycleMutation::Frame(lifecycle)
                 }
-            }
+                _ => return None,
+            },
             PresentationTargetKind::ChildSlot => match (frame_lifecycle, slot_lifecycle) {
                 (None, Some(lifecycle)) if child_slot_lifecycle(target.current) == *lifecycle => {
                     PreparedLifecycleMutation::ChildSlot(lifecycle)
@@ -2782,7 +3180,9 @@ fn prepare_presentation_access<'w>(
             || !pickable_valid
             || (matches!(
                 target.current,
-                EntityLifecycle::PreparedInert | EntityLifecycle::Leaving
+                EntityLifecycle::PreparedInert
+                    | EntityLifecycle::Retained
+                    | EntityLifecycle::Leaving
             ) && (*visibility != Visibility::Hidden || !barrier.denies_all()))
             || (target.current == EntityLifecycle::Active
                 && (*visibility != Visibility::Visible
@@ -2805,7 +3205,11 @@ fn prepare_presentation_access<'w>(
                     pickable,
                     barrier,
                 }),
-                shell_node: if matches!(target.kind, PresentationTargetKind::NativeShell) {
+                shell_node: if matches!(target.kind, PresentationTargetKind::NativeShell)
+                    || (matches!(target.kind, PresentationTargetKind::Shell)
+                        && (target.next == EntityLifecycle::Retained
+                            || target.current == EntityLifecycle::Retained))
+                {
                     Some(node?)
                 } else {
                     None
@@ -3455,6 +3859,16 @@ fn mount_slot_children_are_acceptable(
             else {
                 return false;
             };
+            if record.lifecycle() == EntityLifecycle::Retained {
+                if child == frame.shell
+                    || child_frame == &frame.frame
+                    || !frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
+                    || !registry.retained_shell_is_current(world, child, slot_entity)
+                {
+                    return false;
+                }
+                continue;
+            }
             if !frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
                 || (child == frame.shell && child_frame != &frame.frame)
                 || (child != frame.shell && child_frame == &frame.frame)
@@ -3508,6 +3922,9 @@ fn mount_slot_children_are_acceptable(
                     if world.get::<Visibility>(child) != Some(&Visibility::Hidden) {
                         return false;
                     }
+                }
+                EntityLifecycle::Retained => {
+                    return false;
                 }
                 EntityLifecycle::Quarantined => return false,
             }

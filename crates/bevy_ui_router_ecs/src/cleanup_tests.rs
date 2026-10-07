@@ -794,7 +794,7 @@ fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot 
         },
         None => CleanupOwnerSnapshot::None,
         Some(CleanupOwner::Leaving(branch)) => CleanupOwnerSnapshot::Leaving {
-            claims: claims(branch),
+            claims: branch.claims().cloned().collect(),
         },
         Some(CleanupOwner::FailedPrepared(owner)) => CleanupOwnerSnapshot::FailedPrepared {
             claims: claims(owner.branch.realized()),

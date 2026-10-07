@@ -57,6 +57,8 @@ pub enum IdleHostLossErrorKind {
 impl RouterEngine {
     pub(crate) fn idle_host_loss_eligible(&self) -> bool {
         self.pending_idle_host_loss.is_none()
+            && self.retained_leaves.is_empty()
+            && self.pending_retained_transfer.is_none()
             && self.state.availability() == &RouterAvailability::Ready
             && self.state.current_request().is_none()
             && self

@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 pub(crate) mod idle_host_loss;
+pub(crate) mod retained;
 
 use crate::admission::{
     AdmissionError, HostAdmissionAllocatorCounter, HostAdmissionAllocatorExhaustionEvidence,
@@ -1989,6 +1990,7 @@ struct PublicationPlan {
     state: RouterNavigationState,
     history: Option<PreparedHistoryPublication>,
     history_publication: HistoryPublicationFacts,
+    retained_update: Option<Vec<retained::RetainedRegistryEntry>>,
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     record_index: usize,
@@ -2554,6 +2556,8 @@ struct PreparedPublicationObservation {
     active: ActivePresentation,
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
+    retained_leaves: Vec<retained::RetainedRegistryEntry>,
+    keep_alive_capacity: usize,
 }
 
 impl PreparedPublicationObservation {
@@ -2581,6 +2585,8 @@ impl PreparedPublicationObservation {
             && Self::branch_fingerprint(self.active_branch.as_ref())
                 == Self::branch_fingerprint(expected.active_branch.as_ref())
             && self.active_child_slots == expected.active_child_slots
+            && self.retained_leaves == expected.retained_leaves
+            && self.keep_alive_capacity == expected.keep_alive_capacity
     }
 
     fn accepts(&self, owner: &SealedCommit) -> bool {
@@ -4296,6 +4302,10 @@ pub(crate) struct RouterEngine {
     ids: CoreIdAllocator,
     router: RouterIdentity,
     fallback: RouteViewKey,
+    keep_alive_capacity: usize,
+    retained_leaves: Vec<retained::RetainedRegistryEntry>,
+    next_retained_instance: u64,
+    pending_retained_transfer: Option<retained::PreparedRetainedTransfer>,
     state: RouterNavigationState,
     host_admission_source: HostAdmissionSourceProjection,
     host_admission_source_open: bool,
@@ -4352,6 +4362,10 @@ impl RouterEngine {
             ids,
             router,
             fallback,
+            keep_alive_capacity: 0,
+            retained_leaves: Vec::new(),
+            next_retained_instance: 1,
+            pending_retained_transfer: None,
             state: RouterNavigationState::new(router),
             host_admission_source,
             host_admission_source_open: true,
@@ -4385,6 +4399,15 @@ impl RouterEngine {
             #[cfg(test)]
             testing_back_target_source_drift_before_freeze_once: false,
         })
+    }
+
+    pub(crate) fn with_keep_alive_capacity(mut self, capacity: usize) -> Self {
+        self.keep_alive_capacity = capacity;
+        self
+    }
+
+    pub(crate) const fn keep_alive_capacity(&self) -> usize {
+        self.keep_alive_capacity
     }
 
     pub(crate) fn bind_host_admission_unavailable_cause<Evidence>(
@@ -6724,6 +6747,7 @@ impl RouterEngine {
             host_edge: host_settlement,
             settlement,
         } = batch;
+        self.settle_retained_cleanup(&normal);
         if terminal_plan.retain_completed_current {
             terminal_plan
                 .final_completed_cleanup
@@ -12563,6 +12587,28 @@ impl RouterEngine {
         ticket: &CommitTicket,
         seal: CleanupManifestSeal,
     ) -> Result<SealedCommit, CommitError> {
+        if !self.retained_leaves.is_empty() || self.pending_retained_transfer.is_some() {
+            return Err(CommitError::InvalidManifest);
+        }
+        if let Some(current) = self.current.as_ref()
+            && self
+                .retention_candidate(current, &retained::publication_slots(current))
+                .is_some()
+        {
+            return Err(CommitError::InvalidManifest);
+        }
+        self.seal_commit_partition(ticket, seal, None)
+    }
+
+    fn seal_commit_partition(
+        &mut self,
+        ticket: &CommitTicket,
+        seal: CleanupManifestSeal,
+        retention: Option<(
+            &retained::RetainedCommitPlan,
+            Vec<retained::RetainedRegistryEntry>,
+        )>,
+    ) -> Result<SealedCommit, CommitError> {
         let Some(current) = self.current.as_ref() else {
             return Err(CommitError::Stale);
         };
@@ -12577,11 +12623,21 @@ impl RouterEngine {
             .current
             .as_ref()
             .expect("commit identity was validated");
-        if current.cleanup_roots != seal.logical_roots() {
+        let expected_roots = retention
+            .as_ref()
+            .map_or(current.cleanup_roots.as_slice(), |(plan, _)| {
+                plan.disposable_roots()
+            });
+        if expected_roots != seal.logical_roots() {
             return Err(CommitError::InvalidManifest);
         }
 
-        let current = current.clone_pre_retirement().ok_or(CommitError::Stale)?;
+        let mut current = current.clone_pre_retirement().ok_or(CommitError::Stale)?;
+        if let Some((plan, _)) = &retention {
+            // Only the independent next publication is changed. The observed
+            // current remains intact on every preparation failure.
+            current.cleanup_roots = plan.disposable_roots().to_vec();
+        }
         let cleanup = CleanupBatchToken::sealed(
             current.identity.clone(),
             current.cleanup_batch,
@@ -12599,7 +12655,7 @@ impl RouterEngine {
             debug_assert!(self.current_history_capability.is_none());
             None
         };
-        let publication =
+        let mut publication =
             match self.precompute_publication(current, cleanup.clone(), history_capability) {
                 Ok(publication) => publication,
                 Err(error) => {
@@ -12616,6 +12672,10 @@ impl RouterEngine {
                     return Err(CommitError::Stale);
                 }
             };
+        if let Some((plan, mut registry)) = retention {
+            Self::bind_retained_retirements(&mut registry, plan, &cleanup);
+            publication.retained_update = Some(registry);
+        }
         let evidence = SealedCommitEvidence {
             identity: ticket.identity.clone(),
             cleanup_batch: cleanup.batch(),
@@ -12978,6 +13038,8 @@ impl RouterEngine {
             active: self.state.active().clone(),
             active_branch: self.active_branch.clone(),
             active_child_slots: self.active_child_slots.clone(),
+            retained_leaves: self.retained_leaves.clone(),
+            keep_alive_capacity: self.keep_alive_capacity,
         }
     }
 
@@ -13103,6 +13165,14 @@ impl RouterEngine {
         &mut self,
         prepared: PreparedPublication,
     ) -> Result<PreparedPublication, CommitError> {
+        self.validate_publication_projection(&prepared)?;
+        Ok(prepared)
+    }
+
+    fn validate_publication_projection(
+        &mut self,
+        prepared: &PreparedPublication,
+    ) -> Result<(), CommitError> {
         let validation = match self.prepared_publication_authority.as_ref() {
             Some(PreparedPublicationAuthority::Ready(owner))
                 if owner.evidence == prepared.evidence =>
@@ -13127,7 +13197,7 @@ impl RouterEngine {
             };
             return Err(self.retain_rejected_publication(owner, error));
         }
-        Ok(prepared)
+        Ok(())
     }
 
     pub(crate) fn prepare_back_target_commit(
@@ -13252,6 +13322,7 @@ impl RouterEngine {
             state,
             history,
             history_publication: _,
+            retained_update,
             active_branch,
             active_child_slots,
             record_index,
@@ -13263,6 +13334,9 @@ impl RouterEngine {
         self.state = state;
         self.active_branch = active_branch;
         self.active_child_slots = active_child_slots;
+        if let Some(registry) = retained_update {
+            self.retained_leaves = registry;
+        }
         self.current = Some(current);
         if let Some(history) = history {
             self.history.publish(history);
@@ -13630,6 +13704,7 @@ impl RouterEngine {
             *self
                 .record_mut(request)
                 .expect("authority settlement request remains retained") = terminal_record;
+            self.settle_retained_cleanup(&completed_token);
             self.completed_cleanup.push(CompletedCleanupTombstone {
                 request,
                 token: completed_token,
@@ -13666,6 +13741,7 @@ impl RouterEngine {
         record
             .append_trace(NavigationTraceEvent::request_terminal())
             .expect("terminal status precedes terminal event");
+        self.settle_retained_cleanup(&completed_token);
         self.completed_cleanup.push(CompletedCleanupTombstone {
             request,
             token: completed_token,
@@ -16053,6 +16129,7 @@ impl RouterEngine {
             state,
             history,
             history_publication,
+            retained_update: None,
             active_branch,
             active_child_slots,
             record_index,

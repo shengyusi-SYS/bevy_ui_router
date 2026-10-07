@@ -14,6 +14,7 @@ use bevy_ui_router_core::{
     ids::RouteSlotId,
     integration::{
         BackNoTargetCleanupBatchView, CleanupBatch, CleanupCompletion, PostCommitCleanupBatchView,
+        RetainedLeafProjection,
     },
     slot::RouteSlotKey,
 };
@@ -2895,6 +2896,79 @@ impl FrozenCleanupManifest {
         )
     }
 
+    pub(crate) fn from_retained_partition(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        leaving: &RealizedBranch,
+        retained: Option<&RetainedLeafProjection>,
+        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+        projected_claims: &[ExactRegistryClaim],
+        successor: Option<&RealizedBranch>,
+    ) -> Option<Self> {
+        if let Some(candidate) = retained {
+            let mut frames = leaving
+                .frames()
+                .iter()
+                .filter(|frame| frame.frame() == candidate.frame());
+            let frame = frames.next()?;
+            if frames.next().is_some() || !frame.mount_binding().matches_retained_scope(candidate) {
+                return None;
+            }
+        }
+        let mut frames = leaving
+            .frames()
+            .iter()
+            .filter(|frame| retained.is_none_or(|candidate| frame.frame() != candidate.frame()))
+            .collect::<Vec<_>>();
+        let mut slots = leaving
+            .child_slots()
+            .iter()
+            .filter(|slot| retained.is_none_or(|candidate| slot.parent() != candidate.frame()))
+            .collect::<Vec<_>>();
+        let mut authorized_retired = Vec::with_capacity(retiring.len());
+        for (projection, branch) in retiring {
+            let [frame] = branch.frames() else {
+                return None;
+            };
+            if frame.frame() != projection.frame()
+                || !frame.mount_binding().matches_retained_scope(projection)
+                || branch
+                    .child_slots()
+                    .iter()
+                    .any(|slot| slot.parent() != frame.frame())
+                || authorized_retired.contains(&projection.frame())
+            {
+                return None;
+            }
+            let exact_shells = registry
+                .retained_shell_claims_for_mount(
+                    world,
+                    projection.parent(),
+                    projection.outlet(),
+                    projection.slot(),
+                )
+                .ok()?;
+            if !frame
+                .claims()
+                .any(|claim| claim.entity() == frame.shell() && exact_shells.contains(claim))
+            {
+                return None;
+            }
+            authorized_retired.push(projection.frame());
+            frames.push(frame);
+            slots.extend(branch.child_slots());
+        }
+        Self::from_leaving_frame_refs(
+            world,
+            registry,
+            &frames,
+            &slots,
+            projected_claims,
+            successor,
+            &authorized_retired,
+        )
+    }
+
     fn from_leaving_branch_parts(
         world: &World,
         registry: &RouteEntityRegistry,
@@ -2902,6 +2976,28 @@ impl FrozenCleanupManifest {
         child_slots: &[MountedChildSlot],
         projected_claims: &[ExactRegistryClaim],
         successor: Option<&RealizedBranch>,
+    ) -> Option<Self> {
+        let frames = frames.iter().collect::<Vec<_>>();
+        let child_slots = child_slots.iter().collect::<Vec<_>>();
+        Self::from_leaving_frame_refs(
+            world,
+            registry,
+            &frames,
+            &child_slots,
+            projected_claims,
+            successor,
+            &[],
+        )
+    }
+
+    fn from_leaving_frame_refs(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        frames: &[&RealizedFrame],
+        child_slots: &[&MountedChildSlot],
+        projected_claims: &[ExactRegistryClaim],
+        successor: Option<&RealizedBranch>,
+        authorized_retired: &[&RouteFrameVersion],
     ) -> Option<Self> {
         let obligation_count = frames.iter().try_fold(child_slots.len(), |count, frame| {
             count.checked_add(frame.obligation_count())
@@ -2915,9 +3011,9 @@ impl FrozenCleanupManifest {
         }
         let leaving_entities = frames
             .iter()
-            .flat_map(RealizedFrame::claims)
+            .flat_map(|frame| frame.claims())
             .map(ExactRegistryClaim::entity)
-            .chain(child_slots.iter().map(MountedChildSlot::slot))
+            .chain(child_slots.iter().map(|slot| slot.slot()))
             .collect::<HashSet<_>>();
         if leaving_entities.len() != obligation_count
             || leaving_entities.iter().any(|entity| {
@@ -2953,16 +3049,23 @@ impl FrozenCleanupManifest {
             }
             let mut incoming = vec![None; frames.len()];
             for (slot_index, slot) in child_slots.iter().enumerate() {
-                let mut children = frames
+                let children = frames
                     .iter()
                     .enumerate()
-                    .filter(|(_, frame)| frame.mount_binding().matches_mounted_child_slot(slot));
-                if let Some((child_index, _)) = children.next() {
-                    if children.next().is_some()
-                        || incoming[child_index].replace(slot_index).is_some()
-                    {
-                        return None;
-                    }
+                    .filter(|(_, frame)| frame.mount_binding().matches_mounted_child_slot(slot))
+                    .collect::<Vec<_>>();
+                // Multiple target children require an explicit retained-owner
+                // transfer. The ordinary branch proof remains single-child.
+                if children
+                    .iter()
+                    .filter(|(_, frame)| !authorized_retired.contains(&frame.frame()))
+                    .count()
+                    > 1
+                    || children.iter().any(|(child_index, _)| {
+                        incoming[*child_index].replace(slot_index).is_some()
+                    })
+                {
+                    return None;
                 }
             }
             let roots = incoming
@@ -2980,6 +3083,7 @@ impl FrozenCleanupManifest {
                     frames,
                     child_slots,
                     projected_claims,
+                    authorized_retired,
                     root,
                     &mut visit,
                     &mut obligations,
@@ -5051,7 +5155,7 @@ fn normalize_authority_obligations(
     Ok(())
 }
 
-fn leaving_slot_has_exact_parent(frames: &[RealizedFrame], slot: &MountedChildSlot) -> bool {
+fn leaving_slot_has_exact_parent(frames: &[&RealizedFrame], slot: &MountedChildSlot) -> bool {
     let mut parents = frames.iter().filter(|frame| frame.frame() == slot.parent());
     let Some(parent) = parents.next() else {
         return false;
@@ -5072,9 +5176,10 @@ fn leaving_slot_has_exact_parent(frames: &[RealizedFrame], slot: &MountedChildSl
 
 fn append_exact_leaving_unit(
     registry: &RouteEntityRegistry,
-    frames: &[RealizedFrame],
-    child_slots: &[MountedChildSlot],
+    frames: &[&RealizedFrame],
+    child_slots: &[&MountedChildSlot],
     projected_claims: &[ExactRegistryClaim],
+    authorized_retired: &[&RouteFrameVersion],
     frame_index: usize,
     visit: &mut [u8],
     obligations: &mut Vec<CleanupObligation>,
@@ -5090,19 +5195,26 @@ fn append_exact_leaving_unit(
         .iter()
         .filter(|slot| slot.parent() == frame.frame())
     {
-        let mut children = frames
+        let children = frames
             .iter()
             .enumerate()
-            .filter(|(_, child)| child.mount_binding().matches_mounted_child_slot(slot));
-        if let Some((child_index, _)) = children.next() {
-            if children.next().is_some() {
-                return None;
-            }
+            .filter(|(_, child)| child.mount_binding().matches_mounted_child_slot(slot))
+            .collect::<Vec<_>>();
+        if children
+            .iter()
+            .filter(|(_, child)| !authorized_retired.contains(&child.frame()))
+            .count()
+            > 1
+        {
+            return None;
+        }
+        for (child_index, _) in children {
             append_exact_leaving_unit(
                 registry,
                 frames,
                 child_slots,
                 projected_claims,
+                authorized_retired,
                 child_index,
                 visit,
                 obligations,
@@ -6280,6 +6392,7 @@ fn mount_parent_physical_matches_with_attachment(
                     (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
                 }
                 EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+                EntityLifecycle::Retained => (ChildSlotLifecycle::Retained, Visibility::Hidden),
                 EntityLifecycle::Leaving => (ChildSlotLifecycle::Leaving, Visibility::Hidden),
                 EntityLifecycle::Quarantined => return false,
             };
@@ -9592,8 +9705,226 @@ pub(crate) struct BackNoTargetLedgerProjectionForTest {
     pub(crate) batch_expected_completion_digest: u64,
 }
 
+/// A physical owner container. Its units may share a mount slot; this value
+/// makes no active-branch or routing-topology claim.
+pub(crate) struct LeavingPayload {
+    frames: Vec<RealizedFrame>,
+    child_slots: Vec<MountedChildSlot>,
+}
+
+/// Capacity and source facts for an already authorized cleanup partition.
+/// The caller consumes the same splice/retained holders before publication;
+/// this container neither classifies targets nor grants mutation authority.
+pub(crate) struct PreparedLeavingAssembly {
+    frames: Vec<RealizedFrame>,
+    child_slots: Vec<MountedChildSlot>,
+    _manifest_digest: u64,
+    _source_claims: Vec<ExactRegistryClaim>,
+    _contained_sources: Vec<(Entity, Entity)>,
+}
+
+impl PreparedLeavingAssembly {
+    pub(crate) fn reserve_retained_partition(
+        manifest: &FrozenCleanupManifest,
+        splice: &SealedReconciliationSplice,
+        retiring: &[&RealizedBranch],
+    ) -> Option<Self> {
+        let frames = splice
+            .disposable_frames()
+            .chain(retiring.iter().flat_map(|branch| branch.frames()))
+            .collect::<Vec<_>>();
+        let slots = splice
+            .disposable_child_slots()
+            .chain(retiring.iter().flat_map(|branch| branch.child_slots()))
+            .collect::<Vec<_>>();
+        Self::reserve(manifest, &frames, &slots)
+    }
+
+    pub(crate) fn reserve(
+        manifest: &FrozenCleanupManifest,
+        frames: &[&RealizedFrame],
+        slots: &[&MountedChildSlot],
+    ) -> Option<Self> {
+        let owned_count = frames.iter().try_fold(slots.len(), |count, frame| {
+            count.checked_add(frame.obligation_count())
+        })?;
+        let mut sources = Vec::new();
+        sources.try_reserve_exact(owned_count).ok()?;
+        for frame in frames {
+            for (claim, parent) in frame.cleanup_members() {
+                if !matches!(
+                    claim.lifecycle(),
+                    EntityLifecycle::Active | EntityLifecycle::Retained | EntityLifecycle::Leaving
+                ) {
+                    return None;
+                }
+                sources.push((claim, parent, frame.shell()));
+            }
+        }
+        for slot in slots {
+            if !matches!(
+                slot.slot_claim().lifecycle(),
+                EntityLifecycle::Active
+                    | EntityLifecycle::PreparedInert
+                    | EntityLifecycle::Retained
+                    | EntityLifecycle::Leaving
+            ) {
+                return None;
+            }
+            sources.push((slot.slot_claim(), slot.anchor(), slot.slot()));
+        }
+        if sources.iter().enumerate().any(|(index, (claim, _, _))| {
+            sources[index + 1..]
+                .iter()
+                .any(|(other, _, _)| claim.entity() == other.entity())
+        }) || manifest
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.identity.registered().is_some())
+            .count()
+            != sources.len()
+        {
+            return None;
+        }
+        for (source, parent, root) in &sources {
+            let mut matches = manifest
+                .obligations
+                .iter()
+                .filter(|obligation| obligation.entity() == source.entity());
+            let obligation = matches.next()?;
+            let claim = obligation.identity.registered()?;
+            if matches.next().is_some()
+                || claim.owner() != source.owner()
+                || claim.seal() != source.seal()
+                || claim.lifecycle() != EntityLifecycle::Leaving
+                || obligation.expected_parent != *parent
+                || obligation.unit_root != *root
+            {
+                return None;
+            }
+        }
+        let mut contained_sources = Vec::new();
+        #[cfg(feature = "bsn")]
+        for frame in frames {
+            let targets = crate::presentation::native_frame::contained_cleanup_targets(frame);
+            contained_sources.try_reserve(targets.len()).ok()?;
+            for (entity, parent, target_manifest) in targets {
+                if contained_sources
+                    .iter()
+                    .any(|(existing, _)| *existing == entity)
+                {
+                    return None;
+                }
+                let mut matches = manifest
+                    .obligations
+                    .iter()
+                    .filter(|obligation| obligation.entity() == entity);
+                let obligation = matches.next()?;
+                let CleanupTargetIdentity::ContainedContent { root, shell, .. } =
+                    &obligation.identity
+                else {
+                    return None;
+                };
+                let source_root = frame
+                    .claims()
+                    .find(|claim| Some(claim.entity()) == frame.native_root())?;
+                let source_shell = frame
+                    .claims()
+                    .find(|claim| claim.entity() == frame.shell())?;
+                if matches.next().is_some()
+                    || obligation.expected_parent != parent
+                    || obligation.unit_root != frame.shell()
+                    || obligation.manifest != target_manifest
+                    || root.entity() != source_root.entity()
+                    || root.owner() != source_root.owner()
+                    || root.seal() != source_root.seal()
+                    || root.lifecycle() != EntityLifecycle::Leaving
+                    || shell.entity() != source_shell.entity()
+                    || shell.owner() != source_shell.owner()
+                    || shell.seal() != source_shell.seal()
+                    || shell.lifecycle() != EntityLifecycle::Leaving
+                {
+                    return None;
+                }
+                contained_sources.push((entity, parent));
+            }
+        }
+        if manifest.obligations.len() != owned_count.checked_add(contained_sources.len())? {
+            return None;
+        }
+        let mut owned_frames = Vec::new();
+        owned_frames.try_reserve_exact(frames.len()).ok()?;
+        let mut owned_slots = Vec::new();
+        owned_slots.try_reserve_exact(slots.len()).ok()?;
+        let mut source_claims = Vec::new();
+        source_claims.try_reserve_exact(sources.len()).ok()?;
+        for (claim, _, _) in sources {
+            source_claims.push(claim.try_clone().ok()?);
+        }
+        Some(Self {
+            frames: owned_frames,
+            child_slots: owned_slots,
+            _manifest_digest: manifest.digest(),
+            _source_claims: source_claims,
+            _contained_sources: contained_sources,
+        })
+    }
+
+    /// Consumes only the original payloads observed by reserve. The routing
+    /// owner has already checked their IDs and complete source projection.
+    /// Called before engine.publish; the atomic tail only installs the result.
+    pub(crate) fn assemble(
+        mut self,
+        leaving: RealizedBranch,
+        retired: Vec<RealizedBranch>,
+    ) -> LeavingPayload {
+        for branch in std::iter::once(leaving).chain(retired) {
+            let (mut frames, mut child_slots) = branch.into_owned_parts();
+            self.frames.append(&mut frames);
+            self.child_slots.append(&mut child_slots);
+        }
+        LeavingPayload {
+            frames: self.frames,
+            child_slots: self.child_slots,
+        }
+    }
+}
+
+impl LeavingPayload {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.child_slots.is_empty()
+    }
+
+    fn from_branch(branch: RealizedBranch) -> Self {
+        let (frames, child_slots) = branch.into_owned_parts();
+        Self {
+            frames,
+            child_slots,
+        }
+    }
+
+    fn from_frame(frame: RealizedFrame) -> Self {
+        Self {
+            frames: vec![frame],
+            child_slots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn frames(&self) -> &[RealizedFrame] {
+        &self.frames
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claims(&self) -> impl Iterator<Item = &ExactRegistryClaim> {
+        self.frames
+            .iter()
+            .flat_map(RealizedFrame::claims)
+            .chain(self.child_slots.iter().map(MountedChildSlot::slot_claim))
+    }
+}
+
 pub(crate) enum CleanupOwner {
-    Leaving(RealizedBranch),
+    Leaving(LeavingPayload),
     FailedPrepared(FailedPreparedCleanupOwner),
     AuthoritySettlement(AuthoritySettlementOwner),
     BackNoTargetAuthority(BackNoTargetAuthorityCleanupOwner),
@@ -10194,7 +10525,7 @@ impl CleanupLedger {
     ) -> Self {
         Self::activate_owner(
             prepared,
-            leaving.map(|frame| CleanupOwner::Leaving(RealizedBranch::from_single_frame(frame))),
+            leaving.map(|frame| CleanupOwner::Leaving(LeavingPayload::from_frame(frame))),
         )
     }
 
@@ -10223,7 +10554,18 @@ impl CleanupLedger {
         prepared: PreparedCleanupLedger,
         leaving: Option<RealizedBranch>,
     ) -> Self {
-        Self::activate_owner(prepared, leaving.map(CleanupOwner::Leaving))
+        Self::activate_owner(
+            prepared,
+            leaving.map(|branch| CleanupOwner::Leaving(LeavingPayload::from_branch(branch))),
+        )
+    }
+
+    pub(crate) fn activate_leaving_forest(
+        prepared: PreparedCleanupLedger,
+        leaving: LeavingPayload,
+    ) -> Self {
+        let owner = (!leaving.is_empty()).then_some(CleanupOwner::Leaving(leaving));
+        Self::activate_owner(prepared, owner)
     }
 
     pub(crate) fn activate_authority_settlement(
@@ -15849,6 +16191,9 @@ fn child_slot_components_match(
         (RegistryOwner::Committed(EntityOwner::ChildSlot { .. }), EntityLifecycle::Leaving) => {
             ChildSlotLifecycle::Leaving
         }
+        (RegistryOwner::Committed(EntityOwner::ChildSlot { .. }), EntityLifecycle::Retained) => {
+            ChildSlotLifecycle::Retained
+        }
         (
             RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { .. })
             | RegistryOwner::Committed(EntityOwner::ChildSlot { .. }),
@@ -15909,6 +16254,13 @@ fn child_slot_components_are_compatible(
             slot,
         }) if claim.lifecycle() == EntityLifecycle::Leaving => {
             (ChildSlotLifecycle::Leaving, parent, outlet, *slot)
+        }
+        RegistryOwner::Committed(EntityOwner::ChildSlot {
+            parent,
+            outlet,
+            slot,
+        }) if claim.lifecycle() == EntityLifecycle::Retained => {
+            (ChildSlotLifecycle::Retained, parent, outlet, *slot)
         }
         RegistryOwner::Provisional(ProvisionalOwner::ChildSlot {
             parent,
@@ -17203,3 +17555,164 @@ pub(crate) fn cleanup_batch_matches(
 #[cfg(test)]
 #[path = "cleanup_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod retained_assembly_tests {
+    use super::*;
+
+    #[test]
+    fn leaving_assembly_empty_forest_keeps_zero_obligation_post_commit_transfer_ownerless() {
+        use bevy_ui_router_core::{
+            integration::{CleanupManifest, EngineAction, RouterEngine},
+            prelude::*,
+        };
+        let view = RouteViewKey::new("empty-retained-forest").unwrap();
+        let tree = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(view),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut engine =
+            RouterEngine::install(tree, RouteViewKey::new("fallback").unwrap()).unwrap();
+        let token = engine.request_host_admission().unwrap();
+        let grant = engine.grant_host_admission(&token).unwrap();
+        engine.confirm_host(grant);
+        engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+            panic!("real root task required");
+        };
+        let ticket = engine.report_applied(task).unwrap();
+        let prepared = engine
+            .prepare_commit(&ticket, CleanupManifest::empty())
+            .unwrap();
+        let batch = prepared.cleanup().clone();
+        engine
+            .validate_publication(prepared)
+            .unwrap()
+            .publish(|| {});
+        let manifest = FrozenCleanupManifest::empty();
+        let assembly = PreparedLeavingAssembly::reserve(&manifest, &[], &[]).unwrap();
+        let payload = assembly.assemble(RealizedBranch::empty(), Vec::new());
+        assert!(payload.is_empty());
+        let prepared = CleanupLedger::prepare(batch, manifest).unwrap();
+        let mut ledger = CleanupLedger::activate_leaving_forest(prepared, payload);
+        let mut world = World::new();
+        world.insert_resource(RouteEntityRegistry::new());
+        assert!(ledger.freeze_for_post_commit_transfer(&world).is_ok());
+        engine
+            .complete_cleanup(ledger.pending_completion().unwrap())
+            .unwrap();
+    }
+
+    fn active_branch() -> (bevy_app::App, RealizedBranch) {
+        let (mut app, failed, _, _, _) = crate::navigation::tests::failed_nested_branch_fixture();
+        let mut branch = failed.into_realized_for_test();
+        let targets = branch
+            .entering_mutation_targets(EntityLifecycle::PreparedInert, EntityLifecycle::Active);
+        let transitions = branch.lifecycle_transitions(EntityLifecycle::Active, false);
+        let mutation = app
+            .world()
+            .resource::<RouteEntityRegistry>()
+            .prepare_lifecycle_mutation(&transitions)
+            .unwrap();
+        let projected = mutation.resulting_claims().to_vec();
+        let rebind = branch
+            .prepare_claim_rebind(
+                &projected,
+                EntityLifecycle::PreparedInert,
+                EntityLifecycle::Active,
+            )
+            .unwrap();
+        crate::presentation::prepare_presentation_mutation(app.world_mut(), &targets)
+            .unwrap()
+            .apply();
+        mutation.apply(&mut app.world_mut().resource_mut::<RouteEntityRegistry>());
+        branch.apply_claim_rebind(rebind);
+        (app, branch)
+    }
+
+    fn manifest(app: &bevy_app::App, branch: &RealizedBranch) -> FrozenCleanupManifest {
+        let projected = branch
+            .claims()
+            .map(|claim| claim.with_lifecycle_for_test(EntityLifecycle::Leaving))
+            .collect::<Vec<_>>();
+        FrozenCleanupManifest::from_leaving_branch(
+            app.world(),
+            app.world().resource::<RouteEntityRegistry>(),
+            branch,
+            &projected,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn leaving_assembly_preserves_original_owners_with_reserved_storage() {
+        let (app, mut branch) = active_branch();
+        let manifest = manifest(&app, &branch);
+        let frames = branch.frames().iter().collect::<Vec<_>>();
+        let slots = branch.child_slots().iter().collect::<Vec<_>>();
+        let assembly = PreparedLeavingAssembly::reserve(&manifest, &frames, &slots).unwrap();
+        let expected_frames = branch
+            .frames()
+            .iter()
+            .map(|frame| frame.frame().clone())
+            .collect::<Vec<_>>();
+        let expected_claims = branch
+            .claims()
+            .map(|claim| claim.with_lifecycle_for_test(EntityLifecycle::Leaving))
+            .collect::<Vec<_>>();
+        let capacities = (assembly.frames.capacity(), assembly.child_slots.capacity());
+        let rebind = branch
+            .prepare_claim_rebind(
+                &expected_claims,
+                EntityLifecycle::Active,
+                EntityLifecycle::Leaving,
+            )
+            .unwrap();
+        branch.apply_claim_rebind(rebind);
+        let payload = assembly.assemble(branch, Vec::new());
+        assert_eq!(
+            (payload.frames.capacity(), payload.child_slots.capacity()),
+            capacities
+        );
+        assert_eq!(
+            payload
+                .frames
+                .iter()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>(),
+            expected_frames
+        );
+        let actual = payload
+            .frames
+            .iter()
+            .flat_map(RealizedFrame::claims)
+            .chain(payload.child_slots.iter().map(MountedChildSlot::slot_claim))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected_claims);
+    }
+
+    #[test]
+    fn leaving_assembly_rejects_missing_owner_and_wrong_manifest_seal() {
+        let (app, branch) = active_branch();
+        let mut manifest = manifest(&app, &branch);
+        let frames = branch.frames().iter().collect::<Vec<_>>();
+        let slots = branch.child_slots().iter().collect::<Vec<_>>();
+        assert!(PreparedLeavingAssembly::reserve(&manifest, &frames[..1], &slots).is_none());
+        let original = manifest.obligations[0].identity.registered().unwrap();
+        let other_seal = branch
+            .claims()
+            .find(|claim| claim.seal() != original.seal())
+            .unwrap()
+            .seal();
+        manifest.obligations[0].identity =
+            CleanupTargetIdentity::Registered(original.with_seal_for_test(other_seal));
+        assert!(PreparedLeavingAssembly::reserve(&manifest, &frames, &slots).is_none());
+    }
+}

@@ -21,6 +21,7 @@ mod navigation;
 mod plugin;
 mod presentation;
 mod registry;
+mod retained;
 mod scroll;
 mod snapshots;
 #[cfg(test)]

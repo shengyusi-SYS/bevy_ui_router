@@ -46,6 +46,7 @@ pub struct RouteNodeOptions {
     view: Option<RouteViewKey>,
     error_view: Option<(ErrorBoundaryKey, RouteViewKey)>,
     meta: RouteMeta,
+    keep_alive: bool,
 }
 
 impl RouteNodeOptions {
@@ -57,6 +58,7 @@ impl RouteNodeOptions {
             view: None,
             error_view: None,
             meta: RouteMeta::new(),
+            keep_alive: false,
         }
     }
 
@@ -85,6 +87,17 @@ impl RouteNodeOptions {
         self.error_boundary = Some(boundary.clone());
         self.error_view = Some((boundary, view));
         self
+    }
+
+    /// Retains an eligible normal leaf while its exact parent scope survives.
+    /// Router capacity must also be nonzero; the default is disabled.
+    pub fn with_keep_alive(mut self, keep_alive: bool) -> Self {
+        self.keep_alive = keep_alive;
+        self
+    }
+
+    pub const fn keep_alive(&self) -> bool {
+        self.keep_alive
     }
 
     pub fn with_meta(mut self, meta: RouteMeta) -> Self {

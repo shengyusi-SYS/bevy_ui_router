@@ -25,7 +25,9 @@ use crate::cleanup::{
 };
 use crate::host::HostCandidateRevision;
 use crate::host::VerifiedQuarantineTransfer;
+use crate::presentation::RetainedBoundaryProof;
 use crate::presentation::VerifiedFrameQuarantineTransfer;
+use bevy_ui_router_core::integration::RetainedLeafProjection;
 
 static NEXT_SEAL_DOMAIN: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUARANTINE_DOMAIN: AtomicU64 = AtomicU64::new(1);
@@ -363,6 +365,7 @@ impl ComponentManifest {
 pub(crate) enum EntityLifecycle {
     PreparedInert,
     Active,
+    Retained,
     Leaving,
     Quarantined,
 }
@@ -508,6 +511,19 @@ pub(crate) struct RouteEntityRegistry {
     seal_domain: u64,
     next_seal_sequence: u64,
     records: Vec<RouteEntityRecord>,
+    retained_boundaries: Vec<RetainedBoundaryProof>,
+}
+
+/// Read-only preservation boundaries. These values never contain or create a
+/// lifecycle owner; the corresponding linear Core owner stays in RouterEntry.
+pub(crate) struct PreparedRetainedBoundaries {
+    boundaries: Vec<RetainedBoundaryProof>,
+}
+
+impl PreparedRetainedBoundaries {
+    pub(crate) fn apply(self, registry: &mut RouteEntityRegistry) {
+        registry.retained_boundaries = self.boundaries;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -614,7 +630,85 @@ impl RouteEntityRegistry {
                 .expect("ownership seal domain exhausted"),
             next_seal_sequence: 0,
             records: Vec::new(),
+            retained_boundaries: Vec::new(),
         }
+    }
+
+    pub(crate) fn prepare_retained_boundaries(
+        &self,
+        addition: Option<RetainedBoundaryProof>,
+        retired: &[RetainedLeafProjection],
+    ) -> Result<PreparedRetainedBoundaries, ()> {
+        if retired.iter().enumerate().any(|(index, projection)| {
+            retired[index + 1..].contains(projection)
+                || self
+                    .retained_boundaries
+                    .iter()
+                    .filter(|boundary| boundary.projection() == projection)
+                    .count()
+                    != 1
+        }) {
+            return Err(());
+        }
+        let mut boundaries = Vec::new();
+        boundaries
+            .try_reserve_exact(self.retained_boundaries.len() + usize::from(addition.is_some()))
+            .map_err(|_| ())?;
+        boundaries.extend(
+            self.retained_boundaries
+                .iter()
+                .filter(|boundary| !retired.contains(boundary.projection()))
+                .cloned(),
+        );
+        if let Some(addition) = addition {
+            if boundaries.iter().any(|boundary| {
+                boundary.projection().id() == addition.projection().id()
+                    || boundary.projection().frame() == addition.projection().frame()
+                    || boundary.shell() == addition.shell()
+            }) {
+                return Err(());
+            }
+            boundaries.push(addition);
+        }
+        Ok(PreparedRetainedBoundaries { boundaries })
+    }
+
+    pub(crate) fn retained_shell_is_current(
+        &self,
+        world: &World,
+        shell: Entity,
+        slot: Entity,
+    ) -> bool {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.shell() == shell && boundary.slot_entity() == slot);
+        let Some(boundary) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none() && boundary.is_current(world)
+    }
+
+    pub(crate) fn retained_shell_claims_for_mount(
+        &self,
+        world: &World,
+        parent: &RouteFrameVersion,
+        outlet: &RouteSlotKey,
+        slot: RouteSlotId,
+    ) -> Result<Vec<ExactRegistryClaim>, ()> {
+        let mut claims = Vec::new();
+        for boundary in self.retained_boundaries.iter().filter(|boundary| {
+            boundary.projection().parent() == parent
+                && boundary.projection().outlet() == outlet
+                && boundary.projection().slot() == slot
+        }) {
+            if !boundary.is_current(world) {
+                return Err(());
+            }
+            claims.try_reserve(1).map_err(|_| ())?;
+            claims.push(boundary.shell_claim().try_clone()?);
+        }
+        Ok(claims)
     }
 
     pub(crate) fn protected_projection(

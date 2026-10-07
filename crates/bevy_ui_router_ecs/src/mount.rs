@@ -958,6 +958,7 @@ fn validate_mounted_child_slot_with_policy(
     let (component_lifecycle, visibility) = match lifecycle {
         EntityLifecycle::PreparedInert => (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden),
         EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+        EntityLifecycle::Retained => (ChildSlotLifecycle::Retained, Visibility::Hidden),
         EntityLifecycle::Leaving => (ChildSlotLifecycle::Leaving, Visibility::Hidden),
         EntityLifecycle::Quarantined => (ChildSlotLifecycle::Quarantined, Visibility::Hidden),
     };

@@ -2199,6 +2199,7 @@ pub(crate) struct RouterEntry {
     projectionless_fail_close: Option<ProjectionlessFailCloseContinuation>,
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) scroll: crate::scroll::ScrollState,
+    pub(crate) retained: crate::retained::RetainedLeaves,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
@@ -5763,13 +5764,15 @@ impl RouterNavigation {
         routes: bevy_ui_router_core::prelude::RouteTree,
         views: RouteViewRegistry,
         fallback: bevy_ui_router_core::prelude::RouteViewKey,
+        keep_alive_capacity: usize,
     ) -> Result<RouterHandle, IntegrationError> {
         let handle = RouterHandle::from_parts(self.domain, self.next_router);
         self.next_router = self
             .next_router
             .checked_add(1)
             .ok_or(IntegrationError::Exhausted)?;
-        let mut engine = RouterEngine::install(routes, fallback)?;
+        let mut engine =
+            RouterEngine::install(routes, fallback)?.with_keep_alive_capacity(keep_alive_capacity);
         let history_admission_world = engine.claim_history_admission_world()?;
         let mut entry = RouterEntry {
             handle,
@@ -5791,6 +5794,7 @@ impl RouterNavigation {
             projectionless_fail_close: None,
             active: None,
             scroll: crate::scroll::ScrollState::default(),
+            retained: crate::retained::RetainedLeaves::default(),
             cleanup_ledger: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
@@ -7723,7 +7727,8 @@ fn realize_native_task(
                     prepared,
                 ));
             };
-            let Some(mount) = seal_reconciliation_staging_mount(&projection, active, branch, task)
+            let Some(mount) =
+                seal_staging_mount_with_retained(world, &projection, active, branch, task)
             else {
                 return Err(NativeFrameFailure::before_mount(
                     RealizationError::InvalidMount,
@@ -7733,6 +7738,25 @@ fn realize_native_task(
             realize_native_reconciliation_child(world, &mount, task, prepared)
         }
     }
+}
+
+fn seal_staging_mount_with_retained<'a>(
+    world: &World,
+    projection: &r3_core::ReconciliationProjectionView<'_>,
+    active: Option<&'a RealizedBranch>,
+    entering: &'a PreparedBranch,
+    task: &RootFrameTask,
+) -> Option<crate::branch_transaction::SealedReconciliationStagingMount<'a>> {
+    let retained = match task.mount_target() {
+        FrameMountTarget::ChildOutlet { parent, outlet } => world
+            .get_resource::<RouteEntityRegistry>()?
+            .retained_shell_claims_for_mount(world, &parent, &outlet, task.frame().slot())
+            .ok()?,
+        FrameMountTarget::TopSlot { .. } => Vec::new(),
+    };
+    crate::branch_transaction::seal_reconciliation_staging_mount_with_retained(
+        projection, active, entering, task, &retained,
+    )
 }
 
 fn apply_applied_driver_report_to_branch(
@@ -7787,7 +7811,8 @@ fn apply_applied_driver_report_to_branch(
             let projection = engine
                 .reconciliation_projection_for_task(task)
                 .map_err(|_| DriverReportApplicationError::Stale)?;
-            let Some(mount) = seal_reconciliation_staging_mount(&projection, active, branch, task)
+            let Some(mount) =
+                seal_staging_mount_with_retained(world, &projection, active, branch, task)
             else {
                 return Err(DriverReportApplicationError::Stale);
             };
@@ -15755,6 +15780,107 @@ fn publish_normal_work(
             return;
         }
     };
+    // The complete Core partition is frozen before any retained capability
+    // moves. The ordinary, default-disabled path keeps its original protocol.
+    let retention = world.resource_scope(
+        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            let entry = navigation
+                .entries
+                .iter_mut()
+                .find(|entry| entry.handle == handle)
+                .unwrap();
+            if entry.engine.keep_alive_capacity() == 0 && entry.retained.is_empty() {
+                return Ok(None);
+            }
+            if sealed.is_some() {
+                return Err(Some(AuthorityProtocolResidualKind::Authority(
+                    BeginAuthoritySettlementErrorKind::Stale,
+                )));
+            }
+            if pending.ticket.is_none() {
+                let task = pending
+                    .final_task
+                    .take()
+                    .expect("preflighted task retains its owner");
+                pending.ticket = Some(
+                    entry
+                        .engine
+                        .report_applied(task)
+                        .expect("preflighted task reports once"),
+                );
+            }
+            let inventory = entry.retained.inventory().ok_or_else(|| {
+                Some(AuthorityProtocolResidualKind::Authority(
+                    BeginAuthoritySettlementErrorKind::Stale,
+                ))
+            })?;
+            let plan = entry
+                .engine
+                .prepare_retained_commit_plan(pending.ticket.as_ref().unwrap(), &inventory)
+                .map_err(|_| {
+                    Some(AuthorityProtocolResidualKind::Authority(
+                        BeginAuthoritySettlementErrorKind::Stale,
+                    ))
+                })?;
+            if let Some(projection) = plan.retained() {
+                if !splice.retain_leaf(projection) {
+                    return Err(Some(AuthorityProtocolResidualKind::Authority(
+                        BeginAuthoritySettlementErrorKind::InvalidManifest,
+                    )));
+                }
+                entry.retained.reserve_addition().map_err(|_| None)?;
+            }
+            #[cfg(feature = "bsn")]
+            for projection in plan.retiring() {
+                let branch = entry.retained.branch_mut(projection.id()).ok_or_else(|| {
+                    Some(AuthorityProtocolResidualKind::Authority(
+                        BeginAuthoritySettlementErrorKind::InvalidManifest,
+                    ))
+                })?;
+                if let Err(error) = branch.prepare_native_cleanup(world) {
+                    return Err(if error.is_retryable() {
+                        None
+                    } else {
+                        Some(AuthorityProtocolResidualKind::NativeCleanup(error))
+                    });
+                }
+            }
+            Ok(Some(plan))
+        },
+    );
+    let mut retention = match retention {
+        Ok(plan) => plan,
+        Err(contradiction) => {
+            world.resource_scope(
+                |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                    let entry = navigation
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.handle == handle)
+                        .unwrap();
+                    let (active, entering, _) = splice.reject().into_parts();
+                    pending.branch = entering;
+                    if let Some(kind) = contradiction {
+                        if let Err((active, pending)) =
+                            fail_closed_normal_owner_protocol(world, entry, active, pending, kind)
+                        {
+                            entry.active = had_active.then_some(active);
+                            entry.pending_commit = Some(pending);
+                        }
+                    } else {
+                        entry.active = had_active.then_some(active);
+                        entry.pending_commit = Some(pending);
+                    }
+                },
+            );
+            return;
+        }
+    };
+    let retained_projection = retention.as_ref().and_then(|plan| plan.retained().cloned());
+    let retiring = retention
+        .as_ref()
+        .map(|plan| plan.retiring().to_vec())
+        .unwrap_or_default();
     #[cfg(feature = "bsn")]
     if let Err(error) = splice.prepare_native_cleanup(world) {
         world.resource_scope(
@@ -15794,7 +15920,10 @@ fn publish_normal_work(
     focus_leaving.extend(retained_empty_focus);
     focus_leaving.sort_by_key(|entity| entity.to_bits());
     focus_leaving.dedup();
-    let logical_roots = logical_cleanup_roots(splice.leaving());
+    let logical_roots = retention
+        .as_ref()
+        .map(|plan| plan.disposable_roots().to_vec())
+        .unwrap_or_else(|| logical_cleanup_roots(splice.leaving()));
     let scroll_eligible = crate::scroll::eligible_containers(world);
     let scroll_observation = crate::scroll::ScrollObservation::capture(
         world,
@@ -15812,15 +15941,42 @@ fn publish_normal_work(
     );
     let scroll_targets = scroll_observation.target_entities();
     let gate_before = splice.current_live_interactive_entities(world);
-    let (targets, isolate_count) = splice.presentation_mutation_targets();
+    let (mut targets, mut isolate_count) = splice.presentation_mutation_targets();
+    let mut transitions = splice.lifecycle_transitions();
+    {
+        let navigation = world.resource::<RouterNavigation>();
+        let entry = navigation
+            .entries
+            .iter()
+            .find(|entry| entry.handle == handle)
+            .unwrap();
+        for projection in &retiring {
+            let branch = entry
+                .retained
+                .branch(projection.id())
+                .expect("Core plan used this exact owner inventory");
+            let retired_targets = branch
+                .retained_leaving_mutation_targets()
+                .expect("retained payload was sealed with its owner");
+            let count = retired_targets.len();
+            targets.splice(isolate_count..isolate_count, retired_targets);
+            isolate_count += count;
+            transitions.extend(branch.lifecycle_transitions(EntityLifecycle::Leaving, true));
+            focus_leaving.extend(observed_descendant_closure(
+                world,
+                branch.frames().iter().map(RealizedFrame::shell),
+            ));
+        }
+    }
+    focus_leaving.sort_by_key(|entity| entity.to_bits());
+    focus_leaving.dedup();
     let gate_after = splice.resulting_live_interactive_entities(world, &targets);
-    let transitions = splice.lifecycle_transitions();
-    let leaving_count = splice.leaving().obligation_count();
+
     let registry_changes = transitions
         .iter()
         .any(|(claim, next)| claim.lifecycle() != *next);
     let root_rebase =
-        if !splice.leaving().frames().is_empty() && !splice.entering().frames().is_empty() {
+        if splice.disposable_frames().next().is_some() && !splice.entering().frames().is_empty() {
             match splice.prepare_root_rebase() {
                 Some(prepared) => Some(prepared),
                 None => {
@@ -15845,22 +16001,35 @@ fn publish_normal_work(
         let registry = world.get_resource::<RouteEntityRegistry>()?;
         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
         let resulting_claims = registry_plan.resulting_claims().to_vec();
-        let frozen_manifest = if leaving_count == 0 {
+        let frozen_manifest = if retention.is_some() {
+            let navigation = world.get_resource::<RouterNavigation>()?;
+            let entry = navigation
+                .entries
+                .iter()
+                .find(|entry| entry.handle == handle)?;
+            let retired = retiring
+                .iter()
+                .map(|projection| Some((projection, entry.retained.branch(projection.id())?)))
+                .collect::<Option<Vec<_>>>()?;
+            FrozenCleanupManifest::from_retained_partition(
+                world,
+                registry,
+                splice.leaving(),
+                retained_projection.as_ref(),
+                &retired,
+                &resulting_claims,
+                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+            )?
+        } else if splice.leaving().obligation_count() == 0 {
             FrozenCleanupManifest::empty()
         } else {
-            let splice = &splice;
-            match FrozenCleanupManifest::from_leaving_branch(
+            FrozenCleanupManifest::from_leaving_branch(
                 world,
-                &registry,
+                registry,
                 splice.leaving(),
                 &resulting_claims,
                 (!splice.entering().frames().is_empty()).then_some(splice.entering()),
-            ) {
-                Some(manifest) => manifest,
-                None => {
-                    return None;
-                }
-            }
+            )?
         };
 
         Some(frozen_manifest)
@@ -15871,6 +16040,7 @@ fn publish_normal_work(
     let mut splice_owner = Some(splice);
     let mut cleanup_reserve_contradiction = None;
     let mut commit_authority_contradiction = None;
+    let mut rejected_retained_publication = None;
     let committed = (|| {
         let frozen_manifest = frozen_manifest?;
         if sealed
@@ -15908,6 +16078,53 @@ fn publish_normal_work(
             .find(|entry| entry.handle == handle)?;
         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
         let resulting_claims = registry_plan.resulting_claims().to_vec();
+        let retired_payloads = entry.retained.prepare_retired_payloads(&retiring)?;
+        let retired_branches = retiring
+            .iter()
+            .map(|projection| entry.retained.branch(projection.id()))
+            .collect::<Option<Vec<_>>>()?;
+        let leaving_assembly = if retention.is_some() {
+            Some(
+                crate::cleanup::PreparedLeavingAssembly::reserve_retained_partition(
+                    &frozen_manifest,
+                    splice_owner.as_ref()?,
+                    &retired_branches,
+                )?,
+            )
+        } else {
+            None
+        };
+        let retained_boundaries = if retention.is_some() {
+            let addition = if retained_projection.is_some() {
+                Some(
+                    splice_owner
+                        .as_ref()?
+                        .prepare_retained_boundary(&resulting_claims)?,
+                )
+            } else {
+                None
+            };
+            Some(
+                registry
+                    .prepare_retained_boundaries(addition, &retiring)
+                    .ok()?,
+            )
+        } else {
+            None
+        };
+        let retiring_rebind = retiring
+            .iter()
+            .zip(&retired_branches)
+            .map(|(projection, branch)| {
+                Some((
+                    projection.id(),
+                    branch.prepare_retained_claim_rebind(
+                        &resulting_claims,
+                        EntityLifecycle::Leaving,
+                    )?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
         let manifest_digest = frozen_manifest.digest();
         let obligation_count = frozen_manifest.len();
         let reserved_ledger = match CleanupLedger::reserve(frozen_manifest) {
@@ -15929,9 +16146,18 @@ fn publish_normal_work(
         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
         #[cfg(feature = "bsn")]
         let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
-        let claim_rebind = splice_owner
-            .as_ref()?
-            .prepare_claim_rebind(&resulting_claims)?;
+        let splice = splice_owner.as_ref()?;
+        let splice_transitions = splice.lifecycle_transitions();
+        let splice_claims = resulting_claims
+            .iter()
+            .filter(|claim| {
+                splice_transitions
+                    .iter()
+                    .any(|(source, _)| source.entity() == claim.entity())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let claim_rebind = splice.prepare_claim_rebind(&splice_claims)?;
         if pending.ticket.is_none() {
             let task = pending
                 .final_task
@@ -15947,12 +16173,36 @@ fn publish_normal_work(
         let ticket = pending.ticket.as_ref()?;
         let presentation_plan = presentation.seal_commit(isolate_count)?;
         let prepared = if let Some(sealed) = sealed.take() {
-            sealed.prepared
+            crate::retained::PreparedNormalPublication::Ordinary(sealed.prepared)
+        } else if let Some(plan) = retention.take() {
+            let owners = entry.retained.take_retiring_owners(&retiring).ok()?;
+            let manifest =
+                CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
+            match entry
+                .engine
+                .prepare_commit_with_retention(ticket, plan, manifest, owners)
+            {
+                Ok(prepared) => crate::retained::PreparedNormalPublication::Retained(prepared),
+                Err(error) => {
+                    let (_plan, _manifest, owners, error) = error.into_parts();
+                    assert!(
+                        entry.retained.restore_owners(owners).is_ok(),
+                        "original owners return to their untouched holders"
+                    );
+                    commit_authority_contradiction =
+                        Some(if error == IntegrationError::InvalidManifest {
+                            BeginAuthoritySettlementErrorKind::InvalidManifest
+                        } else {
+                            BeginAuthoritySettlementErrorKind::Stale
+                        });
+                    return None;
+                }
+            }
         } else {
             let manifest =
                 CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
             match entry.engine.prepare_commit(ticket, manifest) {
-                Ok(prepared) => prepared,
+                Ok(prepared) => crate::retained::PreparedNormalPublication::Ordinary(prepared),
                 Err(error) => {
                     commit_authority_contradiction = Some(match error {
                         IntegrationError::InvalidManifest => {
@@ -15971,9 +16221,10 @@ fn publish_normal_work(
                 }
             }
         };
-        let engine = match entry.engine.validate_publication(prepared) {
+        let engine = match prepared.validate(&mut entry.engine) {
             Ok(validated) => validated,
-            Err(error) => {
+            Err((returned, error)) => {
+                rejected_retained_publication = returned;
                 commit_authority_contradiction = Some(match error {
                     IntegrationError::InvalidManifest => {
                         BeginAuthoritySettlementErrorKind::InvalidManifest
@@ -16005,22 +16256,48 @@ fn publish_normal_work(
             splice.apply_root_rebase(rebase);
         }
         let outcome = splice.apply();
-        let (mut active, leaving) = outcome.into_active_and_leaving();
+        let (mut active, leaving, retained_branch) = outcome.into_active_leaving_and_retained();
         active.consume_native_focus_owners();
+        for (id, rebind) in retiring_rebind {
+            entry
+                .retained
+                .branch_mut(id)
+                .expect("the prepared retirement entries remain owned")
+                .apply_claim_rebind(rebind);
+        }
+        let retired_payloads = entry.retained.take_retired_payloads(retired_payloads);
         let next_active = (!active.frames().is_empty()).then_some(active);
-        let next_cleanup = Some(CleanupLedger::activate_leaving_branch(
-            cleanup_ledger,
-            (!leaving.frames().is_empty() || !leaving.child_slots().is_empty()).then_some(leaving),
-        ));
+        let next_cleanup = Some(if let Some(assembly) = leaving_assembly {
+            CleanupLedger::activate_leaving_forest(
+                cleanup_ledger,
+                assembly.assemble(leaving, retired_payloads),
+            )
+        } else {
+            CleanupLedger::activate_leaving_branch(
+                cleanup_ledger,
+                (!leaving.frames().is_empty() || !leaving.child_slots().is_empty())
+                    .then_some(leaving),
+            )
+        });
+        let next_retained = retained_branch.map(|branch| {
+            (
+                retained_projection.expect("retained splice has the same Core projection"),
+                branch,
+            )
+        });
+        let retained_owner = &mut entry.retained;
         let active_owner = &mut entry.active;
         let cleanup_owner = &mut entry.cleanup_ledger;
         let scroll_owner = &mut entry.scroll;
-        engine.publish(|| {
+        engine.publish(|owner| {
             presentation_plan.apply_staged(
                 |_| focus_plan.apply(),
                 |_| {
                     if registry_changes {
                         registry_plan.apply(&mut registry);
+                    }
+                    if let Some(boundaries) = retained_boundaries {
+                        boundaries.apply(&mut registry);
                     }
                 },
                 |_| gate_plan.apply(),
@@ -16028,6 +16305,9 @@ fn publish_normal_work(
             *active_owner = next_active;
             *cleanup_owner = next_cleanup;
             *scroll_owner = scroll.state;
+            if let Some((projection, branch)) = next_retained {
+                retained_owner.install_published(projection, owner, branch);
+            }
         });
         Some(())
     })();
@@ -16049,6 +16329,17 @@ fn publish_normal_work(
                         .is_err()
                 {
                     commit_authority_contradiction = Some(BeginAuthoritySettlementErrorKind::Stale);
+                }
+                if let Some(prepared) = rejected_retained_publication.take() {
+                    if let Ok(owners) = entry
+                        .engine
+                        .cancel_prepared_retained_commit_for_authority_settlement(prepared)
+                    {
+                        assert!(
+                            entry.retained.restore_owners(owners).is_ok(),
+                            "returned original owners have exact untouched holders"
+                        );
+                    }
                 }
                 let splice = splice_owner
                     .take()

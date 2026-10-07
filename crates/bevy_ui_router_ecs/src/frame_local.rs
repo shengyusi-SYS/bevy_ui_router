@@ -411,6 +411,7 @@ pub(crate) fn validate_active_branch_local(
             }
             EntityLifecycle::Active
             | EntityLifecycle::PreparedInert
+            | EntityLifecycle::Retained
             | EntityLifecycle::Leaving
             | EntityLifecycle::Quarantined => false,
         };
@@ -484,7 +485,9 @@ fn validate_committed_branch_with_entering(
                 EntityLifecycle::PreparedInert => {
                     validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert)
                 }
-                EntityLifecycle::Leaving | EntityLifecycle::Quarantined => false,
+                EntityLifecycle::Retained
+                | EntityLifecycle::Leaving
+                | EntityLifecycle::Quarantined => false,
             }
         } else {
             validate_mounted_child_slot(
@@ -1074,6 +1077,12 @@ fn collect_child_slot_foreign_focus(
             return Err(FrameLocalError::RelationshipCycle(entity));
         }
         if let Some(record) = registry.record(entity) {
+            if record.lifecycle() == EntityLifecycle::Retained {
+                if registry.retained_shell_is_current(world, entity, slot) {
+                    continue;
+                }
+                return Err(FrameLocalError::OwnershipDrift(entity));
+            }
             if sealed_entering_shells
                 .iter()
                 .any(|claim| claim.entity() == entity && *claim == record.claim())

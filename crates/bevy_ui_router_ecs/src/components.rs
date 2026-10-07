@@ -96,6 +96,7 @@ pub(crate) enum ChildSlotLifecycle {
     ProvisionalInert,
     RegisteredInert,
     Active,
+    Retained,
     Leaving,
     Quarantined,
 }

@@ -41,6 +41,12 @@ impl RouteMatcher {
         self.tree.node(route)?.options().view_binding()
     }
 
+    pub(crate) fn keep_alive(&self, route: RouteId) -> bool {
+        self.tree
+            .node(route)
+            .is_some_and(|node| node.options().keep_alive())
+    }
+
     pub(crate) fn max_branch_depth(&self) -> usize {
         self.tree.max_branch_depth()
     }
