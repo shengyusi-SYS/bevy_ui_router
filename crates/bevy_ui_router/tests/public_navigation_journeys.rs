@@ -3877,6 +3877,199 @@ fn retained_native_missing_own_outlet_settles_cache_and_resumes_the_original_req
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
+fn active_native_retained_leaf(app: &mut App) -> Entity {
+    let leaves = node_entities_with_width(app, 43);
+    let gate = app.world().resource::<RouterInputGate>();
+    let active = leaves
+        .into_iter()
+        .filter(|entity| gate.allows_pointer(*entity))
+        .collect::<Vec<_>>();
+    assert_eq!(active.len(), 1);
+    active[0]
+}
+
+struct InvalidRetainedOutletFixture {
+    fixture: NestedFixture,
+    cached_root: Entity,
+    own_anchor: Entity,
+    own_slot: Entity,
+    active_root: Entity,
+    layout_root: Entity,
+}
+
+fn invalid_retained_outlet_fixture() -> InvalidRetainedOutletFixture {
+    let mut fixture = nested_fixture_with_retention_and_detail(
+        RoutePattern::path("/:section").unwrap(),
+        Vec::new(),
+        2,
+        Some(RouteViewKey::new("nested-detail").unwrap()),
+    );
+    for path in ["/catalog/items/1/detail", "/catalog/items/1"] {
+        let request = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new(path),
+            None,
+            None,
+        );
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+    }
+    let cached_root = active_native_retained_leaf(&mut fixture.app);
+    let layout_root = node_entities_with_width(&mut fixture.app, 41)[0];
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(cached_root)
+        .unwrap()
+        .0 = 91;
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(layout_root)
+        .unwrap()
+        .0 = 73;
+    let container = fixture.app.world().get::<Children>(cached_root).unwrap()[0];
+    let own_anchor = fixture.app.world().get::<Children>(container).unwrap()[0];
+    let own_slot = fixture.app.world().get::<Children>(own_anchor).unwrap()[0];
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<DefaultOutlet>(own_anchor)
+            .is_some()
+    );
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<Children>(own_slot)
+            .is_none_or(|children| children.is_empty())
+    );
+    assert!(node_entities_with_width(&mut fixture.app, 47).is_empty());
+
+    let request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/catalog/items/2"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let active_root = active_native_retained_leaf(&mut fixture.app);
+    assert_ne!(active_root, cached_root);
+    assert!(fixture.app.world().get_entity(cached_root).is_ok());
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(cached_root)
+    );
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(active_root)
+        .unwrap()
+        .0 = 92;
+
+    // Invalidate only the inactive leaf's own empty outlet declaration. Its
+    // shell, slot, shared parent and current sibling retain their identities.
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(own_anchor)
+        .remove::<DefaultOutlet>();
+    assert_eq!(active_native_retained_leaf(&mut fixture.app), active_root);
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(own_slot)
+            .unwrap()
+            .parent(),
+        own_anchor
+    );
+    InvalidRetainedOutletFixture {
+        fixture,
+        cached_root,
+        own_anchor,
+        own_slot,
+        active_root,
+        layout_root,
+    }
+}
+
+#[test]
+fn retained_native_invalid_non_target_own_outlet_preserves_fresh_sibling_navigation() {
+    let InvalidRetainedOutletFixture {
+        mut fixture,
+        cached_root,
+        own_anchor,
+        own_slot,
+        active_root,
+        layout_root,
+    } = invalid_retained_outlet_fixture();
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let effects = fixture.control.effects();
+    let c = RouteLocation::new("/catalog/items/3");
+
+    let request = push_and_settle(&mut fixture.app, fixture.router, c.clone(), None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let fresh_c = active_native_retained_leaf(&mut fixture.app);
+    assert_ne!(fresh_c, cached_root);
+    assert_ne!(fresh_c, active_root);
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.availability(), &RouterAvailability::Ready);
+    assert_eq!(after.active().frames()[0], before.active().frames()[0]);
+    assert_eq!(
+        after.history().entries(),
+        [
+            RouteLocation::new("/catalog/items/1/detail"),
+            RouteLocation::new("/catalog/items/1"),
+            RouteLocation::new("/catalog/items/2"),
+            c,
+        ]
+    );
+    for (entity, state) in [(cached_root, 91), (active_root, 92), (layout_root, 73)] {
+        assert_eq!(
+            fixture.app.world().get::<LocalState>(entity),
+            Some(&LocalState(state))
+        );
+    }
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<DefaultOutlet>(own_anchor)
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(own_slot)
+            .unwrap()
+            .parent(),
+        own_anchor
+    );
+    let gate = fixture.app.world().resource::<RouterInputGate>();
+    for inactive in [cached_root, active_root] {
+        assert!(!gate.allows_pointer(inactive));
+        assert!(!gate.allows_keyboard(inactive));
+        assert!(!gate.allows_gamepad(inactive));
+    }
+    assert!(gate.allows_keyboard(fresh_c) && gate.allows_gamepad(fresh_c));
+    let after_effects = fixture.control.effects();
+    assert_eq!(after_effects.len(), effects.len() + 1);
+    assert_eq!(&after_effects[..effects.len()], effects.as_slice());
+    assert_eq!(after_effects.last().unwrap().view, fixture.leaf);
+    assert_eq!(after_effects.last().unwrap().id_param.as_deref(), Some("3"));
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
 #[test]
 fn retained_native_lru_evicts_the_oldest_inactive_leaf_and_rebuilds_on_return() {
     let mut fixture =

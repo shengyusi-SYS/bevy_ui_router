@@ -43,9 +43,10 @@ use crate::{
         PreparedAuthorityPublicationCapacity, PreparedExactRegistryRetirement,
         PreparedQuarantineTransfer, PreparedUnresolvedResidualTransfer, ProvisionalOwner,
         QuarantineFacts, QuarantineLeaseId, QuarantineLeaseTable, RegistryOwner, ResidualLeaseId,
-        RouteEntityRegistry, apply_prepared_authority_lost_residual_transfer,
-        apply_prepared_exact_registry_retirement, apply_prepared_quarantine_transfer,
-        apply_prepared_unresolved_residual_transfer, prepare_authority_lost_residual_transfer,
+        RetainedShellClaimsError, RouteEntityRegistry,
+        apply_prepared_authority_lost_residual_transfer, apply_prepared_exact_registry_retirement,
+        apply_prepared_quarantine_transfer, apply_prepared_unresolved_residual_transfer,
+        prepare_authority_lost_residual_transfer,
         prepare_authority_lost_residual_transfer_in_publication, prepare_exact_registry_retirement,
         prepare_unresolved_residual_transfer,
         prepare_verified_authority_cleanup_quarantine_transfer,
@@ -1468,6 +1469,12 @@ pub(crate) struct FrozenCleanupManifest {
     boundary_drifts: Vec<FailedBoundaryDrift>,
     pending_boundary_loss_claims: Vec<ExactRegistryClaim>,
     digest: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedPartitionManifestError {
+    RetryableCapacity,
+    InvalidManifest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2936,15 +2943,17 @@ impl FrozenCleanupManifest {
         retained: Option<&RetainedLeafProjection>,
         retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
         projected_claims: &[ExactRegistryClaim],
-    ) -> Option<Self> {
+    ) -> Result<Self, RetainedPartitionManifestError> {
         if let Some(candidate) = retained {
             let mut frames = leaving
                 .frames()
                 .iter()
                 .filter(|frame| frame.frame() == candidate.frame());
-            let frame = frames.next()?;
+            let frame = frames
+                .next()
+                .ok_or(RetainedPartitionManifestError::InvalidManifest)?;
             if frames.next().is_some() || !frame.mount_binding().matches_retained_scope(candidate) {
-                return None;
+                return Err(RetainedPartitionManifestError::InvalidManifest);
             }
         }
         let mut frames = leaving
@@ -2960,7 +2969,7 @@ impl FrozenCleanupManifest {
         let mut authorized_retired = Vec::with_capacity(retiring.len());
         for (projection, branch) in retiring {
             let [frame] = branch.frames() else {
-                return None;
+                return Err(RetainedPartitionManifestError::InvalidManifest);
             };
             if frame.frame() != projection.frame()
                 || !frame.mount_binding().matches_retained_scope(projection)
@@ -2970,7 +2979,7 @@ impl FrozenCleanupManifest {
                     .any(|slot| slot.parent() != frame.frame())
                 || authorized_retired.contains(&projection.frame())
             {
-                return None;
+                return Err(RetainedPartitionManifestError::InvalidManifest);
             }
             let exact_shells = registry
                 .retained_shell_claims_for_mount(
@@ -2979,12 +2988,19 @@ impl FrozenCleanupManifest {
                     projection.outlet(),
                     projection.slot(),
                 )
-                .ok()?;
+                .map_err(|error| match error {
+                    RetainedShellClaimsError::RetryableCapacity => {
+                        RetainedPartitionManifestError::RetryableCapacity
+                    }
+                    RetainedShellClaimsError::InvalidProof => {
+                        RetainedPartitionManifestError::InvalidManifest
+                    }
+                })?;
             if !frame
                 .claims()
                 .any(|claim| claim.entity() == frame.shell() && exact_shells.contains(claim))
             {
-                return None;
+                return Err(RetainedPartitionManifestError::InvalidManifest);
             }
             authorized_retired.push(projection.frame());
             frames.push(frame);
@@ -2999,6 +3015,7 @@ impl FrozenCleanupManifest {
             LeavingMountProof::RetainedPartition,
             &authorized_retired,
         )
+        .ok_or(RetainedPartitionManifestError::InvalidManifest)
     }
 
     /// A cache-only retirement keeps the original inert claims. Native authored

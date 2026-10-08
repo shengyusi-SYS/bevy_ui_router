@@ -12,7 +12,7 @@
 
 ## 访问、页面实例与物理责任分别建模
 
-history entry 标识一次访问，页面实例保存 Entity 与局部状态，owner 承担物理责任；关系见[架构图](../architecture/README.md#访问实例与责任)。同一页面可服务多次访问，滚动位置必须按 entry 保存。长期 retained owner 可以超出原请求寿命，原请求仍应结清自己的前台 capability。
+history entry 标识一次访问，页面实例保存 Entity 与局部状态，owner 承担物理责任；关系见[架构图](../architecture/README.md#访问实例与责任)。同一页面可服务多次访问，滚动位置必须按 entry 保存。采样缺失与身份失效分开：缺布局保留仍有效的 exact 容器见证，离场再净化记录，避免同 key 新实体继承旧值。长期 retained owner 可以超出原请求寿命，原请求仍应结清自己的前台 capability。
 
 嵌套路由保留 common prefix，服务的是布局与局部状态连续性；整 host 重建会改变这一用户行为。path、route-local params、search 和 fragment 的复用语义不同，不能仅按 route id 或 location 变化统一重建。
 
@@ -24,7 +24,7 @@ active branch 因而不再等于完整生命周期库存。父 scope 退出、fa
 
 Back 的成功目标既可能 fresh，也可能 retained。共享接收器若仍假设所有成功结果都 fresh，就会遗漏合法目标；应让它们进入既有 publication 管线，携带原 history authority、执行身份与 continuation，而不是补一套缓存 Back 状态机。
 
-重新激活与安全处置回答不同问题。缺少原 outlet 声明可能阻止缓存重新激活，却不一定阻止按原 owner 安全清理；处理这类失效应分别证明当前 authority、目标写集和原义务，不能为处置强求激活条件重新成立，也不能把任意 drift 都降成 miss。
+重新激活、非目标保护与安全处置回答不同问题。缺少原 outlet 声明可能阻止激活，不自动撤销受保护身份或阻止按原 owner 安全处置；各路径分别证明当前 authority、角色、目标写集与原义务，不能把任意 drift 都降成 miss。
 
 cleanup 决定物理义务如何处置，continuation 决定原请求如何结束或恢复。后者来自原失败与 attempt，不能由保留了旧 active、剩余实体数或删除结果反推。仅真实容量或可完成前置不足可以重试；永久矛盾必须有界结算。
 
@@ -32,7 +32,7 @@ cleanup 决定物理义务如何处置，continuation 决定原请求如何结�
 
 snapshot、projection 和 fingerprint 提供事实校验，不能重建 capability。会签发 owner 的接口也不是只读查询；所有 typed outcome 都必须完整消费或返还，否则一次空闲观察也可能遗失唯一 owner。
 
-current/next 独立冻结，延迟 action 核对完整 source projection。逐元素有效不能证明仍属于同一次操作；稀疏 slot 和 retained sibling 必须按自身 role/binding 判断。
+current/next 独立冻结，延迟 action 核对完整 source projection。当前挂载证据与清理后的下一轮记录也分别准备；全部选定删除义务都须反映到下一轮 prior。逐元素有效不能证明仍属于同一次操作；稀疏 slot 和 retained sibling 必须按自身 role/binding 判断。
 
 Core 接纳线性责任前，先完成该协议要求的容量预留和 owner 交接准备。缓存自身失效再继续 fresh 的路径，还需提前备妥同次 removal/receipt 包，避免接纳后卡在物理准备；普通 cleanup 的实际 receipt 则随其 attempt 准备。publication 前完成所有可失败工作，tail 只提交预备状态，不能返回后补装 owner。
 

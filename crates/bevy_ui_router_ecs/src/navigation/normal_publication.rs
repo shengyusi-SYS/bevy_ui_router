@@ -472,10 +472,16 @@ pub(super) fn publish_normal_work(
     let registry_changes = transitions
         .iter()
         .any(|(claim, next)| claim.lifecycle() != *next);
-    let mut mount_rebase_contradiction = false;
+    let mut cleanup_preparation_contradiction = false;
     let cleanup_preparation = (|| {
         let registry = world.get_resource::<RouteEntityRegistry>()?;
-        let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+        let registry_plan = match registry.prepare_lifecycle_mutation(&transitions) {
+            Some(prepared) => prepared,
+            None => {
+                cleanup_preparation_contradiction = true;
+                return None;
+            }
+        };
         let resulting_claims = registry_plan.resulting_claims().to_vec();
         let frozen_manifest = if uses_retention {
             let navigation = world.get_resource::<RouterNavigation>()?;
@@ -487,24 +493,39 @@ pub(super) fn publish_normal_work(
                 .as_ref()?
                 .selected(&entry.retained)
                 .collect::<Vec<_>>();
-            FrozenCleanupManifest::from_retained_partition(
+            match FrozenCleanupManifest::from_retained_partition(
                 world,
                 registry,
                 view.leaving(),
                 retained_projection.as_ref(),
                 &retired,
                 &resulting_claims,
-            )?
+            ) {
+                Ok(manifest) => manifest,
+                Err(crate::cleanup::RetainedPartitionManifestError::RetryableCapacity) => {
+                    return None;
+                }
+                Err(crate::cleanup::RetainedPartitionManifestError::InvalidManifest) => {
+                    cleanup_preparation_contradiction = true;
+                    return None;
+                }
+            }
         } else if view.leaving().obligation_count() == 0 {
             FrozenCleanupManifest::empty()
         } else {
-            FrozenCleanupManifest::from_leaving_branch(
+            match FrozenCleanupManifest::from_leaving_branch(
                 world,
                 registry,
                 view.leaving(),
                 &resulting_claims,
                 (!view.entering().frames().is_empty()).then_some(view.entering()),
-            )?
+            ) {
+                Some(manifest) => manifest,
+                None => {
+                    cleanup_preparation_contradiction = true;
+                    return None;
+                }
+            }
         };
 
         let root_rebase = if view.entering().frames().is_empty() {
@@ -513,7 +534,7 @@ pub(super) fn publish_normal_work(
             match view.prepare_root_cleanup_rebase(world, &frozen_manifest) {
                 Some(prepared) => Some(prepared),
                 None => {
-                    mount_rebase_contradiction = true;
+                    cleanup_preparation_contradiction = true;
                     return None;
                 }
             }
@@ -538,8 +559,8 @@ pub(super) fn publish_normal_work(
     );
     let mut splice_owner = Some(splice);
     let mut cleanup_reserve_contradiction = None;
-    let mut commit_authority_contradiction =
-        mount_rebase_contradiction.then_some(BeginAuthoritySettlementErrorKind::InvalidManifest);
+    let mut commit_authority_contradiction = cleanup_preparation_contradiction
+        .then_some(BeginAuthoritySettlementErrorKind::InvalidManifest);
     let mut retained_publication_contradiction = None;
     let mut rejected_retained_publication = None;
     let committed = (|| {

@@ -328,7 +328,7 @@ fn freeze_projectionless_leaving(
     pending: &PendingCommit,
     resulting_claims: &[ExactRegistryClaim],
     retained_change: Option<&crate::retained::PreparedRetainedChange>,
-) -> Option<FrozenCleanupManifest> {
+) -> Result<FrozenCleanupManifest, crate::cleanup::RetainedPartitionManifestError> {
     match (entry.active.as_ref(), retained_change) {
         (Some(leaving), Some(change)) => FrozenCleanupManifest::from_retained_partition(
             world,
@@ -344,9 +344,10 @@ fn freeze_projectionless_leaving(
             leaving,
             resulting_claims,
             Some(pending.branch.as_realized()),
-        ),
-        (None, None) => Some(FrozenCleanupManifest::empty()),
-        (None, Some(_)) => None,
+        )
+        .ok_or(crate::cleanup::RetainedPartitionManifestError::InvalidManifest),
+        (None, None) => Ok(FrozenCleanupManifest::empty()),
+        (None, Some(_)) => Err(crate::cleanup::RetainedPartitionManifestError::InvalidManifest),
     }
 }
 
@@ -675,8 +676,14 @@ pub(super) fn prepare_projectionless_branch(
         &resulting_claims,
         retained_change.as_ref(),
     );
-    let Some(frozen_manifest) = frozen_manifest else {
-        return fail_closed_projectionless_replacement_contradiction(world, entry, pending);
+    let frozen_manifest = match frozen_manifest {
+        Ok(manifest) => manifest,
+        Err(crate::cleanup::RetainedPartitionManifestError::RetryableCapacity) => {
+            return Err(pending);
+        }
+        Err(crate::cleanup::RetainedPartitionManifestError::InvalidManifest) => {
+            return fail_closed_projectionless_replacement_contradiction(world, entry, pending);
+        }
     };
     let manifest_digest = frozen_manifest.digest();
     let obligation_count = frozen_manifest.len();
@@ -985,20 +992,28 @@ pub(super) fn publish_projectionless_work(
         );
         return;
     }
-    let frozen_is_exact = (|| {
-        let navigation = world.get_resource::<RouterNavigation>()?;
+    let frozen_check = (|| {
+        use crate::cleanup::RetainedPartitionManifestError as Error;
+        let navigation = world
+            .get_resource::<RouterNavigation>()
+            .ok_or(Error::InvalidManifest)?;
         let entry = navigation
             .entries
             .iter()
-            .find(|entry| entry.handle == handle)?;
-        let registry = world.get_resource::<RouteEntityRegistry>()?;
+            .find(|entry| entry.handle == handle)
+            .ok_or(Error::InvalidManifest)?;
+        let registry = world
+            .get_resource::<RouteEntityRegistry>()
+            .ok_or(Error::InvalidManifest)?;
         entry
             .engine
-            .inspect_report_identity(pending.final_task.as_ref()?)
-            .ok()?;
-        let current = registry.prepare_lifecycle_mutation(&transitions)?;
+            .inspect_report_identity(pending.final_task.as_ref().ok_or(Error::InvalidManifest)?)
+            .map_err(|_| Error::InvalidManifest)?;
+        let current = registry
+            .prepare_lifecycle_mutation(&transitions)
+            .ok_or(Error::InvalidManifest)?;
         if current.resulting_claims() != resulting_claims {
-            return None;
+            return Err(Error::InvalidManifest);
         }
         let frozen = freeze_projectionless_leaving(
             world,
@@ -1008,9 +1023,35 @@ pub(super) fn publish_projectionless_work(
             &resulting_claims,
             retained_change.as_ref(),
         )?;
-        (frozen == expected_manifest).then_some(())
-    })()
-    .is_some();
+        if frozen != expected_manifest {
+            return Err(Error::InvalidManifest);
+        }
+        Ok(())
+    })();
+    if let Err(error) = frozen_check {
+        world.resource_scope(
+            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+                let entry = navigation
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.handle == handle)
+                    .unwrap();
+                match error {
+                    crate::cleanup::RetainedPartitionManifestError::RetryableCapacity => {
+                        entry.pending_commit = Some(pending);
+                    }
+                    crate::cleanup::RetainedPartitionManifestError::InvalidManifest => {
+                        if let Err(pending) = fail_closed_projectionless_replacement_contradiction(
+                            world, entry, pending,
+                        ) {
+                            entry.pending_commit = Some(pending);
+                        }
+                    }
+                }
+            },
+        );
+        return;
+    }
     #[cfg(feature = "bsn")]
     let native_focus =
         crate::native_focus::prepare_publication(world, pending.branch.frames(), &gate_after);
@@ -1038,9 +1079,6 @@ pub(super) fn publish_projectionless_work(
     let mut failure = None;
     let mut rejected_retained_publication = None;
     let committed = (|| {
-        if !frozen_is_exact {
-            return None;
-        }
         let (presentation, resources) =
             crate::presentation::prepare_publication_access_with_scroll(
                 world,

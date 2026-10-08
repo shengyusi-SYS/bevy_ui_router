@@ -104,7 +104,7 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
-历史验收不能证明所有生产组合；当前已复现的保留页交接、失效清理与滚动记录缺陷见[修复优先级](../roadmap.md#当前优先级)，不因既有绿测而视为已解决。route opt-in 与容量须独立配置；覆盖淘汰后的后续普通导航，以及暂缺布局后正常离场，不只覆盖缓存往返或 host loss。
+历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；覆盖混用 Back/Push、淘汰后的后续普通导航，以及暂缺布局后正常离场。上述公开回归与非目标缓存自身失效旅程已随修复通过；清理中途 host loss 的回归仍失败，见[当前修复项](../roadmap.md#完成缓存失效清理的有界结算)，不能把跳过该用例的检查称为全量通过。
 
 2026-10-08 的缓存/滚动组合已在窗口源码 `1a30dc58d41c91dd3bcadc3d9795edbdd129a6ad` 验证：Linux/WSLg、960×640、软件渲染、debug `ui-debug`，通过应用内 BRP 发送真实 WindowEvent 与 typed messages。已验证原 Entity/页面和布局计数保留、多 entry 各自恢复位置、旧手势与 focus 撤权、命中后的新点击/Space，以及 fallback 清理旧库存后重新构建；renderer 截图检查最终呈现。库侧完成 workspace 全特性、独立 consumer、无 BSN 和新旧性能夹具行为检查；正式耗时结果归[性能基线](../performance.md)。
 

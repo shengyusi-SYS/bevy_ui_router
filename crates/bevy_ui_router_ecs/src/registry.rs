@@ -194,6 +194,12 @@ pub(crate) enum RegistryOwner {
     Provisional(ProvisionalOwner),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedShellClaimsError {
+    RetryableCapacity,
+    InvalidProof,
+}
+
 impl RegistryOwner {
     fn child_binding(&self) -> Option<(&RouteFrameVersion, &RouteSlotKey, RouteSlotId)> {
         match self {
@@ -746,18 +752,25 @@ impl RouteEntityRegistry {
         parent: &RouteFrameVersion,
         outlet: &RouteSlotKey,
         slot: RouteSlotId,
-    ) -> Result<Vec<ExactRegistryClaim>, ()> {
+    ) -> Result<Vec<ExactRegistryClaim>, RetainedShellClaimsError> {
         let mut claims = Vec::new();
         for boundary in self.retained_boundaries.iter().filter(|boundary| {
             boundary.projection().parent() == parent
                 && boundary.projection().outlet() == outlet
                 && boundary.projection().slot() == slot
         }) {
-            if !boundary.is_current(world) {
-                return Err(());
+            if !boundary.preservation_is_current(world) {
+                return Err(RetainedShellClaimsError::InvalidProof);
             }
-            claims.try_reserve(1).map_err(|_| ())?;
-            claims.push(boundary.shell_claim().try_clone()?);
+            claims
+                .try_reserve(1)
+                .map_err(|_| RetainedShellClaimsError::RetryableCapacity)?;
+            claims.push(
+                boundary
+                    .shell_claim()
+                    .try_clone()
+                    .map_err(|_| RetainedShellClaimsError::RetryableCapacity)?,
+            );
         }
         Ok(claims)
     }

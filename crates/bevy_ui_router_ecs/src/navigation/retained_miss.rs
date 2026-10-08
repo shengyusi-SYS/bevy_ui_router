@@ -15,6 +15,7 @@ pub(super) struct Installed {
     removal: Option<crate::cleanup::PreparedRetainedInvalidationRemovalStep>,
     pending: PendingCommit,
     boundaries: crate::registry::PreparedRetainedBoundaries,
+    invalidation: RetainedInvalidationEvidence,
 }
 
 pub(super) enum Rejection {
@@ -169,6 +170,7 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
     let retained = &mut entry.retained;
     let destination = &mut entry.retained_miss_cleanup;
     let mut pending = Some(pending);
+    let mut evidence = Some(evidence);
     let result =
         entry
             .engine
@@ -187,6 +189,9 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
                         .take()
                         .expect("original fresh continuation moves once"),
                     boundaries,
+                    invalidation: evidence
+                        .take()
+                        .expect("original invalidation source moves with its cleanup owner"),
                 })));
             });
     if let Err(error) = result {
@@ -200,7 +205,7 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
                 task,
                 plan,
                 pending: pending.take().unwrap(),
-                evidence,
+                evidence: evidence.take().unwrap(),
             },
             evidence: Rejection::Publication(error),
         }));
@@ -299,13 +304,14 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
         removal: _,
         pending,
         boundaries,
+        invalidation,
     } = installed;
     let mut resumed = None;
     match entry.engine.complete_retained_miss_cleanup(
         owner,
         completion,
-        (ledger, pending, boundaries),
-        |(_, pending, boundaries)| {
+        (ledger, pending, boundaries, invalidation),
+        |(_, pending, boundaries, _)| {
             boundaries.apply(&mut registry);
             resumed = Some(pending);
         },
@@ -315,7 +321,7 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
             entry.pending_mount_frame_task = Some(task);
         }
         Err(error) => {
-            let (owner, _, (ledger, pending, boundaries), error) = error.into_parts();
+            let (owner, _, (ledger, pending, boundaries, invalidation), error) = error.into_parts();
             reject_cleanup(
                 entry,
                 Installed {
@@ -324,6 +330,7 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
                     removal: None,
                     pending,
                     boundaries,
+                    invalidation,
                 },
                 Rejection::Core(error),
             );
