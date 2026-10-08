@@ -66,7 +66,7 @@ publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不�
 
 离开 normal 页面时保存最后一次有效布局显示的二维逻辑像素位置，关联 Core canonical history entry 和 route 复用身份。重复 URL 的不同访问独立，Replace 使用新 entry。normal 被 error/fallback 替换时仍保存原位置，失败呈现不覆盖成功访问记录；失败保留原页面时不恢复或重置。
 
-成功 Back 恢复目标 entry，包括 cache hit 与仍存活的 preserved prefix 容器；Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。位置在 publication 前准备，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
+成功 Back 恢复目标 entry，包括 cache hit 与仍存活的 preserved prefix 容器；Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。只对 publication 前已存在的标记容器准备位置，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
 
 容器或 frame 失效时丢弃恢复请求。缺少实际 UI 布局或有效相机时不保存伪造位置，放弃本次恢复并保留原值、给出有界诊断；不额外运行布局或延迟轮询。首版不自动追赶异步增长或延迟创建的容器。
 
