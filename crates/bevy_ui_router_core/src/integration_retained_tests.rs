@@ -92,7 +92,7 @@ fn prepare(
     let roots = plan.disposable_roots().to_vec();
     let count = roots.len();
     let manifest = CleanupManifest::new(roots, 0x6163, count);
-    match engine.prepare_commit_with_retention(ticket, plan, manifest, retiring) {
+    match engine.prepare_commit_with_retention(ticket, plan, manifest, retiring, None) {
         Ok(prepared) => prepared,
         Err(_) => panic!("exact retention partition must prepare"),
     }
@@ -138,6 +138,188 @@ fn retained_hit_task(engine: &mut RouterEngine, path: &str) -> FrameTask {
     task
 }
 
+fn back_task(
+    engine: &mut RouterEngine,
+    world: &HistoryAdmissionWorldSeal,
+) -> (
+    HistoryExecutionBindingView,
+    LifecycleContinuationCapacity,
+    FrameTask,
+) {
+    let stamp = engine.history_admission_stamp(world).unwrap();
+    let admission = engine.prepare_back_admission(world, &stamp).unwrap();
+    let (_, accepted) = engine.enqueue_back(admission).unwrap().into_parts();
+    engine.collect();
+    let Some(EngineAction::BackResolution(handoff)) = engine.action() else {
+        panic!("a real Back must resolve its canonical predecessor")
+    };
+    let verified = match engine.verify_back_resolution_handoff(accepted, handoff) {
+        BackResolutionVerifyOutcome::Matched(verified) => verified,
+        BackResolutionVerifyOutcome::Mismatch { .. } => panic!("exact Back resolution"),
+    };
+    let (_, owner) = verified.into_parts();
+    let VerifiedBackResolutionOwnerHandoff::Target(owner) = owner else {
+        panic!("two entries have a Back target")
+    };
+    let resume = match engine.resume_back_target_with_retirement(owner, || {}) {
+        BackTargetCoreResumeOutcome::Resumed(BackTargetStart::Ready(resume)) => resume,
+        _ => panic!("the exact Back target must resume"),
+    };
+    let (action, history, capacity) = resume.into_parts();
+    let BackTargetResumeAction::FrameTask(task) = action else {
+        panic!("a changed leaf dispatches its original fresh task")
+    };
+    (history, capacity, task)
+}
+
+#[test]
+fn retained_back_publication_preserves_original_continuation_for_hits_misses_and_cancel() {
+    for capacity in [0, 1] {
+        let mut engine = engine(capacity, true);
+        let world = engine.claim_history_admission_world().unwrap();
+        let mut owners = Vec::new();
+        navigate(&mut engine, "/items/1", &mut owners);
+        let first = engine.active().frames().last().unwrap().clone();
+        let first_entry = engine.canonical_history().current_entry().unwrap();
+        navigate(&mut engine, "/items/2", &mut owners);
+        let before = engine.history().clone();
+        let (history, continuation, task) = back_task(&mut engine, &world);
+        let plan = engine
+            .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+            .unwrap();
+        let (prepared, continuation) = if let Some(plan) = plan {
+            // A foreign original continuation rejects before task/cache transfer.
+            let mut foreign = self::engine(0, true);
+            let foreign_world = foreign.claim_history_admission_world().unwrap();
+            let mut foreign_owners = Vec::new();
+            navigate(&mut foreign, "/items/1", &mut foreign_owners);
+            navigate(&mut foreign, "/items/2", &mut foreign_owners);
+            let (foreign_history, foreign_continuation, _) =
+                back_task(&mut foreign, &foreign_world);
+            let (task, plan, manifest, returned, error) = engine
+                .prepare_retained_hit_commit(
+                    task,
+                    plan,
+                    CleanupManifest::empty(),
+                    owners,
+                    Some((&foreign_history, &foreign_continuation)),
+                )
+                .unwrap_err()
+                .into_parts();
+            assert!(matches!(
+                error,
+                RetainedPublicationError::BackTargetMismatch(_)
+            ));
+            assert_eq!(engine.history(), &before);
+            let prepared = engine
+                .prepare_retained_hit_commit(
+                    task,
+                    plan,
+                    manifest,
+                    returned,
+                    Some((&history, &continuation)),
+                )
+                .unwrap();
+            // The sealed owner cannot use ordinary publication to skip the cap.
+            let (prepared, _) = match engine.validate_retained_publication(prepared) {
+                Err(returned) => returned,
+                Ok(_) => panic!("Back publication requires its original continuation"),
+            };
+            let (prepared, foreign_continuation, error) = match engine
+                .validate_retained_publication_for_back(prepared, foreign_continuation)
+            {
+                Err(returned) => returned,
+                Ok(_) => panic!("foreign capacity must not consume the real prepared owner"),
+            };
+            assert!(matches!(
+                error,
+                RetainedPublicationError::BackTargetMismatch(_)
+            ));
+            drop(foreign_continuation);
+            (prepared, continuation)
+        } else {
+            let outlets = engine
+                .expected_child_outlet(&task)
+                .unwrap()
+                .into_iter()
+                .collect();
+            let (ticket, continuation) = match engine.report_back_target_applied(
+                &history,
+                continuation,
+                task,
+                BackTargetAppliedReport::WithOutlets(outlets),
+            ) {
+                BackTargetAppliedReportOutcome::Commit { ticket, capacity } => (ticket, capacity),
+                _ => panic!("the fresh Back leaf must reach its original commit ticket"),
+            };
+            let plan = engine.prepare_retained_commit_plan(&ticket, &[]).unwrap();
+            let roots = plan.disposable_roots().to_vec();
+            let count = roots.len();
+            let prepared = engine
+                .prepare_commit_with_retention(
+                    &ticket,
+                    plan,
+                    CleanupManifest::new(roots, 0x6261, count),
+                    Vec::new(),
+                    Some((&history, &continuation)),
+                )
+                .unwrap();
+            (prepared, continuation)
+        };
+        assert_eq!(engine.history(), &before);
+        assert!(prepared.history_publication().restores_back());
+        let cleanup = prepared.cleanup().clone();
+        let count = cleanup.obligation_count();
+        owners = Vec::new();
+        engine
+            .validate_retained_publication_for_back(prepared, continuation)
+            .unwrap_or_else(|_| panic!("the original Back continuation must validate"))
+            .publish(|owner| owners.extend(owner));
+        engine
+            .complete_cleanup(if count == 0 {
+                cleanup.complete_empty()
+            } else {
+                cleanup.complete(0x6263, count)
+            })
+            .unwrap();
+        assert_eq!(
+            engine.canonical_history().current_entry(),
+            Some(first_entry)
+        );
+        if capacity == 0 {
+            assert_ne!(engine.active().frames().last(), Some(&first));
+        } else {
+            assert_eq!(engine.active().frames().last(), Some(&first));
+            // Cancellation returns the original cache owner; the borrowed Back
+            // capacity remains available in the physical authority holder.
+            navigate(&mut engine, "/items/3", &mut owners);
+            let before = engine.history().clone();
+            let (history, continuation, task) = back_task(&mut engine, &world);
+            let plan = engine
+                .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+                .unwrap()
+                .unwrap();
+            let cached = plan.hit().clone();
+            let prepared = engine
+                .prepare_retained_hit_commit(
+                    task,
+                    plan,
+                    CleanupManifest::empty(),
+                    owners,
+                    Some((&history, &continuation)),
+                )
+                .unwrap();
+            let returned = engine
+                .cancel_prepared_retained_commit_for_authority_settlement(prepared)
+                .unwrap_or_else(|_| panic!("exact cancellation must return original cache owners"));
+            assert_eq!(returned.len(), 1);
+            assert_eq!(returned[0].projection(), &cached);
+            assert_eq!(engine.history(), &before);
+            assert!(continuation.inner.scope.matches_execution(&history.inner));
+        }
+    }
+}
+
 #[test]
 fn retained_hit_reuses_original_frames_and_empty_slots_with_fresh_history_entries() {
     let mut engine = engine(1, true);
@@ -175,6 +357,7 @@ fn retained_hit_reuses_original_frames_and_empty_slots_with_fresh_history_entrie
                 plan,
                 CleanupManifest::empty(),
                 std::mem::take(&mut owners),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -215,10 +398,13 @@ fn retained_hit_source_rejection_returns_original_task_and_owners_without_histor
         .unwrap();
     engine = engine.with_keep_alive_capacity(0);
     let (task, plan, manifest, returned, error) = engine
-        .prepare_retained_hit_commit(task, plan, CleanupManifest::empty(), owners)
+        .prepare_retained_hit_commit(task, plan, CleanupManifest::empty(), owners, None)
         .unwrap_err()
         .into_parts();
-    assert_eq!(error, IntegrationError::Stale);
+    assert_eq!(
+        error,
+        RetainedPublicationError::Integration(IntegrationError::Stale)
+    );
     assert_eq!(task.request(), request);
     assert_eq!(task.frame(), &fresh_frame);
     assert_eq!(returned[0].projection(), &original);
@@ -228,7 +414,7 @@ fn retained_hit_source_rejection_returns_original_task_and_owners_without_histor
 
     engine = engine.with_keep_alive_capacity(1);
     let prepared = engine
-        .prepare_retained_hit_commit(task, plan, manifest, returned)
+        .prepare_retained_hit_commit(task, plan, manifest, returned, None)
         .unwrap();
     owners = Vec::new();
     publish(&mut engine, prepared, &mut owners);
@@ -421,7 +607,13 @@ fn retained_leaf_lru_eviction_transfers_original_owner_to_its_cleanup_token() {
     assert_eq!(plan.disposable_roots(), std::slice::from_ref(&first));
     let manifest = CleanupManifest::new(plan.disposable_roots().to_vec(), 0x6163, 1);
     let prepared = engine
-        .prepare_commit_with_retention(&third_ticket, plan, manifest, std::mem::take(&mut owners))
+        .prepare_commit_with_retention(
+            &third_ticket,
+            plan,
+            manifest,
+            std::mem::take(&mut owners),
+            None,
+        )
         .unwrap();
     assert_eq!(
         engine.inner.testing_retained_transfer_owners(),
@@ -487,12 +679,16 @@ fn retained_leaf_inventory_and_disposable_roots_are_exact() {
         plan,
         CleanupManifest::empty(),
         std::mem::take(&mut owners),
+        None,
     ) {
         Err(error) => error.into_parts(),
         Ok(_) => panic!("retiring roots cannot be omitted"),
     };
     let (plan, _, returned_owners, error) = returned;
-    assert_eq!(error, IntegrationError::InvalidManifest);
+    assert_eq!(
+        error,
+        RetainedPublicationError::Integration(IntegrationError::InvalidManifest)
+    );
     assert_eq!(returned_owners.len(), 1);
     assert_eq!(plan.disposable_roots(), expected);
     owners = returned_owners;
@@ -607,10 +803,13 @@ fn retained_leaf_another_publication_invalidates_the_full_old_plan_in_the_same_t
     publish(&mut engine, prepared, &mut owners);
     assert_ne!(owners[0].projection().id(), old_id);
     let error = engine
-        .prepare_commit_with_retention(&ticket, old, manifest, Vec::new())
+        .prepare_commit_with_retention(&ticket, old, manifest, Vec::new(), None)
         .unwrap_err();
     let (_, _, returned, error) = error.into_parts();
-    assert_eq!(error, IntegrationError::Stale);
+    assert_eq!(
+        error,
+        RetainedPublicationError::Integration(IntegrationError::Stale)
+    );
     assert!(returned.is_empty());
     assert_eq!(owners.len(), 1);
 }
@@ -626,9 +825,12 @@ fn retained_leaf_capacity_change_invalidates_an_unconsumed_plan() {
     let manifest = CleanupManifest::new(roots.clone(), 0x6163, roots.len());
     engine = engine.with_keep_alive_capacity(0);
     let error = engine
-        .prepare_commit_with_retention(&ticket, plan, manifest, Vec::new())
+        .prepare_commit_with_retention(&ticket, plan, manifest, Vec::new(), None)
         .unwrap_err();
-    assert_eq!(error.into_parts().3, IntegrationError::Stale);
+    assert_eq!(
+        error.into_parts().3,
+        RetainedPublicationError::Integration(IntegrationError::Stale)
+    );
     let prepared = prepare(&mut engine, &ticket, &mut owners);
     assert!(prepared.retained_leaf().is_none());
     publish(&mut engine, prepared, &mut owners);

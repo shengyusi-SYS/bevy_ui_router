@@ -31,6 +31,7 @@ struct FixtureOptions {
     initial: Vec2,
     fallback_fails: bool,
     camera: bool,
+    keep_alive_capacity: usize,
 }
 
 impl Default for FixtureOptions {
@@ -40,6 +41,7 @@ impl Default for FixtureOptions {
             initial: Vec2::ZERO,
             fallback_fails: false,
             camera: true,
+            keep_alive_capacity: 0,
         }
     }
 }
@@ -167,17 +169,22 @@ fn fixture(options: FixtureOptions) -> Fixture {
                 .route_with_options(
                     root,
                     RoutePattern::path(name).unwrap(),
-                    RouteNodeOptions::new().with_view(view),
+                    RouteNodeOptions::new()
+                        .with_view(view)
+                        .with_keep_alive(options.keep_alive_capacity > 0),
                 )
                 .unwrap();
         }
     }
     let router = app
-        .add_ui_router(RouterConfig::new(
-            routes.build().unwrap(),
-            views,
-            RouteViewKey::new("fallback").unwrap(),
-        ))
+        .add_ui_router(
+            RouterConfig::new(
+                routes.build().unwrap(),
+                views,
+                RouteViewKey::new("fallback").unwrap(),
+            )
+            .with_keep_alive_capacity(options.keep_alive_capacity),
+        )
         .unwrap();
     let host = app
         .world_mut()
@@ -268,7 +275,13 @@ fn settle_status(
             _ => {}
         }
     }
-    panic!("navigation must settle in a bounded number of normal updates")
+    panic!(
+        "navigation must settle in a bounded number of normal updates: {:?}; {:?}",
+        app.world()
+            .resource::<RouterSnapshots>()
+            .request(router, request),
+        app.world().resource::<RouterSnapshots>().get(router),
+    )
 }
 
 fn settle(app: &mut App, router: RouterHandle, request: NavigationRequestId) {
@@ -376,6 +389,87 @@ fn drive_availability(app: &mut App, router: RouterHandle, expected: RouterAvail
             .get(router)
             .unwrap()
     );
+}
+
+#[test]
+fn repeated_entries_restore_distinct_positions_on_cache_hits_misses_and_eviction() {
+    for capacity in [0, 1, 2] {
+        let Fixture {
+            mut app, router, ..
+        } = fixture(FixtureOptions {
+            keep_alive_capacity: capacity,
+            ..Default::default()
+        });
+        push(&mut app, router, "/a");
+        let original_a = page(&mut app, "a");
+        let prefix = container(&mut app, "prefix");
+        let secondary = container(&mut app, "secondary");
+        let first_body = Vec2::new(45.0, 70.0);
+        let first_secondary = Vec2::new(12.0, 30.0);
+        let first_prefix = Vec2::new(24.0, 32.0);
+        scroll(&mut app, original_a, first_body);
+        scroll(&mut app, secondary, first_secondary);
+        scroll(&mut app, prefix, first_prefix);
+
+        push(&mut app, router, "/b");
+        let original_b = page(&mut app, "b");
+        let b_position = Vec2::new(88.0, 150.0);
+        scroll(&mut app, original_b, b_position);
+        push(&mut app, router, "/a");
+        let shared_a = page(&mut app, "a");
+        if capacity > 0 {
+            assert_eq!(shared_a, original_a);
+            assert_position(&app, shared_a, first_body);
+        } else {
+            assert_ne!(shared_a, original_a);
+        }
+        let later_body = Vec2::new(210.0, 250.0);
+        let later_secondary = Vec2::new(80.0, 110.0);
+        let later_prefix = Vec2::new(44.0, 52.0);
+        let secondary = container(&mut app, "secondary");
+        scroll(&mut app, shared_a, later_body);
+        scroll(&mut app, secondary, later_secondary);
+        scroll(&mut app, prefix, later_prefix);
+        push(&mut app, router, "/c");
+        assert_eq!(history(&app, router).entries().len(), 4);
+        if capacity == 1 {
+            assert!(app.world().get_entity(original_b).is_err());
+        }
+
+        back(&mut app, router);
+        let returned_a = page(&mut app, "a");
+        let secondary = container(&mut app, "secondary");
+        assert_position(&app, returned_a, later_body);
+        assert_position(&app, secondary, later_secondary);
+        assert_position(&app, prefix, later_prefix);
+        if capacity > 0 {
+            assert_eq!(returned_a, shared_a);
+        } else {
+            assert_ne!(returned_a, shared_a);
+        }
+
+        back(&mut app, router);
+        let returned_b = page(&mut app, "b");
+        assert_position(&app, returned_b, b_position);
+        if capacity == 2 {
+            assert_eq!(returned_b, original_b);
+        } else {
+            assert_ne!(returned_b, original_b);
+        }
+
+        back(&mut app, router);
+        let first_entry_a = page(&mut app, "a");
+        let secondary = container(&mut app, "secondary");
+        assert_position(&app, first_entry_a, first_body);
+        assert_position(&app, secondary, first_secondary);
+        assert_position(&app, prefix, first_prefix);
+        assert_eq!(history(&app, router).cursor(), Some(0));
+        if capacity > 0 {
+            assert_eq!(first_entry_a, shared_a);
+        } else {
+            assert_ne!(first_entry_a, returned_a);
+        }
+    }
 }
 
 #[test]

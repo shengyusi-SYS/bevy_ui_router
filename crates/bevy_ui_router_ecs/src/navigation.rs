@@ -5466,6 +5466,7 @@ enum AuthorityProtocolResidualKind {
     #[cfg(feature = "bsn")]
     NativeCleanup(crate::presentation::native_frame::NativeCleanupPreparationError),
     Authority(BeginAuthoritySettlementErrorKind),
+    RetainedPublication(r3_core::RetainedPublicationError),
     AuthorityIsolation(AuthorityIsolationContradiction),
     CleanupLedger(CleanupLedgerReserveErrorKind),
     AuthorityTrigger(FailedAuthorityTriggerError),
@@ -13614,10 +13615,25 @@ fn route_back_target_applied_report(
                 BackTargetPhysicalOwnerRef::CommitTicket(&owner.ticket),
             ) {
                 BackTargetExecutionPairingOutcome::Matched => {
-                    entry.pending_back_target_execution =
-                        Some(PendingBackTargetExecution::ResumeBlocked(
-                            PendingBackTargetResumeBlocked::AppliedCommitPending(owner),
-                        ));
+                    if entry.engine.keep_alive_capacity() > 0 {
+                        // Fresh Back still reports through its original paired
+                        // driver. Retention uses the same publication partition
+                        // as a cache hit, with this continuation kept intact.
+                        let PendingBackTargetAppliedCommit {
+                            driving,
+                            ticket,
+                            mut pending,
+                        } = owner;
+                        pending.ticket = Some(ticket);
+                        entry.pending_commit = Some(pending);
+                        entry.pending_back_target_execution =
+                            Some(PendingBackTargetExecution::Driving(driving));
+                    } else {
+                        entry.pending_back_target_execution =
+                            Some(PendingBackTargetExecution::ResumeBlocked(
+                                PendingBackTargetResumeBlocked::AppliedCommitPending(owner),
+                            ));
+                    }
                 }
                 BackTargetExecutionPairingOutcome::Mismatch(mismatch) => {
                     entry.pending_back_target_execution =
@@ -14792,6 +14808,15 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
     let Some(mut pending) = entry.pending_commit.take() else {
         return true;
     };
+    if entry.engine.keep_alive_capacity() > 0
+        && (pending.retained_hit.is_some() || pending.ticket.is_some())
+    {
+        // A hit has no fresh branch to bind. A fresh Back may retain its
+        // departing leaf too. Both use the ordinary retention publisher, which
+        // accepts this original Back execution together with its owners.
+        entry.pending_commit = Some(pending);
+        return false;
+    }
     if pending.ticket.is_some() {
         let Some(PendingBackTargetExecution::Driving(driving)) =
             entry.pending_back_target_execution.take()
@@ -15618,6 +15643,21 @@ fn prepare_commit_entry(
                 let (active, _, _) = sealed.reject().into_parts();
                 entry.active = had_active.then_some(active);
                 let task = pending.final_task.take()?;
+                let (pending, task) = match route_back_target_frame_failure(
+                    world,
+                    entry,
+                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
+                    task,
+                    ViewFailureKind::Apply,
+                    "retained entering preparation rejected",
+                ) {
+                    RouteBackTargetFrameFailureOutcome::Handled => return None,
+                    RouteBackTargetFrameFailureOutcome::NonTarget {
+                        physical: BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
+                        task,
+                    } => (pending, task),
+                    RouteBackTargetFrameFailureOutcome::NonTarget { .. } => unreachable!(),
+                };
                 entry.pending_failed_branch = Some(PendingFailedBranch {
                     terminal: PendingFailedBranchTerminal::Task {
                         task,

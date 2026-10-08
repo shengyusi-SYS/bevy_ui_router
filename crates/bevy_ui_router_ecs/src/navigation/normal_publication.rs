@@ -146,13 +146,63 @@ pub(super) fn publish_normal_work(
                     }
                     match rejected {
                         ReconciliationPreflightDecision::Ready(_) => unreachable!(),
-                        ReconciliationPreflightDecision::PendingRejected(_) => {
+                        ReconciliationPreflightDecision::PendingRejected(evidence) => {
+                            if matches!(
+                                entry.pending_back_target_execution,
+                                Some(PendingBackTargetExecution::Driving(_))
+                            ) && pending.ticket.is_some()
+                            {
+                                // Preserve the actual rejected splice and the
+                                // original ticket/continuation. Reclassifying a
+                                // fresh branch later could change the decision.
+                                let NormalPublicationSplice::Fresh(splice) = splice else {
+                                    unreachable!("a retained hit still owns its task")
+                                };
+                                let Some(PendingBackTargetExecution::Driving(driving)) =
+                                    entry.pending_back_target_execution.take()
+                                else {
+                                    unreachable!()
+                                };
+                                entry.pending_commit = Some(pending);
+                                entry.pending_back_target_execution = Some(
+                                    PendingBackTargetExecution::Classifying(
+                                        PendingBackTargetClassification::PendingRejectedUnaccepted {
+                                            owner: TargetPreparationOwner {
+                                                splice,
+                                                history: driving.history,
+                                                continuation: driving.continuation,
+                                            },
+                                            evidence,
+                                        },
+                                    ),
+                                );
+                                drive_back_target_pending_rejected(entry);
+                                return;
+                            }
                             let (active, entering, _roles) = splice.reject().into_parts();
                             entry.active = had_active.then_some(active);
                             pending.branch = entering;
                             let Some(task) = pending.final_task.take() else {
                                 entry.pending_commit = Some(pending);
                                 return;
+                            };
+                            let (pending, task) = match route_back_target_frame_failure(
+                                world,
+                                entry,
+                                BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
+                                task,
+                                ViewFailureKind::Apply,
+                                "frame final preflight rejected",
+                            ) {
+                                RouteBackTargetFrameFailureOutcome::Handled => return,
+                                RouteBackTargetFrameFailureOutcome::NonTarget {
+                                    physical:
+                                        BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
+                                    task,
+                                } => (pending, task),
+                                RouteBackTargetFrameFailureOutcome::NonTarget { .. } => {
+                                    unreachable!()
+                                }
                             };
                             let terminal = if pending.retained_hit.is_some() {
                                 PendingFailedBranchTerminal::Task {
@@ -497,6 +547,7 @@ pub(super) fn publish_normal_work(
     let mut splice_owner = Some(splice);
     let mut cleanup_reserve_contradiction = None;
     let mut commit_authority_contradiction = None;
+    let mut retained_publication_contradiction = None;
     let mut rejected_retained_publication = None;
     let committed = (|| {
         let (frozen_manifest, registry_plan, resulting_claims) = cleanup_preparation?;
@@ -635,10 +686,18 @@ pub(super) fn publish_normal_work(
             let owners = retained_change.as_mut()?.take_owners(&mut entry.retained);
             let manifest =
                 CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
-            match entry
-                .engine
-                .prepare_retained_hit_commit(task, *plan, manifest, owners)
-            {
+            match entry.engine.prepare_retained_hit_commit(
+                task,
+                *plan,
+                manifest,
+                owners,
+                match entry.pending_back_target_execution.as_ref() {
+                    Some(PendingBackTargetExecution::Driving(driving)) => {
+                        Some((&driving.history, &driving.continuation))
+                    }
+                    _ => None,
+                },
+            ) {
                 Ok(prepared) => crate::retained::PreparedPublication::Retained(prepared),
                 Err(error) => {
                     let (task, plan, _manifest, owners, error) = error.into_parts();
@@ -648,12 +707,7 @@ pub(super) fn publish_normal_work(
                         entry.retained.restore_owners(owners).is_ok(),
                         "hit preparation returns the complete original capabilities"
                     );
-                    commit_authority_contradiction =
-                        Some(if error == IntegrationError::InvalidManifest {
-                            BeginAuthoritySettlementErrorKind::InvalidManifest
-                        } else {
-                            BeginAuthoritySettlementErrorKind::Stale
-                        });
+                    retained_publication_contradiction = Some(error);
                     return None;
                 }
             }
@@ -666,6 +720,12 @@ pub(super) fn publish_normal_work(
                 plan,
                 manifest,
                 owners,
+                match entry.pending_back_target_execution.as_ref() {
+                    Some(PendingBackTargetExecution::Driving(driving)) => {
+                        Some((&driving.history, &driving.continuation))
+                    }
+                    _ => None,
+                },
             ) {
                 Ok(prepared) => crate::retained::PreparedPublication::Retained(prepared),
                 Err(error) => {
@@ -674,12 +734,7 @@ pub(super) fn publish_normal_work(
                         entry.retained.restore_owners(owners).is_ok(),
                         "original owners return to their untouched holders"
                     );
-                    commit_authority_contradiction =
-                        Some(if error == IntegrationError::InvalidManifest {
-                            BeginAuthoritySettlementErrorKind::InvalidManifest
-                        } else {
-                            BeginAuthoritySettlementErrorKind::Stale
-                        });
+                    retained_publication_contradiction = Some(error);
                     return None;
                 }
             }
@@ -709,7 +764,28 @@ pub(super) fn publish_normal_work(
                 }
             }
         };
-        let engine = match prepared.validate(&mut entry.engine) {
+        let back = entry.pending_back_target_execution.take();
+        let validated = match back {
+            Some(PendingBackTargetExecution::Driving(driving)) => {
+                match prepared.validate_for_back(&mut entry.engine, driving.continuation) {
+                    Ok(validated) => Ok(validated),
+                    Err((prepared, continuation, error)) => {
+                        entry.pending_back_target_execution = Some(
+                            PendingBackTargetExecution::Driving(PendingBackTargetDriving {
+                                history: driving.history,
+                                continuation,
+                            }),
+                        );
+                        rejected_retained_publication = Some(prepared);
+                        retained_publication_contradiction = Some(error);
+                        return None;
+                    }
+                }
+            }
+            None => prepared.validate(&mut entry.engine),
+            Some(_) => unreachable!("only an original Driving Back reaches retention publication"),
+        };
+        let engine = match validated {
             Ok(validated) => validated,
             Err((returned, error)) => {
                 rejected_retained_publication = returned;
@@ -847,6 +923,19 @@ pub(super) fn publish_normal_work(
                     .expect("failed commit retains its sealed splice owner");
                 let (active, entering, _roles) = splice.reject().into_parts();
                 pending.branch = entering;
+                if let Some(error) = retained_publication_contradiction {
+                    if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+                        world,
+                        entry,
+                        active,
+                        pending,
+                        AuthorityProtocolResidualKind::RetainedPublication(error),
+                    ) {
+                        entry.active = had_active.then_some(active);
+                        entry.pending_commit = Some(pending);
+                    }
+                    return;
+                }
                 if let Some(kind) = commit_authority_contradiction {
                     if let Err((active, pending)) = fail_closed_normal_owner_protocol(
                         world,

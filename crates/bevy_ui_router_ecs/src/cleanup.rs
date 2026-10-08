@@ -7925,6 +7925,46 @@ pub(crate) struct PreparedCleanupLedger {
     ledger_domain: u64,
 }
 
+/// A passive first removal. It has reserved physical storage, but no Core
+/// cleanup batch and no physical owner until the original transfer is accepted.
+pub(crate) struct PreparedRetainedInvalidationRemoval {
+    ledger: CleanupLedger,
+    step: PreparedRetainedInvalidationRemovalStep,
+}
+
+pub(crate) struct PreparedRetainedInvalidationRemovalStep {
+    attempt: CleanupAttempt,
+    removal: PreparedCleanupRemovalPlan,
+    focus: Vec<Entity>,
+    mount_parent_exchanges: Vec<(ExactRegistryClaim, ComponentManifest, ComponentManifest)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedInvalidationRemovalPreparationError {
+    RetryableCapacity,
+    InvalidSource,
+}
+
+impl RetainedInvalidationRemovalPreparationError {
+    pub(crate) const fn is_retryable(&self) -> bool {
+        matches!(self, Self::RetryableCapacity)
+    }
+}
+
+impl PreparedRetainedInvalidationRemoval {
+    /// The caller moves the same selected branch after Core accepts its owner.
+    /// All source checks and removal capacity were prepared before that handoff.
+    pub(crate) fn activate(
+        mut self,
+        batch: CleanupBatch,
+        branch: RealizedBranch,
+    ) -> (CleanupLedger, PreparedRetainedInvalidationRemovalStep) {
+        self.ledger.batch = Some(batch);
+        self.ledger.owner = Some(CleanupOwner::Leaving(LeavingPayload::from_branch(branch)));
+        (self.ledger, self.step)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedCleanupLedgerProjection {
     ledger_domain: u64,
@@ -7987,6 +8027,147 @@ impl PreparedCleanupLedger {
     pub(crate) fn bind_batch(mut self, batch: CleanupBatch) -> Self {
         self.batch = Some(batch);
         self
+    }
+
+    /// Prepares the complete first removal while the selected cache still owns
+    /// its capability and payload. Only its original shell may remain present.
+    pub(crate) fn prepare_retained_invalidation_removal(
+        self,
+        world: &World,
+        branch: &RealizedBranch,
+    ) -> Result<PreparedRetainedInvalidationRemoval, RetainedInvalidationRemovalPreparationError>
+    {
+        use RetainedInvalidationRemovalPreparationError::{InvalidSource, RetryableCapacity};
+        let [frame] = branch.frames() else {
+            return Err(InvalidSource);
+        };
+        let Some(root) = frame.native_root() else {
+            return Err(InvalidSource);
+        };
+        let root_claim = frame.claims().find(|claim| claim.entity() == root);
+        let shell_claim = frame.claims().find(|claim| claim.entity() == frame.shell());
+        if self.batch.is_some()
+            || self.failure_cleanup_partition.is_some()
+            || self.related_protected.is_none()
+            || self.obligations.is_empty()
+            || self.receipts.len() != self.obligations.len()
+            || self.receipts.iter().any(Option::is_some)
+            || root_claim.is_none_or(|claim| {
+                claim.owner()
+                    != &RegistryOwner::Committed(EntityOwner::FrameContentTarget(
+                        frame.frame().clone(),
+                    ))
+            })
+            || shell_claim.is_none_or(|claim| {
+                claim.owner()
+                    != &RegistryOwner::Committed(EntityOwner::FrameShell(frame.frame().clone()))
+            })
+            || branch.claims().any(|claim| {
+                claim.lifecycle() != EntityLifecycle::Retained
+                    || self
+                        .obligations
+                        .iter()
+                        .filter(|obligation| obligation.identity.registered() == Some(claim))
+                        .count()
+                        != 1
+            })
+            || branch
+                .child_slots()
+                .iter()
+                .any(|slot| slot.parent() != frame.frame())
+            || self.obligations.iter().any(|obligation| {
+                obligation.terminal_mode != CleanupTerminalMode::Normal
+                    || match &obligation.identity {
+                        CleanupTargetIdentity::Registered(claim) => {
+                            branch.claims().filter(|source| *source == claim).count() != 1
+                        }
+                        CleanupTargetIdentity::ContainedContent { root, shell, .. } => {
+                            Some(root) != root_claim || Some(shell) != shell_claim
+                        }
+                    }
+            })
+        {
+            return Err(InvalidSource);
+        }
+
+        // This is still reserved storage, not an owner. Reuse its real domain
+        // and first attempt so every prepared receipt survives activation intact.
+        let mut ledger = CleanupLedger::activate_owner(self, None);
+        let attempt = ledger.attempt(world).ok_or(InvalidSource)?;
+        if !attempt.mount_parents_exact
+            || !ledger.related_protected_is_current(world)
+            || !observed_children(world, frame.shell()).is_empty()
+            || !attempt.evidence.iter().any(|(index, evidence)| {
+                ledger.obligations[*index].entity() == root
+                    && matches!(evidence, CleanupEvidence::AlreadyAbsent)
+            })
+            || attempt
+                .evidence
+                .iter()
+                .filter(|(_, evidence)| matches!(evidence, CleanupEvidence::Exact { .. }))
+                .count()
+                != 1
+            || attempt
+                .evidence
+                .iter()
+                .any(|(index, evidence)| match evidence {
+                    CleanupEvidence::AlreadyAbsent => false,
+                    CleanupEvidence::Exact { actual_parent, .. } => {
+                        ledger.obligations[*index].entity() != frame.shell()
+                            || *actual_parent != Some(ledger.obligations[*index].expected_parent)
+                    }
+                    _ => true,
+                })
+        {
+            return Err(InvalidSource);
+        }
+        let focus = ledger.focus_closure_for_attempt(
+            world,
+            quarantine_focus_closure(world, &attempt.evidence, &ledger.obligations),
+        );
+        let mut mount_parent_exchanges = ledger
+            .prepare_mount_parent_exchanges(world)
+            .ok_or(InvalidSource)?;
+        let children = world
+            .components()
+            .component_id::<Children>()
+            .ok_or(InvalidSource)?;
+        for (claim, _, next) in &mut mount_parent_exchanges {
+            let parent = ledger
+                .mount_parents
+                .iter()
+                .find(|parent| parent.bookkeeping_claim() == Some(&*claim))
+                .ok_or(InvalidSource)?;
+            *next = relationship_manifest_after(next, children, !parent.children_after.is_empty());
+        }
+        let mut removal =
+            PreparedCleanupRemovalPlan::prepare_with_failure_kind(world, &ledger, &attempt, &focus)
+                .map_err(|error| match error {
+                    CleanupRemovalPreparationError::Capacity => RetryableCapacity,
+                    CleanupRemovalPreparationError::InvalidSource => InvalidSource,
+                })?;
+        // Settle every absent original member before the sole physical write.
+        // A shell observer can then stop on protected drift only after all
+        // original target receipts have been committed.
+        let targets = &removal.targets;
+        removal
+            .order
+            .sort_unstable_by_key(|row| (!targets[*row].absent, targets[*row].entity.to_bits()));
+        if !removal.targets_are_current(world, &ledger)
+            || !ledger.mount_parents_physical_match(world)
+            || !removal.current_focus_targets(world).is_empty()
+        {
+            return Err(InvalidSource);
+        }
+        Ok(PreparedRetainedInvalidationRemoval {
+            ledger,
+            step: PreparedRetainedInvalidationRemovalStep {
+                attempt,
+                removal,
+                focus,
+                mount_parent_exchanges,
+            },
+        })
     }
 
     pub(crate) fn bind_failure_cleanup_partition(
@@ -9442,6 +9623,11 @@ struct PreparedCleanupRemovalTarget {
     receipt: Option<PreparedCleanupReceiptBatch>,
 }
 
+enum CleanupRemovalPreparationError {
+    Capacity,
+    InvalidSource,
+}
+
 impl PreparedCleanupRemovalPlan {
     fn prepare(
         world: &World,
@@ -9449,10 +9635,24 @@ impl PreparedCleanupRemovalPlan {
         attempt: &CleanupAttempt,
         focus: &[Entity],
     ) -> Option<Self> {
+        Self::prepare_with_failure_kind(world, ledger, attempt, focus).ok()
+    }
+
+    fn prepare_with_failure_kind(
+        world: &World,
+        ledger: &CleanupLedger,
+        attempt: &CleanupAttempt,
+        focus: &[Entity],
+    ) -> Result<Self, CleanupRemovalPreparationError> {
+        use CleanupRemovalPreparationError::{Capacity, InvalidSource};
         let mut targets = Vec::new();
-        targets.try_reserve_exact(attempt.evidence.len()).ok()?;
+        targets
+            .try_reserve_exact(attempt.evidence.len())
+            .map_err(|_| Capacity)?;
         let mut entities = HashMap::new();
-        entities.try_reserve(attempt.evidence.len()).ok()?;
+        entities
+            .try_reserve(attempt.evidence.len())
+            .map_err(|_| Capacity)?;
         let mut sources: Vec<(ExactRegistryClaim, ExactRegistryClaim, Vec<usize>)> = Vec::new();
         for (index, evidence) in &attempt.evidence {
             let obligation = &ledger.obligations[*index];
@@ -9477,11 +9677,11 @@ impl PreparedCleanupRemovalPlan {
                         CleanupDisposition::RemovedDetached
                     },
                 ),
-                _ => return None,
+                _ => return Err(InvalidSource),
             };
             let row = targets.len();
             if entities.insert(obligation.entity(), row).is_some() {
-                return None;
+                return Err(InvalidSource);
             }
             if let CleanupTargetIdentity::ContainedContent { root, shell, .. } =
                 &obligation.identity
@@ -9494,16 +9694,18 @@ impl PreparedCleanupRemovalPlan {
                     sources.push((root.clone(), shell.clone(), vec![row]));
                 }
             }
-            let receipt = ledger.prepare_receipt_batch(
-                attempt,
-                vec![CleanupReceipt::new(
-                    ledger.ledger_domain,
-                    attempt.revision,
-                    *index,
-                    disposition,
-                    obligation,
-                )],
-            )?;
+            let receipt = ledger
+                .prepare_receipt_batch(
+                    attempt,
+                    vec![CleanupReceipt::new(
+                        ledger.ledger_domain,
+                        attempt.revision,
+                        *index,
+                        disposition,
+                        obligation,
+                    )],
+                )
+                .ok_or(InvalidSource)?;
             targets.push(PreparedCleanupRemovalTarget {
                 index: *index,
                 entity: obligation.entity(),
@@ -9526,19 +9728,21 @@ impl PreparedCleanupRemovalPlan {
                 .iter()
                 .any(|child| entities.get(child).is_none_or(|row| targets[*row].absent))
         }) {
-            return None;
+            return Err(InvalidSource);
         }
         // Accepted roles exclude foreign descendants. Use actual direct edges,
         // not the original expected-parent ordering, for non-recursive removal.
         let mut depths = Vec::new();
-        depths.try_reserve_exact(targets.len()).ok()?;
+        depths
+            .try_reserve_exact(targets.len())
+            .map_err(|_| Capacity)?;
         for (row, target) in targets.iter().enumerate() {
             let mut parent = target.parent;
             let mut depth = 0usize;
             while let Some(next) = parent.and_then(|entity| entities.get(&entity).copied()) {
                 depth += 1;
                 if depth > targets.len() {
-                    return None;
+                    return Err(InvalidSource);
                 }
                 parent = targets[next].parent;
             }
@@ -9561,7 +9765,7 @@ impl PreparedCleanupRemovalPlan {
                 }
             })
             .collect();
-        Some(Self {
+        Ok(Self {
             targets,
             entities,
             order,
@@ -12216,6 +12420,65 @@ impl CleanupLedger {
         self.settle_with_failure_source(world, attempt, None, None)
     }
 
+    /// Executes the first removal prepared before the original cache transfer.
+    /// There is no capacity retry or new attempt after Core accepts that owner.
+    pub(crate) fn settle_prepared_retained_invalidation(
+        &mut self,
+        world: &mut World,
+        step: PreparedRetainedInvalidationRemovalStep,
+    ) -> bool {
+        let PreparedRetainedInvalidationRemovalStep {
+            attempt,
+            removal,
+            focus,
+            mount_parent_exchanges,
+        } = step;
+        if self.issued_attempt.as_ref() != Some(&attempt)
+            || attempt.ledger_domain != self.ledger_domain
+            || attempt.manifest_digest != self.manifest_digest
+            || attempt.unsettled_digest
+                != unsettled_digest(self.manifest_digest, &self.obligations, &self.receipts)
+        {
+            return false;
+        }
+        if self.cleanup_settlement_permanent_pending.is_some() {
+            self.retain_cleanup_settlement_permanent_evidence(world);
+            self.issued_attempt = None;
+            return false;
+        }
+        if self.back_no_target_authority_partition.is_some()
+            && !self.back_no_target_authority_partition_is_current(world)
+        {
+            self.issued_attempt = None;
+            return false;
+        }
+        if !self.prepare_related_protected(world) {
+            self.issued_attempt = None;
+            return false;
+        }
+        if !self.related_protected_is_current(world) {
+            self.retain_related_protected_drift(world);
+            self.issued_attempt = None;
+            return false;
+        }
+        let current_evidence = collect_evidence(world, &self.obligations, &self.receipts);
+        if current_evidence != attempt.evidence
+            || current_evidence
+                .iter()
+                .any(|(_, evidence)| matches!(evidence, CleanupEvidence::StaleClaim))
+        {
+            self.issued_attempt = None;
+            return false;
+        }
+        if !attempt.mount_parents_exact || !self.mount_parents_physical_match(world) {
+            self.retain_cleanup_settlement_permanent_evidence(world);
+            self.issued_attempt = None;
+            return false;
+        }
+        release_cleanup_focus(world, &self.current_focus_closure(world, &focus));
+        self.settle_prepared_removal(world, removal, Some(mount_parent_exchanges))
+    }
+
     pub(crate) fn settle_failure_cleanup(
         &mut self,
         world: &mut World,
@@ -12426,12 +12689,22 @@ impl CleanupLedger {
             return false;
         }
 
-        let Some(mut plan) =
-            PreparedCleanupRemovalPlan::prepare(world, self, &attempt, &focus_closure)
+        let Some(plan) = PreparedCleanupRemovalPlan::prepare(world, self, &attempt, &focus_closure)
         else {
             self.issued_attempt = None;
             return false;
         };
+        self.settle_prepared_removal(world, plan, None)
+    }
+
+    fn settle_prepared_removal(
+        &mut self,
+        world: &mut World,
+        mut plan: PreparedCleanupRemovalPlan,
+        mount_parent_exchanges: Option<
+            Vec<(ExactRegistryClaim, ComponentManifest, ComponentManifest)>,
+        >,
+    ) -> bool {
         if !self.related_protected_is_current(world) {
             self.retain_related_protected_drift(world);
             self.issued_attempt = None;
@@ -12489,9 +12762,15 @@ impl CleanupLedger {
                 return false;
             }
         }
-        if self.mount_parent_settlement_required() && !self.settle_mount_parents(world) {
-            self.issued_attempt = None;
-            return false;
+        if self.mount_parent_settlement_required() {
+            let settled = match mount_parent_exchanges {
+                Some(exchanges) => self.settle_prepared_mount_parent_exchanges(world, &exchanges),
+                None => self.settle_mount_parents(world),
+            };
+            if !settled {
+                self.issued_attempt = None;
+                return false;
+            }
         }
         if !plan.current_focus_targets(world).is_empty() {
             self.issued_attempt = None;
@@ -13669,9 +13948,17 @@ impl CleanupLedger {
         let Some(exchanges) = self.prepare_mount_parent_exchanges(world) else {
             return false;
         };
+        self.settle_prepared_mount_parent_exchanges(world, &exchanges)
+    }
+
+    fn settle_prepared_mount_parent_exchanges(
+        &self,
+        world: &mut World,
+        exchanges: &[(ExactRegistryClaim, ComponentManifest, ComponentManifest)],
+    ) -> bool {
         if !world
             .resource_mut::<RouteEntityRegistry>()
-            .compare_exchange_manifests_exact(&exchanges)
+            .compare_exchange_manifests_exact(exchanges)
         {
             return false;
         }

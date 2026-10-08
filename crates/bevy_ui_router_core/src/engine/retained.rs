@@ -1005,6 +1005,9 @@ impl RouterEngine {
         {
             return Err((task, owners, CommitError::InvalidManifest));
         }
+        if self.completed_cleanup.try_reserve(1).is_err() {
+            return Err((task, owners, CommitError::Stale));
+        }
         let batch = match self.ids.reserve_cleanup_batch() {
             Ok(batch) => batch,
             Err(_) => return Err((task, owners, CommitError::Stale)),
@@ -1101,9 +1104,6 @@ impl RouterEngine {
         if !completion.matches(&owner.cleanup) {
             let error = self.cleanup_completion_mismatch(&completion);
             return Err((owner, completion, physical, error));
-        }
-        if self.completed_cleanup.try_reserve(1).is_err() {
-            return Err((owner, completion, physical, CleanupError::Stale));
         }
         let mut record = self.records[index].clone();
         if record
@@ -1427,6 +1427,47 @@ impl RouterEngine {
             retiring,
         });
         cleanup
+    }
+
+    // The history capability moved into the sealed publication. Inspect that
+    // original owner rather than the now-empty current_history_capability slot.
+    pub(crate) fn inspect_retained_back_publication(
+        &self,
+        prepared: &PreparedPublication,
+        scope: &BackResolutionScopeProjection,
+        execution: &HistoryExecutionBindingProjection,
+    ) -> Result<(), CorePreparationReceiverMismatchProjection> {
+        let current = self.current.as_ref();
+        let observed = CoreBackTargetContinuationObservedProjection {
+            scope: self.back_target_engine_scope_projection(),
+            history: self
+                .prepared_publication_authority
+                .as_ref()
+                .and_then(|authority| authority.owner().evidence.history_execution.clone()),
+            current: current.map(|current| current.identity.clone()),
+            action: Self::back_target_action_projection(self.action.as_ref()),
+            stage: Self::back_target_stage_projection(current),
+        };
+        if scope.matches_engine_scope(
+            observed.scope.world,
+            observed.scope.router,
+            observed.scope.history,
+        ) && scope.matches_execution(execution)
+            && prepared.evidence.history_execution.as_ref() == Some(execution)
+            && observed.history.as_ref() == Some(execution)
+            && observed.current.as_ref() == Some(&prepared.evidence.identity)
+            && observed.action == CoreBackTargetReceiverActionProjection::Missing
+        {
+            Ok(())
+        } else {
+            Err(CorePreparationReceiverMismatchProjection::Continuation {
+                expected: CoreBackTargetContinuationExpectedProjection {
+                    scope: scope.clone(),
+                    commit: Some(prepared.evidence.identity.clone()),
+                },
+                observed,
+            })
+        }
     }
 
     pub(crate) fn validate_retained_publication(

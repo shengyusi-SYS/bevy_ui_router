@@ -4156,13 +4156,20 @@ impl<Physical> std::fmt::Debug for RetainedMissCleanupCompletionError<Physical> 
     }
 }
 
+/// A publication rejection preserves the original Back receiver evidence.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RetainedPublicationError {
+    Integration(IntegrationError),
+    BackTargetMismatch(PreparationReceiverMismatchView),
+}
+
 /// A rejected hit returns the original task and every original cache owner.
 pub struct RetainedHitPreparationError {
     task: FrameTask,
     plan: RetainedHitPlan,
     manifest: CleanupManifest,
     owners: Vec<RetainedLeafOwner>,
-    error: IntegrationError,
+    error: RetainedPublicationError,
 }
 
 impl std::fmt::Debug for RetainedHitPreparationError {
@@ -4187,7 +4194,7 @@ impl RetainedHitPreparationError {
         RetainedHitPlan,
         CleanupManifest,
         Vec<RetainedLeafOwner>,
-        IntegrationError,
+        RetainedPublicationError,
     ) {
         (self.task, self.plan, self.manifest, self.owners, self.error)
     }
@@ -4198,7 +4205,7 @@ pub struct RetainedCommitPreparationError {
     plan: RetainedCommitPlan,
     manifest: CleanupManifest,
     owners: Vec<RetainedLeafOwner>,
-    error: IntegrationError,
+    error: RetainedPublicationError,
 }
 
 impl std::fmt::Debug for RetainedCommitPreparationError {
@@ -4220,7 +4227,7 @@ impl RetainedCommitPreparationError {
         RetainedCommitPlan,
         CleanupManifest,
         Vec<RetainedLeafOwner>,
-        IntegrationError,
+        RetainedPublicationError,
     ) {
         (self.plan, self.manifest, self.owners, self.error)
     }
@@ -4231,6 +4238,10 @@ pub struct PreparedRetainedCommit {
     publication: PreparedPublication,
     cleanup: CleanupBatch,
     retained: Option<RetainedLeafProjection>,
+    back_target: Option<(
+        BackResolutionScopeProjection,
+        HistoryExecutionBindingProjection,
+    )>,
 }
 
 impl std::fmt::Debug for PreparedRetainedCommit {
@@ -4260,6 +4271,7 @@ impl PreparedRetainedCommit {
 pub struct ValidatedRetainedCommit<'a> {
     publication: crate::engine::retained::ValidatedRetainedPublication<'a>,
     cleanup: CleanupBatch,
+    back_target_continuation: Option<LifecycleContinuationCapacity>,
 }
 
 impl ValidatedRetainedCommit<'_> {
@@ -4273,7 +4285,14 @@ impl ValidatedRetainedCommit<'_> {
     where
         F: FnOnce(Option<RetainedLeafOwner>),
     {
-        self.publication.publish(mutation);
+        let Self {
+            publication,
+            cleanup,
+            back_target_continuation,
+        } = self;
+        drop(cleanup);
+        publication.publish(mutation);
+        drop(back_target_continuation);
     }
 }
 
@@ -4348,6 +4367,7 @@ pub struct PreparationBoundaryScopeView {
 }
 
 #[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PreparationReceiverMismatchView {
     inner: CorePreparationReceiverMismatchProjection,
 }
@@ -8957,7 +8977,7 @@ impl RouterEngine {
                 plan,
                 manifest,
                 owners,
-                error: map_commit_error(error),
+                error: RetainedPublicationError::Integration(map_commit_error(error)),
             }),
         }
     }
@@ -9014,13 +9034,60 @@ impl RouterEngine {
         }
     }
 
+    fn prepare_retained_back_binding(
+        &self,
+        back: Option<(&HistoryExecutionBindingView, &LifecycleContinuationCapacity)>,
+        physical: CoreBackTargetPhysicalReceiverRef<'_>,
+    ) -> Result<
+        Option<(
+            BackResolutionScopeProjection,
+            HistoryExecutionBindingProjection,
+        )>,
+        RetainedPublicationError,
+    > {
+        let Some((history, continuation)) = back else {
+            return Ok(None);
+        };
+        self.inner
+            .inspect_back_target_execution_pairing(
+                &continuation.inner.scope,
+                &history.inner,
+                physical,
+            )
+            .map_err(|inner| {
+                RetainedPublicationError::BackTargetMismatch(PreparationReceiverMismatchView {
+                    inner,
+                })
+            })?;
+        Ok(Some((
+            continuation.inner.scope.clone(),
+            history.inner.clone(),
+        )))
+    }
+
     pub fn prepare_retained_hit_commit(
         &mut self,
         task: FrameTask,
         plan: RetainedHitPlan,
         manifest: CleanupManifest,
         owners: Vec<RetainedLeafOwner>,
+        back: Option<(&HistoryExecutionBindingView, &LifecycleContinuationCapacity)>,
     ) -> Result<PreparedRetainedCommit, RetainedHitPreparationError> {
+        let back_target = match self.prepare_retained_back_binding(
+            back,
+            CoreBackTargetPhysicalReceiverRef::FrameTask(&task.inner),
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return Err(RetainedHitPreparationError {
+                    task,
+                    plan,
+                    manifest,
+                    owners,
+                    error,
+                });
+            }
+        };
         let seal = CleanupManifestSeal::new(
             manifest.logical_roots.clone(),
             CleanupManifestDigest::from_opaque(manifest.manifest_digest),
@@ -9039,13 +9106,14 @@ impl RouterEngine {
                     obligation_count: manifest.obligation_count,
                 },
                 retained,
+                back_target,
             }),
             Err((task, owners, error)) => Err(RetainedHitPreparationError {
                 task: FrameTask { inner: task },
                 plan,
                 manifest,
                 owners,
-                error: map_commit_error(error),
+                error: RetainedPublicationError::Integration(map_commit_error(error)),
             }),
         }
     }
@@ -9056,7 +9124,22 @@ impl RouterEngine {
         plan: RetainedCommitPlan,
         manifest: CleanupManifest,
         owners: Vec<RetainedLeafOwner>,
+        back: Option<(&HistoryExecutionBindingView, &LifecycleContinuationCapacity)>,
     ) -> Result<PreparedRetainedCommit, RetainedCommitPreparationError> {
+        let back_target = match self.prepare_retained_back_binding(
+            back,
+            CoreBackTargetPhysicalReceiverRef::Commit(&ticket.inner),
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return Err(RetainedCommitPreparationError {
+                    plan,
+                    manifest,
+                    owners,
+                    error,
+                });
+            }
+        };
         let seal = CleanupManifestSeal::new(
             manifest.logical_roots.clone(),
             CleanupManifestDigest::from_opaque(manifest.manifest_digest),
@@ -9076,12 +9159,13 @@ impl RouterEngine {
                     obligation_count: manifest.obligation_count,
                 },
                 retained,
+                back_target,
             }),
             Err((owners, error)) => Err(RetainedCommitPreparationError {
                 plan,
                 manifest,
                 owners,
-                error: map_commit_error(error),
+                error: RetainedPublicationError::Integration(map_commit_error(error)),
             }),
         }
     }
@@ -9090,23 +9174,100 @@ impl RouterEngine {
         &mut self,
         prepared: PreparedRetainedCommit,
     ) -> Result<ValidatedRetainedCommit<'_>, (PreparedRetainedCommit, IntegrationError)> {
+        if prepared.back_target.is_some() || prepared.history_publication().restores_back() {
+            return Err((prepared, IntegrationError::Stale));
+        }
         let PreparedRetainedCommit {
             publication,
             cleanup,
             retained,
+            back_target,
         } = prepared;
         match self.inner.validate_retained_publication(publication) {
             Ok(publication) => Ok(ValidatedRetainedCommit {
                 publication,
                 cleanup,
+                back_target_continuation: None,
             }),
             Err((publication, error)) => Err((
                 PreparedRetainedCommit {
                     publication,
                     cleanup,
                     retained,
+                    back_target,
                 },
                 map_commit_error(error),
+            )),
+        }
+    }
+
+    /// Consumes the original Back continuation only after its sealed binding and
+    /// the retained publication owner both validate. Rejection returns both owners.
+    pub fn validate_retained_publication_for_back(
+        &mut self,
+        prepared: PreparedRetainedCommit,
+        continuation: LifecycleContinuationCapacity,
+    ) -> Result<
+        ValidatedRetainedCommit<'_>,
+        (
+            PreparedRetainedCommit,
+            LifecycleContinuationCapacity,
+            RetainedPublicationError,
+        ),
+    > {
+        let Some((scope, execution)) = prepared.back_target.as_ref() else {
+            return Err((
+                prepared,
+                continuation,
+                RetainedPublicationError::Integration(IntegrationError::Stale),
+            ));
+        };
+        if &continuation.inner.scope != scope {
+            let mismatch = PreparationReceiverMismatchView {
+                inner: CorePreparationReceiverMismatchProjection::Scope {
+                    expected: scope.clone(),
+                    observed: continuation.inner.scope.clone(),
+                },
+            };
+            return Err((
+                prepared,
+                continuation,
+                RetainedPublicationError::BackTargetMismatch(mismatch),
+            ));
+        }
+        if let Err(inner) =
+            self.inner
+                .inspect_retained_back_publication(&prepared.publication, scope, execution)
+        {
+            return Err((
+                prepared,
+                continuation,
+                RetainedPublicationError::BackTargetMismatch(PreparationReceiverMismatchView {
+                    inner,
+                }),
+            ));
+        }
+        let PreparedRetainedCommit {
+            publication,
+            cleanup,
+            retained,
+            back_target,
+        } = prepared;
+        match self.inner.validate_retained_publication(publication) {
+            Ok(publication) => Ok(ValidatedRetainedCommit {
+                publication,
+                cleanup,
+                back_target_continuation: Some(continuation),
+            }),
+            Err((publication, error)) => Err((
+                PreparedRetainedCommit {
+                    publication,
+                    cleanup,
+                    retained,
+                    back_target,
+                },
+                continuation,
+                RetainedPublicationError::Integration(map_commit_error(error)),
             )),
         }
     }
@@ -9119,6 +9280,7 @@ impl RouterEngine {
             publication,
             cleanup,
             retained,
+            back_target,
         } = prepared;
         self.inner
             .cancel_prepared_retained_publication_for_authority_settlement(publication)
@@ -9128,6 +9290,7 @@ impl RouterEngine {
                         publication,
                         cleanup,
                         retained,
+                        back_target,
                     },
                     map_commit_error(error),
                 )

@@ -10,6 +10,26 @@ pub(crate) enum PreparedPublication {
 }
 
 impl PreparedPublication {
+    pub(crate) fn validate_for_back(
+        self,
+        engine: &mut bevy_ui_router_core::integration::RouterEngine,
+        continuation: bevy_ui_router_core::integration::LifecycleContinuationCapacity,
+    ) -> Result<
+        ValidatedPublication<'_>,
+        (
+            bevy_ui_router_core::integration::PreparedRetainedCommit,
+            bevy_ui_router_core::integration::LifecycleContinuationCapacity,
+            bevy_ui_router_core::integration::RetainedPublicationError,
+        ),
+    > {
+        let Self::Retained(prepared) = self else {
+            unreachable!("retention-enabled Back uses a retained publication partition")
+        };
+        engine
+            .validate_retained_publication_for_back(prepared, continuation)
+            .map(ValidatedPublication::Retained)
+    }
+
     pub(crate) fn validate(
         self,
         engine: &mut bevy_ui_router_core::integration::RouterEngine,

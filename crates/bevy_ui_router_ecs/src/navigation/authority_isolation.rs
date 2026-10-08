@@ -489,6 +489,7 @@ fn begin_authority_settlement_from_source(
     let engine = &mut entry.engine;
     let cleanup_ledger = &mut entry.cleanup_ledger;
     let retained = &mut entry.retained;
+    let back_target = &mut entry.pending_back_target_execution;
     let manifest = CleanupManifest::new(logical_roots, manifest_digest, obligation_count);
     let result = world.resource_scope(
         |world, mut registry: bevy_ecs::change_detection::Mut<RouteEntityRegistry>| {
@@ -509,6 +510,10 @@ fn begin_authority_settlement_from_source(
                     host_children,
                     retained,
                 ));
+                // Core accepted retirement of this exact history authority.
+                // The original Back continuation cannot remain a driver after
+                // its active/pending/cache owners have entered settlement.
+                back_target.take();
             };
             if let Some(plan) = retained_plan {
                 engine
@@ -1573,13 +1578,11 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
     world: &mut World,
     entry: &mut RouterEntry,
     active: Option<RealizedBranch>,
-    mut pending: PendingCommit,
+    pending: PendingCommit,
     kind: AuthorityProtocolResidualKind,
     isolation: PreparedAuthorityIsolation,
     isolation_contradiction: Option<AuthorityIsolationContradiction>,
 ) -> Result<(), (Option<RealizedBranch>, PendingCommit)> {
-    pending.ticket.take();
-    pending.final_task.take();
     let (retired_host, lease) = match entry.host.take() {
         Some(host) => {
             let (retired, lease) = host.into_retired();
@@ -1588,7 +1591,7 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
         None => (None, None),
     };
     let mut residual = Some(AuthorityProtocolResidualOwner {
-        back_target: None,
+        back_target: entry.pending_back_target_execution.take().map(Box::new),
         kind,
         isolation_contradiction,
         active,
@@ -1605,6 +1608,12 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
         entry
             .engine
             .fail_closed_authority_protocol_retaining(lease, || {
+                let pending = residual
+                    .as_mut()
+                    .and_then(|owner| owner.pending.as_mut())
+                    .expect("the prepared normal residual owns its original pending inputs");
+                pending.ticket.take();
+                pending.final_task.take();
                 isolation.apply(world);
                 *protocol_residual = residual.take();
             })
@@ -1617,6 +1626,7 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
             (None, None) => {}
             _ => unreachable!("authority fail-closed returns the exact optional host lease"),
         }
+        entry.pending_back_target_execution = owner.back_target.take().map(|owner| *owner);
         return Err((
             owner.active.take(),
             owner

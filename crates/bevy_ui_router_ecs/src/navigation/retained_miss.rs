@@ -12,6 +12,7 @@ pub(super) struct Preparation {
 pub(super) struct Installed {
     owner: r3_core::RetainedMissCleanupOwner,
     ledger: CleanupLedger,
+    removal: Option<crate::cleanup::PreparedRetainedInvalidationRemovalStep>,
     pending: PendingCommit,
     boundaries: crate::registry::PreparedRetainedBoundaries,
 }
@@ -19,7 +20,9 @@ pub(super) struct Installed {
 pub(super) enum Rejection {
     PhysicalSource,
     Ledger(CleanupLedgerReserveErrorKind),
+    Removal(crate::cleanup::RetainedInvalidationRemovalPreparationError),
     Core(IntegrationError),
+    Publication(r3_core::RetainedPublicationError),
     #[cfg(feature = "bsn")]
     Native(crate::presentation::native_frame::NativeCleanupPreparationError),
     Receipt(IntegrationError),
@@ -145,6 +148,17 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
             return;
         }
     };
+    let prepared = match reserved.prepare_retained_invalidation_removal(world, branch) {
+        Ok(prepared) => prepared,
+        Err(error) if error.is_retryable() => {
+            entry.retained_miss_cleanup = Some(Box::new(RetainedMissCleanup::Preparing(source)));
+            return;
+        }
+        Err(error) => {
+            reject_preparation(entry, source, Rejection::Removal(error));
+            return;
+        }
+    };
     let owners = selection.take_owners(&mut entry.retained);
     let Preparation {
         task,
@@ -164,13 +178,11 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
                     .pop()
                     .expect("the selected original cache owns one payload");
                 assert!(payloads.is_empty());
-                let ledger = CleanupLedger::activate_leaving_branch(
-                    reserved.bind_batch(owner.cleanup().clone()),
-                    Some(branch),
-                );
+                let (ledger, removal) = prepared.activate(owner.cleanup().clone(), branch);
                 *destination = Some(Box::new(RetainedMissCleanup::Cleaning(Installed {
                     owner,
                     ledger,
+                    removal: Some(removal),
                     pending: pending
                         .take()
                         .expect("original fresh continuation moves once"),
@@ -190,7 +202,7 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
                 pending: pending.take().unwrap(),
                 evidence,
             },
-            evidence: Rejection::Core(error),
+            evidence: Rejection::Publication(error),
         }));
     }
 }
@@ -252,11 +264,10 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
         reject_cleanup(entry, installed, Rejection::Receipt(error));
         return true;
     }
-    if !installed.ledger.is_settled()
-        && !installed.ledger.is_stopped()
-        && let Some(attempt) = installed.ledger.attempt(world)
-    {
-        installed.ledger.settle(world, attempt);
+    if let Some(removal) = installed.removal.take() {
+        installed
+            .ledger
+            .settle_prepared_retained_invalidation(world, removal);
         if let Err(error) = observe_receipts(entry, &mut installed) {
             reject_cleanup(entry, installed, Rejection::Receipt(error));
             return true;
@@ -271,11 +282,7 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
             .finish_disposed_retained_invalidation(world);
     }
     if !installed.ledger.is_settled() {
-        if installed.ledger.is_stopped() {
-            reject_cleanup(entry, installed, Rejection::Settlement);
-        } else {
-            entry.retained_miss_cleanup = Some(Box::new(RetainedMissCleanup::Cleaning(installed)));
-        }
+        reject_cleanup(entry, installed, Rejection::Settlement);
         return true;
     }
     let completion = installed
@@ -289,6 +296,7 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
     let Installed {
         owner,
         ledger,
+        removal: _,
         pending,
         boundaries,
     } = installed;
@@ -313,6 +321,7 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
                 Installed {
                     owner,
                     ledger,
+                    removal: None,
                     pending,
                     boundaries,
                 },

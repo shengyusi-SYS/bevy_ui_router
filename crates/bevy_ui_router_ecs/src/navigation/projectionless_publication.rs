@@ -1147,6 +1147,7 @@ pub(super) fn publish_projectionless_work(
                     plan,
                     manifest,
                     owners,
+                    None,
                 )
                 .map(crate::retained::PreparedPublication::Retained)
                 .map_err(|error| {
@@ -1162,6 +1163,7 @@ pub(super) fn publish_projectionless_work(
                 .engine
                 .prepare_commit(pending.ticket.as_ref().unwrap(), manifest)
                 .map(crate::retained::PreparedPublication::Ordinary)
+                .map_err(r3_core::RetainedPublicationError::Integration)
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
