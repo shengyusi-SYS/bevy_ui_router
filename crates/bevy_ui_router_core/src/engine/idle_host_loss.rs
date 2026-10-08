@@ -226,7 +226,7 @@ impl RouterEngine {
         roots: &[RouteFrameVersion],
         manifest_digest: u64,
         obligation_count: usize,
-        mut owners: Vec<retained::RetainedLeafOwner>,
+        owners: Vec<retained::RetainedLeafOwner>,
         install: F,
     ) -> Result<
         (),
@@ -303,7 +303,6 @@ impl RouterEngine {
         source.state = recovering.clone();
         source.manifest_digest = manifest_digest;
         source.obligation_count = obligation_count;
-        owners.sort_by_key(|owner| owner.projection().id());
         let receiver = source.clone();
         let retired = match issuer.retire_current(lease) {
             Ok(retired) => retired,

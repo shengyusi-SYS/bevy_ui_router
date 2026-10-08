@@ -682,8 +682,7 @@ impl RouteEntityRegistry {
         );
         if let Some(addition) = addition {
             if boundaries.iter().any(|boundary| {
-                boundary.projection().id() == addition.projection().id()
-                    || boundary.projection().frame() == addition.projection().frame()
+                boundary.projection().frame() == addition.projection().frame()
                     || boundary.shell() == addition.shell()
             }) {
                 return Err(());

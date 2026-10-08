@@ -1,23 +1,12 @@
 //! Linear transfer of a normal leaf out of the foreground request.
+use super::instances::InstanceFacts;
 use super::*;
 use crate::fingerprint::RouteSegmentReuseKey;
 
-/// Opaque identity of one retained instance, scoped to its issuing Router.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RetainedLeafId {
-    router: RouterIdentity,
-    sequence: u64,
-}
-
-/// Read-only facts about a retained instance. A projection cannot recreate its owner.
+/// Read-only facts about an original instance. A projection cannot recreate its owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedLeafProjection {
-    id: RetainedLeafId,
-    frame: RouteFrameVersion,
-    parent: RouteFrameVersion,
-    outlet: RouteSlotKey,
-    slot: RouteSlotId,
-    host: HostVersion,
+    instance: InstanceFacts,
     segment_reuse_key: RouteSegmentReuseKey,
     view: RouteViewKey,
     location: RouteLocation,
@@ -25,23 +14,23 @@ pub struct RetainedLeafProjection {
 }
 
 impl RetainedLeafProjection {
-    pub const fn id(&self) -> RetainedLeafId {
-        self.id
+    pub(crate) fn compare_instance(&self, other: &Self) -> std::cmp::Ordering {
+        self.instance.compare_identity(&other.instance)
     }
     pub const fn frame(&self) -> &RouteFrameVersion {
-        &self.frame
+        &self.instance.frame
     }
     pub const fn parent(&self) -> &RouteFrameVersion {
-        &self.parent
+        &self.instance.parent
     }
     pub const fn outlet(&self) -> &RouteSlotKey {
-        &self.outlet
+        &self.instance.outlet
     }
     pub const fn slot(&self) -> RouteSlotId {
-        self.slot
+        self.instance.slot
     }
     pub const fn host(&self) -> &HostVersion {
-        &self.host
+        &self.instance.host
     }
     pub const fn segment_reuse_key(&self) -> &RouteSegmentReuseKey {
         &self.segment_reuse_key
@@ -87,7 +76,7 @@ impl std::fmt::Debug for RetainedMissCleanupOwner {
         formatter
             .debug_struct("RetainedMissCleanupOwner")
             .field("task", &self.task.identity())
-            .field("retained", &self.retained.projection().id())
+            .field("retained", self.retained.projection())
             .field("cleanup", &self.cleanup)
             .finish()
     }
@@ -235,8 +224,13 @@ pub(super) fn owner_projections_match<'owner, 'expected>(
     let mut observed = owners
         .map(RetainedLeafOwner::projection)
         .collect::<Vec<_>>();
-    observed.sort_by_key(|projection| projection.id());
-    observed.into_iter().eq(expected)
+    let mut expected = expected.collect::<Vec<_>>();
+    observed.sort_by(|left, right| left.compare_instance(right));
+    expected.sort_by(|left, right| left.compare_instance(right));
+    !observed
+        .windows(2)
+        .any(|pair| pair[0].compare_instance(pair[1]).is_eq())
+        && observed == expected
 }
 
 // Transit responsibility is independent of CurrentWork and survives discarded
@@ -315,7 +309,7 @@ impl RouterEngine {
             .rev()
             .cloned()
             .collect::<Vec<_>>();
-        logical_roots.extend(retiring.iter().map(|projection| projection.frame.clone()));
+        logical_roots.extend(retiring.iter().map(|projection| projection.frame().clone()));
         if logical_roots
             .iter()
             .enumerate()
@@ -692,9 +686,7 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
         let current = self.current.as_ref().ok_or(CommitError::Stale)?;
-        let mut plan = self.retained_commit_partition(current, None)?;
-        self.issue_retained_candidate(&mut plan)?;
-        Ok(plan)
+        self.retained_commit_partition(current, None)
     }
 
     fn retained_commit_partition(
@@ -776,7 +768,7 @@ impl RouterEngine {
             })
             .cloned()
             .collect::<Vec<_>>();
-        disposable_roots.extend(retiring.iter().map(|projection| projection.frame.clone()));
+        disposable_roots.extend(retiring.iter().map(|projection| projection.frame().clone()));
         if disposable_roots
             .iter()
             .enumerate()
@@ -790,21 +782,6 @@ impl RouterEngine {
             retiring,
             preserved,
         })
-    }
-
-    fn issue_retained_candidate(
-        &mut self,
-        plan: &mut RetainedCommitPlan,
-    ) -> Result<(), CommitError> {
-        if let Some(candidate) = &mut plan.retained {
-            let sequence = self.next_retained_instance;
-            self.next_retained_instance = sequence.checked_add(1).ok_or(CommitError::Stale)?;
-            candidate.id = RetainedLeafId {
-                router: self.router,
-                sequence,
-            };
-        }
-        Ok(())
     }
 
     pub(crate) fn prepare_retained_hit_plan(
@@ -844,8 +821,7 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
         let next = self.retained_hit_next(task, &hit)?;
-        let mut commit_plan = self.retained_commit_partition(&next, Some(&hit))?;
-        self.issue_retained_candidate(&mut commit_plan)?;
+        let commit_plan = self.retained_commit_partition(&next, Some(&hit))?;
         Ok(Some(RetainedHitPlan {
             hit,
             target_frames: next.target_frames,
@@ -920,12 +896,12 @@ impl RouterEngine {
         else {
             return false;
         };
-        hit.id.router == self.router
-            && hit.frame.origin() == &FrameOrigin::MatchedRoute(matched.route())
-            && &hit.parent == parent
-            && hit.outlet == *matched.slot()
-            && hit.slot == task.frame.slot()
-            && &hit.host == host
+        hit.frame().router_identity() == self.router
+            && hit.frame().origin() == &FrameOrigin::MatchedRoute(matched.route())
+            && hit.parent() == parent
+            && hit.outlet() == matched.slot()
+            && hit.slot() == task.frame.slot()
+            && hit.host() == host
             && hit.segment_reuse_key == *matched.segment_reuse_key()
             && hit.view == task.view
             && hit.location.search() == task.location.search()
@@ -955,14 +931,14 @@ impl RouterEngine {
             next.reconciliation
                 .as_ref()
                 .ok_or(CommitError::Stale)?
-                .retarget_retained_leaf(&hit.frame, &hit.empty_child_slots)
+                .retarget_retained_leaf(hit.frame(), &hit.empty_child_slots)
                 .ok_or(CommitError::InvalidManifest)?,
         );
-        next.target_frames[task.identity.branch_index] = hit.frame.clone();
-        next.identity.frame = hit.frame.frame();
-        next.identity.generation = hit.frame.generation();
-        next.identity.origin = hit.frame.origin().clone();
-        next.applied_frames.push(hit.frame.clone());
+        next.target_frames[task.identity.branch_index] = hit.frame().clone();
+        next.identity.frame = hit.frame().frame();
+        next.identity.generation = hit.frame().generation();
+        next.identity.origin = hit.frame().origin().clone();
+        next.applied_frames.push(hit.frame().clone());
         next.stage = WorkStage::ReadyToCommit;
         Ok(next)
     }
@@ -1169,13 +1145,12 @@ impl RouterEngine {
         {
             return Err((task, owners, CommitError::Stale));
         }
-        let mut expected = plan
+        let expected = plan
             .commit_plan
             .retiring
             .iter()
             .chain(std::iter::once(&plan.hit))
             .collect::<Vec<_>>();
-        expected.sort_by_key(|projection| projection.id());
         if !owner_projections_match(owners.iter(), expected.into_iter())
             || seal.logical_roots() != plan.commit_plan.disposable_roots()
         {
@@ -1184,7 +1159,7 @@ impl RouterEngine {
         let mut registry = self
             .retained_leaves
             .iter()
-            .filter(|entry| entry.projection.id != plan.hit.id)
+            .filter(|entry| entry.projection != plan.hit)
             .cloned()
             .collect::<Vec<_>>();
         if let Some(projection) = &plan.commit_plan.retained {
@@ -1280,15 +1255,13 @@ impl RouterEngine {
             .iter()
             .find(|matched| matched.route() == *route)?;
         let candidate = RetainedLeafProjection {
-            id: RetainedLeafId {
-                router: self.router,
-                sequence: 0,
+            instance: InstanceFacts {
+                frame: frame.clone(),
+                host: host.clone(),
+                parent: binding.parent().clone(),
+                outlet: binding.outlet().clone(),
+                slot: binding.slot(),
             },
-            frame: frame.clone(),
-            parent: binding.parent().clone(),
-            outlet: binding.outlet().clone(),
-            slot: binding.slot(),
-            host: host.clone(),
             segment_reuse_key: matched.segment_reuse_key().clone(),
             view: self.matcher.view_binding(*route)?.clone(),
             location: self.state.active().location()?.clone(),
@@ -1321,7 +1294,7 @@ impl RouterEngine {
         }
         // Rebuild scope, LRU retirement, and roots from the complete registry;
         // individually valid owners or a caller's retiring subset are insufficient.
-        let Ok(mut selection) = self.retained_commit_selection(current, &next_slots, hit) else {
+        let Ok(selection) = self.retained_commit_selection(current, &next_slots, hit) else {
             return false;
         };
         if !selection
@@ -1332,15 +1305,6 @@ impl RouterEngine {
             || !selection.retiring.iter().copied().eq(plan.retiring.iter())
         {
             return false;
-        }
-        if let (Some(candidate), Some(frozen)) = (&mut selection.retained, &plan.retained) {
-            if frozen.id.router != self.router
-                || frozen.id.sequence == 0
-                || frozen.id.sequence >= self.next_retained_instance
-            {
-                return false;
-            }
-            candidate.id = frozen.id;
         }
         selection.retained == plan.retained && selection.disposable_roots == plan.disposable_roots
     }
@@ -1531,7 +1495,7 @@ impl RouterEngine {
         for entry in registry {
             if retiring
                 .iter()
-                .any(|retiring| retiring.id == entry.projection.id)
+                .any(|retiring| retiring == &entry.projection)
             {
                 entry.retirement = Some(cleanup.clone());
             }
@@ -1574,14 +1538,14 @@ pub(super) fn scope_survives(
     frames: &[RouteFrameVersion],
     slots: &[LogicalChildSlotBinding],
 ) -> bool {
-    &projection.host == host
-        && frames.contains(&projection.parent)
+    projection.host() == host
+        && frames.contains(projection.parent())
         && slots
             .iter()
             .filter(|binding| {
-                binding.parent() == &projection.parent
-                    && binding.outlet() == &projection.outlet
-                    && binding.slot() == projection.slot
+                binding.parent() == projection.parent()
+                    && binding.outlet() == projection.outlet()
+                    && binding.slot() == projection.slot()
             })
             .count()
             == 1

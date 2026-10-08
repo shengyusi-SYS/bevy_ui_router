@@ -5481,9 +5481,9 @@ fn append_retained_authority_branches(
             || branch
                 .claims()
                 .any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
-            || retiring[..index].iter().any(|(prior, _)| {
-                prior.id() == projection.id() || prior.frame() == projection.frame()
-            })
+            || retiring[..index]
+                .iter()
+                .any(|(prior, _)| prior.frame() == projection.frame())
             || branch
                 .claims()
                 .any(|claim| !primary_entities.insert(claim.entity()))

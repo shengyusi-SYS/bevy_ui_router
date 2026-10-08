@@ -1,5 +1,5 @@
 #[cfg(test)]
-use bevy_ui_router_core::integration::RetainedLeafId;
+use bevy_ui_router_core::frame::RouteFrameVersion;
 use bevy_ui_router_core::integration::{RetainedLeafOwner, RetainedLeafProjection};
 
 use crate::branch_transaction::RealizedBranch;
@@ -289,10 +289,10 @@ impl RetainedLeaves {
     }
 
     #[cfg(test)]
-    pub(crate) fn branch(&self, id: RetainedLeafId) -> Option<&RealizedBranch> {
+    pub(crate) fn branch(&self, frame: &RouteFrameVersion) -> Option<&RealizedBranch> {
         self.entries
             .iter()
-            .find(|entry| entry.projection.id() == id)
+            .find(|entry| entry.projection.frame() == frame)
             .map(|entry| &entry.branch)
     }
 
@@ -303,7 +303,7 @@ impl RetainedLeaves {
         if owners.iter().enumerate().any(|(index, owner)| {
             owners[index + 1..]
                 .iter()
-                .any(|other| owner.projection().id() == other.projection().id())
+                .any(|other| owner.projection().frame() == other.projection().frame())
                 || self
                     .entries
                     .iter()

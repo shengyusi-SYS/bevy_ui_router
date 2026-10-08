@@ -81,7 +81,7 @@ fn prepare(
         if plan
             .retiring()
             .iter()
-            .any(|projection| projection.id() == owner.projection().id())
+            .any(|projection| projection.frame() == owner.projection().frame())
         {
             retiring.push(owner);
         } else {
@@ -382,6 +382,62 @@ fn retained_hit_reuses_original_frames_and_empty_slots_with_fresh_history_entrie
 }
 
 #[test]
+fn retained_redeparture_preserves_original_identity_without_reordering_lru() {
+    let mut engine = engine(2, true);
+    let mut owners = Vec::new();
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        navigate(&mut engine, path, &mut owners);
+    }
+    let original = owners[0].projection().clone();
+    let oldest_remaining = owners[1].projection().clone();
+    let third = engine.active().frames().last().unwrap().clone();
+
+    // Restore the oldest physical instance without creating a new identity.
+    owners.reverse();
+    let task = retained_hit_task(&mut engine, "/items/1");
+    let plan = engine
+        .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.hit(), &original);
+    let hit = owners.remove(1);
+    let prepared = engine
+        .prepare_retained_hit_commit(task, plan, CleanupManifest::empty(), vec![hit], None)
+        .unwrap();
+    publish(&mut engine, prepared, &mut owners);
+    assert_eq!(engine.active().frames().last(), Some(original.frame()));
+
+    // Its next departure is newest in LRU, even though its frame is oldest.
+    let next = ticket(&mut engine, "/items/4");
+    let plan = engine
+        .prepare_retained_commit_plan(&next, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(plan.retiring(), &[oldest_remaining]);
+    assert_eq!(plan.retained().unwrap().frame(), original.frame());
+    assert_eq!(plan.retained().unwrap().host(), original.host());
+    let prepared = prepare(&mut engine, &next, &mut owners);
+    publish(&mut engine, prepared, &mut owners);
+
+    // Inventory order is now [third, original], unlike physical creation order.
+    // Arbitrary owner order must still validate and evict the third, not original.
+    owners.reverse();
+    let next = ticket(&mut engine, "/items/5");
+    let plan = engine
+        .prepare_retained_commit_plan(&next, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(plan.retiring().len(), 1);
+    assert_eq!(plan.retiring()[0].frame(), &third);
+    let prepared = prepare(&mut engine, &next, &mut owners);
+    publish(&mut engine, prepared, &mut owners);
+    assert!(
+        owners
+            .iter()
+            .any(|owner| owner.projection().frame() == original.frame()
+                && owner.projection().host() == original.host())
+    );
+}
+
+#[test]
 fn retained_hit_source_rejection_returns_original_task_and_owners_without_history_change() {
     let mut engine = engine(1, true);
     let mut owners = Vec::new();
@@ -556,7 +612,10 @@ fn retained_leaf_two_transfers_terminate_old_requests_and_parent_loss_disposes_e
     assert_eq!(owners[0].projection().frame(), &first);
     navigate(&mut engine, "/items/3", &mut owners);
     assert_eq!(owners.len(), 2);
-    assert_ne!(owners[0].projection().id(), owners[1].projection().id());
+    assert_ne!(
+        owners[0].projection().frame(),
+        owners[1].projection().frame()
+    );
     assert_eq!(
         owners[0].projection().parent(),
         owners[1].projection().parent()
@@ -796,12 +855,12 @@ fn retained_leaf_another_publication_invalidates_the_full_old_plan_in_the_same_t
     navigate(&mut engine, "/items/1", &mut owners);
     let ticket = ticket(&mut engine, "/items/2");
     let old = engine.prepare_retained_commit_plan(&ticket, &[]).unwrap();
-    let old_id = old.retained().unwrap().id();
+    let original = old.retained().unwrap().clone();
     let roots = old.disposable_roots().to_vec();
     let manifest = CleanupManifest::new(roots.clone(), 0x6163, roots.len());
     let prepared = prepare(&mut engine, &ticket, &mut owners);
     publish(&mut engine, prepared, &mut owners);
-    assert_ne!(owners[0].projection().id(), old_id);
+    assert_eq!(owners[0].projection(), &original);
     let error = engine
         .prepare_commit_with_retention(&ticket, old, manifest, Vec::new(), None)
         .unwrap_err();
@@ -953,7 +1012,7 @@ fn retained_failed_task_authority_preserves_owners_on_trigger_drift_and_settles_
         .unwrap();
     let mut roots = base_roots.clone();
     let mut canonical = originals.iter().collect::<Vec<_>>();
-    canonical.sort_by_key(|projection| projection.id());
+    canonical.sort_by(|left, right| left.compare_instance(right));
     roots.extend(
         canonical
             .iter()

@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 pub(crate) mod idle_host_loss;
+mod instances;
 pub(crate) mod retained;
 
 use crate::admission::{
@@ -4331,7 +4332,6 @@ pub(crate) struct RouterEngine {
     fallback: RouteViewKey,
     keep_alive_capacity: usize,
     retained_leaves: Vec<retained::RetainedRegistryEntry>,
-    next_retained_instance: u64,
     pending_retained_transfer: Option<retained::PreparedRetainedTransfer>,
     pending_retained_miss_cleanup: Option<CleanupBatchToken>,
     state: RouterNavigationState,
@@ -4393,7 +4393,6 @@ impl RouterEngine {
             fallback,
             keep_alive_capacity: 0,
             retained_leaves: Vec::new(),
-            next_retained_instance: 1,
             pending_retained_transfer: None,
             pending_retained_miss_cleanup: None,
             state: RouterNavigationState::new(router),

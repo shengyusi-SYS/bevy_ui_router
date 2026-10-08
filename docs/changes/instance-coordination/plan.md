@@ -44,8 +44,9 @@
 
 输入：现行 leaf 实例、原 owner、RealizedBranch。产出：以原 `RouteFrameVersion` + `HostVersion` 识别的库存事实、exact 父依赖，以及每份只含一个 RealizedFrame/own slots 的原 payload；行为仍为已交付 leaf 范围。
 
-- [ ] 先保留/补齐 leaf 命中、fragment 精确匹配、LRU、Back、拒绝返还、host loss/readmission 的现有回归，记录它们所保护的生产 predicate，禁止直接注入分类结果。
-- [ ] 引入实例事实与 frame-local payload，迁移唯一 owner 的持有位置。库存依赖只存身份，外部父 slot 仅作 mount alias；保持 existing source projection、seal 和原 owner 的线性转移。
+- [x] 保留 leaf 命中、fragment 精确匹配、LRU、Back、拒绝返还、host loss/readmission 的现有回归，补齐原实例激活后再次离场的身份/LRU 回归。覆盖 Core `retained_hit_matches`、`retained_plan_partition_matches`、`owner_projections_match` 和 ECS `retained_payload_is_current`，不直接注入分类结果。
+- [x] 将 Core 实例事实归并为原 `RouteFrameVersion` + `HostVersion` 与 exact 父依赖，删除 retained 身份发号。owner 集合按原身份对比，库存仍按成功离场的 LRU 顺序；冻结 source/seal 和旧计划失效语义不变。
+- [ ] 引入 frame-local payload，迁移唯一 owner 的持有位置。库存依赖只存身份，外部父 slot 仅作 mount alias；保持 existing source projection、seal 和原 owner 的线性转移。
 - [ ] 将 current target steps 与 fresh creation obligations 分开；leaf 激活不再进入 fresh `applied_frames`/failure roots。现阶段同一协议选择单个 leaf，保证拒绝原 owner 返回与 cleanup 写集不变。
 - [ ] 迁移后删除被替代的 leaf 身份权威、重复 payload 容器及 facade 内部假设；保留必要投影/证据，不因重命名丢失错误来源。通过门禁后以 `refactor: unify retained instance ownership` 独立提交。
 

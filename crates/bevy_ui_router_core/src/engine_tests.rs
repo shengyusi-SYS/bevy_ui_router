@@ -10571,12 +10571,13 @@ fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_sourc
         .find(|entry| !entry.is_live())
         .unwrap()
         .projection()
-        .id();
+        .frame()
+        .clone();
     assert_eq!(
         engine
             .retained_leaves
             .iter()
-            .find(|entry| entry.projection().id() == original_retiring)
+            .find(|entry| entry.projection().frame() == &original_retiring)
             .unwrap()
             .retirement(),
         Some(&normal)
@@ -10642,7 +10643,7 @@ fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_sourc
         engine
             .retained_leaves
             .iter()
-            .find(|entry| entry.projection().id() == original_retiring)
+            .find(|entry| entry.projection().frame() == &original_retiring)
             .unwrap()
             .retirement(),
         Some(&normal)
@@ -10651,7 +10652,7 @@ fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_sourc
         engine
             .retained_leaves
             .iter()
-            .find(|entry| entry.projection().id() == original.id())
+            .find(|entry| entry.projection() == &original)
             .unwrap()
             .retirement(),
         Some(&batch.authority_batch)

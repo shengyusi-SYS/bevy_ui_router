@@ -5413,7 +5413,7 @@ fn retained_hit_host_loss_settles_all_cache_owners_and_readmits_without_replay()
             owned.extend(
                 entry
                     .retained
-                    .branch(owner.projection().id())
+                    .branch(owner.projection().frame())
                     .unwrap()
                     .claims()
                     .map(ExactRegistryClaim::entity),
@@ -5568,7 +5568,7 @@ fn retained_idle_host_loss_clears_original_owners_and_readmits_without_changing_
             owned.extend(
                 entry
                     .retained
-                    .branch(owner.projection().id())
+                    .branch(owner.projection().frame())
                     .unwrap()
                     .claims()
                     .map(ExactRegistryClaim::entity),

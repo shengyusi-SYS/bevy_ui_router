@@ -4045,8 +4045,8 @@ pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> 
 }
 
 pub use crate::engine::retained::{
-    RetainedAuthoritySettlementPlan, RetainedCommitPlan, RetainedHitPlan, RetainedLeafId,
-    RetainedLeafOwner, RetainedLeafProjection, RetainedPostCommitAuthorityPlan,
+    RetainedAuthoritySettlementPlan, RetainedCommitPlan, RetainedHitPlan, RetainedLeafOwner,
+    RetainedLeafProjection, RetainedPostCommitAuthorityPlan,
 };
 
 /// Rejected authority transfer returns the unchanged host and every retained owner.

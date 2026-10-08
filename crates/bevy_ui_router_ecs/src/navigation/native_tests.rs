@@ -837,7 +837,7 @@ fn native_post_commit_host_loss_settles_live_and_already_retiring_cached_leaves(
             owned.extend(
                 entry
                     .retained
-                    .branch(owner.projection().id())
+                    .branch(owner.projection().frame())
                     .unwrap()
                     .claims()
                     .map(ExactRegistryClaim::entity),
@@ -884,7 +884,7 @@ fn native_post_commit_host_loss_settles_live_and_already_retiring_cached_leaves(
             EntityLifecycle::Leaving
         );
         for owner in inventory {
-            let branch = entry.retained.branch(owner.projection().id()).unwrap();
+            let branch = entry.retained.branch(owner.projection().frame()).unwrap();
             assert_eq!(
                 registry
                     .record(branch.frames()[0].shell())
@@ -1052,7 +1052,7 @@ fn native_delayed_retained_proof_removal_preserves_another_router_cache() {
         let inventory = entry.retained.inventory().unwrap();
         assert_eq!(inventory.len(), 1);
         let projection = inventory[0].projection();
-        let branch = entry.retained.branch(projection.id()).unwrap();
+        let branch = entry.retained.branch(projection.frame()).unwrap();
         app.world()
             .resource::<RouteEntityRegistry>()
             .retained_payload_is_current(
@@ -1766,7 +1766,7 @@ fn native_bound_error_preserves_cache_in_the_surviving_parent_scope() {
             .flat_map(|projection| {
                 entry
                     .retained
-                    .branch(projection.id())
+                    .branch(projection.frame())
                     .unwrap()
                     .claims()
                     .map(ExactRegistryClaim::entity)
@@ -1902,7 +1902,7 @@ fn native_invalid_cached_content_is_settled_before_the_same_request_builds_fresh
         assert_eq!(inventory.len(), 1);
         let cached = entry
             .retained
-            .branch(inventory[0].projection().id())
+            .branch(inventory[0].projection().frame())
             .unwrap();
         let active = entry.active.as_ref().unwrap();
         (
@@ -2016,7 +2016,7 @@ fn native_invalid_cached_content_returns_its_task_when_authority_changes_before_
         let inventory = entry.retained.inventory().unwrap();
         let cached = entry
             .retained
-            .branch(inventory[0].projection().id())
+            .branch(inventory[0].projection().frame())
             .unwrap();
         (
             entry.host.as_ref().unwrap().version.clone(),
@@ -2112,7 +2112,7 @@ fn native_invalid_cached_content_releases_its_completed_cleanup_before_host_reco
         let inventory = entry.retained.inventory().unwrap();
         let cached = entry
             .retained
-            .branch(inventory[0].projection().id())
+            .branch(inventory[0].projection().frame())
             .unwrap();
         (
             cached.frames()[0].shell(),
@@ -2224,7 +2224,7 @@ fn native_leaf_cache_settles_after_failure_or_host_loss() {
                 owned.extend(
                     entry
                         .retained
-                        .branch(projection.id())
+                        .branch(projection.frame())
                         .unwrap()
                         .claims()
                         .map(ExactRegistryClaim::entity),
