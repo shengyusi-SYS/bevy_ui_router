@@ -117,6 +117,20 @@ active 已切换而请求仍在 `PostCommitCleanup` 是合法状态；避免仅�
 
 ## 输入与焦点接入
 
+页面后台工作通过 facade/prelude 的 `RouteActivity` SystemParam 查询资格：
+
+```rust
+fn update_pages(activity: RouteActivity, mut pages: Query<(Entity, &mut PageState)>) {
+    for (entity, mut page) in &mut pages {
+        if activity.is_active(entity) {
+            page.update();
+        }
+    }
+}
+```
+
+它依据已发布 active、exact ownership、host registration 与真实父链判断，适用于注册内容和原生页面内的普通后代，包含非交互 Entity。应用据此控制自己的 timer、Query 或后台工作；隐藏本身不会暂停这些系统。输入资格仍使用下面的专用 gate。完整用法见[公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs)。
+
 标准 UI pointer 使用原生 UI picking。Router 在正常提交和后续输入刷新时维护
 非活动内容隔离，并撤销历史手势状态；应用无需另建一套 pointer 路由。
 运行时新增、隐藏或移动内容，应在输入刷新前完成，供当前 containment 判断使用。

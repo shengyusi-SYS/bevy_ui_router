@@ -68,6 +68,11 @@ path = "tests/scroll_restoration.rs"
 required-features = ["bsn"]
 
 [[test]]
+name = "public_activity"
+path = "tests/public_activity.rs"
+required-features = ["bsn"]
+
+[[test]]
 name = "ecs_facade_features"
 path = "tests/ecs_facade_features.rs"
 required-features = ["ecs"]

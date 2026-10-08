@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod activity;
 mod app_ext;
 #[cfg(test)]
 mod authority_regression_tests;
@@ -29,6 +30,7 @@ mod task10_regression_tests;
 #[cfg(test)]
 mod test_support;
 
+pub use activity::RouteActivity;
 pub use app_ext::{
     AppRouterExt, RouterConfig, RouterHandle, RouterHostRegistration, RouterInstallError,
     RouterInstallErrorKind, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
@@ -46,8 +48,8 @@ pub mod prelude {
     pub use crate::AppBsnExt;
     pub use crate::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteScroll, RouterConfig, RouterHandle,
-        RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
+        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteScroll, RouterConfig,
+        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
         RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
         RouterSnapshots, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };

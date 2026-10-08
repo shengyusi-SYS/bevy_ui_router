@@ -111,6 +111,7 @@ fn published_native<'a>(
 fn observe_snapshots(
     tracked: Option<Res<TrackedRequest>>,
     snapshots: Res<RouterSnapshots>,
+    activity: RouteActivity,
     gate: Res<RouterInputGate>,
     native: Query<(Entity, Option<&NativeLeaf>, Has<ErrorPage>)>,
     mut observation: ResMut<SnapshotObservation>,
@@ -121,10 +122,14 @@ fn observe_snapshots(
         RequestLookup::Unknown => None,
         RequestLookup::NotRetained => panic!("tracked request was evicted"),
     };
+    let published = published_native(tracked.native, &gate, native.iter());
+    if let Some(entity) = published {
+        assert!(activity.is_active(entity));
+    }
     observation.0 = Some(UpdateObservation {
         request,
         router: snapshots.get(tracked.router).unwrap().clone(),
-        native: published_native(tracked.native, &gate, native.iter()),
+        native: published,
     });
 }
 

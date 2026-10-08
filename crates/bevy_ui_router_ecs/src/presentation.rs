@@ -415,7 +415,13 @@ impl FrameMountBinding {
 }
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
-struct FrameShell(RouteFrameVersion);
+pub(crate) struct FrameShell(RouteFrameVersion);
+
+impl FrameShell {
+    pub(crate) fn matches_frame(&self, frame: &RouteFrameVersion) -> bool {
+        self.0 == *frame
+    }
+}
 
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrameContentTarget(RouteFrameVersion);

@@ -1,13 +1,21 @@
 // No-BSN feature consumer: exercises plugin/resource setup and synchronous
 // installation rejection, not rendering. Independent rendering behavior is
 // covered by private ECS unit tests; the BSN consumer proves public rendering.
-use bevy_app::App;
-use bevy_ecs::prelude::Component;
+use bevy_app::{App, Update};
+use bevy_ecs::prelude::{Component, Entity, Query};
 use bevy_ui::{Node, Val};
 use bevy_ui_router::prelude::*;
 
 #[derive(Component)]
 struct HostSentinel(u32);
+
+fn tick_active_content(activity: RouteActivity, mut work: Query<(Entity, &mut HostSentinel)>) {
+    for (entity, mut sentinel) in &mut work {
+        if activity.is_active(entity) {
+            sentinel.0 += 1;
+        }
+    }
+}
 
 fn config(bound: bool) -> RouterConfig {
     let view = RouteViewKey::new("normal").unwrap();
@@ -34,6 +42,7 @@ fn config(bound: bool) -> RouterConfig {
 fn main() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());
+    app.add_systems(Update, tick_active_content);
     assert!(app.world().contains_resource::<RouterNavigation>());
     assert!(app.world().contains_resource::<RouterSnapshots>());
     assert!(app.world().contains_resource::<RouterInputGate>());
