@@ -16,24 +16,38 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 
 | 导航变化 | view/lifecycle 行为 |
 | --- | --- |
-| 同祖先切换 leaf | 保留不变 prefix 的 frame、outlet 和 UI 状态，替换 suffix |
+| 同祖先切换 leaf | 保留不变 prefix；suffix 默认 fresh，符合下述 keep-alive 条件时复用原 leaf |
 | 某段 params 或复用身份变化 | 从该段起替换，保留此前 prefix |
 | raw search 变化 | 按上述精确比较重建整链 |
 | 仅 fragment 变化 | 保留祖先，重建最深 normal frame；frame/slot 身份保持，generation 推进 |
 | canonical path/search/fragment 全部等价 | normal presentation 保持原结构，history 仍按命令语义提交；显式滚动恢复可写入位置 |
 
-新建或重建 view 得到本次 input。保留 layout 不重新调用 factory，其局部内容维持原状态；active snapshot 的 location 更新不表示历史 factory input 被原位更新。
+新建或重建 view 得到本次 input。保留 layout 和命中的 cached leaf 不重新调用 factory，其局部内容维持原状态；active snapshot 的 location 更新不表示历史 factory input 被原位更新。
 
 active error presentation 不走 normal 等价导航优化。复用判定包含路由树 provenance、route/slot/explicit key 等身份，不能只比较路径字符串。
 
 实现见 [matcher](../../crates/bevy_ui_router_core/src/matcher.rs)、[branch diff](../../crates/bevy_ui_router_core/src/branch_diff.rs) 与 [location](../../crates/bevy_ui_router_core/src/location.rs)。
+
+## 同父 leaf 保留
+
+`RouteNodeOptions::with_keep_alive(true)` 为 route 显式启用保留；`RouterConfig::with_keep_alive_capacity(n)` 限制每个 Router 的非活动实例数，默认 0。active 实例不占容量，未 opt-in 或容量为 0 时沿用 fresh/cleanup 路径。
+
+仅最深 normal leaf 可保留，而且 exact parent frame/generation、outlet、slot binding 与 host incarnation 必须处于仍有效的保留作用域。root 独立页面、带活动子分支的页面、error/fallback、失败或 quarantine 内容不进入缓存。leaf 自己声明的空 child slot 不等于活动子分支。
+
+命中使用该父作用域内的 route/view 复用身份、params、raw search 和 raw fragment。命中保留原 Entity、局部组件状态和内容 handles，跳过 factory、Scene resolve/apply；本次请求仍沿合法的新执行与 publication 合同运行，不重放旧 task。未命中创建 fresh Scene。
+
+缓存按失活时刻维护简单 LRU。命中实例移出非活动库存，原 active leaf 若可保留则成为最新失活项；超出容量时受控清理最旧非活动实例。parent/outlet/slot 或 host scope 失效时不能跨 scope 命中，旧责任须经[生命周期结算](lifecycle.md#非活动实例与长期-owner)。
+
+keep-alive 不改变输入更新规则：raw search 变化仍重建整条分支并失效旧父 scope；仅 fragment 变化仍重建 deepest normal frame，不把此次重建解释为缓存命中。
+
+history entry 标识一次访问，缓存标识页面实例。不同 entry 可以命中同一个 Entity；Push/Replace 的新 entry 与 Back 的既有 entry 语义保持。显式滚动仍按目标 entry 恢复，不按共享实例当前值冒充该次访问的记录。
 
 ## 请求、history 与 presentation
 
 同 Router 的命令按内部 sequence 串行处理。push/replace 在入队时确定 requested location；back 在轮到运行时冻结前一个成功 history entry，避免排队期间的旧目标成为执行权限。
 
 - push 成功追加 entry，并截断 forward 分支。
-- replace 成功替换当前 entry；空 history 时建立首项。
+- replace 成功以新身份替换当前 entry；空 history 时建立首项。
 - back 成功才移动 cursor；失败保持 cursor 和原 history。
 
 入队时已发布 `can_back=false`，同步返回 `NoBackEntry`，不生成 request。已成功入队但执行时无目标，请求失败为 `BackTargetUnavailable`，不调用 view，不改变 UI/history。
@@ -52,7 +66,7 @@ publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不�
 
 离开 normal 页面时保存最后一次有效布局显示的二维逻辑像素位置，关联 Core canonical history entry 和 route 复用身份。重复 URL 的不同访问独立，Replace 使用新 entry。normal 被 error/fallback 替换时仍保存原位置，失败呈现不覆盖成功访问记录；失败保留原页面时不恢复或重置。
 
-成功 Back 恢复目标 entry，包括仍存活的 preserved prefix 容器；Push/Replace 保持实例当前值，fresh Scene 使用初值。目标没有记录时保持当前值。位置在 publication 前准备，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
+成功 Back 恢复目标 entry，包括 cache hit 与仍存活的 preserved prefix 容器；Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。位置在 publication 前准备，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
 
 容器或 frame 失效时丢弃恢复请求。缺少实际 UI 布局或有效相机时不保存伪造位置，放弃本次恢复并保留原值、给出有界诊断；不额外运行布局或延迟轮询。首版不自动追赶异步增长或延迟创建的容器。
 

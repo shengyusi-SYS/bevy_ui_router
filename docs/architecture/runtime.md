@@ -16,14 +16,16 @@ flowchart TD
     Root --> Layout["侧栏、工具栏等 Scene 内容"]
     Root --> Outlet["内部 Node + DefaultOutlet"]
     Outlet --> Slot["Router child slot"]
-    Slot --> ChildShell["子 FrameShell"]
+    Slot --> ChildShell["active 子 FrameShell"]
     ChildShell --> ChildRoot["子 Scene 内容根"]
+    Slot --> Retained["retained leaf shell<br/>隐藏、独立长期 owner"]
+    Retained --> CachedRoot["原 Scene 内容根与局部状态"]
 ```
 
 host 由应用创建、布置并添加 `RouterHostRegistration`。Router 管理自己的
 top slot、frame shell、child slot 及授权内容边界，不删除或重建 host。
 `DefaultOutlet` 是 Scene 内的普通声明，可以放在内部容器上；它本身不是
-mount binding 或 lifecycle owner。
+mount binding 或 lifecycle owner。符合条件的 retained leaf 与 active sibling 留在同一 child slot 下；其独立 role/claim 使它成为受保护的非活动内容，不扩大 active frame 的内容边界。
 
 结构身份关联 Router、host、slot、frame 与 generation；执行结果还需匹配 task。
 host registration 的 incarnation 区分同一 Entity 上移除再插入的实例。
@@ -57,11 +59,16 @@ sequenceDiagram
     Nav-->>App: request id
     Note over Nav,Core: 后续 Update 按顺序推进，可跨多轮
     Nav->>Core: collect / 获取 action
-    Core-->>Nav: frame task 与 mount 合同
-    Nav->>Scene: 只读 input，构建并 resolve fresh Scene
-    Nav->>World: 登记、inert staging、apply、写后复验
-    Nav->>Core: 消费执行与挂载结果
-    Nav->>World: 准备 current/next、输入/focus 与 cleanup owner
+    Core-->>Nav: 当前 frame task 与 mount 合同
+    Nav->>Core: 核对同父 retained 候选与原 owner
+    alt 有效缓存命中
+        Nav->>World: 借原实体准备目标，不运行 factory/apply
+    else 未命中
+        Nav->>Scene: 只读 input，构建并 resolve fresh Scene
+        Nav->>World: 登记、inert staging、apply、写后复验
+        Nav->>Core: 消费执行与挂载结果
+    end
+    Nav->>World: 准备 current/next、输入/focus 与 cleanup/retained owner
     Note over Nav,World: 所有可失败准备与最终校验在 publication 前完成
     Nav->>World: publication tail：预备好的原位提交
     Nav->>Core: 最后发布 presentation / history
@@ -70,9 +77,10 @@ sequenceDiagram
     App->>Snap: 观察 request 与 active/history
 ```
 
-factory 每次产生一个 fresh Scene，错误呈现也使用自己的 Scene；不克隆或回放
-旧执行产物。ECS 通过官方 `ScenePatch::load/resolve` 准备，再由实际 Scene executor
-执行模板。依赖 handles 随该次 preparation/apply/settlement 保留。
+未命中时 factory 产生 fresh Scene，错误呈现也使用自己的 Scene。ECS 通过官方
+`ScenePatch::load/resolve` 准备，再由实际 Scene executor 执行模板。缓存命中跳过
+factory/resolve/apply，消费本次合法执行身份并复用原 frame 与物理内容，不回放旧 task。
+原内容 handles 随原 retained owner 保留；fresh 路径依赖随 preparation/apply/settlement 保留。
 
 ECS 先将物理切换、输入/focus 和后续 cleanup owner 组合成准备好的 publication work，
 再由预借状态的提交 tail 应用，最后交给 Core 发布 presentation/history。
@@ -82,6 +90,8 @@ ECS 先将物理切换、输入/focus 和后续 cleanup owner 组合成准备好
 旧内容的物理清理可以晚于可见 publication，请求也可能仍处于 `PostCommitCleanup`。
 这时已发布页面和 history 已生效；清理失败不能回滚或改写原成功结果。
 snapshot 发布是每轮观察出口，与真正的 presentation publication 是不同步骤。
+
+Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定命中、容量分区和退休责任；ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 持有原物理 payload 与长期 owner。命中先借库存做全部准备，最后单次移交原 owner；拒绝保留原责任。容量按非活动库存计算，简单 LRU 复用同一离场/cleanup 管线。安全的缓存自身失效通过私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算该实例，再返还原 fresh task；当前 authority 失效仍走原 authority settlement。语义范围归[导航](../contracts/navigation.md#同父-leaf-保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
 
 显式滚动容器由 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 仅交接 opaque canonical entry key 及已准备 publication 的来源、目标和存活 entry 事实；位置记录不能签发路由权限。Back 的位置写入在原有 tail 前准备，正常 `PostUpdate` UI layout 后核对当前完整 branch 归属，再单次结算裁剪结果并采样实际逻辑像素位置。
 
@@ -114,7 +124,7 @@ flowchart TB
 ```
 
 `Update` 的前五个生命周期 set 是 crate-private；公开的本轮观察排序锚点只有
-`RouterScheduleSet::PublishSnapshots`。普通应用系统在它之后读取 snapshots，
+`RouterScheduleSet::PublishSnapshots`。普通应用系统在它之后读取 snapshots 或用 `RouteActivity` 查询本轮已发布 active，
 可观察本轮完整结果。显式 plugin 与 App extensions 共用幂等 foundations 安装。
 
 `Refresh` 在 picking hover 前更新当前内容资格；hovermap 生成后、interaction 更新前

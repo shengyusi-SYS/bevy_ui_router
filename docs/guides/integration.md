@@ -90,7 +90,7 @@ Cargo feature 只控制编译，不能证明应用运行时资源已就绪。
 ## 嵌套内容与结果观察
 
 layout Scene 在希望显示子路由的内部 `Node` 上声明一个 `DefaultOutlet`。
-相邻 leaf 切换会保留可复用的父 layout、outlet 及局部组件状态；leaf 内容按导航重建。
+相邻 leaf 切换会保留可复用的父 layout、outlet 及局部组件状态；leaf 默认重建，也可按下一节启用同父保留。
 当前支持每个 layout 的单个 default outlet。Scene 加载 profile 见[Scene 合同](../contracts/scene.md)，
 search/fragment 更新见[导航合同](../contracts/navigation.md)，错误恢复见[生命周期](../contracts/lifecycle.md)。
 
@@ -109,11 +109,29 @@ headless 程序应给等待设置边界并检查 `RequestStatus::Succeeded` / `F
 active 已切换而请求仍在 `PostCommitCleanup` 是合法状态；避免仅凭一次 phase
 或 factory 返回就把整个导航视为完成。
 
+## 同父页面保留
+
+在已有父 route 下为 leaf opt-in，并为 Router 配置非活动容量：
+
+```rust
+let leaf = RouteNodeOptions::new()
+    .with_view(page_view)
+    .with_keep_alive(true);
+routes.route_with_options(parent, RoutePattern::path(":id")?, leaf)?;
+let config = RouterConfig::new(routes.build()?, views, fallback)
+    .with_keep_alive_capacity(2);
+let router = app.add_ui_router(config)?;
+```
+
+默认容量为 0；只设 route 或只设容量不会使所有页面自动保留。适用范围、LRU、search/fragment 与 history entry 的区别见[导航合同](../contracts/navigation.md#同父-leaf-保留)，失效和原 owner 结算见[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。不需要额外缓存 runtime、factory wrapper 或应用自建 Entity 仓库。
+
+命中继续使用原实体与组件状态，应用的后台系统通过下述 `RouteActivity` 查询决定是否工作；布局仍由正常 Bevy UI 管线执行，滚动接入不需要另换容器或记录接口。
+
 ## 滚动恢复
 
 在 Scene 的滚动容器上同时声明 `RouteScroll::new("body")`、Bevy 的 `ScrollPosition` 和配置了 scroll overflow 的 `Node`；`RouteScroll` 从 facade/prelude 导入。多个容器使用不同稳定 key，例如 `"body"` 和 `"sidebar"`，子页面可重复父布局的 key。
 
-应用需安装正常 UI layout 并配置有效 camera/render target。Router 在 Back 时恢复该次访问的位置，包含被保留的父布局容器；未标记容器保持现有行为。完整语义和缺省行为见[导航合同](../contracts/navigation.md#按访问恢复滚动)，真实布局接入可参考[公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs)。
+应用需安装正常 UI layout 并配置有效 camera/render target。Router 在 Back 时恢复该次访问的位置，包含缓存命中的 leaf 和被保留的父布局容器；未标记容器保持现有行为。完整语义和缺省行为见[导航合同](../contracts/navigation.md#按访问恢复滚动)，真实布局接入可参考[公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs)。
 
 ## 输入与焦点接入
 
@@ -129,7 +147,7 @@ fn update_pages(activity: RouteActivity, mut pages: Query<(Entity, &mut PageStat
 }
 ```
 
-它依据已发布 active、exact ownership、host registration 与真实父链判断，适用于注册内容和原生页面内的普通后代，包含非交互 Entity。应用据此控制自己的 timer、Query 或后台工作；隐藏本身不会暂停这些系统。输入资格仍使用下面的专用 gate。完整用法见[公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs)。
+activity 的范围和调度见[输入与活动合同](../contracts/input-focus.md#页面活动查询)；它可以与应用的可变组件查询共用，隐藏不会自动暂停系统。输入资格仍使用下面的专用 gate。完整用法见[公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs)。
 
 标准 UI pointer 使用原生 UI picking。Router 在正常提交和后续输入刷新时维护
 非活动内容隔离，并撤销历史手势状态；应用无需另建一套 pointer 路由。

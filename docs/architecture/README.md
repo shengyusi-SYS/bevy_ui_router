@@ -24,9 +24,9 @@ flowchart TD
 
 | Crate | 拥有的职责 | 边界 |
 | --- | --- | --- |
-| Core | location、匹配、branch diff、请求顺序、frame/generation、history、失败与恢复决策 | 无 Bevy 或其他外部依赖，不操作 Entity |
+| Core | location、匹配、branch diff、请求顺序、frame/generation、history、leaf 保留/命中/LRU、失败与恢复决策 | 无 Bevy 或其他外部依赖，不操作 Entity |
 | View | view key、driver key、registry、descriptor、只读 effect/input | 仅依赖 Core，不拥有 World 或 lifecycle 权限 |
-| ECS | host/slot/frame binding、执行编排、staging、publication、cleanup、输入与焦点 | 消费 Core 的受控合同，不维护第二套路由/history |
+| ECS | host/slot/frame binding、执行编排、staging、publication、cleanup、retained 物理内容、滚动、输入与活动资格 | 消费 Core 的受控合同，不维护第二套路由/history |
 | BSN | fresh Scene factory、build error、default outlet 声明 | 不依赖 ECS，不签发 mount、frame 或 commit 权限 |
 | Platform | 当前仅转导出 Back 相关类型 | 尚无浏览器 history、URL 同步或系统 Back 实现 |
 | Facade | 常用 API 与 opt-in feature 组合 | 不导出内部 owner、registry writer 或可伪造的完成凭据 |
@@ -56,10 +56,13 @@ BSN 的 `AppBsnExt` 实现在 ECS 的可选 bridge 中，再由 facade 导出。
 | route tree、稳定候选匹配、prefix/suffix | [route_tree.rs](../../crates/bevy_ui_router_core/src/route_tree.rs)、[matcher.rs](../../crates/bevy_ui_router_core/src/matcher.rs)、[branch_diff.rs](../../crates/bevy_ui_router_core/src/branch_diff.rs) |
 | Core 决策与跨 crate 协议 | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs)、[integration.rs](../../crates/bevy_ui_router_core/src/integration.rs) |
 | history authority、post-commit 与 idle settlement | [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)、[post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs)、[idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) |
+| leaf 保留、命中/LRU 与自身失效 continuation | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs)、[retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) |
+| entry 滚动与页面活动资格 | ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs)、[activity.rs](../../crates/bevy_ui_router_ecs/src/activity.rs) |
 | View registry 与 effect | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs)、[effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |
 | 注册、调度、导航、快照 | [app_ext.rs](../../crates/bevy_ui_router_ecs/src/app_ext.rs)、[plugin.rs](../../crates/bevy_ui_router_ecs/src/plugin.rs)、[navigation.rs](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[snapshots.rs](../../crates/bevy_ui_router_ecs/src/snapshots.rs) |
 | host、slot、frame 与内容执行 | [host.rs](../../crates/bevy_ui_router_ecs/src/host.rs)、[mount.rs](../../crates/bevy_ui_router_ecs/src/mount.rs)、[presentation.rs](../../crates/bevy_ui_router_ecs/src/presentation.rs)、[native_scene.rs](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs) |
 | ownership 与清理 | [registry.rs](../../crates/bevy_ui_router_ecs/src/registry.rs)、[cleanup.rs](../../crates/bevy_ui_router_ecs/src/cleanup.rs)、[cleanup/](../../crates/bevy_ui_router_ecs/src/cleanup) |
+| publication 准备 | [normal_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs)、[projectionless_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs)、[branch_transaction.rs](../../crates/bevy_ui_router_ecs/src/branch_transaction.rs) |
 | reconciliation、frame-local、native failure 与 authority settlement | [生命周期执行协议的模块地图](lifecycle.md#修改时定位哪些模块) |
 | 输入与焦点 | [input.rs](../../crates/bevy_ui_router_ecs/src/input.rs)、[native_focus.rs](../../crates/bevy_ui_router_ecs/src/native_focus.rs) |
 | BSN 合同与 bridge | [BSN lib.rs](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bsn.rs](../../crates/bevy_ui_router_ecs/src/bsn.rs) |

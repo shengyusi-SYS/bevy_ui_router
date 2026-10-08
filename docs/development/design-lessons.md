@@ -18,6 +18,12 @@ facade 的默认功能不拉入 Bevy runtime，应用显式选择 `ecs` / `bsn`�
 
 path、route-local params、raw search 和 fragment 对复用的影响不同。判断复用时应遵守既有语义，而不是以“同一个 route id”或“location 变化”统一重建全部内容。
 
+## 访问、页面实例与物理责任分别建模
+
+history entry 标识一次访问，缓存标识可复用页面，ECS owner 承担实体责任。相同 Entity 可服务多次访问，滚动记录不能绑定缓存实例；长期缓存可以超出原请求寿命，也不能继续占用该请求的前台 capability。当前 active branch 因而不再等于完整生命周期库存，清理必须纳入原缓存 owner。
+
+Back 的目标可以是 fresh 或 retained。曾保留一条“成功目标总是 fresh”的专门发布路径，导致缓存命中卡在 Ready；让两者共用 retained publisher、保留原 Back history/continuation 配对，比新增缓存 Back 状态机更直接。复用准备工具仍须区分目的：缓存页自身空 slot 的 outlet 声明是重新激活条件，安全删除原内容并不要求该声明重新出现。
+
 ## 可信应用不需要 World 沙箱
 
 Scene/template/observer 是应用代码，可以触发组件 hook、修改资源或创建自己的实体。Router 的事务只管理授权的路由内容与物理结构，不能承诺回滚任意应用副作用。

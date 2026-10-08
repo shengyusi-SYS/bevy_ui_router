@@ -20,7 +20,7 @@ MVP 不提供动态 unregister/rebind。窗口、相机、字体、渲染配置�
 
 `AppBsnExt::register_bsn_view` 接受同步 factory：输入为只读 `RouteViewInput`，成功返回一个 fresh owned Scene，失败返回 `BsnBuildError`。
 
-每个 view effect 调用一次 factory，并单次消费返回的 Scene；不克隆、缓存或重放旧 Scene。错误 presentation 使用自己的 factory 调用和身份。
+fresh 路径每个 view effect 调用一次 factory，并单次消费返回的 Scene；不克隆、缓存或重放旧 Scene。错误 presentation 使用自己的 factory 调用和身份。keep-alive 命中复用已应用的 Entity 实例，跳过 factory，不缓存 Scene 值。
 
 输入提供 requested location、当前 matched route、route-local params、raw search、fragment、origin 和错误尝试的原始 failure。factory 不得到 World、Commands、Entity、slot、frame/generation 或 lifecycle 权限。
 

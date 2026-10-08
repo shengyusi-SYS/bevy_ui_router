@@ -34,7 +34,7 @@ ROUTER_BENCH_MODE=keep_alive cargo bench -p bevy_ui_router --bench router_baseli
 ROUTER_BENCH_MODE=keep_alive ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > keep-alive-nested.csv
 ```
 
-行为 smoke 使用相同环境变量与 `cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test`。样本数仍由 `ROUTER_BENCH_SAMPLES` 控制；正式比较至少重复两轮，同一轮记录 flat/nested 的完整输出和构建身份。每种形状输出 24 行，覆盖相同的 1/32/128 内容预算。
+行为 smoke 使用相同环境变量与 `cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test`。正式计时样本数由 `ROUTER_BENCH_SAMPLES` 控制，smoke 固定为 2；正式比较至少重复两轮，同一轮记录 flat/nested 的完整输出和构建身份。每种形状输出 24 行，覆盖相同的 1/32/128 内容预算。
 
 | 场景前缀 | 真实工作与计时外检查 |
 | --- | --- |
@@ -71,6 +71,20 @@ Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `
 导航分位数是逐操作 nearest-rank；idle 每个样本连续 32 update 后取均值，其 p95 是批次均值的分布，不能当成单帧 p95。多轮同场景 p50 的算术均值也不是合并样本分位数。CSV 数量列在场景组结束后、计时外读取，表示稳定状态而非峰值；failure 行的数量在对应 recover 完成后读取。
 
 直接 BSN 对照保留 host/layout/toolbar/outlet，测 fresh Scene 构造、resolve/apply、旧页递归删除、flush 和普通 update。它没有 Router history、授权、隔离、失败/残留或写后复验，两者差值不构成严格 Router 开销归因。
+
+## Keep-alive 实测
+
+2026-10-08 在同机顺序完成两轮 flat/nested 优化构建对照，每场景 128 样本，共四组完整结果。运行前已关闭窗口和 renderer；源码、工具链、环境及全部 CSV 见[数据身份](data/performance/README.md#keep-alive-2026-10-08)。下表为四组逐操作 p50 范围，单位 ms；p95、最大值、idle 与实例数量保留在[完整数据](data/performance/performance-keep-alive-2026-10-08.csv)。
+
+| 内容子节点 | disabled Replace | 首次 miss | 连续 hit | 满容量 LRU |
+| --- | --- | --- | --- | --- |
+| 1 | 0.184–0.196 | 0.147–0.156 | 0.108–0.114 | 0.238–0.254 |
+| 32 | 1.019–1.090 | 0.440–0.454 | 0.210–0.212 | 1.308–1.370 |
+| 128 | 7.466–7.706 | 4.026–4.177 | 0.580–0.659 | 10.017–10.241 |
+
+128 子节点时，活实体数在默认关闭时稳定为 179，miss/hit 为 309，满容量 LRU 为 439，非活动页为 0/1/2；每组离开父 scope 后旧 Page/Content/布局均释放，app-owned host 保留。满容量 idle p50 为 0.225–0.237 ms，默认关闭为 0.143–0.154 ms。计数证明本夹具驻留有界，不能由此宣称堆内存或内部 owner 数量无泄漏。
+
+命中省去 factory/apply 并复用实体，连续往返收益明确。首次 miss 保留旧页，默认关闭则立即清理旧页，两者职责不同；不能把时间差称为 Scene 构建优化。满容量淘汰包含回收成本，128 子节点仍约 10 ms 且不含 layout/render，复杂页面性能尚不能据此宣布就绪。后续优先按代表页面预算定位清理与逐写复验成本，避免以更换 LRU 容器或新增 runtime 代替实际热点分析。
 
 ## 已有结果与含义
 

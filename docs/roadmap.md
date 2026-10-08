@@ -22,4 +22,6 @@ Windows 原生、最低 Rust、物理 GPU 与硬件输入尚未验证。它们�
 
 增加能力前先证明消费者需求，说明与现有生命周期合同的关系，再确定最小实现及验收。
 
-按 history entry 的显式滚动恢复已实现；同一保留父布局下的 leaf keep-alive 正在推进，之后完成组合、窗口与性能验收。[页面保留设计](changes/advanced-ui/design.md)已确认，进度见[实施计划](changes/advanced-ui/plan.md)。当前暂不支持浏览器，异步 factory 与过渡动画未纳入本轮。基础能力中的 query 更新语义与标准键盘插件接线单独评估；这轮范围选择不自动改变首次发布前置。前期选型比较见[范围参考](changes/advanced-ui/scope.md)。
+按 history entry 的显式滚动恢复和同父 leaf 保留已完成组合、独立 consumer、窗口与性能验收；行为归[导航合同](contracts/navigation.md)，方法和边界归[验证](development/verification.md)与[性能记录](performance.md)。已完成的设计/实施材料退出默认文档树，由 Git 追溯。
+
+query 更新时的布局保留与标准键盘插件接线，分别按消费者需求确定最小范围；它们不作为本轮交付或首次发布的隐式前置。浏览器 URL/history adapter、异步 factory 与过渡动画仍未排期。

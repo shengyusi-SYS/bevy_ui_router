@@ -8,18 +8,21 @@
 
 成功导航统一发布 presentation 与 history；失败提供明确结果和有限恢复；非活动 Router 内容不保留集成输入权限或焦点。
 
-当前 MVP 交付：
+当前实现范围：
 
 - builder-first 路由树，静态/参数/末尾 wildcard 匹配，index route、pathless layout，以及 raw location/search/fragment。
 - 单条嵌套路由链，每个 layout 一个 default outlet，common-prefix 保留、suffix 替换和 memory history。
 - 显式滚动容器按 history entry 保存二维位置，Back 恢复并由正常 UI 布局裁剪。
+- 同一保留父布局下的 normal leaf 可 opt-in 保留原 Entity 和局部状态；非活动容量默认 0，启用后按简单 LRU 淘汰。
 - 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。
 - route-bound error view、router fallback、host loss/re-registration、stale 拒绝、局部 cleanup、输入与 focus 隔离。
 - facade、可运行示例、独立 consumer 和相称的跨层验证。
 
 依赖采用官方 crates.io Bevy `0.19`，允许 `>=0.19.0, <0.20.0`；已验证的版本和环境归[验证说明](development/verification.md)。Core/View 与 facade 默认功能不依赖 Bevy。
 
-当前不交付 typed route/search、codegen、loader/action/async guard/revalidation、transition、retained cache、multiple/named/dynamic outlets、queued/streaming/file/cached-asset BSN、hot reload、平台特定 adapter、后台 reaper 或公开 authority audit/probe。
+当前不支持 typed route/search、codegen、loader/action/async guard/revalidation、transition、整分支或跨父布局缓存、multiple/named/dynamic outlets、queued/streaming/file/cached-asset BSN、hot reload、平台特定 adapter、后台 reaper 或公开 authority audit/probe。
+
+实例保留与访问记录是两个维度：不同 history entry 可以复用同一页面，滚动仍按 entry 恢复。页面的应用系统可用 `RouteActivity` 查询当前活动资格；布局、窗口和后台任务由应用配置。行为细节见[导航合同](contracts/navigation.md)，窗口与性能证据以专门验证文档为准。
 
 不引入业务、品牌、主题、数据服务、权限或应用 shell 假设。多 Router 保留 handle 命名空间隔离，但完整多 Router 产品旅程不是 MVP 前置。
 

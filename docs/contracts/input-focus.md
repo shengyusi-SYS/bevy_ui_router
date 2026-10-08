@@ -8,7 +8,7 @@
 
 Refresh 根据 active roots 的当前 frame-local Children closure 计算权限，下一 Ready 边界接纳新增内容、撤销移出内容。无 World 的 gate 是该边界快照，不是任意时刻实时 ancestry 查询。
 
-Router 生命周期切换在同次 publication/隔离内撤权，不能等下一帧。hidden、pending、leaving、failed、retained/residual 内容不保留集成输入或 active focus；其它有效目标不被无理由清除。
+Router 生命周期切换在同次 publication/隔离内撤权，包括 active→retained，不能等下一帧。hidden、pending、leaving、failed、retained/residual 内容不保留集成输入或 active focus；其它有效目标不被无理由清除。
 
 原生 pointer 撤权同时清除目标的当前/前次 hover、press/click/drag 和祖先缓存，保留其它目标状态。在真实 hover 生成后、dispatch 前过滤非活动 owned scope；不能只依赖 Display、最新命中或修改 Pickable，也不能全局清空 pointer 状态。
 
@@ -18,6 +18,14 @@ pending Scene 的 `InputFocus::set`/AutoFocus 只形成候选，不授予权限�
 
 后发合法 set/clear 优先，包括同值 set、已空时 clear；后发 pending 候选也替代前一个。候选失败、stale、取消、隐藏或移出 source 时丢弃，不复活早先候选，不重放整段 pending focus 历史。
 
-无显式意图时，不自动选择首控件或恢复历史焦点。无操作的可变借用不是 focus 操作。保持应用原 focus queue、cause 与延后事件顺序；不能向从未 active 的 pending/failed 目标派发延后 FocusGained/Lost，也不能仅 clear focus 就宣称派发已隔离。
+无显式意图时，不自动选择首控件或恢复历史焦点；缓存重新激活也不恢复旧焦点。无操作的可变借用不是 focus 操作。保持应用原 focus queue、cause 与延后事件顺序；不能向从未 active 的 pending/failed 目标派发延后 FocusGained/Lost，也不能仅 clear focus 就宣称派发已隔离。
 
-实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs) 与 [公开调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。
+## 页面活动查询
+
+facade/prelude 的 `RouteActivity` SystemParam 提供 `is_active(Entity)`，用于应用决定页面 timer、Query 或其他后台工作是否执行。它读取已发布 active assignment、最近已登记边界的 exact claim、同一 host registration incarnation 和当前内容挂载/containment；cached、pending、leaving、failed、quarantine 与无关 app-owned host 返回 false，不能借活动父布局获得资格。
+
+普通原生页面后代和非交互 Entity 也可查询。该参数只读取 Router 元数据与相关层级组件，可与应用自己的 `Query<(Entity, &mut T)>` 共用；本轮 publication 后的活动状态可在 `RouterScheduleSet::PublishSnapshots` 之后读取。
+
+activity 独立于 authored visibility 和输入资格，也不是完整 frame-local 内容健康检查。Router 不会因隐藏缓存而暂停应用系统、observer 或任意副作用；应用选择是否执行自己的工作。pointer/keyboard/gamepad 仍遵守上面的输入边界，不以 activity 查询替代 gate。
+
+实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[activity](../../crates/bevy_ui_router_ecs/src/activity.rs) 与 [公开调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。

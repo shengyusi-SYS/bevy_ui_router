@@ -74,6 +74,8 @@ cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-fea
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
+窗口示例显式为 Overview / Settings 开启容量 2 的 leaf 保留，并标记列表滚动容器；quick start/nested 保留默认关闭的示范。窗口交互还验证同 Entity/计数往返、不同 history entry 的滚动位置、retained 输入/focus 撤权与命中后新的点击/Space、fallback 清库存后重建。
+
 Linux 示例选择 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev`。窗口交互验证 push/replace/back、布局计数保留、页面点击与 Space、旧焦点释放、跨页按住/释放、Build failure/fallback 和恢复。应用内 BRP 自动化见 [调试指南](../guides/debugging.md)。
 
 原生 `TabNavigationPlugin` / `InputDispatchPlugin` 不在示例接线中；键盘通过 Ready 后显式消费 gate。引擎消息注入、OS 事件与物理设备输入是不同证据，不能混写。
@@ -85,6 +87,7 @@ CI 只检查性能夹具行为，不设耗时门禁：
 ```sh
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
 ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
 正式时间比较使用 [性能基线](../performance.md) 的优化构建方法，不能使用 smoke 的 debug 时间。
@@ -99,6 +102,8 @@ python3 scripts/check-packaged-consumer.py
 第一步解压并验证六个库包；[产物 consumer](../../scripts/check-packaged-consumer.py) 只把 Router 依赖指向这些解压产物，核对实际来源后运行包内 BSN consumer。Bevy 来自官方 crates.io，consumer 固定 0.19.1。标准打包需要可用的 registry；已有离线多包验证曾遇到 Cargo checksum 错误，不能用 `--no-verify` 将它转成通过。确需验证未提交改动时，先审阅实际 diff，再显式使用 `--allow-dirty` 并准确记录源码状态。
 
 ## 已有证据与未验证范围
+
+2026-10-08 的缓存/滚动组合已在窗口源码 `1a30dc58d41c91dd3bcadc3d9795edbdd129a6ad` 验证：Linux/WSLg、960×640、软件渲染、debug `ui-debug`，通过应用内 BRP 发送真实 WindowEvent 与 typed messages。已验证原 Entity/页面和布局计数保留、多 entry 各自恢复位置、旧手势与 focus 撤权、命中后的新点击/Space，以及 fallback 清理旧库存后重新构建；renderer 截图检查最终呈现。库侧完成 workspace 全特性、独立 consumer、无 BSN 和新旧性能夹具行为检查；正式耗时结果归[性能基线](../performance.md)。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 

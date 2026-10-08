@@ -1,6 +1,6 @@
 # 性能测量数据
 
-这里保存已有测量，CSV 原样迁移，不混作现行合同或当前树的新验收。运行方法、统计边界和结果解读见[性能说明](../../performance.md)。除窗口文件为逐帧记录外，其余是样本汇总，不能从汇总分位数还原或合并原始样本。
+这里保存测量数据；历史 CSV 原样迁移，新测量注明完整源码与环境身份，不混作现行合同。运行方法、统计边界和结果解读见[性能说明](../../performance.md)。除窗口文件为逐帧记录外，其余是样本汇总，不能从汇总分位数还原或合并原始样本。
 
 ## 数据身份
 
@@ -16,6 +16,7 @@
 | [performance-cleanup-prototype-2026-09-27.csv](performance-cleanup-prototype-2026-09-27.csv) | 180 | baseline 与有限 normal 原型 | 55911d6 对照；prototype 无 failure/recover，不能视为完整生产版本 |
 | [performance-shape-2026-09-27.csv](performance-shape-2026-09-27.csv) | 576 | flat/nested 与读取合并候选，三轮 | b0dbc3b 基线；candidate 未采用；仅 run 1 uncontended_pair 可比较 |
 | [performance-window-2026-09-27.csv](performance-window-2026-09-27.csv) | 960 | 简单窗口逐帧诊断，非 Router headless 基准 | b0dbc3b；临时 release BRP/采样副本，两轮 |
+| [performance-keep-alive-2026-10-08.csv](performance-keep-alive-2026-10-08.csv) | 96 | 默认关闭、miss/hit、idle、容量淘汰；两轮 flat/nested | `3d6ca2c62a4f1011eb9449e25f1ed237b4c8f35e`；完整已提交 crate/benchmark 源码 |
 
 上述日期和 revision 是测量身份；部分局部提交在后续整理历史时已合并，不承诺其短 SHA 在当前分支仍可检出。`b0dbc3b7486e71cd41e5a8cd05e84ac031b10ce0` 当前仍可解析，但不在当前分支祖先链内。完整历史测量说明固定保存于 `6de4233e2c636daa5892807b05af8a19d6e2cc0f:docs/performance.md`，可用 `git show` 查询；它记录比较方法，不补足未保存的源码。
 
@@ -23,7 +24,15 @@
 
 原型、正式迁移、removal plan 以及读取候选分别比较，不能互相替代。shape 的第二/三轮保留 `contended_pair` 标记，整组不用于收益估算；没有删掉较慢配对或最大值。原型只覆盖有限 normal cleanup，其结果不证明完整 failure/authority/residual 通道。
 
-## 共同环境与统计
+## Keep-alive 2026-10-08
+
+使用完整提交 `3d6ca2c62a4f1011eb9449e25f1ed237b4c8f35e` 的 crate、lock 和 benchmark；编译与计时期间这些文件没有未提交修改。命令为[独立 keep-alive 模式](../../performance.md#keep-alive-对照)，round 1/2 均按 flat→nested 顺序；每组 24 行，128 样本，未过滤离群值。CSV 增加 `round` / `shape` 两列，保留各组全部原始汇总字段。
+
+环境为 Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 可见逻辑 CPU，`rustc 1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0，Bevy 0.19.1。默认优化 bench profile，构建并发 4；窗口已关闭、无并行 Cargo/rustc 或本任务的渲染/采样，未固定 CPU affinity/频率。方法为 CPU 侧 wall-clock，不含 layout/GPU/I/O；idle 是 32 update 批次均值的分布。
+
+`Cargo.lock` SHA-256 为 `1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`；实测 benchmark 二进制 SHA-256 为 `7cc3e143254610b5c790564fc885f81d1c34d6c17811ae345c460327d34f7fef`。版本与历史测量工具链不同，不将二者时间差解释为单一改动收益。
+
+## 历史测量共同环境与统计
 
 - Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`，`x86_64-unknown-linux-gnu`；AMD Ryzen 9 9950X，环境可见 24 逻辑 CPU。
 - `rustc 1.98.1 (48a229cea 2026-09-01)`，LLVM 22.1.8，官方 Bevy 0.19.1；默认优化 bench profile，未固定 CPU affinity/频率。
