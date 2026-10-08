@@ -544,6 +544,99 @@ fn containers_restore_independently_with_frame_local_keys() {
 }
 
 #[test]
+fn missing_container_layout_keeps_its_last_valid_position_on_fresh_back() {
+    let (mut app, router) = app();
+    push(&mut app, router, "/a");
+    let body = page(&mut app, "a");
+    let secondary = container(&mut app, "secondary");
+    scroll(&mut app, body, Vec2::new(70.0, 240.0));
+    scroll(&mut app, secondary, Vec2::new(25.0, 130.0));
+    app.world_mut()
+        .entity_mut(secondary)
+        .remove::<bevy_ui::UiGlobalTransform>();
+    app.update();
+
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let restored = page(&mut app, "a");
+    let restored_secondary = container(&mut app, "secondary");
+    assert_ne!(restored, body);
+    assert_ne!(restored_secondary, secondary);
+    assert_position(&app, restored, Vec2::new(70.0, 240.0));
+    assert_position(&app, restored_secondary, Vec2::new(25.0, 130.0));
+}
+
+#[test]
+fn removing_a_scroll_marker_discards_its_last_valid_live_position() {
+    let (mut app, router) = app();
+    push(&mut app, router, "/a");
+    let secondary = container(&mut app, "secondary");
+    scroll(&mut app, secondary, Vec2::new(25.0, 130.0));
+    app.world_mut()
+        .entity_mut(secondary)
+        .remove::<RouteScroll>();
+    app.update();
+    // Rejoining with the same key does not revive a witness discarded while
+    // the container was unmarked, and this instance has no new layout sample.
+    app.world_mut()
+        .entity_mut(secondary)
+        .insert(RouteScroll::new("secondary"))
+        .remove::<bevy_ui::UiGlobalTransform>();
+    app.update();
+
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let restored_secondary = container(&mut app, "secondary");
+    assert_ne!(restored_secondary, secondary);
+    assert_position(&app, restored_secondary, Vec2::ZERO);
+}
+
+#[test]
+fn a_replacement_entity_with_the_same_scroll_key_has_no_old_live_position() {
+    let (mut app, router) = app();
+    push(&mut app, router, "/a");
+    let secondary = container(&mut app, "secondary");
+    scroll(&mut app, secondary, Vec2::new(25.0, 130.0));
+    let parent = content(&mut app, "a");
+    app.world_mut().despawn(secondary);
+    let replacement = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(100.0),
+                height: Val::Px(80.0),
+                flex_shrink: 0.0,
+                overflow: Overflow::scroll(),
+                ..Default::default()
+            },
+            RouteScroll::new("secondary"),
+            ScrollPosition(Vec2::new(9.0, 19.0)),
+            ScrollContainer("secondary"),
+            ChildOf(parent),
+        ))
+        .id();
+    app.world_mut().spawn((
+        Node {
+            width: Val::Px(500.0),
+            height: Val::Px(600.0),
+            flex_shrink: 0.0,
+            ..Default::default()
+        },
+        ChildOf(replacement),
+    ));
+    app.world_mut()
+        .entity_mut(replacement)
+        .remove::<bevy_ui::UiGlobalTransform>();
+    app.update();
+
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let restored_secondary = container(&mut app, "secondary");
+    assert_ne!(restored_secondary, replacement);
+    assert_position(&app, restored_secondary, Vec2::ZERO);
+}
+
+#[test]
 fn duplicate_keys_do_not_pick_one_container_to_restore() {
     let Fixture {
         mut app, router, ..

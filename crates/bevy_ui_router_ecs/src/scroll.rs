@@ -62,8 +62,8 @@ pub(crate) struct ScrollObservation {
 #[derive(Clone, Default)]
 pub(crate) struct ScrollState {
     records: HashMap<HistoryEntryKey, HashMap<(RouteSegmentReuseKey, String), ScrollPosition>>,
-    // Exact bindings are short lived: replaced after each normal layout and
-    // publication, never used as a second source of history or frame authority.
+    // Latest valid displays survive layout gaps only while the exact marked
+    // containers remain active; they never supply history or frame authority.
     displayed: Vec<Container>,
     published: Option<PublishedEntry>,
     pending: Vec<Restoration>,
@@ -210,6 +210,14 @@ impl ScrollState {
         state
             .records
             .retain(|entry, _| facts.surviving_entries().contains(entry));
+        // Preserved exact containers keep their latest display until another
+        // valid layout; entering containers need their own layout witness.
+        state.displayed.retain(|displayed| {
+            observation
+                .target
+                .iter()
+                .any(|container| same_container(displayed, container))
+        });
         let mut writes = Vec::new();
         if facts.restores_back()
             && let Some(records) = facts
@@ -244,14 +252,6 @@ impl ScrollState {
                 });
             }
         }
-        // Preserved source observations remain usable until the next layout;
-        // entering frames acquire a witness only after an actual layout.
-        state.displayed.retain(|container| {
-            facts
-                .target_frames()
-                .iter()
-                .any(|fact| fact.frame() == &container.frame)
-        });
         state.published = facts.target_entry().map(|entry| PublishedEntry {
             entry,
             frames: facts.target_frames().to_vec(),
@@ -259,7 +259,20 @@ impl ScrollState {
         PreparedScroll { state, writes }
     }
 
-    fn sample_displayed(&mut self, current: Option<HistoryEntryKey>, observed: Vec<Container>) {
+    fn sample_displayed(
+        &mut self,
+        current: Option<HistoryEntryKey>,
+        mut observed: Vec<Container>,
+        laid_out: &HashSet<Entity>,
+    ) {
+        // Loss of layout does not revoke the last display. Loss of the exact
+        // container identity, eligibility or active binding does.
+        self.displayed.retain(|displayed| {
+            observed
+                .iter()
+                .any(|container| same_container(displayed, container))
+        });
+        observed.retain(|container| laid_out.contains(&container.entity));
         // Keep the current visit's last valid display even if authority loss
         // removes its physical branch before another navigation publication.
         // The entry/frame binding comes from the original Core publication.
@@ -285,7 +298,17 @@ impl ScrollState {
                     .extend(positions);
             }
         }
-        self.displayed = observed;
+        for container in observed {
+            if let Some(displayed) = self
+                .displayed
+                .iter_mut()
+                .find(|displayed| same_container(displayed, &container))
+            {
+                *displayed = container;
+            } else {
+                self.displayed.push(container);
+            }
+        }
     }
 }
 
@@ -385,16 +408,17 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
                 world.get_mut::<ScrollPosition>(current.entity).unwrap().0 = settled.0;
             }
         }
-        observed.retain(|container| laid_out.contains(&container.entity));
         let mut navigation = world.resource_mut::<RouterNavigation>();
         let entry = navigation
             .entries
             .iter_mut()
             .find(|entry| entry.handle == handle)
             .unwrap();
-        entry
-            .scroll
-            .sample_displayed(entry.engine.canonical_history().current_entry(), observed);
+        entry.scroll.sample_displayed(
+            entry.engine.canonical_history().current_entry(),
+            observed,
+            &laid_out,
+        );
         if duplicates && !entry.scroll.warned_duplicate {
             eprintln!(
                 "bevy_ui_router: duplicate RouteScroll key within a frame; that key is excluded"

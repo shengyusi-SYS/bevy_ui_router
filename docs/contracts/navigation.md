@@ -64,7 +64,7 @@ publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不�
 
 `RouteScroll::new(key)` 显式标记带有 `Node`、`ScrollPosition` 的容器。key 在一个 route frame 内唯一且稳定；不同 frame 可重复。未标记容器保持应用行为，同 frame 的冲突 key 全部排除并给出有界诊断。
 
-离开 normal 页面时保存最后一次有效布局显示的二维逻辑像素位置，关联 Core canonical history entry 和 route 复用身份。重复 URL 的不同访问独立，Replace 使用新 entry。normal 被 error/fallback 替换时仍保存原位置，失败呈现不覆盖成功访问记录；失败保留原页面时不恢复或重置。
+离开 normal 页面时保存最后一次有效布局显示的二维逻辑像素位置，关联 Core canonical history entry 和 route 复用身份。同一 exact frame、Entity 和 key 仍有效而暂缺布局时保留最近见证；去标记、失去归属或替换 Entity 会清除该容器的 live 见证。重复 URL 的不同访问独立，Replace 使用新 entry。normal 被 error/fallback 替换时仍保存原位置，失败呈现不覆盖成功访问记录；失败保留原页面时不恢复或重置。
 
 成功 Back 恢复目标 entry，包括 cache hit 与仍存活的 preserved prefix 容器；Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。只对 publication 前已存在的标记容器准备位置，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
 
