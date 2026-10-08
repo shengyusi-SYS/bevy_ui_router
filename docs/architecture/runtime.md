@@ -120,12 +120,19 @@ flowchart TB
         Commit --> Cleanup["SettleCleanup"]
         Cleanup --> Publish["RouterScheduleSet::PublishSnapshots"]
     end
+    subgraph PostUpdate
+        direction LR
+        Layout["UiSystems::Layout"] --> Scroll["滚动恢复单次结算<br/>采样实际显示位置"]
+    end
     Ready --> Observe
+    Publish --> Layout
 ```
 
 `Update` 的前五个生命周期 set 是 crate-private；公开的本轮观察排序锚点只有
 `RouterScheduleSet::PublishSnapshots`。普通应用系统在它之后读取 snapshots 或用 `RouteActivity` 查询本轮已发布 active，
 可观察本轮完整结果。显式 plugin 与 App extensions 共用幂等 foundations 安装。
+
+该 snapshot 观察点早于本轮 `PostUpdate`，不表示布局或滚动结算已经完成。
 
 `Refresh` 在 picking hover 前更新当前内容资格；hovermap 生成后、interaction 更新前
 过滤非活动目标。正常 publication 同次调用撤销离场目标的历史 hover、press、click、

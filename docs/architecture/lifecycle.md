@@ -13,6 +13,7 @@ Core 的 [engine](../../crates/bevy_ui_router_core/src/engine.rs) 决定下一�
 | `CommitTicket` 或最后一个 `final_task` | current/next projection 对接为 sealed reconciliation；准备物理切换、claim rebind、输入/focus 和 cleanup owner | publication work 消费预备状态，Core 最后发布；leaving 责任交给 cleanup |
 | `FailureCleanup` | failed branch 冻结 manifest，预留 ledger，再与 Core cleanup batch 绑定 | 逐项物理 receipt 形成 typed completion；Core 消费原 continuation 决定恢复或 terminal |
 | `BackResolution` | history authority 与 capacity reservation 配对，保存完整 source evidence，分别准备 target/no-target | 有目标进入既有执行与 publication；无目标不运行 view，完成明确的失败/authority 结算 |
+| `RetainedMissCleanupOwner` | 缓存自身失效时，`retained_miss` 持有原 fresh task、独立 cleanup token、物理 ledger 与 pending continuation | 清理完成后返还原 task；当前拒绝 holder 的部分完成/host loss 后继仍有[待修复缺口](../roadmap.md#先修复保留页物理交接与失败结算)，不能把保存 owner 等同于有界结算 |
 
 拒绝、容量不足或 completion error 必须返还原 owner 给对应 holder；不能重新签发一个看似等价的 task。已发布 active、pending branch、cleanup ledger 和私有 residual 是不同责任，不以任一容器是否为空替代协议完成。
 
