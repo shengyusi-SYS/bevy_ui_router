@@ -2423,10 +2423,18 @@ fn install_deep_nested_router(app: &mut App) -> RouterHandle {
 }
 
 pub(crate) fn install_retained_slice_router(app: &mut App, capacity: usize) -> RouterHandle {
+    install_retained_slice_router_observed(app, capacity, Default::default())
+}
+
+fn install_retained_slice_router_observed(
+    app: &mut App,
+    capacity: usize,
+    observed: std::sync::Arc<std::sync::Mutex<Vec<RouteViewKey>>>,
+) -> RouterHandle {
     let driver = ViewDriverKey::new("retained-slice").unwrap();
     app.register_ui_view_driver(NestedDriver {
         key: driver.clone(),
-        observed: Default::default(),
+        observed,
         declare_outlet: true,
     })
     .unwrap();
@@ -5285,6 +5293,93 @@ fn retained_leaves_coexist_through_later_mounts_and_close_before_parent_cleanup(
     assert!(entry.cleanup_ledger.is_none());
     assert!(entry.pending_commit.is_none());
     assert!(entry.engine.snapshot().running_request().is_none());
+}
+
+#[test]
+fn retained_hit_reuses_original_entities_and_skips_driver_apply() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = install_retained_slice_router_observed(&mut app, 2, applied.clone());
+    app.update();
+    let mut leaves = Vec::new();
+    for (index, path) in ["/items/1", "/items/2", "/items/1", "/items/2"]
+        .into_iter()
+        .enumerate()
+    {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, request);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let active = entry.active.as_ref().unwrap();
+        let leaf = active.frames().last().unwrap();
+        let pair = (leaf.shell(), leaf.interactive_entities()[0]);
+        assert!(entry.pending_commit.is_none());
+        assert!(entry.cleanup_ledger.is_none());
+        assert!(entry.engine.snapshot().running_request().is_none());
+        assert_eq!(
+            entry.engine.canonical_history().entry_keys().len(),
+            index + 1
+        );
+        if index < 2 {
+            leaves.push(pair);
+        } else {
+            assert_eq!(
+                pair,
+                leaves[index % 2],
+                "cache hit must reuse the original payload"
+            );
+            assert_eq!(entry.retained.len(), 1);
+            assert_eq!(entry.retained.inventory().unwrap().len(), 1);
+        }
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(pair.1)
+        );
+        for other in leaves.iter().filter(|other| **other != pair) {
+            assert!(app.world().get_entity(other.0).is_ok());
+            assert_eq!(
+                app.world().get::<Visibility>(other.0),
+                Some(&Visibility::Hidden)
+            );
+            assert!(
+                !app.world()
+                    .resource::<RouterInputGate>()
+                    .allows_pointer(other.1)
+            );
+        }
+    }
+    let applied = applied.lock().unwrap();
+    let layout = RouteViewKey::new("layout").unwrap();
+    let item = RouteViewKey::new("item").unwrap();
+    assert_eq!(applied.iter().filter(|view| *view == &layout).count(), 1);
+    assert_eq!(
+        applied.iter().filter(|view| *view == &item).count(),
+        2,
+        "both cache hits must bypass driver apply"
+    );
+    drop(applied);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/outside"))
+        .unwrap();
+    run_updates_until_succeeded(&mut app, request);
+    assert!(
+        leaves
+            .iter()
+            .all(|(shell, output)| app.world().get_entity(*shell).is_err()
+                && app.world().get_entity(*output).is_err())
+    );
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .retained
+            .is_empty()
+    );
 }
 
 #[test]

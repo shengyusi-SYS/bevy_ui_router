@@ -673,6 +673,25 @@ impl RouteEntityRegistry {
         Ok(PreparedRetainedBoundaries { boundaries })
     }
 
+    pub(crate) fn retained_payload_is_current(
+        &self,
+        world: &World,
+        projection: &bevy_ui_router_core::integration::RetainedLeafProjection,
+        frame: &crate::presentation::RealizedFrame,
+        slots: &[crate::mount::MountedChildSlot],
+    ) -> bool {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let Some(boundary) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none()
+            && boundary.matches_payload(frame, slots)
+            && boundary.is_current(world)
+    }
+
     pub(crate) fn retained_shell_is_current(
         &self,
         world: &World,

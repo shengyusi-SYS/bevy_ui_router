@@ -264,6 +264,38 @@ pub(crate) fn validate_entering_mount_parent(
         )
 }
 
+pub(crate) fn validate_retained_entering_branch(
+    world: &World,
+    entering: &RealizedBranch,
+    projection: &bevy_ui_router_core::integration::RetainedLeafProjection,
+) -> Result<(), FrameLocalError> {
+    let [frame] = entering.frames() else {
+        return Err(FrameLocalError::OwnershipDrift(
+            entering
+                .frames()
+                .first()
+                .map_or(Entity::PLACEHOLDER, |frame| frame.shell()),
+        ));
+    };
+    if let Some(slot) = entering.child_slots().iter().find(|slot| {
+        world
+            .get::<Children>(slot.slot())
+            .is_some_and(|children| !children.is_empty())
+    }) {
+        return Err(FrameLocalError::ForeignChildSlot(slot.slot()));
+    }
+    if world
+        .get_resource::<RouteEntityRegistry>()
+        .is_some_and(|registry| {
+            registry.retained_payload_is_current(world, projection, frame, entering.child_slots())
+        })
+    {
+        Ok(())
+    } else {
+        Err(FrameLocalError::OwnershipDrift(frame.shell()))
+    }
+}
+
 pub(crate) fn validate_reconciliation_entering_branch(
     world: &World,
     entering: &RealizedBranch,
@@ -374,12 +406,13 @@ pub(crate) fn validate_preserved_branch_local(
             ReconciliationSlotRoleKind::PreservedActive
                 | ReconciliationSlotRoleKind::RetainEmpty
                 | ReconciliationSlotRoleKind::ActivateExisting
-        ) && preserved
-            .child_slots()
-            .iter()
-            .filter(|slot| sealed_existing_role_matches_slot(role, slot))
-            .count()
-            != 1
+        ) && role.current() != EntityLifecycle::Retained
+            && preserved
+                .child_slots()
+                .iter()
+                .filter(|slot| sealed_existing_role_matches_slot(role, slot))
+                .count()
+                != 1
     }) {
         return Err(FrameLocalError::OwnershipDrift(role.entity()));
     }
@@ -517,6 +550,7 @@ fn validate_committed_branch_with_entering(
                 )
             };
             belongs_to_branch
+                && role.current() != EntityLifecycle::Retained
                 && branch
                     .child_slots()
                     .iter()

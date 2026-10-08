@@ -668,6 +668,14 @@ fn nested_fixture_with_patterns(
     root_pattern: RoutePattern,
     ancestors: Vec<RoutePattern>,
 ) -> NestedFixture {
+    nested_fixture_with_retention(root_pattern, ancestors, 0)
+}
+
+fn nested_fixture_with_retention(
+    root_pattern: RoutePattern,
+    ancestors: Vec<RoutePattern>,
+    capacity: usize,
+) -> NestedFixture {
     let mut app = native_app();
 
     let layout = RouteViewKey::new("nested-layout").unwrap();
@@ -706,7 +714,8 @@ fn nested_fixture_with_patterns(
             RoutePattern::path("items/:id").unwrap(),
             RouteNodeOptions::new()
                 .with_view(leaf.clone())
-                .with_slot(RouteSlotKey::default()),
+                .with_slot(RouteSlotKey::default())
+                .with_keep_alive(capacity > 0),
         )
         .unwrap();
     let routes = routes.build().unwrap();
@@ -725,7 +734,9 @@ fn nested_fixture_with_patterns(
             .unwrap();
     }
     let router = app
-        .add_ui_router(RouterConfig::new(routes, views, fallback))
+        .add_ui_router(
+            RouterConfig::new(routes, views, fallback).with_keep_alive_capacity(capacity),
+        )
         .unwrap();
 
     let host = app
@@ -3278,6 +3289,121 @@ fn reconciliation_journey_b_preserves_layout_and_replaces_leaf() {
     assert_manifest_not_added_or_changed(&fixture.app, host, app_owned_change_baseline);
     assert_manifest_not_added_or_changed(&fixture.app, existing_child, app_owned_change_baseline);
     assert_manifest_not_added_or_changed(&fixture.app, existing_sibling, app_owned_change_baseline);
+}
+
+#[test]
+fn retained_native_hit_preserves_state_and_skips_factory_and_scene_apply() {
+    let mut fixture =
+        nested_fixture_with_retention(RoutePattern::path("/:section").unwrap(), Vec::new(), 2);
+    let scene_writes = Arc::new(AtomicUsize::new(0));
+    let observed = scene_writes.clone();
+    fixture
+        .app
+        .world_mut()
+        .add_observer(move |_: On<Insert, LocalState>| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+    let first = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/catalog/items/1"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, first));
+    let original = node_entities_with_width(&mut fixture.app, 43)[0];
+    let first_frames = router_snapshot(&fixture.app, fixture.router)
+        .active()
+        .frames()
+        .to_vec();
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(original)
+        .unwrap()
+        .0 = 91;
+
+    let second = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/catalog/items/2"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, second));
+    let second_entity = node_entities_with_width(&mut fixture.app, 43)
+        .into_iter()
+        .find(|entity| *entity != original)
+        .unwrap();
+    let effects = fixture.control.effects();
+    let writes = scene_writes.load(Ordering::Relaxed);
+    assert!(
+        writes > 0,
+        "the real Scene executor must have applied the fixture"
+    );
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(original)
+    );
+
+    let hit = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/catalog/items/1"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, hit));
+    let leaves = node_entities_with_width(&mut fixture.app, 43);
+    let gate = fixture.app.world().resource::<RouterInputGate>();
+    let active = leaves
+        .iter()
+        .copied()
+        .filter(|entity| gate.allows_pointer(*entity))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        active,
+        [original],
+        "native cache hit must activate the original Entity"
+    );
+    assert!(gate.allows_keyboard(original) && gate.allows_gamepad(original));
+    assert!(!gate.allows_pointer(second_entity));
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(original),
+        Some(&LocalState(91))
+    );
+    assert_eq!(
+        fixture.control.effects(),
+        effects,
+        "hit must bypass the BSN factory"
+    );
+    assert_eq!(
+        scene_writes.load(Ordering::Relaxed),
+        writes,
+        "hit must not reapply the Scene"
+    );
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .active()
+            .frames(),
+        first_frames
+    );
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+
+    let outside = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/other/items/3"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, outside));
+    assert!(fixture.app.world().get_entity(original).is_err());
+    assert!(fixture.app.world().get_entity(second_entity).is_err());
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 
 #[test]

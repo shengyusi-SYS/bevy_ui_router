@@ -713,6 +713,33 @@ impl RetainedBoundaryProof {
         })
     }
 
+    pub(crate) fn matches_payload(
+        &self,
+        frame: &RealizedFrame,
+        slots: &[MountedChildSlot],
+    ) -> bool {
+        frame.frame() == self.projection.frame()
+            && frame.shell == self.shell
+            && frame.native_root() == self.native_root
+            && frame.mount.matches_retained_scope(&self.projection)
+            && frame.entities == self.entities
+            && slots.len() == self.empty_slots.len()
+            && slots.iter().all(|slot| {
+                self.empty_slots
+                    .iter()
+                    .filter(|expected| {
+                        expected.claim == *slot.slot_claim()
+                            && expected.parent == *slot.parent()
+                            && expected.outlet == *slot.outlet()
+                            && expected.slot == slot.slot_id()
+                            && expected.anchor_binding == *slot.anchor_binding()
+                            && expected.expected_anchor_children == slot.expected_anchor_children()
+                    })
+                    .count()
+                    == 1
+            })
+    }
+
     pub(crate) const fn projection(&self) -> &RetainedLeafProjection {
         &self.projection
     }
@@ -952,6 +979,23 @@ impl RetainedBoundaryProof {
                 .empty_slots
                 .iter()
                 .all(|slot| seen.contains(&slot.claim.entity()))
+    }
+}
+
+/// Fresh readonly mount facts for an existing retained physical owner.
+/// Consuming this packet only refreshes aliases; it creates no ownership.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparedRetainedFrameActivation {
+    mount: FrameMountBinding,
+    prior_mount_children: Vec<Entity>,
+}
+
+impl PreparedRetainedFrameActivation {
+    pub(crate) const fn mount(&self) -> &FrameMountBinding {
+        &self.mount
+    }
+    pub(crate) fn matches_frame(&self, frame: &RealizedFrame) -> bool {
+        self.mount == frame.mount && self.prior_mount_children == frame.prior_mount_children
     }
 }
 
@@ -1228,12 +1272,16 @@ impl<'w> PreparedPresentationMutation<'w> {
                                 (
                                     EntityLifecycle::Active | EntityLifecycle::PreparedInert,
                                     EntityLifecycle::Leaving | EntityLifecycle::Retained
-                                ) | (EntityLifecycle::Retained, EntityLifecycle::Leaving)
-                                    | (EntityLifecycle::Active, EntityLifecycle::PreparedInert)
+                                ) | (
+                                    EntityLifecycle::Retained,
+                                    EntityLifecycle::Leaving | EntityLifecycle::PreparedInert
+                                ) | (EntityLifecycle::Active, EntityLifecycle::PreparedInert)
                             ) && !entity.active_after
                         } else {
-                            entity.current == EntityLifecycle::PreparedInert
-                                && entity.next == EntityLifecycle::Active
+                            matches!(
+                                entity.current,
+                                EntityLifecycle::PreparedInert | EntityLifecycle::Retained
+                            ) && entity.next == EntityLifecycle::Active
                                 && entity.active_after
                         }
                 });
@@ -1519,6 +1567,105 @@ impl RealizedFrame {
 
     pub(crate) const fn shell_is_attached(&self) -> bool {
         matches!(self.mount_stage, FrameMountStage::ShellAttached)
+    }
+
+    pub(crate) fn prepare_retained_activation(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+        slot: &MountedChildSlot,
+        leaving_shells: &[ExactRegistryClaim],
+    ) -> Option<PreparedRetainedFrameActivation> {
+        let registry = world.get_resource::<RouteEntityRegistry>()?;
+        if self.frame() != projection.frame()
+            || !self.shell_is_attached()
+            || !self.mount.matches_retained_scope(projection)
+            || self.mount.slot != slot.slot()
+            || self.mount.slot_claim.owner() != slot.slot_claim().owner()
+            || self.mount.slot_claim.seal() != slot.slot_claim().seal()
+        {
+            return None;
+        }
+        #[cfg(feature = "bsn")]
+        if self.native_focus_owner().is_some() {
+            return None;
+        }
+        let FrameMountBindingKind::ChildOutlet {
+            parent,
+            outlet,
+            anchor,
+            anchor_binding,
+            ..
+        } = &self.mount.kind
+        else {
+            return None;
+        };
+        if parent != slot.parent()
+            || outlet != slot.outlet()
+            || *anchor != slot.anchor()
+            || anchor_binding.anchor() != slot.anchor_binding().anchor()
+            || anchor_binding.source_claim().entity() != slot.anchor_claim().entity()
+            || anchor_binding.source_claim().owner() != slot.anchor_claim().owner()
+            || anchor_binding.source_claim().seal() != slot.anchor_claim().seal()
+        {
+            return None;
+        }
+        let children = world
+            .get::<Children>(slot.slot())?
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        if children
+            .iter()
+            .filter(|child| **child == self.shell)
+            .count()
+            != 1
+        {
+            return None;
+        }
+        let mut peers = Vec::new();
+        peers
+            .try_reserve_exact(children.len().saturating_sub(1))
+            .ok()?;
+        let mut prior = Vec::new();
+        prior
+            .try_reserve_exact(children.len().saturating_sub(1))
+            .ok()?;
+        for child in children.into_iter().filter(|child| *child != self.shell) {
+            if world.get::<ChildOf>(child).map(ChildOf::parent) != Some(slot.slot()) {
+                return None;
+            }
+            let claim = registry.record(child)?.claim();
+            let current_leaving =
+                leaving_shells.contains(&claim) && claim.lifecycle() == EntityLifecycle::Active;
+            if !current_leaving && !registry.retained_shell_is_current(world, child, slot.slot()) {
+                return None;
+            }
+            prior.push(child);
+            // Other retained peers keep their independently re-observed proof.
+            if current_leaving {
+                peers.push(claim);
+            }
+        }
+        let mut mount = FrameMountBinding::from_mounted_child_slot(slot);
+        if let FrameMountBindingKind::ChildOutlet {
+            staging_lifecycle,
+            allowed_existing_shells,
+            ..
+        } = &mut mount.kind
+        {
+            *staging_lifecycle = slot.slot_claim().lifecycle();
+            *allowed_existing_shells = peers;
+        }
+        Some(PreparedRetainedFrameActivation {
+            mount,
+            prior_mount_children: prior,
+        })
+    }
+
+    pub(crate) fn apply_retained_activation(&mut self, prepared: PreparedRetainedFrameActivation) {
+        self.mount = prepared.mount;
+        self.prior_mount_children = prepared.prior_mount_children;
     }
 
     pub(crate) fn prepare_mount_rebase(&self, leaving: &Self) -> Option<PreparedFrameMountRebase> {

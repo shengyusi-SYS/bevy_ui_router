@@ -81,8 +81,15 @@ pub(crate) struct RetainedLeaves {
 /// entries in the cache; only Core acceptance permits physical handoff.
 pub(crate) struct PreparedRetainedChange {
     indices: Vec<usize>,
+    hit: Option<usize>,
+    removals: Vec<usize>,
     owners: Vec<RetainedLeafOwner>,
     payloads: Vec<RealizedBranch>,
+}
+
+pub(crate) struct RetainedPayloads {
+    pub(crate) hit: Option<RealizedBranch>,
+    pub(crate) retiring: Vec<RealizedBranch>,
 }
 
 impl PreparedRetainedChange {
@@ -115,7 +122,7 @@ impl PreparedRetainedChange {
     /// The cache cannot change membership between preparation and handoff.
     /// Rejection returns these same capabilities through restore_owners.
     pub(crate) fn take_owners(&mut self, leaves: &mut RetainedLeaves) -> Vec<RetainedLeafOwner> {
-        for index in &self.indices {
+        for index in &self.removals {
             self.owners.push(
                 leaves.entries[*index]
                     .owner
@@ -127,10 +134,26 @@ impl PreparedRetainedChange {
     }
 
     pub(crate) fn into_payloads(mut self, leaves: &mut RetainedLeaves) -> Vec<RealizedBranch> {
-        for index in self.indices.into_iter().rev() {
+        for index in self.removals.into_iter().rev() {
             self.payloads.push(leaves.entries.remove(index).branch);
         }
         self.payloads
+    }
+
+    pub(crate) fn into_hit_and_payloads(mut self, leaves: &mut RetainedLeaves) -> RetainedPayloads {
+        let mut hit = None;
+        for index in self.removals.into_iter().rev() {
+            let branch = leaves.entries.remove(index).branch;
+            if Some(index) == self.hit {
+                hit = Some(branch);
+            } else {
+                self.payloads.push(branch);
+            }
+        }
+        RetainedPayloads {
+            hit,
+            retiring: self.payloads,
+        }
     }
 }
 
@@ -150,6 +173,15 @@ impl RetainedLeaves {
         retiring: &[RetainedLeafProjection],
         reserve_addition: bool,
     ) -> Option<PreparedRetainedChange> {
+        self.prepare_change_with_hit(retiring, None, reserve_addition)
+    }
+
+    pub(crate) fn prepare_change_with_hit(
+        &mut self,
+        retiring: &[RetainedLeafProjection],
+        hit: Option<&RetainedLeafProjection>,
+        reserve_addition: bool,
+    ) -> Option<PreparedRetainedChange> {
         let mut indices = Vec::new();
         indices.try_reserve_exact(retiring.len()).ok()?;
         for projection in retiring {
@@ -167,8 +199,30 @@ impl RetainedLeaves {
             indices.push(index);
         }
         indices.sort_unstable();
+        let hit = if let Some(projection) = hit {
+            let mut matches = self.entries.iter().enumerate().filter(|(_, entry)| {
+                &entry.projection == projection
+                    && entry
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.projection() == projection)
+            });
+            let (index, _) = matches.next()?;
+            if matches.next().is_some() || indices.binary_search(&index).is_ok() {
+                return None;
+            }
+            Some(index)
+        } else {
+            None
+        };
+        let transfer_count = indices.len().checked_add(usize::from(hit.is_some()))?;
+        let mut removals = Vec::new();
+        removals.try_reserve_exact(transfer_count).ok()?;
+        removals.extend(indices.iter().copied());
+        removals.extend(hit);
+        removals.sort_unstable();
         let mut owners = Vec::new();
-        owners.try_reserve_exact(indices.len()).ok()?;
+        owners.try_reserve_exact(transfer_count).ok()?;
         let mut payloads = Vec::new();
         payloads.try_reserve_exact(indices.len()).ok()?;
         if reserve_addition {
@@ -176,9 +230,27 @@ impl RetainedLeaves {
         }
         Some(PreparedRetainedChange {
             indices,
+            hit,
+            removals,
             owners,
             payloads,
         })
+    }
+
+    pub(crate) fn branch_for(
+        &self,
+        projection: &RetainedLeafProjection,
+    ) -> Option<&RealizedBranch> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                &entry.projection == projection
+                    && entry
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.projection() == projection)
+            })
+            .map(|entry| &entry.branch)
     }
 
     pub(crate) fn is_empty(&self) -> bool {

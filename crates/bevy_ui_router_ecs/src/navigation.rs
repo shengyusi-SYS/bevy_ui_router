@@ -8138,6 +8138,8 @@ fn complete_zero_physical_failure(
             entry.pending_commit = Some(PendingCommit {
                 ticket: None,
                 final_task: None,
+                retained_hit: None,
+                rejected_retained_publication: None,
                 branch,
             });
         }
@@ -9167,6 +9169,34 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         None,
                                     ),
                                 };
+                                if retry_effect.is_none()
+                                    && pending.branch.frames().is_empty()
+                                    && pending.branch.child_slots().is_empty()
+                                    && !entry.retained.is_empty()
+                                {
+                                    let hit = entry.retained.inventory().ok_or(IntegrationError::Stale)
+                                        .and_then(|inventory| entry.engine.prepare_retained_hit_plan(&task, &inventory));
+                                    match hit {
+                                        Ok(Some(plan)) => {
+                                            pending.retained_hit = Some(Box::new(plan));
+                                            pending.final_task = Some(task);
+                                            entry.pending_commit = Some(pending);
+                                            continue;
+                                        }
+                                        Ok(None) => {}
+                                        Err(_) => {
+                                            entry.pending_failed_branch = Some(PendingFailedBranch {
+                                                terminal: PendingFailedBranchTerminal::Task {
+                                                    task,
+                                                    failure: ViewFailureKind::Apply,
+                                                    message: "retained hit selection became stale".into(),
+                                                },
+                                                branch: failed_prepared_branch(pending, None),
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let expected_child_outlet =
                                     match entry.engine.expected_child_outlet(&task) {
                                         Ok(expected) => expected,
@@ -10529,12 +10559,40 @@ fn commit_sealed_registration_removal_is_armed(_entry: &RouterEntry) -> bool {
     false
 }
 
+enum ReconciliationPreflightDecision {
+    Ready(Vec<Entity>),
+    PendingRejected(LifecyclePreflightEvidence),
+    AuthorityLost(LifecyclePreflightEvidence),
+}
+
 fn reconciliation_preflight(
     world: &World,
     host_is_current: bool,
     has_leaving: bool,
     splice: SealedReconciliationSplice,
 ) -> ReconciliationPreflightOutcome {
+    match reconciliation_preflight_view(world, host_is_current, has_leaving, splice.view()) {
+        ReconciliationPreflightDecision::Ready(focus_leaving) => {
+            ReconciliationPreflightOutcome::Ready {
+                splice,
+                focus_leaving,
+            }
+        }
+        ReconciliationPreflightDecision::PendingRejected(evidence) => {
+            ReconciliationPreflightOutcome::PendingRejected { splice, evidence }
+        }
+        ReconciliationPreflightDecision::AuthorityLost(evidence) => {
+            ReconciliationPreflightOutcome::AuthorityLost { splice, evidence }
+        }
+    }
+}
+
+fn reconciliation_preflight_view(
+    world: &World,
+    host_is_current: bool,
+    has_leaving: bool,
+    splice: crate::branch_transaction::ReconciliationSpliceView<'_>,
+) -> ReconciliationPreflightDecision {
     let entering_boundaries = splice
         .entering()
         .claims()
@@ -10576,14 +10634,7 @@ fn reconciliation_preflight(
     } else {
         None
     };
-    let pending_rejection = if validate_reconciliation_entering_branch(
-        world,
-        splice.entering(),
-        splice.preserved(),
-        splice.leaving(),
-    )
-    .is_err()
-    {
+    let pending_rejection = if splice.validate_entering(world).is_err() {
         Some(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::PendingEntering,
             LifecyclePreflightExpectation::ExactAuthority,
@@ -10603,30 +10654,19 @@ fn reconciliation_preflight(
         })
     });
     if let Some(evidence) = current_loss {
-        ReconciliationPreflightOutcome::AuthorityLost { splice, evidence }
+        ReconciliationPreflightDecision::AuthorityLost(evidence)
     } else if let Some(evidence) = pending_rejection {
-        ReconciliationPreflightOutcome::PendingRejected { splice, evidence }
-    } else if validate_active_branch_for_splice(
-        world,
-        splice.preserved(),
-        splice.entering(),
-        splice.slot_roles(),
-    )
-    .is_err()
-    {
-        ReconciliationPreflightOutcome::PendingRejected {
-            splice,
-            evidence: LifecyclePreflightEvidence::new(
-                LifecyclePreflightSource::CrossRoleRebase,
-                LifecyclePreflightExpectation::RebaseCompatible,
-                LifecyclePreflightObserved::Contradictory,
-            ),
-        }
+        ReconciliationPreflightDecision::PendingRejected(evidence)
+    } else if splice.validate_active_for_splice(world).is_err() {
+        ReconciliationPreflightDecision::PendingRejected(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::CrossRoleRebase,
+            LifecyclePreflightExpectation::RebaseCompatible,
+            LifecyclePreflightObserved::Contradictory,
+        ))
     } else {
-        ReconciliationPreflightOutcome::Ready {
-            splice,
-            focus_leaving: leaving_closure.expect("current closure was independently validated"),
-        }
+        ReconciliationPreflightDecision::Ready(
+            leaving_closure.expect("current closure was independently validated"),
+        )
     }
 }
 
@@ -15283,7 +15323,7 @@ struct SealedNormalPreparation {
 enum PendingPublicationWork {
     Normal {
         pending: PendingCommit,
-        splice: SealedReconciliationSplice,
+        splice: NormalPublicationSplice,
         had_active: bool,
         has_leaving: bool,
         sealed: Option<SealedNormalPreparation>,
@@ -15397,6 +15437,33 @@ fn prepare_commit_entry(
     let Some(mut pending) = entry.pending_commit.take() else {
         return None;
     };
+    if let Some(prepared) = pending.rejected_retained_publication.take() {
+        match entry
+            .engine
+            .cancel_prepared_retained_commit_for_authority_settlement(*prepared)
+        {
+            Ok(owners) => {
+                assert!(
+                    entry.retained.restore_owners(owners).is_ok(),
+                    "cancelled publication returns its original cache capabilities"
+                );
+            }
+            Err((prepared, _)) => pending.rejected_retained_publication = Some(Box::new(prepared)),
+        }
+        let had_active = entry.active.is_some();
+        let active = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+        if let Err((active, pending)) = fail_closed_normal_owner_protocol(
+            world,
+            entry,
+            active,
+            pending,
+            AuthorityProtocolResidualKind::Authority(BeginAuthoritySettlementErrorKind::Stale),
+        ) {
+            entry.active = had_active.then_some(active);
+            entry.pending_commit = Some(pending);
+        }
+        return None;
+    }
     if !pending.branch.frames().is_empty()
         && pending.ticket.is_none()
         && pending.final_task.is_none()
@@ -15422,12 +15489,16 @@ fn prepare_commit_entry(
         return None;
     };
     let (facts, has_leaving) = {
-        let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
-            (Some(ticket), _) => entry.engine.reconciliation_projection_for_commit(ticket),
-            (None, Some(task)) => entry.engine.reconciliation_projection_for_task(task),
-            (None, None) => {
-                entry.pending_commit = Some(pending);
-                return None;
+        let projection = if let Some(plan) = pending.retained_hit.as_ref() {
+            Ok(plan.reconciliation())
+        } else {
+            match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+                (Some(ticket), _) => entry.engine.reconciliation_projection_for_commit(ticket),
+                (None, Some(task)) => entry.engine.reconciliation_projection_for_task(task),
+                (None, None) => {
+                    entry.pending_commit = Some(pending);
+                    return None;
+                }
             }
         };
         let Ok(projection) = projection else {
@@ -15446,7 +15517,15 @@ fn prepare_commit_entry(
     };
     let had_active = entry.active.is_some();
     let active_owner = entry.active.take().unwrap_or_else(RealizedBranch::empty);
-    let sealed = match SealedExistingReconciliation::prepare_from_projection(active_owner, facts) {
+    let sealed = match if let Some(plan) = pending.retained_hit.as_ref() {
+        SealedExistingReconciliation::prepare_retained_from_projection(
+            active_owner,
+            facts,
+            plan.hit(),
+        )
+    } else {
+        SealedExistingReconciliation::prepare_from_projection(active_owner, facts)
+    } {
         Ok(sealed) => sealed,
         Err(failure) => {
             let (active, _) = failure.into_parts();
@@ -15455,37 +15534,74 @@ fn prepare_commit_entry(
             return None;
         }
     };
-    let entering_owner = std::mem::replace(&mut pending.branch, PreparedBranch::empty());
-    let splice = match sealed.bind_entering(entering_owner) {
-        Ok(splice) => splice,
-        Err(failure) => {
-            let (sealed, entering, _) = failure.into_parts();
-            let (active, _, _roles) = sealed.reject().into_parts();
+    let splice = if let Some(plan) = pending.retained_hit.as_ref() {
+        let Some(branch) = entry.retained.branch_for(plan.hit()) else {
+            let (active, _, _) = sealed.reject().into_parts();
             entry.active = had_active.then_some(active);
-            pending.branch = entering;
             entry.pending_commit = Some(pending);
             return None;
+        };
+        match sealed.prepare_retained_entering(world, branch, plan.hit()) {
+            Ok(prepared) => NormalPublicationSplice::Retained {
+                prepared,
+                hit: plan.hit().clone(),
+            },
+            Err((sealed, _)) => {
+                let (active, _, _) = sealed.reject().into_parts();
+                entry.active = had_active.then_some(active);
+                let task = pending.final_task.take()?;
+                entry.pending_failed_branch = Some(PendingFailedBranch {
+                    terminal: PendingFailedBranchTerminal::Task {
+                        task,
+                        failure: ViewFailureKind::Apply,
+                        message: "retained entering preparation rejected".into(),
+                    },
+                    branch: failed_prepared_branch(pending, None),
+                });
+                return None;
+            }
+        }
+    } else {
+        let entering_owner = std::mem::replace(&mut pending.branch, PreparedBranch::empty());
+        match sealed.bind_entering(entering_owner) {
+            Ok(splice) => NormalPublicationSplice::Fresh(splice),
+            Err(failure) => {
+                let (sealed, entering, _) = failure.into_parts();
+                let (active, _, _roles) = sealed.reject().into_parts();
+                entry.active = had_active.then_some(active);
+                pending.branch = entering;
+                entry.pending_commit = Some(pending);
+                return None;
+            }
         }
     };
 
     let mut splice = splice;
-    let sealed = if commit_sealed_registration_removal_is_armed(entry) {
-        let host_is_current = entry
-            .host
-            .as_ref()
-            .is_some_and(|host| current_host_binding_is_exact(world, host));
-        let (observed_splice, ready) =
-            match reconciliation_preflight(world, host_is_current, has_leaving, splice) {
-                ReconciliationPreflightOutcome::Ready { splice, .. } => (splice, true),
-                ReconciliationPreflightOutcome::PendingRejected { splice, .. }
-                | ReconciliationPreflightOutcome::AuthorityLost { splice, .. } => (splice, false),
+    let sealed = if let NormalPublicationSplice::Fresh(fresh) = splice {
+        let (fresh, sealed) = if commit_sealed_registration_removal_is_armed(entry) {
+            let host_is_current = entry
+                .host
+                .as_ref()
+                .is_some_and(|host| current_host_binding_is_exact(world, host));
+            let (observed_splice, ready) =
+                match reconciliation_preflight(world, host_is_current, has_leaving, fresh) {
+                    ReconciliationPreflightOutcome::Ready { splice, .. } => (splice, true),
+                    ReconciliationPreflightOutcome::PendingRejected { splice, .. }
+                    | ReconciliationPreflightOutcome::AuthorityLost { splice, .. } => {
+                        (splice, false)
+                    }
+                };
+            let sealed = if ready {
+                prepare_normal_registration_probe(world, entry, &mut pending, &observed_splice)
+            } else {
+                None
             };
-        splice = observed_splice;
-        if ready {
-            prepare_normal_registration_probe(world, entry, &mut pending, &splice)
+            (observed_splice, sealed)
         } else {
-            None
-        }
+            (fresh, None)
+        };
+        splice = NormalPublicationSplice::Fresh(fresh);
+        sealed
     } else {
         None
     };
@@ -15663,7 +15779,7 @@ fn settle_prepublication_authority_loss(
 }
 
 mod normal_publication;
-use normal_publication::publish_normal_work;
+use normal_publication::{NormalPublicationSplice, publish_normal_work};
 
 mod authority_isolation;
 mod idle_host_loss;
@@ -22158,6 +22274,8 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 entry.pending_commit = Some(PendingCommit {
                     ticket: None,
                     final_task: None,
+                    retained_hit: None,
+                    rejected_retained_publication: None,
                     branch,
                 });
                 bind_post_cleanup_back_resolution(entry);

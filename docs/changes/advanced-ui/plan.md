@@ -4,7 +4,7 @@
 
 按结果顺序交付。Core 决定 history 与 lifecycle，ECS 持有实体、滚动数据和物理 owner；沿用现有 publication/cleanup 协议。只在实际改动处拆分私有模块，不整体重写 navigation。默认关闭新增能力时保持现有行为。
 
-闲置 host loss 的完整缓存移交已闭合；局部结构收敛单独提交。之后先闭合 A→B→A 的命中旅程及一次准备拒绝返还，再沿同一协议完成 LRU、其余失效路径与组合验收：
+闲置 host loss 的完整缓存移交与 A→B→A 命中已闭合，局部结构收敛单独提交。接下来先完成前台失败/authority 拒绝的缓存责任结算，再沿同一协议完成 LRU 与组合验收：
 
 - Core 在 `engine/retained.rs` 集中 retained 库存和移交 owner 的 exact 核对；normal 按 next scope、idle 按 exact host 明确分区，保留各自已有 history/host owner 和 continuation，不为每种失败增加独立缓存状态机。
 - ECS 在 `retained.rs` 统一原 owner/physical payload 的选择、预分配、移交与返还；选定内容进入既有 cleanup manifest/physical forest。normal publication 编排移入私有模块，主 navigation 分派到该入口；不通过机械拆文件代替职责收敛。
@@ -31,24 +31,22 @@
 
 ## 3. Retained 共存机制验证
 
-- [x] 沿现有 slot/mount/frame-local/registry 边界验证独立 retained role 与 exact claim 能在同一 child slot 下和 active 共存；原请求不持有长期 outstanding capability。
-- [ ] 覆盖 active 正向输入、retained 拒绝、无关缓存 protected、hook 写后 drift 拒绝和 parent cleanup 责任交接。机制证据必须经过生产 predicate，不能直接注入分类结论。
-- [ ] 若探针揭示设计不可行，先收敛到有证据的 owner/角色协议再继续完整缓存；不通过放宽所有 child-set 检查获得通过。
-
-实现入口：Core `frame.rs`/`engine.rs`/`integration.rs`，ECS `registry.rs`、`mount.rs`、`frame_local.rs`、`presentation.rs`、`input.rs`、`cleanup.rs` 与 `branch_transaction.rs`。此阶段独立审查后进入缓存实现。
-
-已闭合连续多个 inactive leaf 与 active 共存、撤销输入/focus、离开父布局以及闲置 host 丢失后清理并重新接纳的完整旅程。库存/移交准备收敛后先完成命中主线，再补齐 LRU、前台失败与 authority 失效时的结算及组合验收。
+独立 retained role 与 exact claim 已进入生产路径；连续多个 inactive leaf 与 active 共存、输入/focus 撤权、离开父布局、闲置 host 丢失及重新接纳已有完整旅程。长期 owner 不再挂在原请求上。这些机制已通过独立审查和完整 crate/public gate，后续只补命中、失效路径及组合行为暴露的缺口，不重做探针或另建反例矩阵。
 
 ## 4. 同父 leaf 缓存与完整责任交接
 
-- [ ] Route 显式启用 keep-alive，Router 设置 inactive leaf 容量；默认关闭，容量零禁用。Core 决定 retain/reactivate/dispose，ECS 私有模块持有长期 retained owner 与实体。
+命中切片沿三处接缝落实：Core 以本次 task 冻结只读命中/next 事实，在 late prepare 中构造独立 next work 并沿原 history/publication 接受；ECS 短借用原缓存完成 mount/closure/claim/输入准备，产出只读准备包，接受后才移动原 payload；driver 在 factory/apply 前分派此路径。原 frame/Entity/slot 保留，拒绝返还原 task、plan 和 owners；缓存不提前转成 fresh PreparedInert。leaf 自身的空 child slot 由 Core 在 retain 时保存并在 hit 时恢复。
+
+- [x] Route 显式启用 keep-alive，Router 设置 inactive leaf 容量；默认关闭，容量零禁用。Core 决定 retain/reactivate/dispose，ECS 私有模块持有长期 retained owner 与实体。
 - [ ] 按 exact parent frame/generation、outlet、slot binding、host incarnation 和 route/view/params/raw search/raw fragment 判定；只缓存 normal leaf，保持 fragment 替换与 search 重建合同。
 - [ ] 离场同次撤销 pointer 历史 hover/已开始手势、keyboard/gamepad 和 focus，再隐藏并退出布局。提供一个最小活动资格查询入口，应用可据此决定后台工作。
-- [ ] 命中决策发生在 fresh factory/Scene apply 前，消费本次 Core task 与原缓存 owner，保留 Entity、局部组件及 handles；在 Ready 前完成 claim rebind、owner 组合、输入及恢复准备。其他缓存始终 protected。
+- [x] 命中决策发生在 fresh factory/Scene apply 前，消费本次 Core task 与原缓存 owner，保留 Entity、局部组件及 handles；在 Ready 前完成 claim rebind、owner 组合、输入及恢复准备。其他缓存始终 protected。
 - [ ] 按失活时刻维护 LRU；淘汰、parent/outlet/slot 失效、host loss/readmission 经明确 cleanup owner 结算。cache 自身失效与 current authority loss 分别处理；准备或写后发布失败返还原 owner 或有界隔离清理。
 - [ ] 验证 A→B→A 同 Entity/状态、factory 次数、禁用/LRU/淘汰重建、稀疏 binding、多缓存共存、动态内容、命中失败、parent/host loss、terminal owner 收敛与后续合法请求。
 
 实现入口沿第 3 阶段接缝扩展，缓存策略和物理 holder 按职责拆私有模块；公开配置与活动查询经 facade/独立 consumer 验证。
+
+命中已有通用 driver 连续往返及公开 Native Scene 旅程；后者证明原 Entity/自定义组件值保持，factory 与 Scene apply 均不重复。Core 覆盖自身空 slot 恢复及一次真实 source 准备拒绝返还。authority 拒绝后的原 owners 虽保存在既有 residual/transfer 中，物理处置、retained registry retirement 和 readmission 尚未闭合；下一切片沿现有 settlement 统一交接，不能以保存句柄代替收敛。
 
 ## 5. 组合、真实输入与交付
 

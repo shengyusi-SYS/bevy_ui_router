@@ -9821,22 +9821,6 @@ pub(crate) struct PreparedLeavingAssembly {
 }
 
 impl PreparedLeavingAssembly {
-    pub(crate) fn reserve_retained_partition(
-        manifest: &FrozenCleanupManifest,
-        splice: &SealedReconciliationSplice,
-        retiring: &[&RealizedBranch],
-    ) -> Option<Self> {
-        let frames = splice
-            .disposable_frames()
-            .chain(retiring.iter().flat_map(|branch| branch.frames()))
-            .collect::<Vec<_>>();
-        let slots = splice
-            .disposable_child_slots()
-            .chain(retiring.iter().flat_map(|branch| branch.child_slots()))
-            .collect::<Vec<_>>();
-        Self::reserve(manifest, &frames, &slots)
-    }
-
     pub(crate) fn reserve(
         manifest: &FrozenCleanupManifest,
         frames: &[&RealizedFrame],
