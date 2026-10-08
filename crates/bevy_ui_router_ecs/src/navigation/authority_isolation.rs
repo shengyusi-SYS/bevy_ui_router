@@ -1202,6 +1202,49 @@ pub(super) fn prepare_failed_branch_authority_isolation(
     branch: &FailedPreparedBranch,
     host: Option<&HostBinding>,
 ) -> AuthorityIsolationPreparation {
+    prepare_failed_branch_authority_isolation_with_retained(world, active, branch, host, &[], None)
+}
+
+pub(super) fn prepare_failed_manifest_authority_isolation_with_retained(
+    world: &World,
+    active: Option<&RealizedBranch>,
+    failed: &PendingFailedBranch,
+    host: Option<&HostBinding>,
+    retained: &[&RealizedBranch],
+    targets: Vec<bevy_ecs::entity::Entity>,
+) -> AuthorityIsolationPreparation {
+    prepare_failed_branch_authority_isolation_with_retained(
+        world,
+        active,
+        &failed.branch,
+        host,
+        retained,
+        Some(targets),
+    )
+}
+
+fn prepare_failed_branch_authority_isolation_with_retained(
+    world: &World,
+    active: Option<&RealizedBranch>,
+    branch: &FailedPreparedBranch,
+    host: Option<&HostBinding>,
+    retained: &[&RealizedBranch],
+    frozen_targets: Option<Vec<bevy_ecs::entity::Entity>>,
+) -> AuthorityIsolationPreparation {
+    #[cfg(feature = "bsn")]
+    let frozen_targets = if let Some(mut targets) = frozen_targets {
+        if let Some(failure) = branch.native_failure() {
+            if targets.try_reserve(failure.claims().count()).is_err() {
+                return AuthorityIsolationPreparation::RetryableCapacity;
+            }
+            targets.extend(failure.entities());
+            targets.sort_by_key(|entity| entity.to_bits());
+            targets.dedup();
+        }
+        Some(targets)
+    } else {
+        None
+    };
     let stored_claims = branch
         .frames()
         .iter()
@@ -1226,6 +1269,7 @@ pub(super) fn prepare_failed_branch_authority_isolation(
                 .map(|rejected| rejected.slot().slot_claim()),
         )
         .chain(active.into_iter().flat_map(RealizedBranch::claims))
+        .chain(retained.iter().flat_map(|branch| branch.claims()))
         .chain(host.into_iter().map(|host| &host.top_slot_claim));
     #[cfg(feature = "bsn")]
     let stored_claims = stored_claims.chain(
@@ -1252,6 +1296,11 @@ pub(super) fn prepare_failed_branch_authority_isolation(
                 .chain(branch.detached_frames())
                 .flat_map(|frame| frame.live_interactive_entities(world)),
         )
+        .chain(
+            retained
+                .iter()
+                .flat_map(|branch| branch.live_interactive_entities(world)),
+        )
         .chain(host.into_iter().map(|host| host.top_slot));
     #[cfg(feature = "bsn")]
     let gate_targets = gate_targets.chain(
@@ -1260,8 +1309,11 @@ pub(super) fn prepare_failed_branch_authority_isolation(
             .into_iter()
             .flat_map(|failure| failure.entities()),
     );
-    let mut preparation =
-        prepare_authority_isolation_targets(world, stored_claims, gate_targets, 0);
+    let mut preparation = if let Some(targets) = frozen_targets {
+        prepare_frozen_authority_isolation(world, stored_claims, targets, 0)
+    } else {
+        prepare_authority_isolation_targets(world, stored_claims, gate_targets, 0)
+    };
     #[cfg(feature = "bsn")]
     if let Some(failure) = branch.native_failure() {
         let isolation = match &mut preparation {

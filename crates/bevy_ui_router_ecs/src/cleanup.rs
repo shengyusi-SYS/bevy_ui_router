@@ -3409,13 +3409,14 @@ impl FrozenCleanupManifest {
         })
     }
 
-    pub(crate) fn finalize_failed_authority_settlement(
+    pub(crate) fn finalize_failed_authority_settlement_with_retained(
         mut self,
         world: &World,
         registry: &RouteEntityRegistry,
         active: Option<&RealizedBranch>,
         host: &HostBinding,
         bindings: Vec<FailedAuthorityBoundaryBinding>,
+        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
     ) -> Result<Self, AuthoritySettlementManifestError> {
         if !self.pending_boundary_loss_claims.is_empty()
             || bindings.len() != self.boundary_drifts.len()
@@ -3471,6 +3472,14 @@ impl FrozenCleanupManifest {
                 }
             };
         }
+        append_retained_authority_branches(
+            world,
+            registry,
+            active,
+            host,
+            retiring,
+            &mut self.obligations,
+        )?;
         if let Some(active) = active {
             append_exact_authority_branch(
                 world,
@@ -10728,19 +10737,20 @@ impl CleanupLedger {
         ledger
     }
 
-    pub(crate) fn activate_failed_authority_settlement(
+    pub(crate) fn activate_failed_authority_settlement_with_retained(
         prepared: PreparedCleanupLedger,
         active: Option<RealizedBranch>,
         failed: PendingFailedBranch,
         host: RetiredHostBinding,
         host_children: Vec<Entity>,
+        retained: Vec<RealizedBranch>,
     ) -> Self {
         let mut ledger = Self::activate_owner(
             prepared,
             Some(CleanupOwner::AuthoritySettlement(
                 AuthoritySettlementOwner {
                     active,
-                    retained: Vec::new(),
+                    retained,
                     pending: AuthoritySettlementPendingOwner::Terminal(failed),
                     host,
                 },

@@ -15842,6 +15842,7 @@ use authority_isolation::{
     fail_closed_normal_authority_protocol, fail_closed_normal_authority_protocol_prepared,
     fail_closed_normal_owner_protocol, fail_closed_projectionless_owner_protocol,
     prepare_authority_isolation_targets, prepare_failed_branch_authority_isolation,
+    prepare_failed_manifest_authority_isolation_with_retained,
     prepare_failed_manifest_protocol_isolation, prepare_normal_authority_isolation,
     prepare_post_commit_input_isolation, prepare_target_preparation_permanent_isolation,
 };
@@ -17902,6 +17903,34 @@ fn begin_failed_authority_settlement(
         };
     };
     let cause = precommit_authority_cause(world, host);
+    let has_retained = !entry.retained.is_empty();
+    let retiring = if has_retained {
+        let Some(inventory) = entry.retained.inventory() else {
+            return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                failed,
+                kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+            };
+        };
+        inventory
+            .into_iter()
+            .map(|owner| owner.projection().clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let Some(mut retained_change) = entry.retained.prepare_all(&retiring) else {
+        return FailedAuthoritySettlementBeginOutcome::Retryable(failed);
+    };
+    #[cfg(feature = "bsn")]
+    for (_, branch) in retained_change.selected_mut(&mut entry.retained) {
+        if let Err(error) = branch.prepare_native_cleanup(world) {
+            return if error.is_retryable() {
+                FailedAuthoritySettlementBeginOutcome::Retryable(failed)
+            } else {
+                FailedAuthoritySettlementBeginOutcome::NativeCleanupContradiction { failed, error }
+            };
+        }
+    }
     #[cfg(feature = "bsn")]
     if let Some(active) = entry.active.as_mut()
         && let Err(error) = active.prepare_native_cleanup(world)
@@ -17912,14 +17941,18 @@ fn begin_failed_authority_settlement(
             FailedAuthoritySettlementBeginOutcome::NativeCleanupContradiction { failed, error }
         };
     }
-    let frozen = {
+    let (frozen, retained_boundaries) = {
         let registry = world.resource::<RouteEntityRegistry>();
-        match manifest.finalize_failed_authority_settlement(
+        let retired_branches = retained_change
+            .selected(&entry.retained)
+            .collect::<Vec<_>>();
+        let frozen = match manifest.finalize_failed_authority_settlement_with_retained(
             world,
             registry,
             entry.active.as_ref(),
             host,
             bindings,
+            &retired_branches,
         ) {
             Ok(frozen) => frozen,
             Err(AuthoritySettlementManifestError::RetryableCapacity) => {
@@ -17934,11 +17967,26 @@ fn begin_failed_authority_settlement(
                     kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
                 };
             }
-        }
+        };
+        let boundaries = if has_retained {
+            match registry.prepare_retained_boundaries(None, &retiring) {
+                Ok(boundaries) => Some(boundaries),
+                Err(()) => {
+                    return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                        failed,
+                        kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        (frozen, boundaries)
     };
-    let mut logical_roots = failed_authority_logical_roots(&failed, &frozen);
+    let base_logical_roots = failed_authority_logical_roots(&failed, &frozen);
     let manifest_digest = frozen.digest();
     let obligation_count = frozen.len();
+    let frozen_targets = frozen.obligation_entities();
     let reserved = match CleanupLedger::reserve(frozen) {
         Ok(reserved) => reserved,
         Err(error) => match error.kind() {
@@ -17971,12 +18019,28 @@ fn begin_failed_authority_settlement(
             kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
         };
     }
-    let isolation = match prepare_failed_manifest_protocol_isolation(
-        world,
-        entry.active.as_ref(),
-        &failed,
-        entry.host.as_ref(),
-    ) {
+    let isolation_preparation = if has_retained {
+        let retained_branches = retained_change
+            .selected(&entry.retained)
+            .map(|(_, branch)| branch)
+            .collect::<Vec<_>>();
+        prepare_failed_manifest_authority_isolation_with_retained(
+            world,
+            entry.active.as_ref(),
+            &failed,
+            entry.host.as_ref(),
+            &retained_branches,
+            frozen_targets,
+        )
+    } else {
+        prepare_failed_manifest_protocol_isolation(
+            world,
+            entry.active.as_ref(),
+            &failed,
+            entry.host.as_ref(),
+        )
+    };
+    let isolation = match isolation_preparation {
         AuthorityIsolationPreparation::Ready(isolation) => isolation,
         AuthorityIsolationPreparation::RetryableCapacity => {
             return FailedAuthoritySettlementBeginOutcome::Retryable(failed);
@@ -17998,6 +18062,39 @@ fn begin_failed_authority_settlement(
             return FailedAuthoritySettlementBeginOutcome::TriggerContradiction { failed, kind };
         }
     };
+    let retained_plan = if has_retained {
+        let Some(inventory) = entry.retained.inventory() else {
+            return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                failed,
+                kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+            };
+        };
+        match entry
+            .engine
+            .prepare_retained_failed_authority_settlement_plan(
+                &host.lease,
+                &trigger,
+                &base_logical_roots,
+                &inventory,
+            ) {
+            Ok(plan) => Some(plan),
+            Err(BeginAuthoritySettlementErrorKind::RetryablePreparation) => {
+                return FailedAuthoritySettlementBeginOutcome::Retryable(failed);
+            }
+            Err(kind) => {
+                return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
+                    failed,
+                    kind,
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let mut logical_roots = retained_plan
+        .as_ref()
+        .map(|plan| plan.logical_roots().to_vec())
+        .unwrap_or(base_logical_roots);
     inject_failed_authority_begin_manifest_rejection(world, &mut logical_roots);
 
     let (retired_host, lease) = entry
@@ -18007,35 +18104,66 @@ fn begin_failed_authority_settlement(
         .into_retired();
     let active = entry.active.take();
     let mut settlement_owner = Some((reserved, active, failed, retired_host));
+    let owners = retained_change.take_owners(&mut entry.retained);
     let engine = &mut entry.engine;
     let cleanup_ledger = &mut entry.cleanup_ledger;
-    match engine.begin_failed_authority_settlement_for_cause_retaining(
-        lease,
-        trigger,
-        cause,
-        CleanupManifest::new(logical_roots, manifest_digest, obligation_count),
-        |batch| {
-            isolation.apply(world);
-            let (reserved, active, failed, retired_host) = settlement_owner
-                .take()
-                .expect("failed authority publication consumes its composed owner once");
-            *cleanup_ledger = Some(CleanupLedger::activate_failed_authority_settlement(
-                reserved.bind_batch(batch),
-                active,
-                failed,
-                retired_host,
-                host_children,
-            ));
+    let retained = &mut entry.retained;
+    let manifest = CleanupManifest::new(logical_roots, manifest_digest, obligation_count);
+    let result = world.resource_scope(
+        |world, mut registry: bevy_ecs::change_detection::Mut<RouteEntityRegistry>| {
+            let publish = |batch| {
+                isolation.apply(world);
+                let retained = retained_change.into_payloads(retained);
+                if let Some(boundaries) = retained_boundaries {
+                    boundaries.apply(&mut registry);
+                }
+                let (reserved, active, failed, retired_host) = settlement_owner
+                    .take()
+                    .expect("failed authority publication consumes its composed owner once");
+                *cleanup_ledger = Some(
+                    CleanupLedger::activate_failed_authority_settlement_with_retained(
+                        reserved.bind_batch(batch),
+                        active,
+                        failed,
+                        retired_host,
+                        host_children,
+                        retained,
+                    ),
+                );
+            };
+            if let Some(plan) = retained_plan {
+                engine
+                    .begin_failed_authority_settlement_with_retention(
+                        lease, trigger, cause, plan, manifest, owners, publish,
+                    )
+                    .map_err(|error| {
+                        let (lease, _plan, _manifest, owners, kind) = error.into_parts();
+                        (lease, owners, kind)
+                    })
+            } else {
+                engine
+                    .begin_failed_authority_settlement_for_cause_retaining(
+                        lease, trigger, cause, manifest, publish,
+                    )
+                    .map_err(|error| {
+                        let kind = error.kind();
+                        (error.into_owner(), owners, kind)
+                    })
+            }
         },
-    ) {
+    );
+    match result {
         Ok(_) => FailedAuthoritySettlementBeginOutcome::Begun,
-        Err(error) => {
-            let kind = error.kind();
+        Err((lease, owners, kind)) => {
+            assert!(
+                entry.retained.restore_owners(owners).is_ok(),
+                "rejected failed authority transfer returns every original cache capability"
+            );
             let (reserved, active, failed, retired_host) = settlement_owner
                 .take()
                 .expect("rejected failed authority publication returns its composed owner");
             drop(reserved);
-            entry.host = Some(retired_host.restore(error.into_owner()));
+            entry.host = Some(retired_host.restore(lease));
             entry.active = active;
             match kind {
                 BeginAuthoritySettlementErrorKind::RetryablePreparation => {

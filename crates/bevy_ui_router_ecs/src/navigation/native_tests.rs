@@ -118,6 +118,15 @@ fn fixture_with_dependency(
     nested: bool,
     dependency: bool,
 ) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
+    fixture_with_retention(failing, nested, dependency, 0)
+}
+
+fn fixture_with_retention(
+    failing: bool,
+    nested: bool,
+    dependency: bool,
+    capacity: usize,
+) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
     let mut app = App::new();
     if dependency {
         use bevy_asset::{
@@ -197,10 +206,28 @@ fn fixture_with_dependency(
         routes
             .route_with_options(
                 routes.root_id().unwrap(),
-                RoutePattern::path("child").unwrap(),
-                RouteNodeOptions::new().with_view(view.clone()),
+                RoutePattern::path(if capacity == 0 { "child" } else { "child/:id" }).unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(view.clone())
+                    .with_keep_alive(capacity > 0),
             )
             .unwrap();
+        if capacity > 0 {
+            let branch = routes
+                .route_with_options(
+                    routes.root_id().unwrap(),
+                    RoutePattern::path("broken").unwrap(),
+                    RouteNodeOptions::new().with_view(layout.clone()),
+                )
+                .unwrap();
+            routes
+                .route_with_options(
+                    branch,
+                    RoutePattern::path(":id").unwrap(),
+                    RouteNodeOptions::new().with_view(view.clone()),
+                )
+                .unwrap();
+        }
     }
     let mut views = RouteViewRegistry::new();
     views
@@ -213,7 +240,10 @@ fn fixture_with_dependency(
         .insert(fallback.clone(), RouteViewDescriptor::new(fallback_driver))
         .unwrap();
     let router = app
-        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .add_ui_router(
+            RouterConfig::new(routes.build().unwrap(), views, fallback)
+                .with_keep_alive_capacity(capacity),
+        )
         .unwrap();
     let host = app
         .world_mut()
@@ -1404,6 +1434,245 @@ fn native_retained_root_failure_transfers_owner_then_allows_next_navigation() {
         matches!(app.world().resource::<RouterSnapshots>().request(router, next), RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded)
     );
     assert!(app.world().get_entity(protected).is_ok());
+}
+
+#[test]
+fn native_leaf_cache_survives_pending_failure_then_settles_on_host_loss() {
+    for host_loss in [false, true] {
+        let (mut app, router, host, protected, failure) =
+            fixture_with_retention(false, true, false, 2);
+        app.world_mut().entity_mut(host).add_child(protected);
+        for path in ["/child/1", "/child/2", "/child/3"] {
+            let request = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new(path))
+                .unwrap();
+            settle(&mut app);
+            assert_eq!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(request)
+                    .unwrap()
+                    .status(),
+                &RequestStatus::Succeeded
+            );
+        }
+        let (version, history, active, cached, mut owned) = {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let binding = entry.host.as_ref().unwrap();
+            let cached = entry
+                .retained
+                .inventory()
+                .unwrap()
+                .iter()
+                .map(|owner| owner.projection().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(cached.len(), 2);
+            let mut owned = entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>();
+            for projection in &cached {
+                owned.extend(
+                    entry
+                        .retained
+                        .branch(projection.id())
+                        .unwrap()
+                        .claims()
+                        .map(ExactRegistryClaim::entity),
+                );
+            }
+            owned.push(binding.top_slot);
+            (
+                binding.version.clone(),
+                entry.engine.history().clone(),
+                entry.engine.active().clone(),
+                cached,
+                owned,
+            )
+        };
+        app.insert_resource(CleanFailure);
+        failure.store(true, Ordering::Relaxed);
+        let original_owned = owned.len();
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/broken/4"))
+            .unwrap();
+        collect_navigation_system(app.world_mut());
+        for _ in 0..8 {
+            drive_navigation_system(app.world_mut());
+            if app.world().resource::<RouterNavigation>().entries[0]
+                .pending_failed_branch
+                .is_some()
+            {
+                break;
+            }
+        }
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let pending = entry.pending_failed_branch.as_ref().unwrap();
+            assert!(
+                matches!(pending.terminal, PendingFailedBranchTerminal::Request(_)),
+                "the real successful prefix produces its original FailureCleanupRequest"
+            );
+            assert!(pending.branch.native_failure().is_some());
+            assert!(!pending.branch.frames().is_empty());
+            owned.extend(
+                pending
+                    .branch
+                    .frames()
+                    .iter()
+                    .flat_map(|frame| frame.claims())
+                    .map(ExactRegistryClaim::entity),
+            );
+            owned.extend(
+                pending
+                    .branch
+                    .child_slots()
+                    .iter()
+                    .map(|slot| slot.slot_claim().entity()),
+            );
+        }
+        if !host_loss {
+            // Stop at original cleanup completion, before Drive builds the fallback.
+            // Ordinary failure must preserve the current/cache throughout this batch.
+            for _ in 0..8 {
+                settle_cleanup_system(app.world_mut());
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                if entry.pending_failed_branch.is_none() && entry.cleanup_ledger.is_none() {
+                    break;
+                }
+            }
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready
+            );
+            assert_eq!(entry.engine.active(), &active);
+            assert_eq!(entry.engine.history(), &history);
+            assert_eq!(
+                entry
+                    .retained
+                    .inventory()
+                    .unwrap()
+                    .iter()
+                    .map(|owner| owner.projection())
+                    .collect::<Vec<_>>(),
+                cached.iter().collect::<Vec<_>>()
+            );
+            assert!(entry.pending_failed_branch.is_none() && entry.cleanup_ledger.is_none());
+            assert!(entry.authority_protocol_residual.is_none());
+            assert!(matches!(
+                entry.engine.request(request).unwrap().status(),
+                RequestStatus::Running(_)
+            ));
+            assert_eq!(
+                app.world()
+                    .resource::<NativeFallbackCalls>()
+                    .0
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(
+                owned[..original_owned]
+                    .iter()
+                    .all(|entity| app.world().get_entity(*entity).is_ok())
+            );
+            assert!(
+                owned[original_owned..]
+                    .iter()
+                    .all(|entity| app.world().get_entity(*entity).is_err())
+            );
+            continue;
+        }
+        app.world_mut()
+            .entity_mut(host)
+            .remove::<RouterHostRegistration>();
+        settle_cleanup_system(app.world_mut());
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::RecoveringAuthority
+            );
+            assert!(
+                entry
+                    .cleanup_ledger
+                    .as_ref()
+                    .is_some_and(CleanupLedger::is_authority_settlement)
+            );
+            assert!(entry.authority_protocol_residual.is_none());
+        }
+        settle(&mut app);
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert!(matches!(entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(error) if error.kind() == NavigationFailureKind::HostLost));
+            assert_eq!(entry.engine.history(), &history);
+            assert!(entry.retained.is_empty());
+            assert!(entry.active.is_none() && entry.host.is_none());
+            assert!(entry.pending_failed_branch.is_none() && entry.cleanup_ledger.is_none());
+            assert!(
+                entry.authority_protocol_residual.is_none() && entry.native_residuals.is_empty()
+            );
+            assert!(entry.engine.snapshot().running_request().is_none());
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+            );
+        }
+        assert!(
+            owned
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+        assert!(app.world().get_entity(host).is_ok());
+        assert_eq!(
+            app.world().get::<Node>(protected).unwrap().width,
+            Val::Px(91.0)
+        );
+        assert_eq!(
+            app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+            Some(host)
+        );
+        app.world_mut()
+            .entity_mut(host)
+            .insert(RouterHostRegistration::new(router));
+        settle(&mut app);
+        {
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_ne!(entry.host.as_ref().unwrap().version, version);
+            assert_eq!(entry.engine.history(), &history);
+            assert!(entry.active.is_none() && entry.engine.snapshot().running_request().is_none());
+        }
+        failure.store(false, Ordering::Relaxed);
+        let next = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/child/1"))
+            .unwrap();
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(next)
+                .unwrap()
+                .status(),
+            &RequestStatus::Succeeded
+        );
+        assert_eq!(
+            app.world()
+                .resource::<NativeFallbackCalls>()
+                .0
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
 }
 
 #[test]
