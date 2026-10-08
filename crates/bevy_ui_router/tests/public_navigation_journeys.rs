@@ -3407,6 +3407,108 @@ fn retained_native_hit_preserves_state_and_skips_factory_and_scene_apply() {
 }
 
 #[test]
+fn retained_native_host_loss_cleans_cache_and_readmits_without_replay() {
+    let mut fixture =
+        nested_fixture_with_retention(RoutePattern::path("/:section").unwrap(), Vec::new(), 2);
+    let mut previous_requests = Vec::new();
+    for path in ["/catalog/items/1", "/catalog/items/2", "/catalog/items/3"] {
+        previous_requests.push(push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new(path),
+            None,
+            None,
+        ));
+    }
+    let old_leaves = node_entities_with_width(&mut fixture.app, 43);
+    assert_eq!(old_leaves.len(), 3);
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let effects = fixture.control.effects();
+    let host = fixture.host_fingerprint.host;
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, RouteLocation::new("/catalog/items/1"))
+        .unwrap();
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    let lost = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+    );
+    assert_failed(
+        &request_snapshot(&fixture.app, fixture.router, request),
+        NavigationFailureKind::HostLost,
+    );
+    assert_eq!(lost.history(), before.history());
+    assert_eq!(lost.active().kind(), ActivePresentationKind::None);
+    assert!(
+        old_leaves
+            .iter()
+            .all(|entity| fixture.app.world().get_entity(*entity).is_err())
+    );
+    assert_eq!(
+        fixture.control.effects(),
+        effects,
+        "host loss must not invoke the queued request's factory"
+    );
+    assert_host_after_registration_loss(&fixture.app, &fixture.host_fingerprint);
+    for previous in previous_requests {
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, previous));
+    }
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(fixture.router));
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_ne!(ready.host().version(), before.host().version());
+    assert_eq!(ready.history(), before.history());
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(
+        fixture.control.effects(),
+        effects,
+        "readmission does not replay old requests"
+    );
+    fixture.host_fingerprint.top_slot = fixture
+        .app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !fixture.host_fingerprint.existing_children.contains(child));
+    let next = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        RouteLocation::new("/catalog/items/1"),
+        None,
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, next));
+    let fresh = node_entities_with_width(&mut fixture.app, 43);
+    assert_eq!(fresh.len(), 1);
+    assert!(!old_leaves.contains(&fresh[0]));
+    assert!(
+        fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(fresh[0])
+    );
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
 fn reconciliation_nested_fragment_preserves_ancestors_and_advances_leaf_generation() {
     let mut fixture = nested_fixture();
     let first_location = RouteLocation::new("/items/1");

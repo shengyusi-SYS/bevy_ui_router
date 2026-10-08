@@ -225,6 +225,60 @@ fn begin_authority_settlement_from_source(
         };
     };
     let cause = precommit_authority_cause(world, host);
+    let retained_plan = if entry.retained.is_empty() {
+        None
+    } else {
+        if !matches!(source, AuthoritySettlementSource::Reconciliation) {
+            return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                active,
+                pending,
+                kind: BeginAuthoritySettlementErrorKind::WrongPhase,
+            };
+        }
+        let Some(inventory) = entry.retained.inventory() else {
+            return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                active,
+                pending,
+                kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+            };
+        };
+        match entry
+            .engine
+            .prepare_retained_authority_settlement_plan(&host.lease, &inventory)
+        {
+            Ok(plan) => Some(plan),
+            Err(BeginAuthoritySettlementErrorKind::RetryablePreparation) => {
+                return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+            }
+            Err(kind) => {
+                return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                    active,
+                    pending,
+                    kind,
+                };
+            }
+        }
+    };
+    let retiring = retained_plan
+        .as_ref()
+        .map(|plan| plan.retiring().to_vec())
+        .unwrap_or_default();
+    let Some(mut retained_change) = entry.retained.prepare_all(&retiring) else {
+        return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+    };
+    #[cfg(feature = "bsn")]
+    for (_, branch) in retained_change.selected_mut(&mut entry.retained) {
+        if let Err(error) = branch.prepare_native_cleanup(world) {
+            if error.is_retryable() {
+                return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+            }
+            return AuthoritySettlementBeginOutcome::NativeCleanupContradiction {
+                active,
+                pending,
+                error,
+            };
+        }
+    }
     #[cfg(feature = "bsn")]
     if let Err(error) = active
         .prepare_native_cleanup(world)
@@ -239,14 +293,18 @@ fn begin_authority_settlement_from_source(
             error,
         };
     }
-    let frozen = {
+    let (frozen, retained_boundaries) = {
         let registry = world.resource::<RouteEntityRegistry>();
-        match FrozenCleanupManifest::from_authority_settlement(
+        let retired_branches = retained_change
+            .selected(&entry.retained)
+            .collect::<Vec<_>>();
+        let frozen = match FrozenCleanupManifest::from_authority_settlement_with_retained(
             world,
             registry,
             &pending.branch,
             &active,
             host,
+            &retired_branches,
         ) {
             Ok(frozen) => frozen,
             Err(AuthoritySettlementManifestError::RetryableCapacity) => {
@@ -262,10 +320,26 @@ fn begin_authority_settlement_from_source(
                     kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
                 };
             }
-        }
+        };
+        let boundaries = if retained_plan.is_some() {
+            match registry.prepare_retained_boundaries(None, &retiring) {
+                Ok(boundaries) => Some(boundaries),
+                Err(()) => {
+                    return AuthoritySettlementBeginOutcome::ProtocolContradiction {
+                        active,
+                        pending,
+                        kind: BeginAuthoritySettlementErrorKind::InvalidManifest,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        (frozen, boundaries)
     };
     let manifest_digest = frozen.digest();
     let obligation_count = frozen.len();
+    let frozen_targets = frozen.obligation_entities();
     let reserved = match CleanupLedger::reserve(frozen) {
         Ok(reserved) => reserved,
         Err(error) => match error.kind() {
@@ -305,24 +379,44 @@ fn begin_authority_settlement_from_source(
         };
     }
 
-    let isolation =
-        match prepare_normal_authority_isolation(world, &active, &pending.branch, Some(host)) {
-            AuthorityIsolationPreparation::Ready(isolation) => isolation,
-            AuthorityIsolationPreparation::RetryableCapacity => {
-                return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
-            }
-            AuthorityIsolationPreparation::PermanentContradiction {
+    let isolation_preparation = if retained_plan.is_some() {
+        let capacity_probe = projectionless_fail_close_capacity_probe(world);
+        prepare_frozen_authority_isolation(
+            world,
+            pending
+                .branch
+                .as_realized()
+                .claims()
+                .chain(active.claims())
+                .chain(
+                    retained_change
+                        .selected(&entry.retained)
+                        .flat_map(|(_, branch)| branch.claims()),
+                )
+                .chain(std::iter::once(&host.top_slot_claim)),
+            frozen_targets,
+            capacity_probe,
+        )
+    } else {
+        prepare_normal_authority_isolation(world, &active, &pending.branch, Some(host))
+    };
+    let isolation = match isolation_preparation {
+        AuthorityIsolationPreparation::Ready(isolation) => isolation,
+        AuthorityIsolationPreparation::RetryableCapacity => {
+            return AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending };
+        }
+        AuthorityIsolationPreparation::PermanentContradiction {
+            contradiction,
+            fail_closed,
+        } => {
+            return AuthoritySettlementBeginOutcome::IsolationContradiction {
+                active,
+                pending,
                 contradiction,
-                fail_closed,
-            } => {
-                return AuthoritySettlementBeginOutcome::IsolationContradiction {
-                    active,
-                    pending,
-                    contradiction,
-                    isolation: fail_closed,
-                };
-            }
-        };
+                isolation: fail_closed,
+            };
+        }
+    };
 
     // All physical preparation precedes minting the one-shot trigger. The
     // original task remains in pending until the retaining callback succeeds.
@@ -374,8 +468,13 @@ fn begin_authority_settlement_from_source(
         .host
         .take()
         .expect("authority settlement retains its exact host binding");
-    let logical_roots = logical_roots_override
-        .unwrap_or_else(|| authority_settlement_logical_roots(&pending.branch, &active));
+    let logical_roots = retained_plan
+        .as_ref()
+        .map(|plan| plan.logical_roots().to_vec())
+        .unwrap_or_else(|| {
+            logical_roots_override
+                .unwrap_or_else(|| authority_settlement_logical_roots(&pending.branch, &active))
+        });
     let retired_host = RetiredHostBinding {
         version: version.clone(),
         slot_id,
@@ -386,34 +485,63 @@ fn begin_authority_settlement_from_source(
         registration_incarnation,
     };
     let mut settlement_owner = Some((reserved, active, pending, retired_host));
+    let owners = retained_change.take_owners(&mut entry.retained);
     let engine = &mut entry.engine;
     let cleanup_ledger = &mut entry.cleanup_ledger;
+    let retained = &mut entry.retained;
     let manifest = CleanupManifest::new(logical_roots, manifest_digest, obligation_count);
-    let publish = |batch| {
-        isolation.apply(world);
-        let (reserved, active, pending, owner) = settlement_owner
-            .take()
-            .expect("authority publication consumes its composed owner once");
-        *cleanup_ledger = Some(CleanupLedger::activate_authority_settlement(
-            reserved.bind_batch(batch),
-            active,
-            FailedPreparedBranch::new(pending.branch),
-            owner,
-            host_children,
-        ));
-    };
-    let result = match trigger {
-        Some(trigger) => engine.begin_failed_authority_settlement_for_cause_retaining(
-            lease, trigger, cause, manifest, publish,
-        ),
-        None => {
-            engine.begin_authority_settlement_for_cause_retaining(lease, cause, manifest, publish)
-        }
-    };
+    let result = world.resource_scope(
+        |world, mut registry: bevy_ecs::change_detection::Mut<RouteEntityRegistry>| {
+            let publish = |batch| {
+                isolation.apply(world);
+                let retained = retained_change.into_payloads(retained);
+                if let Some(boundaries) = retained_boundaries {
+                    boundaries.apply(&mut registry);
+                }
+                let (reserved, active, pending, owner) = settlement_owner
+                    .take()
+                    .expect("authority publication consumes its composed owner once");
+                *cleanup_ledger = Some(CleanupLedger::activate_authority_settlement_with_retained(
+                    reserved.bind_batch(batch),
+                    active,
+                    FailedPreparedBranch::new(pending.branch),
+                    owner,
+                    host_children,
+                    retained,
+                ));
+            };
+            if let Some(plan) = retained_plan {
+                engine
+                    .begin_authority_settlement_with_retention(
+                        lease, cause, plan, manifest, owners, publish,
+                    )
+                    .map_err(|error| {
+                        let (lease, _plan, _manifest, owners, kind) = error.into_parts();
+                        (lease, owners, kind)
+                    })
+            } else {
+                let result = match trigger {
+                    Some(trigger) => engine.begin_failed_authority_settlement_for_cause_retaining(
+                        lease, trigger, cause, manifest, publish,
+                    ),
+                    None => engine.begin_authority_settlement_for_cause_retaining(
+                        lease, cause, manifest, publish,
+                    ),
+                };
+                result.map_err(|error| {
+                    let kind = error.kind();
+                    (error.into_owner(), owners, kind)
+                })
+            }
+        },
+    );
     match result {
         Ok(_) => AuthoritySettlementBeginOutcome::Begun,
-        Err(error) => {
-            let kind = error.kind();
+        Err((lease, owners, kind)) => {
+            assert!(
+                entry.retained.restore_owners(owners).is_ok(),
+                "rejected authority transfer returns the complete original cache capabilities"
+            );
             entry.host = Some(HostBinding {
                 version,
                 slot_id,
@@ -422,7 +550,7 @@ fn begin_authority_settlement_from_source(
                 top_slot_claim,
                 candidate,
                 registration_incarnation,
-                lease: error.into_owner(),
+                lease,
             });
             let (_, active, pending, _) = settlement_owner
                 .take()
@@ -669,9 +797,18 @@ pub(super) fn prepare_idle_host_isolation<'a>(
     claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
     targets: Vec<bevy_ecs::entity::Entity>,
 ) -> AuthorityIsolationPreparation {
+    prepare_frozen_authority_isolation(world, claims, targets, 0)
+}
+
+fn prepare_frozen_authority_isolation<'a>(
+    world: &World,
+    claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
+    targets: Vec<bevy_ecs::entity::Entity>,
+    capacity_probe: usize,
+) -> AuthorityIsolationPreparation {
     let mut preparation =
-        prepare_authority_isolation_targets(world, claims, targets.iter().copied(), 0);
-    // Idle cleanup owns the frozen target set. A protected descendant is not an
+        prepare_authority_isolation_targets(world, claims, targets.iter().copied(), capacity_probe);
+    // Authority cleanup owns the frozen target set. A protected descendant is not an
     // authorized focus target simply because an old owned ancestor reaches it.
     match &mut preparation {
         AuthorityIsolationPreparation::Ready(prepared)

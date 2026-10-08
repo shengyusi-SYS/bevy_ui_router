@@ -5383,6 +5383,160 @@ fn retained_hit_reuses_original_entities_and_skips_driver_apply() {
 }
 
 #[test]
+fn retained_hit_host_loss_settles_all_cache_owners_and_readmits_without_replay() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = install_retained_slice_router_observed(&mut app, 2, applied.clone());
+    app.update();
+    for path in ["/items/1", "/items/2", "/items/3"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        run_updates_until_succeeded(&mut app, request);
+    }
+    let (host, version, history, owned) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let host = entry.host.as_ref().unwrap();
+        assert_eq!(entry.retained.len(), 2);
+        let mut owned = entry
+            .active
+            .as_ref()
+            .unwrap()
+            .claims()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        for owner in entry.retained.inventory().unwrap() {
+            owned.extend(
+                entry
+                    .retained
+                    .branch(owner.projection().id())
+                    .unwrap()
+                    .claims()
+                    .map(ExactRegistryClaim::entity),
+            );
+        }
+        owned.push(host.top_slot);
+        (
+            host.host,
+            host.version.clone(),
+            entry.engine.history().clone(),
+            owned,
+        )
+    };
+    let sentinel = app.world_mut().spawn(NestedAppHostSentinel(0x17_2e)).id();
+    app.world_mut().entity_mut(host).add_child(sentinel);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/items/1"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let pending = entry.pending_commit.as_ref().unwrap();
+        assert!(
+            pending.retained_hit.is_some(),
+            "exercise a selected real cache hit"
+        );
+        assert!(pending.branch.frames().is_empty());
+        assert_eq!(entry.retained.inventory().unwrap().len(), 2);
+    }
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    commit_presentation_system(app.world_mut());
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::RecoveringAuthority
+        );
+        assert!(
+            entry.authority_protocol_residual.is_none(),
+            "recoverable host loss uses settlement"
+        );
+        assert!(
+            entry
+                .cleanup_ledger
+                .as_ref()
+                .is_some_and(CleanupLedger::is_authority_settlement)
+        );
+    }
+    for _ in 0..16 {
+        settle_cleanup_system(app.world_mut());
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        if entry.cleanup_ledger.is_none() && entry.engine.snapshot().running_request().is_none() {
+            break;
+        }
+    }
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(matches!(entry.engine.request(request).unwrap().status(),
+            RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost));
+        assert_eq!(entry.engine.history(), &history);
+        assert!(entry.active.is_none() && entry.host.is_none());
+        assert!(entry.pending_commit.is_none() && entry.cleanup_ledger.is_none());
+        assert!(
+            entry.pending_failed_branch.is_none() && entry.authority_protocol_residual.is_none()
+        );
+        assert!(entry.retained.is_empty());
+        assert!(entry.retained.inventory().unwrap().is_empty());
+    }
+    assert!(
+        owned
+            .iter()
+            .all(|entity| app.world().get_entity(*entity).is_err())
+    );
+    assert_eq!(
+        app.world().get::<NestedAppHostSentinel>(sentinel),
+        Some(&NestedAppHostSentinel(0x17_2e))
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(sentinel).map(ChildOf::parent),
+        Some(host)
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    for _ in 0..8 {
+        observe_authority_system(app.world_mut());
+        if app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .is_some()
+        {
+            break;
+        }
+    }
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_ne!(entry.host.as_ref().unwrap().version, version);
+        assert_eq!(entry.engine.history(), &history);
+        assert!(entry.engine.snapshot().running_request().is_none());
+    }
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/items/1"))
+        .unwrap();
+    run_updates_until_succeeded(&mut app, next);
+    let item = RouteViewKey::new("item").unwrap();
+    assert_eq!(
+        applied
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|view| *view == &item)
+            .count(),
+        4,
+        "the interrupted hit is not replayed; the new host builds a fresh leaf"
+    );
+}
+
+#[test]
 fn retained_idle_host_loss_clears_original_owners_and_readmits_without_changing_history() {
     let mut app = App::new();
     app.add_plugins(BevyUiRouterPlugin::default());

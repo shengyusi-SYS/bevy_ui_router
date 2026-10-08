@@ -3181,12 +3181,31 @@ impl FrozenCleanupManifest {
         active: &RealizedBranch,
         host: &HostBinding,
     ) -> Result<Self, AuthoritySettlementManifestError> {
+        Self::from_authority_settlement_with_retained(world, registry, pending, active, host, &[])
+    }
+
+    pub(crate) fn from_authority_settlement_with_retained(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        pending: &crate::branch_transaction::PreparedBranch,
+        active: &RealizedBranch,
+        host: &HostBinding,
+        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+    ) -> Result<Self, AuthoritySettlementManifestError> {
         let mut obligations = Vec::new();
         append_exact_authority_branch(
             world,
             registry,
             pending.frames(),
             pending.child_slots(),
+            &mut obligations,
+        )?;
+        append_retained_authority_branches(
+            world,
+            registry,
+            Some(active),
+            host,
+            retiring,
             &mut obligations,
         )?;
         append_exact_authority_branch(
@@ -3206,29 +3225,7 @@ impl FrozenCleanupManifest {
         ) {
             return Err(AuthoritySettlementManifestError::InvalidAuthority);
         }
-        let top_slot_record = registry.record(host.top_slot);
-        let registry_exact =
-            top_slot_record.is_some_and(|record| record.claim() == host.top_slot_claim);
-        let physical_exact =
-            registry_exact && cleanup_claim_has_exact_authority(world, &host.top_slot_claim);
-        let manifest = top_slot_record
-            .filter(|record| record.claim() == host.top_slot_claim)
-            .map(|record| record.manifest().clone())
-            .or_else(|| ComponentManifest::from_world(world, host.top_slot))
-            .unwrap_or_else(|| ComponentManifest::new([]));
-        obligations.push(CleanupObligation {
-            identity: CleanupTargetIdentity::Registered(host.top_slot_claim.clone()),
-            manifest,
-            expected_parent: host.host,
-            unit_root: host.top_slot,
-            authorized_parent: host.host,
-            allow_missing_components: false,
-            terminal_mode: if physical_exact {
-                CleanupTerminalMode::AuthorityExact
-            } else {
-                CleanupTerminalMode::AuthorityLost
-            },
-        });
+        obligations.push(authority_host_obligation(world, registry, host));
         normalize_authority_obligations(&mut obligations)?;
         let mount_parents = Vec::new();
         let digest = frozen_manifest_digest(&obligations, &mount_parents);
@@ -3266,97 +3263,15 @@ impl FrozenCleanupManifest {
         host: &HostBinding,
         retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
     ) -> Result<Self, AuthoritySettlementManifestError> {
-        let mut primary_entities = HashSet::new();
-        let primary_count = active
-            .map_or(Some(1), |branch| branch.obligation_count().checked_add(1))
-            .and_then(|count| {
-                retiring.iter().try_fold(count, |count, (_, branch)| {
-                    count.checked_add(branch.obligation_count())
-                })
-            })
-            .ok_or(AuthoritySettlementManifestError::RetryableCapacity)?;
-        primary_entities
-            .try_reserve(primary_count)
-            .map_err(|_| AuthoritySettlementManifestError::RetryableCapacity)?;
-        primary_entities.insert(host.top_slot);
-        if let Some(active) = active {
-            primary_entities.extend(active.claims().map(ExactRegistryClaim::entity));
-        }
-        for (index, (projection, branch)) in retiring.iter().enumerate() {
-            let [frame] = branch.frames() else {
-                return Err(AuthoritySettlementManifestError::InvalidTopology);
-            };
-            let active = active.ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
-            let mut parents = active
-                .frames()
-                .iter()
-                .filter(|frame| frame.frame() == projection.parent());
-            let parent = parents
-                .next()
-                .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
-            let mut slots = active.child_slots().iter().filter(|slot| {
-                slot.parent() == projection.parent()
-                    && slot.outlet() == projection.outlet()
-                    && slot.slot_id() == projection.slot()
-            });
-            let slot = slots
-                .next()
-                .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
-            let mount = frame.mount_binding();
-            if parents.next().is_some()
-                || slots.next().is_some()
-                || projection.host() != &host.version
-                || frame.frame() != projection.frame()
-                || !mount.matches_retained_scope(projection)
-                || mount.slot() != slot.slot()
-                || mount.slot_claim().entity() != slot.slot_claim().entity()
-                || mount.slot_claim().owner() != slot.slot_claim().owner()
-                || mount.slot_claim().seal() != slot.slot_claim().seal()
-                || !matches!(
-                    mount.slot_claim().lifecycle(),
-                    EntityLifecycle::Active | EntityLifecycle::PreparedInert
-                )
-                || !matches!(
-                    slot.slot_claim().lifecycle(),
-                    EntityLifecycle::Active | EntityLifecycle::PreparedInert
-                )
-                || mount.physical_parent().0 != slot.anchor()
-                || mount.outlet_binding() != Some(slot.anchor_binding())
-                || !parent.outlet(slot.outlet()).is_some_and(|outlet| {
-                    outlet.anchor() == slot.anchor()
-                        && outlet.anchor_claim() == slot.anchor_claim()
-                        && parent.claims().any(|claim| claim == slot.anchor_claim())
-                })
-                || branch
-                    .child_slots()
-                    .iter()
-                    .any(|slot| slot.parent() != frame.frame())
-                || branch
-                    .claims()
-                    .any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
-                || retiring[..index].iter().any(|(prior, _)| {
-                    prior.id() == projection.id() || prior.frame() == projection.frame()
-                })
-                || branch
-                    .claims()
-                    .any(|claim| !primary_entities.insert(claim.entity()))
-            {
-                return Err(AuthoritySettlementManifestError::InvalidTopology);
-            }
-        }
         let mut obligations = Vec::new();
-        // Core has already transferred these exact retained instances. Their
-        // current physical facts use the same authority-loss classification as
-        // the active branch; a read-only preservation proof grants no cleanup.
-        for (_, branch) in retiring {
-            append_exact_authority_branch(
-                world,
-                registry,
-                branch.frames(),
-                branch.child_slots(),
-                &mut obligations,
-            )?;
-        }
+        append_retained_authority_branches(
+            world,
+            registry,
+            active,
+            host,
+            retiring,
+            &mut obligations,
+        )?;
         if let Some(active) = active {
             append_exact_authority_branch(
                 world,
@@ -5339,6 +5254,114 @@ fn append_exact_leaving_unit(
     obligations.extend(frame_obligations(registry, frame, &frame_projected)?);
     visit[frame_index] = 2;
     Some(())
+}
+
+// The Core plan selects the complete original cache inventory. These source
+// checks bind its physical payloads without requiring a live host or granting
+// cleanup authority from a read-only preservation proof.
+fn append_retained_authority_branches(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    active: Option<&RealizedBranch>,
+    host: &HostBinding,
+    retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+    obligations: &mut Vec<CleanupObligation>,
+) -> Result<(), AuthoritySettlementManifestError> {
+    if retiring.is_empty() {
+        return Ok(());
+    }
+    let mut primary_entities = HashSet::new();
+    let primary_count = active
+        .map_or(Some(1), |branch| branch.obligation_count().checked_add(1))
+        .and_then(|count| {
+            retiring.iter().try_fold(count, |count, (_, branch)| {
+                count.checked_add(branch.obligation_count())
+            })
+        })
+        .and_then(|count| count.checked_add(obligations.len()))
+        .ok_or(AuthoritySettlementManifestError::RetryableCapacity)?;
+    primary_entities
+        .try_reserve(primary_count)
+        .map_err(|_| AuthoritySettlementManifestError::RetryableCapacity)?;
+    primary_entities.extend(obligations.iter().map(CleanupObligation::entity));
+    primary_entities.insert(host.top_slot);
+    if let Some(active) = active {
+        primary_entities.extend(active.claims().map(ExactRegistryClaim::entity));
+    }
+    for (index, (projection, branch)) in retiring.iter().enumerate() {
+        let [frame] = branch.frames() else {
+            return Err(AuthoritySettlementManifestError::InvalidTopology);
+        };
+        let active = active.ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        let mut parents = active
+            .frames()
+            .iter()
+            .filter(|frame| frame.frame() == projection.parent());
+        let parent = parents
+            .next()
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        let mut slots = active.child_slots().iter().filter(|slot| {
+            slot.parent() == projection.parent()
+                && slot.outlet() == projection.outlet()
+                && slot.slot_id() == projection.slot()
+        });
+        let slot = slots
+            .next()
+            .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
+        let mount = frame.mount_binding();
+        if parents.next().is_some()
+            || slots.next().is_some()
+            || projection.host() != &host.version
+            || frame.frame() != projection.frame()
+            || !mount.matches_retained_scope(projection)
+            || mount.slot() != slot.slot()
+            || mount.slot_claim().entity() != slot.slot_claim().entity()
+            || mount.slot_claim().owner() != slot.slot_claim().owner()
+            || mount.slot_claim().seal() != slot.slot_claim().seal()
+            || !matches!(
+                mount.slot_claim().lifecycle(),
+                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+            )
+            || !matches!(
+                slot.slot_claim().lifecycle(),
+                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+            )
+            || mount.physical_parent().0 != slot.anchor()
+            || mount.outlet_binding() != Some(slot.anchor_binding())
+            || !parent.outlet(slot.outlet()).is_some_and(|outlet| {
+                outlet.anchor() == slot.anchor()
+                    && outlet.anchor_claim() == slot.anchor_claim()
+                    && parent.claims().any(|claim| claim == slot.anchor_claim())
+            })
+            || branch
+                .child_slots()
+                .iter()
+                .any(|slot| slot.parent() != frame.frame())
+            || branch
+                .claims()
+                .any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
+            || retiring[..index].iter().any(|(prior, _)| {
+                prior.id() == projection.id() || prior.frame() == projection.frame()
+            })
+            || branch
+                .claims()
+                .any(|claim| !primary_entities.insert(claim.entity()))
+        {
+            return Err(AuthoritySettlementManifestError::InvalidTopology);
+        }
+    }
+    // Append each cached leaf before its active parent's slot obligation.
+    // The ordinary branch validator still rejects multiple owned siblings.
+    for (_, branch) in retiring {
+        append_exact_authority_branch(
+            world,
+            registry,
+            branch.frames(),
+            branch.child_slots(),
+            obligations,
+        )?;
+    }
+    Ok(())
 }
 
 fn append_exact_authority_branch(
@@ -10137,6 +10160,7 @@ pub(crate) struct CompletedFailedPreparedOwner {
 
 pub(crate) struct AuthoritySettlementOwner {
     active: Option<RealizedBranch>,
+    retained: Vec<RealizedBranch>,
     pending: AuthoritySettlementPendingOwner,
     host: RetiredHostBinding,
 }
@@ -10671,11 +10695,30 @@ impl CleanupLedger {
         host: RetiredHostBinding,
         host_children: Vec<Entity>,
     ) -> Self {
+        Self::activate_authority_settlement_with_retained(
+            prepared,
+            active,
+            pending,
+            host,
+            host_children,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn activate_authority_settlement_with_retained(
+        prepared: PreparedCleanupLedger,
+        active: RealizedBranch,
+        pending: FailedPreparedBranch,
+        host: RetiredHostBinding,
+        host_children: Vec<Entity>,
+        retained: Vec<RealizedBranch>,
+    ) -> Self {
         let mut ledger = Self::activate_owner(
             prepared,
             Some(CleanupOwner::AuthoritySettlement(
                 AuthoritySettlementOwner {
                     active: Some(active),
+                    retained,
                     pending: AuthoritySettlementPendingOwner::Prepared(pending),
                     host,
                 },
@@ -10697,6 +10740,7 @@ impl CleanupLedger {
             Some(CleanupOwner::AuthoritySettlement(
                 AuthoritySettlementOwner {
                     active,
+                    retained: Vec::new(),
                     pending: AuthoritySettlementPendingOwner::Terminal(failed),
                     host,
                 },

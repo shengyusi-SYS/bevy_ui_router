@@ -10587,17 +10587,15 @@ fn reconciliation_preflight(
     }
 }
 
-fn reconciliation_preflight_view(
+fn reconciliation_current_preflight(
     world: &World,
     host_is_current: bool,
     has_leaving: bool,
-    splice: crate::branch_transaction::ReconciliationSpliceView<'_>,
-) -> ReconciliationPreflightDecision {
-    let entering_boundaries = splice
-        .entering()
-        .claims()
-        .map(ExactRegistryClaim::entity)
-        .collect::<Vec<_>>();
+    preserved: &RealizedBranch,
+    leaving: &RealizedBranch,
+    slot_roles: &[crate::branch_transaction::SealedReconciliationSlotRole],
+    entering_boundaries: &[Entity],
+) -> Result<Vec<Entity>, LifecyclePreflightEvidence> {
     let current_loss = if world.get_resource::<RouteEntityRegistry>().is_none() {
         Some(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::RequiredResources(RequiredResourceSet::ROUTE_ENTITY_REGISTRY),
@@ -10610,21 +10608,15 @@ fn reconciliation_preflight_view(
             LifecyclePreflightExpectation::ExactAuthority,
             LifecyclePreflightObserved::Drifted,
         ))
-    } else if validate_preserved_branch_local(
-        world,
-        splice.preserved(),
-        splice.slot_roles(),
-        &entering_boundaries,
-    )
-    .is_err()
+    } else if validate_preserved_branch_local(world, preserved, slot_roles, entering_boundaries)
+        .is_err()
     {
         Some(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::PreservedCurrent,
             LifecyclePreflightExpectation::ExactAuthority,
             LifecyclePreflightObserved::Drifted,
         ))
-    } else if has_leaving
-        && validate_leaving_branch_for_splice(world, splice.leaving(), splice.slot_roles()).is_err()
+    } else if has_leaving && validate_leaving_branch_for_splice(world, leaving, slot_roles).is_err()
     {
         Some(LifecyclePreflightEvidence::new(
             LifecyclePreflightSource::LeavingCurrent,
@@ -10634,16 +10626,7 @@ fn reconciliation_preflight_view(
     } else {
         None
     };
-    let pending_rejection = if splice.validate_entering(world).is_err() {
-        Some(LifecyclePreflightEvidence::new(
-            LifecyclePreflightSource::PendingEntering,
-            LifecyclePreflightExpectation::ExactAuthority,
-            LifecyclePreflightObserved::Drifted,
-        ))
-    } else {
-        None
-    };
-    let leaving_closure = validate_branch_descendants(world, splice.leaving());
+    let leaving_closure = validate_branch_descendants(world, leaving);
     let current_loss = current_loss.or_else(|| {
         leaving_closure.as_ref().err().map(|_| {
             LifecyclePreflightEvidence::new(
@@ -10653,7 +10636,42 @@ fn reconciliation_preflight_view(
             )
         })
     });
-    if let Some(evidence) = current_loss {
+    match current_loss {
+        Some(evidence) => Err(evidence),
+        None => Ok(leaving_closure.expect("current closure was independently validated")),
+    }
+}
+
+fn reconciliation_preflight_view(
+    world: &World,
+    host_is_current: bool,
+    has_leaving: bool,
+    splice: crate::branch_transaction::ReconciliationSpliceView<'_>,
+) -> ReconciliationPreflightDecision {
+    let entering_boundaries = splice
+        .entering()
+        .claims()
+        .map(ExactRegistryClaim::entity)
+        .collect::<Vec<_>>();
+    let current = reconciliation_current_preflight(
+        world,
+        host_is_current,
+        has_leaving,
+        splice.preserved(),
+        splice.leaving(),
+        splice.slot_roles(),
+        &entering_boundaries,
+    );
+    let pending_rejection = if splice.validate_entering(world).is_err() {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::PendingEntering,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ))
+    } else {
+        None
+    };
+    if let Err(evidence) = current {
         ReconciliationPreflightDecision::AuthorityLost(evidence)
     } else if let Some(evidence) = pending_rejection {
         ReconciliationPreflightDecision::PendingRejected(evidence)
@@ -10665,7 +10683,7 @@ fn reconciliation_preflight_view(
         ))
     } else {
         ReconciliationPreflightDecision::Ready(
-            leaving_closure.expect("current closure was independently validated"),
+            current.expect("current authority was independently validated"),
         )
     }
 }
@@ -15535,6 +15553,32 @@ fn prepare_commit_entry(
         }
     };
     let splice = if let Some(plan) = pending.retained_hit.as_ref() {
+        let entering_boundaries = entry
+            .retained
+            .branch_for(plan.hit())
+            .into_iter()
+            .flat_map(RealizedBranch::claims)
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        let host_is_current = entry
+            .host
+            .as_ref()
+            .is_some_and(|host| current_host_binding_is_exact(world, host));
+        if let Err(evidence) = reconciliation_current_preflight(
+            world,
+            host_is_current,
+            has_leaving,
+            sealed.preserved(),
+            sealed.leaving(),
+            sealed.slot_roles(),
+            &entering_boundaries,
+        ) {
+            let (active, _, _) = sealed.reject().into_parts();
+            settle_prepublication_authority_loss(
+                world, entry, active, pending, had_active, evidence, false,
+            );
+            return None;
+        }
         let Some(branch) = entry.retained.branch_for(plan.hit()) else {
             let (active, _, _) = sealed.reject().into_parts();
             entry.active = had_active.then_some(active);
