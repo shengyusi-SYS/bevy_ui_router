@@ -42827,6 +42827,7 @@ fn root_fallback_live_host_binding_drift_is_source_drift() {
 #[test]
 fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
     let source = include_str!("navigation.rs");
+    let normal = include_str!("navigation/normal_publication.rs");
     let commit = source
         .split_once("pub(crate) fn commit_presentation_system")
         .unwrap()
@@ -42835,7 +42836,11 @@ fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
         .unwrap()
         .0;
 
-    assert!(!commit.contains("cleanup_batch_matches"));
+    assert!(
+        [commit, normal]
+            .iter()
+            .all(|source| !source.contains("cleanup_batch_matches"))
+    );
     assert_eq!(
         commit
             .match_indices(".validate_publication(prepared)")
@@ -42844,7 +42849,7 @@ fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
         "projectionless publication exact-refreezes before consuming ECS owners"
     );
     assert_eq!(
-        commit
+        normal
             .matches("prepared.validate(&mut entry.engine)")
             .count(),
         1
@@ -42852,14 +42857,16 @@ fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
     let retained = include_str!("retained.rs");
     assert!(retained.contains(".validate_publication(prepared)"));
     assert!(retained.contains(".validate_retained_publication(prepared)"));
-    let publish_tails = commit
-        .match_indices("engine.publish(")
-        .map(|(start, _)| {
-            let tail = &commit[start..];
-            let end = tail
-                .find("Some(())")
-                .expect("each publish must return immediately through its prepared success");
-            &tail[..end]
+    let publish_tails = [commit, normal]
+        .into_iter()
+        .flat_map(|source| {
+            source.match_indices("engine.publish(").map(|(start, _)| {
+                let tail = &source[start..];
+                let end = tail
+                    .find("Some(())")
+                    .expect("each publish must return immediately through its prepared success");
+                &tail[..end]
+            })
         })
         .collect::<Vec<_>>();
     assert_eq!(publish_tails.len(), 2, "splice and projectionless paths");

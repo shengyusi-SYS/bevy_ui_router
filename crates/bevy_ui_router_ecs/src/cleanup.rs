@@ -9812,15 +9812,12 @@ pub(crate) struct LeavingPayload {
     child_slots: Vec<MountedChildSlot>,
 }
 
-/// Capacity and source facts for an already authorized cleanup partition.
+/// Reserved capacity for an already checked cleanup partition.
 /// The caller consumes the same splice/retained holders before publication;
 /// this container neither classifies targets nor grants mutation authority.
 pub(crate) struct PreparedLeavingAssembly {
     frames: Vec<RealizedFrame>,
     child_slots: Vec<MountedChildSlot>,
-    _manifest_digest: u64,
-    _source_claims: Vec<ExactRegistryClaim>,
-    _contained_sources: Vec<(Entity, Entity)>,
 }
 
 impl PreparedLeavingAssembly {
@@ -9903,7 +9900,7 @@ impl PreparedLeavingAssembly {
                 return None;
             }
         }
-        let mut contained_sources = Vec::new();
+        let mut contained_sources: Vec<(Entity, Entity)> = Vec::new();
         #[cfg(feature = "bsn")]
         for frame in frames {
             let targets = crate::presentation::native_frame::contained_cleanup_targets(frame);
@@ -9956,17 +9953,9 @@ impl PreparedLeavingAssembly {
         owned_frames.try_reserve_exact(frames.len()).ok()?;
         let mut owned_slots = Vec::new();
         owned_slots.try_reserve_exact(slots.len()).ok()?;
-        let mut source_claims = Vec::new();
-        source_claims.try_reserve_exact(sources.len()).ok()?;
-        for (claim, _, _) in sources {
-            source_claims.push(claim.try_clone().ok()?);
-        }
         Some(Self {
             frames: owned_frames,
             child_slots: owned_slots,
-            _manifest_digest: manifest.digest(),
-            _source_claims: source_claims,
-            _contained_sources: contained_sources,
         })
     }
 

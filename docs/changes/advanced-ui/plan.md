@@ -4,10 +4,10 @@
 
 按结果顺序交付。Core 决定 history 与 lifecycle，ECS 持有实体、滚动数据和物理 owner；沿用现有 publication/cleanup 协议。只在实际改动处拆分私有模块，不整体重写 navigation。默认关闭新增能力时保持现有行为。
 
-闲置 host loss 的完整缓存移交已闭合；接下来单独提交局部结构收敛，再扩展缓存策略：
+闲置 host loss 的完整缓存移交已闭合；局部结构收敛单独提交。之后先闭合 A→B→A 的命中旅程及一次准备拒绝返还，再沿同一协议完成 LRU、其余失效路径与组合验收：
 
-- Core 在 `engine/retained.rs` 统一 retained 库存核对和 preserve/retire 分区；normal、idle 与失败入口复用这些准备，保留各自已有 history/host owner 和 continuation，不为每种失败增加独立缓存状态机。
-- ECS 在 `retained.rs` 统一原 owner/physical payload 的准备、移交与返还；选定内容进入既有 cleanup manifest/physical forest。retained publication 编排移入私有模块，主 navigation 仅保留流程分派；不用机械拆文件代替职责收敛。
+- Core 在 `engine/retained.rs` 集中 retained 库存和移交 owner 的 exact 核对；normal 按 next scope、idle 按 exact host 明确分区，保留各自已有 history/host owner 和 continuation，不为每种失败增加独立缓存状态机。
+- ECS 在 `retained.rs` 统一原 owner/physical payload 的选择、预分配、移交与返还；选定内容进入既有 cleanup manifest/physical forest。normal publication 编排移入私有模块，主 navigation 分派到该入口；不通过机械拆文件代替职责收敛。
 - 验证围绕用户旅程及关键 owner 不变量，覆盖一次代表性准备拒绝和真实写后变化。相同语义不叠加多份低层反例矩阵；已有行为回归不因重组而删除。LRU 先用标准容器，避免手写链表或引入不能减少生命周期复杂度的依赖。
 
 ## 1. Canonical history 的受控只读交接
@@ -37,14 +37,14 @@
 
 实现入口：Core `frame.rs`/`engine.rs`/`integration.rs`，ECS `registry.rs`、`mount.rs`、`frame_local.rs`、`presentation.rs`、`input.rs`、`cleanup.rs` 与 `branch_transaction.rs`。此阶段独立审查后进入缓存实现。
 
-已闭合连续多个 inactive leaf 与 active 共存、撤销输入/focus、离开父布局以及闲置 host 丢失后清理并重新接纳的完整旅程。当前先收敛库存/移交准备，再补前台失败与 authority 失效时的结算，之后完成命中、LRU 与组合验收。
+已闭合连续多个 inactive leaf 与 active 共存、撤销输入/focus、离开父布局以及闲置 host 丢失后清理并重新接纳的完整旅程。库存/移交准备收敛后先完成命中主线，再补齐 LRU、前台失败与 authority 失效时的结算及组合验收。
 
 ## 4. 同父 leaf 缓存与完整责任交接
 
 - [ ] Route 显式启用 keep-alive，Router 设置 inactive leaf 容量；默认关闭，容量零禁用。Core 决定 retain/reactivate/dispose，ECS 私有模块持有长期 retained owner 与实体。
 - [ ] 按 exact parent frame/generation、outlet、slot binding、host incarnation 和 route/view/params/raw search/raw fragment 判定；只缓存 normal leaf，保持 fragment 替换与 search 重建合同。
 - [ ] 离场同次撤销 pointer 历史 hover/已开始手势、keyboard/gamepad 和 focus，再隐藏并退出布局。提供一个最小活动资格查询入口，应用可据此决定后台工作。
-- [ ] 命中保留 Entity、局部组件及 handles，不重复 factory/apply；在 Ready 前完成 claim rebind、owner 组合、输入及恢复准备。其他缓存始终 protected。
+- [ ] 命中决策发生在 fresh factory/Scene apply 前，消费本次 Core task 与原缓存 owner，保留 Entity、局部组件及 handles；在 Ready 前完成 claim rebind、owner 组合、输入及恢复准备。其他缓存始终 protected。
 - [ ] 按失活时刻维护 LRU；淘汰、parent/outlet/slot 失效、host loss/readmission 经明确 cleanup owner 结算。cache 自身失效与 current authority loss 分别处理；准备或写后发布失败返还原 owner 或有界隔离清理。
 - [ ] 验证 A→B→A 同 Entity/状态、factory 次数、禁用/LRU/淘汰重建、稀疏 binding、多缓存共存、动态内容、命中失败、parent/host loss、terminal owner 收敛与后续合法请求。
 

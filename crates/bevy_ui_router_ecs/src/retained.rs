@@ -1,4 +1,6 @@
-use bevy_ui_router_core::integration::{RetainedLeafId, RetainedLeafOwner, RetainedLeafProjection};
+#[cfg(test)]
+use bevy_ui_router_core::integration::RetainedLeafId;
+use bevy_ui_router_core::integration::{RetainedLeafOwner, RetainedLeafProjection};
 
 use crate::branch_transaction::RealizedBranch;
 
@@ -75,69 +77,108 @@ pub(crate) struct RetainedLeaves {
     entries: Vec<RetainedLeaf>,
 }
 
-/// Storage and exact entry indices are prepared before Core installs Ready.
-/// The caller consumes this only in the same publication that transfers the
-/// corresponding original owners to Core.
-pub(crate) struct PreparedRetiredPayloads {
+/// One exact selection and its transfer storage. Preparation keeps the original
+/// entries in the cache; only Core acceptance permits physical handoff.
+pub(crate) struct PreparedRetainedChange {
     indices: Vec<usize>,
+    owners: Vec<RetainedLeafOwner>,
     payloads: Vec<RealizedBranch>,
 }
 
-pub(crate) struct RetainedSettlementStorage {
-    branches: Vec<RealizedBranch>,
-}
-
-/// Keeps the original physical holder intact until Core accepts the idle
-/// settlement. A rejected begin restores this same holder and its owners.
-pub(crate) struct RetainedSettlementPayload {
-    leaves: RetainedLeaves,
-    branches: Vec<RealizedBranch>,
-}
-
-impl RetainedSettlementPayload {
-    pub(crate) fn restore(self) -> RetainedLeaves {
-        self.leaves
+impl PreparedRetainedChange {
+    pub(crate) fn selected<'a>(
+        &'a self,
+        leaves: &'a RetainedLeaves,
+    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a RealizedBranch)> {
+        self.indices.iter().map(move |index| {
+            let entry = &leaves.entries[*index];
+            (&entry.projection, &entry.branch)
+        })
     }
 
-    pub(crate) fn into_branches(mut self) -> Vec<RealizedBranch> {
-        for entry in self.leaves.entries {
-            self.branches.push(entry.branch);
+    pub(crate) fn selected_mut<'a>(
+        &'a self,
+        leaves: &'a mut RetainedLeaves,
+    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a mut RealizedBranch)> {
+        leaves
+            .entries
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(index, entry)| {
+                self.indices
+                    .binary_search(&index)
+                    .is_ok()
+                    .then_some((&entry.projection, &mut entry.branch))
+            })
+    }
+
+    /// The cache cannot change membership between preparation and handoff.
+    /// Rejection returns these same capabilities through restore_owners.
+    pub(crate) fn take_owners(&mut self, leaves: &mut RetainedLeaves) -> Vec<RetainedLeafOwner> {
+        for index in &self.indices {
+            self.owners.push(
+                leaves.entries[*index]
+                    .owner
+                    .take()
+                    .expect("prepared retained entry still owns its capability"),
+            );
         }
-        self.branches
+        std::mem::take(&mut self.owners)
+    }
+
+    pub(crate) fn into_payloads(mut self, leaves: &mut RetainedLeaves) -> Vec<RealizedBranch> {
+        for index in self.indices.into_iter().rev() {
+            self.payloads.push(leaves.entries.remove(index).branch);
+        }
+        self.payloads
     }
 }
 
 impl RetainedLeaves {
-    pub(crate) fn prepare_settlement(
-        &self,
+    pub(crate) fn prepare_all(
+        &mut self,
         retiring: &[RetainedLeafProjection],
-    ) -> Option<RetainedSettlementStorage> {
-        if retiring.len() != self.entries.len()
-            || retiring.iter().enumerate().any(|(index, projection)| {
-                retiring[index + 1..].contains(projection)
-                    || self
-                        .entries
-                        .iter()
-                        .filter(|entry| &entry.projection == projection && entry.owner.is_some())
-                        .count()
-                        != 1
-            })
-        {
+    ) -> Option<PreparedRetainedChange> {
+        if retiring.len() != self.entries.len() {
             return None;
         }
-        let mut branches = Vec::new();
-        branches.try_reserve_exact(retiring.len()).ok()?;
-        Some(RetainedSettlementStorage { branches })
+        self.prepare_change(retiring, false)
     }
 
-    pub(crate) fn take_settlement(
+    pub(crate) fn prepare_change(
         &mut self,
-        storage: RetainedSettlementStorage,
-    ) -> RetainedSettlementPayload {
-        RetainedSettlementPayload {
-            leaves: std::mem::take(self),
-            branches: storage.branches,
+        retiring: &[RetainedLeafProjection],
+        reserve_addition: bool,
+    ) -> Option<PreparedRetainedChange> {
+        let mut indices = Vec::new();
+        indices.try_reserve_exact(retiring.len()).ok()?;
+        for projection in retiring {
+            let mut matches = self.entries.iter().enumerate().filter(|(_, entry)| {
+                &entry.projection == projection
+                    && entry
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.projection() == projection)
+            });
+            let (index, _) = matches.next()?;
+            if matches.next().is_some() || indices.contains(&index) {
+                return None;
+            }
+            indices.push(index);
         }
+        indices.sort_unstable();
+        let mut owners = Vec::new();
+        owners.try_reserve_exact(indices.len()).ok()?;
+        let mut payloads = Vec::new();
+        payloads.try_reserve_exact(indices.len()).ok()?;
+        if reserve_addition {
+            self.entries.try_reserve(1).ok()?;
+        }
+        Some(PreparedRetainedChange {
+            indices,
+            owners,
+            payloads,
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -155,54 +196,12 @@ impl RetainedLeaves {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn branch(&self, id: RetainedLeafId) -> Option<&RealizedBranch> {
         self.entries
             .iter()
             .find(|entry| entry.projection.id() == id)
             .map(|entry| &entry.branch)
-    }
-
-    pub(crate) fn branch_mut(&mut self, id: RetainedLeafId) -> Option<&mut RealizedBranch> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.projection.id() == id)
-            .map(|entry| &mut entry.branch)
-    }
-
-    pub(crate) fn reserve_addition(&mut self) -> Result<(), ()> {
-        self.entries.try_reserve(1).map_err(|_| ())
-    }
-
-    /// Validate the whole transfer and reserve its storage before moving any
-    /// capability. An unsuccessful preparation leaves every owner in place.
-    pub(crate) fn take_retiring_owners(
-        &mut self,
-        retiring: &[RetainedLeafProjection],
-    ) -> Result<Vec<RetainedLeafOwner>, ()> {
-        let mut indices = Vec::new();
-        indices.try_reserve_exact(retiring.len()).map_err(|_| ())?;
-        for projection in retiring {
-            let index = self
-                .entries
-                .iter()
-                .position(|entry| &entry.projection == projection && entry.owner.is_some())
-                .ok_or(())?;
-            if indices.contains(&index) {
-                return Err(());
-            }
-            indices.push(index);
-        }
-        let mut owners = Vec::new();
-        owners.try_reserve_exact(indices.len()).map_err(|_| ())?;
-        for index in indices {
-            owners.push(
-                self.entries[index]
-                    .owner
-                    .take()
-                    .expect("transfer was fully checked"),
-            );
-        }
-        Ok(owners)
     }
 
     pub(crate) fn restore_owners(
@@ -248,37 +247,5 @@ impl RetainedLeaves {
             owner,
             branch,
         });
-    }
-
-    pub(crate) fn prepare_retired_payloads(
-        &self,
-        retiring: &[RetainedLeafProjection],
-    ) -> Option<PreparedRetiredPayloads> {
-        let mut indices = Vec::new();
-        indices.try_reserve_exact(retiring.len()).ok()?;
-        for projection in retiring {
-            let index = self
-                .entries
-                .iter()
-                .position(|entry| &entry.projection == projection && entry.owner.is_some())?;
-            if indices.contains(&index) {
-                return None;
-            }
-            indices.push(index);
-        }
-        let mut payloads = Vec::new();
-        payloads.try_reserve_exact(indices.len()).ok()?;
-        indices.sort_unstable_by(|left, right| right.cmp(left));
-        Some(PreparedRetiredPayloads { indices, payloads })
-    }
-
-    pub(crate) fn take_retired_payloads(
-        &mut self,
-        mut prepared: PreparedRetiredPayloads,
-    ) -> Vec<RealizedBranch> {
-        for index in prepared.indices {
-            prepared.payloads.push(self.entries.remove(index).branch);
-        }
-        prepared.payloads
     }
 }

@@ -113,6 +113,17 @@ impl RetainedRegistryEntry {
     }
 }
 
+pub(super) fn owner_projections_match<'owner, 'expected>(
+    owners: impl Iterator<Item = &'owner RetainedLeafOwner>,
+    expected: impl Iterator<Item = &'expected RetainedLeafProjection>,
+) -> bool {
+    let mut observed = owners
+        .map(RetainedLeafOwner::projection)
+        .collect::<Vec<_>>();
+    observed.sort_by_key(|projection| projection.id());
+    observed.into_iter().eq(expected)
+}
+
 // Transit responsibility is independent of CurrentWork and survives discarded
 // prepared handles and rejected publication. Neither this holder nor its owners is Clone.
 pub(super) struct PreparedRetainedTransfer {
@@ -162,17 +173,12 @@ impl RouterEngine {
         {
             return Err(CommitError::Stale);
         }
-        let mut observed = inventory
-            .iter()
-            .map(|owner| owner.projection.clone())
-            .collect::<Vec<_>>();
-        observed.sort_by_key(RetainedLeafProjection::id);
-        let expected = self
-            .retained_leaves
-            .iter()
-            .map(|entry| entry.projection.clone())
-            .collect::<Vec<_>>();
-        if observed != expected {
+        if !owner_projections_match(
+            inventory.iter().copied(),
+            self.retained_leaves
+                .iter()
+                .map(RetainedRegistryEntry::projection),
+        ) {
             return Err(CommitError::InvalidManifest);
         }
         let current = self.current.as_ref().ok_or(CommitError::Stale)?;
@@ -362,12 +368,9 @@ impl RouterEngine {
         retiring: Vec<RetainedLeafOwner>,
     ) -> Result<(PreparedPublication, CleanupBatchToken), (Vec<RetainedLeafOwner>, CommitError)>
     {
-        let mut owned = retiring
-            .iter()
-            .map(|owner| owner.projection.clone())
-            .collect::<Vec<_>>();
-        owned.sort_by_key(RetainedLeafProjection::id);
-        if owned != plan.retiring || self.pending_retained_transfer.is_some() {
+        if !owner_projections_match(retiring.iter(), plan.retiring.iter())
+            || self.pending_retained_transfer.is_some()
+        {
             return Err((retiring, CommitError::InvalidManifest));
         }
         let record_index = match self

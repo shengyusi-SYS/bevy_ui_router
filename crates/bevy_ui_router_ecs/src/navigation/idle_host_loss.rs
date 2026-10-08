@@ -362,14 +362,11 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         .as_ref()
         .map(|plan| plan.retiring().to_vec())
         .unwrap_or_default();
-    let Some(retained_storage) = entry.retained.prepare_settlement(&retiring) else {
+    let Some(mut retained_change) = entry.retained.prepare_all(&retiring) else {
         return true;
     };
     #[cfg(feature = "bsn")]
-    for projection in &retiring {
-        let Some(branch) = entry.retained.branch_mut(projection.id()) else {
-            return true;
-        };
+    for (_, branch) in retained_change.selected_mut(&mut entry.retained) {
         if let Err(error) = branch.prepare_native_cleanup(world)
             && error.is_retryable()
         {
@@ -387,13 +384,9 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     // owner. The existing authority-loss partition classifies that residual;
     // it must not remint claims or retry the contradictory closure.
     let registry = world.resource::<RouteEntityRegistry>();
-    let retired_branches = retiring
-        .iter()
-        .map(|projection| Some((projection, entry.retained.branch(projection.id())?)))
-        .collect::<Option<Vec<_>>>();
-    let Some(retired_branches) = retired_branches else {
-        return true;
-    };
+    let retired_branches = retained_change
+        .selected(&entry.retained)
+        .collect::<Vec<_>>();
     let Ok(frozen) = FrozenCleanupManifest::from_idle_host_authority_with_retained(
         world,
         registry,
@@ -466,10 +459,7 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         .get::<Children>(host.host)
         .map(|children| children.iter().copied().collect())
         .unwrap_or_default();
-    let Ok(owners) = entry.retained.take_retiring_owners(&retiring) else {
-        return true;
-    };
-    let mut retained_payload = Some(entry.retained.take_settlement(retained_storage));
+    let owners = retained_change.take_owners(&mut entry.retained);
     let (host, lease) = entry
         .host
         .take()
@@ -485,13 +475,11 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         host_children,
     });
     let pending = &mut entry.idle_host_loss;
+    let retained = &mut entry.retained;
     let mut registry = world.resource_mut::<RouteEntityRegistry>();
     let install = |core| {
         let mut physical = physical.take().expect("single physical owner installation");
-        physical.retained = retained_payload
-            .take()
-            .expect("single retained physical holder")
-            .into_branches();
+        physical.retained = retained_change.into_payloads(retained);
         if let Some(boundaries) = retained_boundaries {
             boundaries.apply(&mut registry);
         }
@@ -519,10 +507,6 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         let physical = physical
             .take()
             .expect("rejected begin returns physical ownership");
-        entry.retained = retained_payload
-            .take()
-            .expect("rejected begin returns the original cache holder")
-            .restore();
         assert!(
             entry.retained.restore_owners(owners).is_ok(),
             "rejected begin returns original owners to unchanged entries"

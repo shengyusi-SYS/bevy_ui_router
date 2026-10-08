@@ -136,16 +136,12 @@ impl RouterEngine {
         if !self.idle_host_loss_eligible() || !lease.matches(self.router, host, slot) {
             return Err(IdleHostLossErrorKind::ReceiverMismatch);
         }
-        let mut observed = inventory
-            .iter()
-            .map(|owner| owner.projection().clone())
-            .collect::<Vec<_>>();
-        observed.sort_by_key(retained::RetainedLeafProjection::id);
-        if !observed.iter().eq(self
-            .retained_leaves
-            .iter()
-            .map(retained::RetainedRegistryEntry::projection))
-        {
+        if !retained::owner_projections_match(
+            inventory.iter().copied(),
+            self.retained_leaves
+                .iter()
+                .map(retained::RetainedRegistryEntry::projection),
+        ) {
             return Err(IdleHostLossErrorKind::InvalidManifest);
         }
         let mut retiring = Vec::new();
@@ -254,13 +250,8 @@ impl RouterEngine {
         {
             return Err((lease, plan, owners, IdleHostLossErrorKind::ReceiverMismatch));
         }
-        let mut observed = owners
-            .iter()
-            .map(|owner| owner.projection().clone())
-            .collect::<Vec<_>>();
-        observed.sort_by_key(retained::RetainedLeafProjection::id);
         if roots != plan.logical_roots.as_slice()
-            || observed != plan.retiring
+            || !retained::owner_projections_match(owners.iter(), plan.retiring.iter())
             || obligation_count == 0
         {
             return Err((lease, plan, owners, IdleHostLossErrorKind::InvalidManifest));
