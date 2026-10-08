@@ -1000,6 +1000,13 @@ pub(super) fn prepare_post_commit_input_isolation(
     authority: &PreparedPostCommitAuthorityLedger,
 ) -> Result<PreparedPostCommitInputIsolation, PostCommitInputIsolationFailure> {
     let mut gate_targets = active.live_interactive_entities(world);
+    gate_targets.extend(
+        authority
+            .partition()
+            .targets()
+            .iter()
+            .map(|target| target.entity()),
+    );
     // Protected descendants participate in read-only partition validation, not
     // input revocation. Only the original owned cleanup obligations are targets.
     gate_targets.extend(original.immutable_entities().iter().copied());

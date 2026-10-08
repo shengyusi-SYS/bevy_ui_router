@@ -1850,6 +1850,8 @@ struct PreparedPostCommitPhysicalOwner {
     original_freeze: FrozenOriginalCleanupLedgerTransfer,
     authority: PreparedPostCommitAuthorityLedger,
     active: RealizedBranch,
+    retained: Vec<RealizedBranch>,
+    retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
     input_isolation: Option<PreparedPostCommitInputIsolation>,
@@ -1881,6 +1883,8 @@ struct PostCommitCompoundPhysicalOwner {
     authority: CleanupLedger,
     partition: FrozenPostCommitAuthorityPartition,
     active: RealizedBranch,
+    retained: Vec<RealizedBranch>,
+    retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
     input_isolation: FrozenPostCommitInputIsolation,
@@ -1914,6 +1918,10 @@ enum PostCommitPreAcceptInertEvidence {
     ReceiptObservationMismatch,
     Original(PostCommitOriginalFreezePermanentEvidence),
     EntryOwnerMissing,
+    RetainedInventory,
+    Isolation(PostCommitInputIsolationFailure),
+    #[cfg(feature = "bsn")]
+    NativeCleanup(crate::presentation::native_frame::NativeCleanupPreparationError),
     RetiredHostEdge(RetiredHostEdgeFreezePermanentEvidence),
     Authority(PostCommitAuthorityFreezePermanentEvidence),
     MissingNormalBatch,
@@ -19422,6 +19430,7 @@ enum PostCommitPlanBindFailure {
 
 enum PostCommitAcceptedInertEvidence {
     Receiver(PostCommitReceiverMismatchView),
+    Retained(IntegrationError),
     Retryable(PostCommitAuthorityBeginRetryEvidence),
     Permanent(PostCommitAuthorityBeginPermanentEvidence),
 }
@@ -19539,7 +19548,7 @@ fn begin_post_commit_compound(
             return true;
         }
     };
-    let (Some(active), Some(host)) = (entry.active.as_ref(), entry.host.as_ref()) else {
+    if entry.active.is_none() || entry.host.is_none() {
         entry.post_commit_compound = Some(
             PostCommitCompoundHolder::PreAcceptInert {
                 physical: PostCommitPreAcceptPhysicalOwner {
@@ -19553,7 +19562,71 @@ fn begin_post_commit_compound(
             .into(),
         );
         return true;
+    }
+    let Some(inventory) = entry.retained.inventory() else {
+        entry.post_commit_compound = Some(
+            PostCommitCompoundHolder::PreAcceptInert {
+                physical: PostCommitPreAcceptPhysicalOwner {
+                    original,
+                    original_freeze: Some(original_freeze),
+                    authority: None,
+                    edge: None,
+                },
+                evidence: PostCommitPreAcceptInertEvidence::RetainedInventory,
+            }
+            .into(),
+        );
+        return true;
     };
+    let retiring = inventory
+        .iter()
+        .map(|owner| owner.projection().clone())
+        .collect::<Vec<_>>();
+    let mut retained_change = if retiring.is_empty() {
+        None
+    } else {
+        let Some(change) = entry.retained.prepare_all(&retiring) else {
+            entry.cleanup_ledger = Some(original);
+            return true;
+        };
+        Some(change)
+    };
+    #[cfg(feature = "bsn")]
+    let native_preparation = (|| {
+        entry
+            .active
+            .as_mut()
+            .unwrap()
+            .prepare_native_cleanup(world)?;
+        if let Some(change) = &retained_change {
+            for (_, branch) in change.selected_mut(&mut entry.retained) {
+                branch.prepare_native_cleanup(world)?;
+            }
+        }
+        Ok::<(), crate::presentation::native_frame::NativeCleanupPreparationError>(())
+    })();
+    #[cfg(feature = "bsn")]
+    if let Err(error) = native_preparation {
+        if error.is_retryable() {
+            entry.cleanup_ledger = Some(original);
+        } else {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreAcceptInert {
+                    physical: PostCommitPreAcceptPhysicalOwner {
+                        original,
+                        original_freeze: Some(original_freeze),
+                        authority: None,
+                        edge: None,
+                    },
+                    evidence: PostCommitPreAcceptInertEvidence::NativeCleanup(error),
+                }
+                .into(),
+            );
+        }
+        return true;
+    }
+    let active = entry.active.as_ref().unwrap();
+    let host = entry.host.as_ref().unwrap();
     let edge = match FrozenRetiredHostEdge::freeze(world, host) {
         Ok(edge) => edge,
         Err(evidence) => {
@@ -19577,6 +19650,11 @@ fn begin_post_commit_compound(
         active,
         host,
         &original_freeze,
+        &retained_change
+            .as_ref()
+            .into_iter()
+            .flat_map(|change| change.selected(&entry.retained))
+            .collect::<Vec<_>>(),
     ) {
         Ok(authority) => authority,
         Err(PostCommitAuthorityFreezeFailure::RetryableCapacity) => {
@@ -19599,6 +19677,52 @@ fn begin_post_commit_compound(
             return true;
         }
     };
+    let retained_boundaries = if retiring.is_empty() {
+        None
+    } else {
+        let Ok(boundaries) = world
+            .resource::<RouteEntityRegistry>()
+            .prepare_retained_boundaries(None, &retiring)
+        else {
+            entry.post_commit_compound = Some(
+                PostCommitCompoundHolder::PreAcceptInert {
+                    physical: PostCommitPreAcceptPhysicalOwner {
+                        original,
+                        original_freeze: Some(original_freeze),
+                        authority: Some(authority),
+                        edge: Some(edge),
+                    },
+                    evidence: PostCommitPreAcceptInertEvidence::RetainedInventory,
+                }
+                .into(),
+            );
+            return true;
+        };
+        Some(boundaries)
+    };
+    let input_isolation =
+        match prepare_post_commit_input_isolation(world, active, &original_freeze, &authority) {
+            Ok(isolation) => Some(isolation),
+            Err(PostCommitInputIsolationFailure::RetryableCapacity) => {
+                entry.cleanup_ledger = Some(original);
+                return true;
+            }
+            Err(evidence) => {
+                entry.post_commit_compound = Some(
+                    PostCommitCompoundHolder::PreAcceptInert {
+                        physical: PostCommitPreAcceptPhysicalOwner {
+                            original,
+                            original_freeze: Some(original_freeze),
+                            authority: Some(authority),
+                            edge: Some(edge),
+                        },
+                        evidence: PostCommitPreAcceptInertEvidence::Isolation(evidence),
+                    }
+                    .into(),
+                );
+                return true;
+            }
+        };
     let Some(normal_batch) = original.batch() else {
         entry.post_commit_compound = Some(
             PostCommitCompoundHolder::PreAcceptInert {
@@ -19645,257 +19769,108 @@ fn begin_post_commit_compound(
         .take()
         .expect("the accepted post-commit receiver retains host ownership")
         .into_retired();
-    let logical_roots = active
-        .frames()
-        .iter()
-        .rev()
-        .map(|frame| frame.frame().clone())
-        .collect::<Vec<_>>();
-    let physical = PreparedPostCommitPhysicalOwner {
+    let mut physical = PreparedPostCommitPhysicalOwner {
         original,
         original_freeze,
         authority,
         active,
+        retained: Vec::new(),
+        retained_boundaries,
         host,
         edge,
-        input_isolation: None,
+        input_isolation,
     };
     let source = PostCommitAuthorityPreparationSource::new(transfer, lease);
-    let (prepared, _authority_batch) = match entry.engine.prepare_post_commit_authority_transfer(
-        source,
-        CleanupManifest::new(
-            logical_roots,
+    let preparation = if let Some(change) = retained_change.as_mut() {
+        let plan = entry
+            .retained
+            .inventory()
+            .ok_or(IntegrationError::Stale)
+            .and_then(|inventory| {
+                entry
+                    .engine
+                    .prepare_retained_post_commit_authority_plan(&source, &inventory)
+            });
+        let plan = match plan {
+            Ok(plan)
+                if plan.retiring().len() == retiring.len()
+                    && plan
+                        .retiring()
+                        .iter()
+                        .all(|projection| retiring.contains(projection)) =>
+            {
+                plan
+            }
+            result => {
+                let error = result.err().unwrap_or(IntegrationError::InvalidManifest);
+                entry.post_commit_compound =
+                    Some(Box::new(PostCommitCompoundHolder::AcceptedInert {
+                        source,
+                        physical: Box::new(physical),
+                        evidence: Box::new(PostCommitAcceptedInertEvidence::Retained(error)),
+                    }));
+                return true;
+            }
+        };
+        let manifest = CleanupManifest::new(
+            plan.logical_roots().to_vec(),
             physical.authority.manifest_digest(),
             physical.authority.obligation_count(),
-        ),
-    ) {
-        PostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => (owner, batch),
+        );
+        let owners = change.take_owners(&mut entry.retained);
+        let preparation = entry
+            .engine
+            .prepare_post_commit_authority_transfer_with_retention(source, plan, manifest, owners);
+        // The returned Source or Prepared transfer owns the original
+        // capabilities; its matching physical payloads follow every outcome.
+        physical.retained = retained_change
+            .take()
+            .unwrap()
+            .into_payloads(&mut entry.retained);
+        preparation
+    } else {
+        let logical_roots = physical
+            .active
+            .frames()
+            .iter()
+            .rev()
+            .map(|frame| frame.frame().clone())
+            .collect::<Vec<_>>();
+        entry.engine.prepare_post_commit_authority_transfer(
+            source,
+            CleanupManifest::new(
+                logical_roots,
+                physical.authority.manifest_digest(),
+                physical.authority.obligation_count(),
+            ),
+        )
+    };
+    entry.post_commit_compound = Some(match preparation {
+        PostCommitAuthorityPreparationOutcome::Prepared { owner, .. } => {
+            resume_prepared_post_commit_compound(world, entry, owner, physical)
+        }
         PostCommitAuthorityPreparationOutcome::Mismatch { source, evidence } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::AcceptedInert {
-                    source,
-                    physical: Box::new(physical),
-                    evidence: Box::new(PostCommitAcceptedInertEvidence::Receiver(evidence)),
-                }
-                .into(),
-            );
-            return true;
+            Box::new(PostCommitCompoundHolder::AcceptedInert {
+                source,
+                physical: Box::new(physical),
+                evidence: Box::new(PostCommitAcceptedInertEvidence::Receiver(evidence)),
+            })
         }
         PostCommitAuthorityPreparationOutcome::Retryable { source, evidence } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::AcceptedInert {
-                    source,
-                    physical: Box::new(physical),
-                    evidence: Box::new(PostCommitAcceptedInertEvidence::Retryable(evidence)),
-                }
-                .into(),
-            );
-            return true;
+            Box::new(PostCommitCompoundHolder::AcceptedInert {
+                source,
+                physical: Box::new(physical),
+                evidence: Box::new(PostCommitAcceptedInertEvidence::Retryable(evidence)),
+            })
         }
         PostCommitAuthorityPreparationOutcome::Permanent { source, evidence } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::AcceptedInert {
-                    source,
-                    physical: Box::new(physical),
-                    evidence: Box::new(PostCommitAcceptedInertEvidence::Permanent(evidence)),
-                }
-                .into(),
-            );
-            return true;
+            Box::new(PostCommitCompoundHolder::AcceptedInert {
+                source,
+                physical: Box::new(physical),
+                evidence: Box::new(PostCommitAcceptedInertEvidence::Permanent(evidence)),
+            })
         }
-    };
-    let mut physical = physical;
-    physical.input_isolation = match prepare_post_commit_input_isolation(
-        world,
-        &physical.active,
-        &physical.original_freeze,
-        &physical.authority,
-    ) {
-        Ok(isolation) => Some(isolation),
-        Err(evidence) => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::PreparedInert {
-                    owner: prepared,
-                    physical,
-                    evidence: PostCommitPlanBindFailure::Isolation(evidence),
-                }
-                .into(),
-            );
-            return true;
-        }
-    };
-
-    let mut installed = None;
-    let outcome = entry.engine.begin_post_commit_authority_transfer(
-        prepared,
-        Box::new(physical),
-        |mut physical, observed_batch, builder| {
-            let plan = match bind_post_commit_settlement_plan(
-                &physical.original_freeze,
-                physical.authority.partition(),
-                &physical.edge,
-                builder,
-            ) {
-                Ok(plan) => plan,
-                Err(evidence) => {
-                    return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
-                }
-            };
-            if !physical.authority.batch_matches(observed_batch) {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Authority(
-                        crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
-                    ),
-                ));
-            }
-            let Some(isolation) = physical.input_isolation.take() else {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Isolation(
-                        PostCommitInputIsolationFailure::RefreezeRejected,
-                    ),
-                ));
-            };
-            let Some(original_removed) = physical
-                .original_freeze
-                .removed_entities_for_authority_refreeze(world, &physical.original, None)
-            else {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Isolation(
-                        PostCommitInputIsolationFailure::RefreezeRejected,
-                    ),
-                ));
-            };
-            let input_isolation = match isolation.apply_guarded(world, &|world| {
-                physical
-                    .original_freeze
-                    .refreeze(world, &physical.original, None)
-                    && physical
-                        .authority
-                        .partition()
-                        .refreeze_allowing_input_isolation(world, &original_removed)
-                    && physical.edge.host_projection_is_current(world, false)
-            }) {
-                Ok(isolation) => isolation,
-                Err(evidence) => {
-                    return Err((physical, PostCommitPlanBindFailure::Isolation(evidence)));
-                }
-            };
-            if !physical.authority.commit_input_isolation(
-                world,
-                &physical.original_freeze,
-                &physical.original,
-            ) {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Isolation(
-                        PostCommitInputIsolationFailure::RefreezeRejected,
-                    ),
-                ));
-            }
-            let PreparedPostCommitPhysicalOwner {
-                original,
-                original_freeze,
-                authority,
-                active,
-                host,
-                edge,
-                input_isolation: _,
-            } = *physical;
-            let authority = authority.bind_verified_batch(observed_batch.clone());
-            let (authority, partition) = authority.into_parts();
-            Ok((
-                Box::new(PostCommitCompoundPhysicalOwner {
-                    original,
-                    original_freeze,
-                    authority,
-                    partition,
-                    active,
-                    host,
-                    edge,
-                    input_isolation,
-                    original_cursor: 0,
-                    authority_non_top_cursor: 0,
-                    settled_authority: Vec::new(),
-                    edge_terminal: None,
-                    top_settled: false,
-                }),
-                plan,
-            ))
-        },
-        |physical, core| installed = Some((physical, core)),
-    );
-    match outcome {
-        PostCommitAuthorityBeginOutcome::Begun => {
-            let (physical, core) =
-                installed.expect("the infallible install callback publishes the compound owner");
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::Active(ActivePostCommitCompoundOwner {
-                    core,
-                    physical: *physical,
-                })
-                .into(),
-            );
-        }
-        PostCommitAuthorityBeginOutcome::BindingMismatch {
-            owner,
-            unbound,
-            evidence,
-        } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::PreparedInert {
-                    owner,
-                    physical: *unbound,
-                    evidence,
-                }
-                .into(),
-            );
-        }
-        PostCommitAuthorityBeginOutcome::ReceiverMismatch {
-            owner,
-            bound,
-            evidence,
-        } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::BoundInert {
-                    owner,
-                    physical: bound,
-                    evidence: Box::new(PostCommitBoundInertEvidence::Receiver(evidence)),
-                }
-                .into(),
-            );
-        }
-        PostCommitAuthorityBeginOutcome::Retryable {
-            owner,
-            bound,
-            evidence,
-        } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::BoundInert {
-                    owner,
-                    physical: bound,
-                    evidence: Box::new(PostCommitBoundInertEvidence::Retryable(evidence)),
-                }
-                .into(),
-            );
-        }
-        PostCommitAuthorityBeginOutcome::Permanent {
-            owner,
-            bound,
-            evidence,
-        } => {
-            entry.post_commit_compound = Some(
-                PostCommitCompoundHolder::BoundInert {
-                    owner,
-                    physical: bound,
-                    evidence: Box::new(PostCommitBoundInertEvidence::Permanent(evidence)),
-                }
-                .into(),
-            );
-        }
-    }
+    });
     true
 }
 
@@ -19905,13 +19880,18 @@ fn resume_accepted_post_commit_compound(
     source: PostCommitAuthorityPreparationSource,
     physical: PreparedPostCommitPhysicalOwner,
 ) -> Box<PostCommitCompoundHolder> {
-    let logical_roots = physical
-        .active
-        .frames()
-        .iter()
-        .rev()
-        .map(|frame| frame.frame().clone())
-        .collect::<Vec<_>>();
+    let logical_roots = source
+        .retained_logical_roots()
+        .map(<[_]>::to_vec)
+        .unwrap_or_else(|| {
+            physical
+                .active
+                .frames()
+                .iter()
+                .rev()
+                .map(|frame| frame.frame().clone())
+                .collect::<Vec<_>>()
+        });
     match entry.engine.prepare_post_commit_authority_transfer(
         source,
         CleanupManifest::new(
@@ -19947,6 +19927,121 @@ fn resume_accepted_post_commit_compound(
     }
 }
 
+type PostCommitBoundPhysical<'w> = (
+    Box<PostCommitCompoundPhysicalOwner>,
+    bevy_ecs::change_detection::Mut<'w, RouteEntityRegistry>,
+);
+
+fn bind_prepared_post_commit_physical<'w>(
+    world: &'w mut World,
+    mut physical: Box<PreparedPostCommitPhysicalOwner>,
+    observed_batch: &r3_core::PostCommitCleanupBatchView,
+    builder: r3_core::PostCommitSettlementPlanBuilder,
+) -> Result<
+    (
+        PostCommitBoundPhysical<'w>,
+        r3_core::PostCommitSettlementPlan,
+    ),
+    (
+        Box<PreparedPostCommitPhysicalOwner>,
+        PostCommitPlanBindFailure,
+    ),
+> {
+    let plan = match bind_post_commit_settlement_plan(
+        &physical.original_freeze,
+        physical.authority.partition(),
+        &physical.edge,
+        builder,
+    ) {
+        Ok(plan) => plan,
+        Err(evidence) => {
+            return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
+        }
+    };
+    if !physical.authority.batch_matches(observed_batch) {
+        return Err((
+            physical,
+            PostCommitPlanBindFailure::Authority(
+                crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
+            ),
+        ));
+    }
+    let Some(isolation) = physical.input_isolation.take() else {
+        return Err((
+            physical,
+            PostCommitPlanBindFailure::Isolation(PostCommitInputIsolationFailure::RefreezeRejected),
+        ));
+    };
+    let Some(original_removed) = physical
+        .original_freeze
+        .removed_entities_for_authority_refreeze(world, &physical.original, None)
+    else {
+        return Err((
+            physical,
+            PostCommitPlanBindFailure::Isolation(PostCommitInputIsolationFailure::RefreezeRejected),
+        ));
+    };
+    let input_isolation = match isolation.apply_guarded(world, &|world| {
+        physical
+            .original_freeze
+            .refreeze(world, &physical.original, None)
+            && physical
+                .authority
+                .partition()
+                .refreeze_allowing_input_isolation(world, &original_removed)
+            && physical.edge.host_projection_is_current(world, false)
+    }) {
+        Ok(isolation) => isolation,
+        Err(evidence) => {
+            return Err((physical, PostCommitPlanBindFailure::Isolation(evidence)));
+        }
+    };
+    if !physical.authority.commit_input_isolation(
+        world,
+        &physical.original_freeze,
+        &physical.original,
+    ) {
+        return Err((
+            physical,
+            PostCommitPlanBindFailure::Isolation(PostCommitInputIsolationFailure::RefreezeRejected),
+        ));
+    }
+    let PreparedPostCommitPhysicalOwner {
+        original,
+        original_freeze,
+        authority,
+        active,
+        retained,
+        retained_boundaries,
+        host,
+        edge,
+        input_isolation: _,
+    } = *physical;
+    let authority = authority.bind_verified_batch(observed_batch.clone());
+    let (authority, partition) = authority.into_parts();
+    let physical = Box::new(PostCommitCompoundPhysicalOwner {
+        original,
+        original_freeze,
+        authority,
+        partition,
+        active,
+        retained,
+        retained_boundaries,
+        host,
+        edge,
+        input_isolation,
+        original_cursor: 0,
+        authority_non_top_cursor: 0,
+        settled_authority: Vec::new(),
+        edge_terminal: None,
+        top_settled: false,
+    });
+    // Borrow only after all World writes and their partition checks. This
+    // temporary receiver travels to Core's infallible installation callback.
+    let registry = world.resource_mut::<RouteEntityRegistry>();
+    Ok(((physical, registry), plan))
+}
+
 fn resume_prepared_post_commit_compound(
     world: &mut World,
     entry: &mut RouterEntry,
@@ -19975,108 +20070,63 @@ fn resume_prepared_post_commit_compound(
     let outcome = entry.engine.begin_post_commit_authority_transfer(
         owner,
         Box::new(physical),
-        |mut physical, observed_batch, builder| {
-            let plan = match bind_post_commit_settlement_plan(
-                &physical.original_freeze,
-                physical.authority.partition(),
-                &physical.edge,
-                builder,
-            ) {
-                Ok(plan) => plan,
-                Err(evidence) => {
-                    return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
-                }
-            };
-            if !physical.authority.batch_matches(observed_batch) {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Authority(
-                        crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
-                    ),
-                ));
-            }
-            let Some(isolation) = physical.input_isolation.take() else {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Isolation(
-                        PostCommitInputIsolationFailure::RefreezeRejected,
-                    ),
-                ));
-            };
-            let Some(original_removed) = physical
-                .original_freeze
-                .removed_entities_for_authority_refreeze(world, &physical.original, None)
-            else {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Isolation(
-                        PostCommitInputIsolationFailure::RefreezeRejected,
-                    ),
-                ));
-            };
-            let input_isolation = match isolation.apply_guarded(world, &|world| {
-                physical
-                    .original_freeze
-                    .refreeze(world, &physical.original, None)
-                    && physical
-                        .authority
-                        .partition()
-                        .refreeze_allowing_input_isolation(world, &original_removed)
-                    && physical.edge.host_projection_is_current(world, false)
-            }) {
-                Ok(isolation) => isolation,
-                Err(evidence) => {
-                    return Err((physical, PostCommitPlanBindFailure::Isolation(evidence)));
-                }
-            };
-            if !physical.authority.commit_input_isolation(
-                world,
-                &physical.original_freeze,
-                &physical.original,
-            ) {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Isolation(
-                        PostCommitInputIsolationFailure::RefreezeRejected,
-                    ),
-                ));
-            }
-            let PreparedPostCommitPhysicalOwner {
-                original,
-                original_freeze,
-                authority,
-                active,
-                host,
-                edge,
-                input_isolation: _,
-            } = *physical;
-            let authority = authority.bind_verified_batch(observed_batch.clone());
-            let (authority, partition) = authority.into_parts();
-            Ok((
-                Box::new(PostCommitCompoundPhysicalOwner {
-                    original,
-                    original_freeze,
-                    authority,
-                    partition,
-                    active,
-                    host,
-                    edge,
-                    input_isolation,
-                    original_cursor: 0,
-                    authority_non_top_cursor: 0,
-                    settled_authority: Vec::new(),
-                    edge_terminal: None,
-                    top_settled: false,
-                }),
-                plan,
-            ))
+        move |physical, observed_batch, builder| {
+            bind_prepared_post_commit_physical(world, physical, observed_batch, builder)
         },
-        |physical, core| installed = Some((physical, core)),
+        |(mut physical, mut registry), core| {
+            if let Some(boundaries) = physical.retained_boundaries.take() {
+                boundaries.apply(&mut registry);
+            }
+            drop(registry);
+            installed = Some((physical, core));
+        },
     );
-    post_commit_begin_outcome_holder(outcome, installed)
+    post_commit_begin_outcome_holder(release_post_commit_bound_registry(outcome), installed)
+}
+
+fn bind_bound_post_commit_physical<'w>(
+    world: &'w mut World,
+    physical: Box<PostCommitCompoundPhysicalOwner>,
+    observed_batch: &r3_core::PostCommitCleanupBatchView,
+    builder: r3_core::PostCommitSettlementPlanBuilder,
+) -> Result<
+    (
+        PostCommitBoundPhysical<'w>,
+        r3_core::PostCommitSettlementPlan,
+    ),
+    (
+        Box<PostCommitCompoundPhysicalOwner>,
+        PostCommitPlanBindFailure,
+    ),
+> {
+    let plan = match bind_post_commit_settlement_plan(
+        &physical.original_freeze,
+        &physical.partition,
+        &physical.edge,
+        builder,
+    ) {
+        Ok(plan) => plan,
+        Err(evidence) => return Err((physical, PostCommitPlanBindFailure::Plan(evidence))),
+    };
+    if !physical.authority.post_commit_batch_matches(observed_batch) {
+        return Err((
+            physical,
+            PostCommitPlanBindFailure::Authority(
+                crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
+            ),
+        ));
+    }
+    let Some(registry) = world.get_resource_mut::<RouteEntityRegistry>() else {
+        return Err((
+            physical,
+            PostCommitPlanBindFailure::Isolation(PostCommitInputIsolationFailure::RefreezeRejected),
+        ));
+    };
+    Ok(((physical, registry), plan))
 }
 
 fn resume_bound_post_commit_compound(
+    world: &mut World,
     entry: &mut RouterEntry,
     owner: PreparedPostCommitAuthorityTransfer,
     physical: PostCommitCompoundPhysicalOwner,
@@ -20085,31 +20135,71 @@ fn resume_bound_post_commit_compound(
     let outcome = entry.engine.begin_post_commit_authority_transfer(
         owner,
         Box::new(physical),
-        |physical, observed_batch, builder| {
-            let plan = match bind_post_commit_settlement_plan(
-                &physical.original_freeze,
-                &physical.partition,
-                &physical.edge,
-                builder,
-            ) {
-                Ok(plan) => plan,
-                Err(evidence) => {
-                    return Err((physical, PostCommitPlanBindFailure::Plan(evidence)));
-                }
-            };
-            if !physical.authority.post_commit_batch_matches(observed_batch) {
-                return Err((
-                    physical,
-                    PostCommitPlanBindFailure::Authority(
-                        crate::cleanup::PreparedAuthorityLedgerBindingMismatch::WrongBatch,
-                    ),
-                ));
-            }
-            Ok((physical, plan))
+        move |physical, observed_batch, builder| {
+            bind_bound_post_commit_physical(world, physical, observed_batch, builder)
         },
-        |physical, core| installed = Some((physical, core)),
+        |(mut physical, mut registry), core| {
+            if let Some(boundaries) = physical.retained_boundaries.take() {
+                boundaries.apply(&mut registry);
+            }
+            drop(registry);
+            installed = Some((physical, core));
+        },
     );
-    post_commit_bound_retry_outcome_holder(outcome, installed)
+    post_commit_bound_retry_outcome_holder(release_post_commit_bound_registry(outcome), installed)
+}
+
+fn release_post_commit_bound_registry<Unbound, BindError>(
+    outcome: PostCommitAuthorityBeginOutcome<Unbound, PostCommitBoundPhysical<'_>, BindError>,
+) -> PostCommitAuthorityBeginOutcome<Unbound, Box<PostCommitCompoundPhysicalOwner>, BindError> {
+    match outcome {
+        PostCommitAuthorityBeginOutcome::Begun => PostCommitAuthorityBeginOutcome::Begun,
+        PostCommitAuthorityBeginOutcome::BindingMismatch {
+            owner,
+            unbound,
+            evidence,
+        } => PostCommitAuthorityBeginOutcome::BindingMismatch {
+            owner,
+            unbound,
+            evidence,
+        },
+        PostCommitAuthorityBeginOutcome::ReceiverMismatch {
+            owner,
+            bound: (physical, registry),
+            evidence,
+        } => {
+            drop(registry);
+            PostCommitAuthorityBeginOutcome::ReceiverMismatch {
+                owner,
+                bound: physical,
+                evidence,
+            }
+        }
+        PostCommitAuthorityBeginOutcome::Retryable {
+            owner,
+            bound: (physical, registry),
+            evidence,
+        } => {
+            drop(registry);
+            PostCommitAuthorityBeginOutcome::Retryable {
+                owner,
+                bound: physical,
+                evidence,
+            }
+        }
+        PostCommitAuthorityBeginOutcome::Permanent {
+            owner,
+            bound: (physical, registry),
+            evidence,
+        } => {
+            drop(registry);
+            PostCommitAuthorityBeginOutcome::Permanent {
+                owner,
+                bound: physical,
+                evidence,
+            }
+        }
+    }
 }
 
 fn post_commit_begin_outcome_holder(
@@ -20261,7 +20351,7 @@ fn resume_retryable_post_commit_holder(
         } => resume_prepared_post_commit_compound(world, entry, owner, physical),
         PostCommitCompoundHolder::BoundInert {
             owner, physical, ..
-        } => resume_bound_post_commit_compound(entry, owner, *physical),
+        } => resume_bound_post_commit_compound(world, entry, owner, *physical),
         _ => unreachable!("only a retryable post-accept holder is resumed"),
     }
 }
@@ -20678,12 +20768,13 @@ fn drive_post_commit_completion(
                             original,
                             authority,
                             active,
+                            retained,
                             host,
                             edge,
                             edge_terminal,
                             ..
                         } = physical;
-                        drop((original, authority, active));
+                        drop((original, authority, active, retained));
                         RetiredHostPhysicalTerminal {
                             host,
                             edge,

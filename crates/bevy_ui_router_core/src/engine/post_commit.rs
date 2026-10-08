@@ -91,6 +91,7 @@ pub(crate) struct CorePostCommitCleanupReceiverProjection {
     pub(super) current_top_slot: RouteSlotId,
     pub(super) committed_history: FrozenCommittedHistoryProjection,
     pub(super) active: FrozenActiveBranchProjection,
+    pub(super) retained_registry: Vec<super::retained::RetainedRegistryEntry>,
     pub(super) stage: CorePostCommitCleanupStageProjection,
 }
 
@@ -195,6 +196,7 @@ pub(crate) struct CorePostCommitAuthorityTransferOwner {
     pub(super) receiver: CorePostCommitCleanupReceiverProjection,
     pub(super) normal_source: CleanupBatchSourceProjection,
     pub(super) cause: PostCommitAuthorityCause,
+    pub(super) retained: Option<super::retained::PostCommitRetainedTransfer>,
 }
 
 impl CorePostCommitAuthorityTransferOwner {
@@ -257,6 +259,31 @@ impl CorePostCommitAuthorityPreparationSource {
 
     pub(crate) const fn cause(&self) -> PostCommitAuthorityCause {
         self.transfer.cause
+    }
+
+    pub(crate) fn with_retention(
+        mut self,
+        plan: super::retained::RetainedPostCommitAuthorityPlan,
+        owners: Vec<super::retained::RetainedLeafOwner>,
+    ) -> Self {
+        // Preserve every input even if a caller supplies an already-attached source.
+        // Exact inventory validation below rejects an invalid combined transfer.
+        let owners = match self.transfer.retained.take() {
+            Some(mut previous) => {
+                previous.owners.extend(owners);
+                previous.owners
+            }
+            None => owners,
+        };
+        self.transfer.retained = Some(super::retained::PostCommitRetainedTransfer { plan, owners });
+        self
+    }
+
+    pub(crate) fn retained_logical_roots(&self) -> Option<&[RouteFrameVersion]> {
+        self.transfer
+            .retained
+            .as_ref()
+            .map(|retained| retained.plan.logical_roots())
     }
 }
 

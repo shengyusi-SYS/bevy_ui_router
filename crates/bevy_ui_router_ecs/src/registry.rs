@@ -516,13 +516,19 @@ pub(crate) struct RouteEntityRegistry {
 
 /// Read-only preservation boundaries. These values never contain or create a
 /// lifecycle owner; the corresponding linear Core owner stays in RouterEntry.
-pub(crate) struct PreparedRetainedBoundaries {
-    boundaries: Vec<RetainedBoundaryProof>,
+pub(crate) enum PreparedRetainedBoundaries {
+    Replace(Vec<RetainedBoundaryProof>),
+    Remove(Vec<RetainedLeafProjection>),
 }
 
 impl PreparedRetainedBoundaries {
     pub(crate) fn apply(self, registry: &mut RouteEntityRegistry) {
-        registry.retained_boundaries = self.boundaries;
+        match self {
+            Self::Replace(boundaries) => registry.retained_boundaries = boundaries,
+            Self::Remove(retired) => registry
+                .retained_boundaries
+                .retain(|boundary| !retired.contains(boundary.projection())),
+        }
     }
 }
 
@@ -650,6 +656,14 @@ impl RouteEntityRegistry {
         }) {
             return Err(());
         }
+        // Recovery may keep this packet across updates. Remove only its exact
+        // targets so other routers can continue changing their own boundaries.
+        if addition.is_none() {
+            let mut removals = Vec::new();
+            removals.try_reserve_exact(retired.len()).map_err(|_| ())?;
+            removals.extend(retired.iter().cloned());
+            return Ok(PreparedRetainedBoundaries::Remove(removals));
+        }
         let mut boundaries = Vec::new();
         boundaries
             .try_reserve_exact(self.retained_boundaries.len() + usize::from(addition.is_some()))
@@ -670,7 +684,7 @@ impl RouteEntityRegistry {
             }
             boundaries.push(addition);
         }
-        Ok(PreparedRetainedBoundaries { boundaries })
+        Ok(PreparedRetainedBoundaries::Replace(boundaries))
     }
 
     pub(crate) fn retained_payload_is_current(

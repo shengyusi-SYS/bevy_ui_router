@@ -3208,6 +3208,10 @@ impl PostCommitAuthorityPreparationSource {
     pub fn cause(&self) -> PostCommitAuthorityCauseView {
         PostCommitAuthorityCauseView::from_core(self.inner.cause())
     }
+
+    pub fn retained_logical_roots(&self) -> Option<&[RouteFrameVersion]> {
+        self.inner.retained_logical_roots()
+    }
 }
 
 #[doc(hidden)]
@@ -4042,7 +4046,7 @@ pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> 
 
 pub use crate::engine::retained::{
     RetainedAuthoritySettlementPlan, RetainedCommitPlan, RetainedHitPlan, RetainedLeafId,
-    RetainedLeafOwner, RetainedLeafProjection,
+    RetainedLeafOwner, RetainedLeafProjection, RetainedPostCommitAuthorityPlan,
 };
 
 /// Rejected authority transfer returns the unchanged host and every retained owner.
@@ -6222,6 +6226,29 @@ impl RouterEngine {
                 }
             }
         }
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_retained_post_commit_authority_plan(
+        &self,
+        source: &PostCommitAuthorityPreparationSource,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedPostCommitAuthorityPlan, IntegrationError> {
+        self.inner
+            .prepare_retained_post_commit_authority_plan(&source.inner, inventory)
+            .map_err(map_commit_error)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_post_commit_authority_transfer_with_retention(
+        &mut self,
+        mut source: PostCommitAuthorityPreparationSource,
+        plan: RetainedPostCommitAuthorityPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+    ) -> PostCommitAuthorityPreparationOutcome {
+        source.inner = source.inner.with_retention(plan, owners);
+        self.prepare_post_commit_authority_transfer(source, manifest)
     }
 
     #[doc(hidden)]

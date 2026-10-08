@@ -5397,7 +5397,8 @@ impl RouterEngine {
             && self.action.is_none()
             && self.current_history_capability.is_none()
             && self.pending_history_preparation_error.is_none()
-            && self.prepared_publication_authority.is_none();
+            && self.prepared_publication_authority.is_none()
+            && self.pending_retained_transfer.is_none();
         if !exact {
             return PostCommitAuthorityAcceptanceOutcome::Mismatch { expected, observed };
         }
@@ -5421,6 +5422,7 @@ impl RouterEngine {
             receiver: accepted,
             normal_source,
             cause,
+            retained: None,
         })
     }
 
@@ -5459,13 +5461,17 @@ impl RouterEngine {
                 evidence: CorePostCommitReceiverMismatchProjection { expected, observed },
             };
         };
-        if manifest.logical_roots()
-            != current
-                .target_frames
-                .iter()
-                .rev()
-                .cloned()
-                .collect::<Vec<_>>()
+        let logical_roots = source
+            .retained_logical_roots()
+            .map(|roots| roots.to_vec())
+            .unwrap_or_else(|| current.target_frames.iter().rev().cloned().collect());
+        if !self.retained_post_commit_source_is_current(&source.transfer)
+            || (source.transfer.retained.is_none()
+                && self
+                    .retained_leaves
+                    .iter()
+                    .any(retained::RetainedRegistryEntry::is_live))
+            || manifest.logical_roots() != logical_roots
         {
             return PostCommitAuthorityPreparationOutcome::Permanent {
                 source,
@@ -5513,7 +5519,7 @@ impl RouterEngine {
     pub(crate) fn begin_post_commit_authority_transfer<Unbound, Bound, BindError, Bind, Install>(
         &mut self,
         issuer: &mut HostAdmissionIssuer,
-        owner: CorePreparedPostCommitAuthorityTransfer,
+        mut owner: CorePreparedPostCommitAuthorityTransfer,
         unbound: Unbound,
         bind: Bind,
         install_compound: Install,
@@ -5533,6 +5539,15 @@ impl RouterEngine {
         let mut cleanup_receiver = owner.transfer.receiver.clone();
         cleanup_receiver.stage = CorePostCommitCleanupStageProjection::AuthorityCleanup;
         let retired_projection = owner.host.retirement_projection();
+        let mut retained_after = self.retained_leaves.clone();
+        if let Some(retained) = &owner.transfer.retained {
+            Self::bind_retained_retirements(
+                &mut retained_after,
+                retained.plan.retiring(),
+                &owner.authority_batch,
+            );
+        }
+        cleanup_receiver.retained_registry = retained_after.clone();
         let compound_projection = CorePostCommitCompoundProjection {
             receiver: cleanup_receiver.clone(),
             authority_batch: owner.authority_batch.projection(),
@@ -5562,7 +5577,9 @@ impl RouterEngine {
         };
 
         let observed = self.observe_post_commit_cleanup();
-        if observed.receiver.as_ref() != Some(&expected) {
+        if observed.receiver.as_ref() != Some(&expected)
+            || !self.retained_post_commit_source_is_current(&owner.transfer)
+        {
             return PostCommitAuthorityBeginCoreOutcome::ReceiverMismatch {
                 owner,
                 bound,
@@ -5711,6 +5728,8 @@ impl RouterEngine {
         };
 
         install_compound(bound, compound);
+        self.retained_leaves = retained_after;
+        drop(owner.transfer.retained.take());
 
         let current = self
             .current
@@ -5762,6 +5781,7 @@ impl RouterEngine {
                 presentation: self.state.active().clone(),
                 frames: self.state.active().frames().to_vec(),
             },
+            retained_registry: self.retained_leaves.clone(),
             stage,
         })
     }
@@ -6768,6 +6788,7 @@ impl RouterEngine {
             settlement,
         } = batch;
         self.settle_retained_cleanup(&normal);
+        self.settle_retained_cleanup(&authority_batch);
         if terminal_plan.retain_completed_current {
             terminal_plan
                 .final_completed_cleanup

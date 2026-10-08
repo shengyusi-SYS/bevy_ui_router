@@ -232,7 +232,9 @@ fn fixture_with_retention(
                 .route_with_options(
                     branch,
                     RoutePattern::path(":id").unwrap(),
-                    RouteNodeOptions::new().with_view(view.clone()),
+                    RouteNodeOptions::new()
+                        .with_view(view.clone())
+                        .with_keep_alive(true),
                 )
                 .unwrap();
         }
@@ -789,6 +791,288 @@ fn native_published_normal_post_commit_host_loss_keeps_success() {
 }
 
 #[test]
+fn native_post_commit_host_loss_settles_live_and_already_retiring_cached_leaves() {
+    let (mut app, router, host, protected, _) =
+        fixture_with_retention(false, true, false, 3, false);
+    app.world_mut().entity_mut(host).add_child(protected);
+    let mut deep_cached_shell = None;
+    for path in ["/child/1", "/child/2", "/broken/1", "/broken/2"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Succeeded
+        );
+        if path == "/broken/1" {
+            deep_cached_shell = Some(
+                entry
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .frames()
+                    .last()
+                    .unwrap()
+                    .shell(),
+            );
+        }
+    }
+    let deep_cached_shell = deep_cached_shell.unwrap();
+    let (version, mut owned) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let inventory = entry.retained.inventory().unwrap();
+        assert_eq!(inventory.len(), 3);
+        let mut owned = entry
+            .active
+            .as_ref()
+            .unwrap()
+            .claims()
+            .map(ExactRegistryClaim::entity)
+            .collect::<Vec<_>>();
+        for owner in &inventory {
+            owned.extend(
+                entry
+                    .retained
+                    .branch(owner.projection().id())
+                    .unwrap()
+                    .claims()
+                    .map(ExactRegistryClaim::entity),
+            );
+        }
+        let binding = entry.host.as_ref().unwrap();
+        owned.push(binding.top_slot);
+        (binding.version.clone(), owned)
+    };
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/3"))
+        .unwrap();
+    // Preserve the real published-but-not-yet-cleaned window. The broken-parent
+    // cache is already in the normal batch; the root-parent caches are still live.
+    for _ in 0..8 {
+        collect_navigation_system(app.world_mut());
+        drive_navigation_system(app.world_mut());
+        commit_presentation_system(app.world_mut());
+        if app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .status()
+            == &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        {
+            break;
+        }
+        settle_cleanup_system(app.world_mut());
+    }
+    let committed_history = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        );
+        let inventory = entry.retained.inventory().unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert!(entry.cleanup_ledger.is_some());
+        let registry = app.world().resource::<RouteEntityRegistry>();
+        assert_eq!(
+            registry.record(deep_cached_shell).unwrap().lifecycle(),
+            EntityLifecycle::Leaving
+        );
+        for owner in inventory {
+            let branch = entry.retained.branch(owner.projection().id()).unwrap();
+            assert_eq!(
+                registry
+                    .record(branch.frames()[0].shell())
+                    .unwrap()
+                    .lifecycle(),
+                EntityLifecycle::Retained
+            );
+        }
+        owned.extend(
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .map(ExactRegistryClaim::entity),
+        );
+        entry.engine.history().clone()
+    };
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    settle(&mut app);
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let record = entry.engine.request(request).unwrap();
+        assert_eq!(record.status(), &RequestStatus::Succeeded);
+        assert_eq!(entry.engine.history(), &committed_history);
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+        );
+        assert!(entry.retained.is_empty());
+        assert!(entry.active.is_none() && entry.host.is_none());
+        assert!(entry.cleanup_ledger.is_none() && entry.post_commit_compound.is_none());
+        assert!(entry.pending_commit.is_none() && entry.pending_failed_branch.is_none());
+        assert!(entry.authority_protocol_residual.is_none() && entry.native_residuals.is_empty());
+        assert!(entry.engine.snapshot().running_request().is_none());
+        assert_eq!(
+            record
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+                .count(),
+            1
+        );
+        assert_eq!(
+            record
+                .diagnostics()
+                .iter()
+                .filter(|event| event.kind() == DiagnosticEventKind::PostCommitCleanupAnomaly)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        owned
+            .iter()
+            .all(|entity| app.world().get_entity(*entity).is_err())
+    );
+    assert!(app.world().get::<Node>(host).is_some());
+    assert_eq!(
+        app.world().get::<Node>(protected).unwrap().width,
+        Val::Px(91.0)
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+        Some(host)
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    settle(&mut app);
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_ne!(entry.host.as_ref().unwrap().version, version);
+        assert_eq!(entry.engine.history(), &committed_history);
+        assert!(entry.active.is_none() && entry.engine.snapshot().running_request().is_none());
+    }
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(next)
+            .unwrap()
+            .status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn native_delayed_retained_proof_removal_preserves_another_router_cache() {
+    let (mut app, router, _, _, _) = fixture_with_retention(false, true, false, 2, false);
+    for path in ["/child/1", "/child/2"] {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+    }
+    let removal = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let inventory = entry.retained.inventory().unwrap();
+        assert_eq!(inventory.len(), 1);
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .prepare_retained_boundaries(None, &[inventory[0].projection().clone()])
+            .unwrap()
+    };
+    let driver = app
+        .register_bsn_view(ViewDriverKey::new("other-router-cache").unwrap(), |_| {
+            Ok(bevy_scene::bsn! { Node bevy_ui_router_bsn::DefaultOutlet })
+        })
+        .unwrap();
+    let view = RouteViewKey::new("other-router-cache").unwrap();
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(view.clone()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path(":id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(view.clone())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let mut views = RouteViewRegistry::new();
+    views
+        .insert(view.clone(), RouteViewDescriptor::new(driver))
+        .unwrap();
+    let other = app
+        .add_ui_router(
+            RouterConfig::new(routes.build().unwrap(), views, view).with_keep_alive_capacity(2),
+        )
+        .unwrap();
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(other)));
+    settle(&mut app);
+    for path in ["/a", "/b"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(other, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[1]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            &RequestStatus::Succeeded
+        );
+    }
+    let cache_is_current = |app: &App, index: usize| {
+        let entry = &app.world().resource::<RouterNavigation>().entries[index];
+        let inventory = entry.retained.inventory().unwrap();
+        assert_eq!(inventory.len(), 1);
+        let projection = inventory[0].projection();
+        let branch = entry.retained.branch(projection.id()).unwrap();
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .retained_payload_is_current(
+                app.world(),
+                projection,
+                &branch.frames()[0],
+                branch.child_slots(),
+            )
+    };
+    assert!(cache_is_current(&app, 0));
+    assert!(cache_is_current(&app, 1));
+    removal.apply(&mut app.world_mut().resource_mut::<RouteEntityRegistry>());
+    assert!(!cache_is_current(&app, 0));
+    assert!(
+        cache_is_current(&app, 1),
+        "a delayed exact removal must preserve another Router's newer cache"
+    );
+}
+
+#[test]
 fn native_published_fallback_post_commit_host_loss_keeps_original_failure() {
     assert_native_published_host_loss_keeps_result(NativePublishedCase::Fallback);
 }
@@ -835,6 +1119,7 @@ fn native_post_commit_isolation_keeps_authored_values_and_rejects_content_drift(
                     active,
                     host,
                     &original_freeze,
+                    &[],
                 )
                 .ok()
                 .unwrap();

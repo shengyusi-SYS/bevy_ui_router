@@ -16,7 +16,7 @@ Core 的 [engine](../../crates/bevy_ui_router_core/src/engine.rs) 决定下一�
 
 拒绝、容量不足或 completion error 必须返还原 owner 给对应 holder；不能重新签发一个看似等价的 task。已发布 active、pending branch、cleanup ledger 和私有 residual 是不同责任，不以任一容器是否为空替代协议完成。
 
-history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)。publication 后的 compound settlement 在 Core [post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs) 与 ECS navigation 中，保留已发布结果。无运行请求的 host loss 则由 Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) 和 ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs) 持有独立 settlement owner，不重开 terminal 请求。
+history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)。publication 后的 compound settlement 在 Core [post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs) 与 ECS navigation 中，保留已发布结果。已退役缓存继续由原 normal token/ledger 持有，Live 缓存进入 authority 第二批；完整库存随原 receiver 冻结，联合完成分别结算两个 token。延迟删除非权威 preservation proof 时只移除原选定项，保留其他 Router 的合法变化。无运行请求的 host loss 则由 Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) 和 ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs) 持有独立 settlement owner，不重开 terminal 请求。
 
 ## 准备结果与失败分流
 

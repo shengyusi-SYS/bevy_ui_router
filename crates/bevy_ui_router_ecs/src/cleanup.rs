@@ -14471,6 +14471,7 @@ impl PreparedPostCommitAuthorityLedger {
         active: &RealizedBranch,
         host: &HostBinding,
         original: &FrozenOriginalCleanupLedgerTransfer,
+        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
     ) -> Result<Self, PostCommitAuthorityFreezeFailure> {
         let original_entities = original.partition_entities();
         let registry = world.get_resource::<RouteEntityRegistry>().ok_or_else(|| {
@@ -14478,16 +14479,21 @@ impl PreparedPostCommitAuthorityLedger {
                 PostCommitAuthorityFreezePermanentEvidence::RequiredRegistryMissing,
             )
         })?;
-        let manifest =
-            FrozenCleanupManifest::from_back_no_target_authority(world, &registry, active, host)
-                .map_err(|error| match error {
-                    AuthoritySettlementManifestError::RetryableCapacity => {
-                        PostCommitAuthorityFreezeFailure::RetryableCapacity
-                    }
-                    error => PostCommitAuthorityFreezeFailure::Permanent(
-                        PostCommitAuthorityFreezePermanentEvidence::Manifest(error),
-                    ),
-                })?;
+        let manifest = FrozenCleanupManifest::from_idle_host_authority_with_retained(
+            world,
+            &registry,
+            Some(active),
+            host,
+            retiring,
+        )
+        .map_err(|error| match error {
+            AuthoritySettlementManifestError::RetryableCapacity => {
+                PostCommitAuthorityFreezeFailure::RetryableCapacity
+            }
+            error => PostCommitAuthorityFreezeFailure::Permanent(
+                PostCommitAuthorityFreezePermanentEvidence::Manifest(error),
+            ),
+        })?;
         let manifest_digest = manifest.digest;
         let obligation_count = manifest.obligations.len();
         let mut target_entities = manifest

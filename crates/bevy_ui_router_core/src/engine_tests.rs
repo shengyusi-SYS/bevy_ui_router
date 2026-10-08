@@ -10486,6 +10486,203 @@ fn back_target_atomic_applied_receiver_never_derives_outcome_from_ambient_action
     );
 }
 
+fn publish_retained_post_commit_test_navigation(
+    engine: &mut RouterEngine,
+    path: &str,
+    owners: &mut Vec<super::retained::RetainedLeafOwner>,
+) -> CleanupBatchToken {
+    engine.push(RouteLocation::new(path)).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(engine, action);
+    let plan = engine
+        .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let (retiring, preserved) = std::mem::take(owners)
+        .into_iter()
+        .partition::<Vec<_>, _>(|owner| plan.retiring().contains(owner.projection()));
+    *owners = preserved;
+    let roots = plan.disposable_roots().to_vec();
+    let count = roots.len();
+    let (prepared, normal) = engine
+        .prepare_retained_publication(
+            &ticket,
+            &plan,
+            CleanupManifestSeal::new(roots, manifest_digest(0x7171), count),
+            retiring,
+        )
+        .unwrap();
+    let validated = match engine.validate_retained_publication(prepared) {
+        Ok(validated) => validated,
+        Err(_) => panic!("the exact retained publication must validate"),
+    };
+    validated.publish(|retained| owners.extend(retained));
+    normal
+}
+
+#[test]
+fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_source_owners() {
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("retained-root").unwrap()),
+        )
+        .unwrap();
+    let leaf = routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("retained-leaf").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            leaf,
+            RoutePattern::path("detail").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("retained-detail").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let (engine, mut issuer, lease) = ready_engine_with_tree_and_authority(routes.build().unwrap());
+    let mut engine = engine.with_keep_alive_capacity(2);
+    let mut owners = Vec::new();
+    for path in ["/items/1/detail", "/items/1"] {
+        let normal = publish_retained_post_commit_test_navigation(&mut engine, path, &mut owners);
+        engine.complete_cleanup(valid_completion(&normal)).unwrap();
+    }
+    assert_eq!(owners.len(), 1);
+    let normal = publish_retained_post_commit_test_navigation(&mut engine, "/items/2", &mut owners);
+    assert_eq!(
+        owners.len(),
+        1,
+        "only the still-live parent leaf has an ECS owner"
+    );
+    assert_eq!(
+        engine.retained_leaves.len(),
+        2,
+        "the original normal token also owns a retiring child"
+    );
+    let original = owners[0].projection().clone();
+    let original_retiring = engine
+        .retained_leaves
+        .iter()
+        .find(|entry| !entry.is_live())
+        .unwrap()
+        .projection()
+        .id();
+    assert_eq!(
+        engine
+            .retained_leaves
+            .iter()
+            .find(|entry| entry.projection().id() == original_retiring)
+            .unwrap()
+            .retirement(),
+        Some(&normal)
+    );
+    let history = engine.history_snapshot();
+    let request = normal.identity().request();
+    let accepted = match engine.accept_post_commit_authority_transfer(
+        &normal,
+        PostCommitAuthorityCause::HostRegistrationLost,
+    ) {
+        PostCommitAuthorityAcceptanceOutcome::Accepted(owner) => owner,
+        _ => panic!("the published source must remain accepted with mixed inventory"),
+    };
+    let source = CorePostCommitAuthorityPreparationSource::new(accepted, lease);
+    let plan = engine
+        .prepare_retained_post_commit_authority_plan(&source, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(plan.retiring(), &[original.clone()]);
+    let roots = plan.logical_roots().to_vec();
+    let count = roots.len() + 1;
+    let manifest = CleanupManifestSeal::new(roots.clone(), manifest_digest(0x7272), count);
+    let location = engine.current.as_ref().unwrap().location.clone();
+    engine.current.as_mut().unwrap().location = RouteLocation::new("/changed-source");
+    let source = match engine
+        .prepare_post_commit_authority_transfer(source.with_retention(plan, owners), manifest)
+    {
+        PostCommitAuthorityPreparationOutcome::Permanent { source, .. } => source,
+        _ => panic!("real source drift must return the original source and owners"),
+    };
+    assert_eq!(source.retained_logical_roots(), Some(roots.as_slice()));
+    assert_eq!(
+        source.transfer.retained.as_ref().unwrap().owners[0].projection(),
+        &original,
+    );
+    assert_eq!(engine.history_snapshot(), history);
+    engine.current.as_mut().unwrap().location = location;
+    let (prepared, authority) = match engine.prepare_post_commit_authority_transfer(
+        source,
+        CleanupManifestSeal::new(roots, manifest_digest(0x7272), count),
+    ) {
+        PostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => (owner, batch),
+        _ => panic!("retry borrows the original source attachment without reminting a plan"),
+    };
+    let mut installed = None;
+    assert!(matches!(
+        engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            prepared,
+            (),
+            |(), _, builder| {
+                let prior = builder.current_trace.len();
+                let (plan, physical) =
+                    bind_test_settlement_plan_with_authority(builder, prior, Vec::new());
+                Ok::<_, ((), ())>((physical, plan))
+            },
+            |physical, batch| installed = Some((batch, physical)),
+        ),
+        PostCommitAuthorityBeginCoreOutcome::Begun
+    ));
+    assert_eq!(engine.retained_leaves.len(), 2);
+    let (batch, physical) = installed.unwrap();
+    assert_eq!(
+        engine
+            .retained_leaves
+            .iter()
+            .find(|entry| entry.projection().id() == original_retiring)
+            .unwrap()
+            .retirement(),
+        Some(&normal)
+    );
+    assert_eq!(
+        engine
+            .retained_leaves
+            .iter()
+            .find(|entry| entry.projection().id() == original.id())
+            .unwrap()
+            .retirement(),
+        Some(&batch.authority_batch)
+    );
+    let (batch, _) = record_exact_post_commit_settlement_trace(&mut engine, batch, &physical);
+    let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+    let PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) =
+        engine.prepare_post_commit_compound_completion(batch, inputs)
+    else {
+        panic!("both original receipts must prepare their exact joint completion")
+    };
+    assert!(matches!(
+        engine.complete_post_commit_authority_compound(owner, |_| ()),
+        PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+    ));
+    assert!(
+        engine.retained_leaves.is_empty(),
+        "each receipt clears only its own retirement metadata"
+    );
+    assert_eq!(engine.history_snapshot(), history);
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(
+        engine.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert!(engine.current.is_none() && engine.action.is_none());
+}
+
 fn prepared_post_commit_authority_fixture_for_cause(
     cause: PostCommitAuthorityCause,
 ) -> (

@@ -126,6 +126,31 @@ impl RetainedAuthoritySettlementPlan {
     }
 }
 
+/// Frozen Live inventory joining the authority half of an existing post-commit pair.
+/// Metadata already owned by the normal batch remains bound to its original token.
+#[derive(Debug)]
+pub struct RetainedPostCommitAuthorityPlan {
+    source: PreparedPublicationObservation,
+    normal: CleanupBatchToken,
+    logical_roots: Vec<RouteFrameVersion>,
+    retiring: Vec<RetainedLeafProjection>,
+}
+
+impl RetainedPostCommitAuthorityPlan {
+    pub fn logical_roots(&self) -> &[RouteFrameVersion] {
+        &self.logical_roots
+    }
+
+    pub fn retiring(&self) -> &[RetainedLeafProjection] {
+        &self.retiring
+    }
+}
+
+pub(super) struct PostCommitRetainedTransfer {
+    pub(super) plan: RetainedPostCommitAuthorityPlan,
+    pub(super) owners: Vec<RetainedLeafOwner>,
+}
+
 /// A frozen hit before any cached content is moved or the fresh task is consumed.
 #[derive(Debug)]
 pub struct RetainedHitPlan {
@@ -159,6 +184,10 @@ pub(super) struct RetainedRegistryEntry {
 impl RetainedRegistryEntry {
     pub(super) const fn projection(&self) -> &RetainedLeafProjection {
         &self.projection
+    }
+
+    pub(super) const fn retirement(&self) -> Option<&CleanupBatchToken> {
+        self.retirement.as_ref()
     }
 
     pub(super) fn is_live(&self) -> bool {
@@ -211,6 +240,120 @@ impl ValidatedRetainedPublication<'_> {
 }
 
 impl RouterEngine {
+    pub(crate) fn prepare_retained_post_commit_authority_plan(
+        &self,
+        source: &CorePostCommitAuthorityPreparationSource,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedPostCommitAuthorityPlan, CommitError> {
+        if source.transfer.retained.is_some()
+            || self.observe_post_commit_cleanup().receiver.as_ref()
+                != Some(&source.transfer.receiver)
+            || !self.retained_post_commit_source_is_current(&source.transfer)
+            || !source.host.matches(
+                self.router,
+                &source.transfer.receiver.current_host,
+                source.transfer.receiver.current_top_slot,
+            )
+        {
+            return Err(CommitError::Stale);
+        }
+        let current = self.current.as_ref().ok_or(CommitError::Stale)?;
+        let WorkStage::PostCommitAuthorityAccepted { normal, .. } = &current.stage else {
+            return Err(CommitError::Stale);
+        };
+        if !owner_projections_match(
+            inventory.iter().copied(),
+            self.retained_leaves
+                .iter()
+                .filter(|entry| entry.is_live())
+                .map(RetainedRegistryEntry::projection),
+        ) {
+            return Err(CommitError::InvalidManifest);
+        }
+        let retiring = self
+            .retained_leaves
+            .iter()
+            .filter(|entry| entry.is_live())
+            .map(|entry| entry.projection.clone())
+            .collect::<Vec<_>>();
+        let mut logical_roots = current
+            .target_frames
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        logical_roots.extend(retiring.iter().map(|projection| projection.frame.clone()));
+        if logical_roots
+            .iter()
+            .enumerate()
+            .any(|(index, frame)| logical_roots[..index].contains(frame))
+        {
+            return Err(CommitError::InvalidManifest);
+        }
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == current.identity.request)
+            .ok_or(CommitError::Stale)?;
+        Ok(RetainedPostCommitAuthorityPlan {
+            source: self.observe_prepared_publication_source(record_index),
+            normal: normal.clone(),
+            logical_roots,
+            retiring,
+        })
+    }
+
+    pub(super) fn retained_post_commit_source_is_current(
+        &self,
+        transfer: &CorePostCommitAuthorityTransferOwner,
+    ) -> bool {
+        let Some(current) = self.current.as_ref() else {
+            return false;
+        };
+        let WorkStage::PostCommitAuthorityAccepted { normal, .. } = &current.stage else {
+            return false;
+        };
+        if self.pending_retained_transfer.is_some()
+            || self.retained_leaves != transfer.receiver.retained_registry
+            || normal.source_projection() != transfer.normal_source
+            || self
+                .retained_leaves
+                .iter()
+                .any(|entry| match entry.retirement() {
+                    Some(token) => token != normal,
+                    None => !scope_survives(
+                        &entry.projection,
+                        &transfer.receiver.current_host,
+                        self.state.active().frames(),
+                        &self.active_child_slots,
+                    ),
+                })
+        {
+            return false;
+        }
+        let Some(retained) = &transfer.retained else {
+            return true;
+        };
+        let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.id() == current.identity.request)
+        else {
+            return false;
+        };
+        retained.plan.normal == *normal
+            && self
+                .observe_prepared_publication_source(index)
+                .same_source(&retained.plan.source)
+            && owner_projections_match(retained.owners.iter(), retained.plan.retiring.iter())
+            && self
+                .retained_leaves
+                .iter()
+                .filter(|entry| entry.is_live())
+                .map(RetainedRegistryEntry::projection)
+                .eq(retained.plan.retiring.iter())
+    }
+
     fn retained_authority_settlement_source_eligible(&self) -> bool {
         self.current
             .as_ref()
