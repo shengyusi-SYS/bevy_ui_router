@@ -38,6 +38,8 @@ history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router
 | 机制 | 实现职责 |
 | --- | --- |
 | [branch_transaction.rs](../../crates/bevy_ui_router_ecs/src/branch_transaction.rs) | 对接 Core projection；稀疏 slot role、sealed splice、prepared/failed branch 和 claim rebind |
+| [normal_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs) / [projectionless_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs) | 前者编排 reconciliation 与缓存命中，后者编排无 reconciliation 的 fallback；共用 retained commit、离场 forest 和 publication holder，各自保留 preflight 与失败来源 |
+| [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) | 原长期 owner 与物理 payload 的选择、预分配、移交及拒绝返还；逻辑 preserve/retire 分区由 Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定 |
 | [frame_local.rs](../../crates/bevy_ui_router_ecs/src/frame_local.rs) | 按 frame 自身 role/binding 验证局部 closure，遇 child slot 停止，不把子 frame 并入父内容权限 |
 | [bsn.rs](../../crates/bevy_ui_router_ecs/src/bsn.rs) / [native_scene.rs](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs) | 前者构建并准备声明图；后者对已准备声明预分配登记、官方 executor apply、adoption 和即时失败隔离 |
 | [native_frame.rs](../../crates/bevy_ui_router_ecs/src/presentation/native_frame.rs) | adoption 后 containment、native cleanup preparation 和依赖保活 |

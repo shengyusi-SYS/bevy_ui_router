@@ -6,14 +6,14 @@
 
 entry 滚动、A→B→A 命中，以及闲置、normal 提交前和 pending failure 期间 host loss 的缓存结算已闭合。后续按以下顺序收尾，不扩张功能范围：
 
-1. 完成 fallback/error 替换父 scope 时的缓存退役，以及 postcommit authority loss 的原两批责任结算。
+1. 完成 postcommit authority loss 的原两批责任结算。
 2. 完成 LRU、缓存自身失效与必要的活动资格入口。
 3. 验证多 entry 滚动与缓存组合、真实输入/窗口和性能，更新合同及 consumer。
 
 近期问题共同来自“当前物理分支就是完整生命周期库存”的旧假设。调整实施接缝，将完整库存选择、原 owner 移交和物理 manifest 组合集中到现有 retained/cleanup 职责；不同来源的 history、失败 continuation 和 cleanup receipt 仍由原合同持有：
 
 - Core 在 `engine/retained.rs` 集中 retained 库存和移交 owner 的 exact 核对；normal 按 next scope、idle 按 exact host 明确分区，保留各自已有 history/host owner 和 continuation，不为每种失败增加独立缓存状态机。
-- ECS 在 `retained.rs` 统一原 owner/physical payload 的选择、预分配、移交与返还；选定内容进入既有 cleanup manifest/physical forest。normal publication 编排移入私有模块，主 navigation 分派到该入口；不通过机械拆文件代替职责收敛。
+- ECS 在 `retained.rs` 统一原 owner/physical payload 的选择、预分配、移交与返还；选定内容进入既有 cleanup manifest/physical forest。normal 与 projectionless publication 分别在私有模块编排，共用 publication holder，主 navigation 仅分派到对应入口。
 - 验证围绕用户旅程及关键 owner 不变量，覆盖一次代表性准备拒绝和真实写后变化。相同语义不叠加多份低层反例矩阵；已有行为回归不因重组而删除。LRU 先用标准容器，避免手写链表或引入不能减少生命周期复杂度的依赖。
 
 ## 1. Canonical history 的受控只读交接
@@ -54,9 +54,11 @@ entry 滚动、A→B→A 命中，以及闲置、normal 提交前和 pending fai
 
 命中已有通用 driver 连续往返及公开 Native Scene 旅程；后者证明原 Entity/自定义组件值保持，factory 与 Scene apply 均不重复。Core 覆盖自身空 slot 恢复及一次真实 source 准备拒绝返还。normal 提交前 host loss 已将原缓存 owners、物理 payload 与 registry retirement 交给同一 authority batch；命中尚未实现的 fresh frame 保留为零物理义务的逻辑 root。完整清理后保留 history 和 app-owned host，新 epoch 可接纳且不重放中断请求。
 
-pending failure 已通过真实 Native Scene 失败验证：普通 pending cleanup 保留合法 active/cache 与原 failure continuation；期间 host loss 将原 failed source、全部缓存 owners/payload 与 registry retirement 移交同一 authority batch，完成后可重新接纳。Core 另验证真实 trigger revision 变化时返还原 owners。该验证止于普通 pending cleanup 完成，不代表后续 fallback 已完整闭合。
+pending failure 已通过真实 Native Scene 失败验证：普通 pending cleanup 保留合法 active/cache 与原 failure continuation；期间 host loss 将原 failed source、全部缓存 owners/payload 与 registry retirement 移交同一 authority batch，完成后可重新接纳。Core 另验证真实 trigger revision 变化时返还原 owners。
 
-fallback/error 替换父 scope 的缓存退役与 postcommit 缓存交接仍待闭合，分别保留原失败来源与已有 normal/authority 两批责任。前者优先复用现有 retained commit 分区及 transfer，不另建 fallback 缓存状态机。永久协议矛盾的 residual/transfer 保持原 owner；这类保存句柄的路径不算可恢复结算，也不扩展为新的自动恢复需求。
+该 Native 旅程已继续到完整 fallback：旧父 scope 与缓存在同一普通 cleanup batch 退役，保留原 Apply 失败、history 与 host，后续导航成功。projectionless 在 report 前借原完整库存准备物理候选，report 后由现有 Core retained commit plan 核准完整退休集合及逻辑 roots；拒绝仍返还原 owners。BoundError 另验证 surviving parent 的 exact frame/slot 与缓存保留、非活动输入拒绝和后续合法请求，没有套用 fallback 的全退休政策。
+
+postcommit 缓存交接仍待闭合，保留已有 normal/authority 两批责任：已绑定原 normal token 的退休项留在原 ledger，仍由 ECS 持有的 Live 缓存进入 authority 第二批，联合完成分别结算两个 exact token。用一次多层 scope 导航同时形成两类库存验证该分区。永久协议矛盾的 residual/transfer 保持原 owner；这类保存句柄的路径不算可恢复结算，也不扩展为新的自动恢复需求。
 
 ## 5. 组合、真实输入与交付
 

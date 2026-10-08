@@ -4,17 +4,17 @@ use bevy_ui_router_core::integration::{RetainedLeafOwner, RetainedLeafProjection
 
 use crate::branch_transaction::RealizedBranch;
 
-pub(crate) enum PreparedNormalPublication {
+pub(crate) enum PreparedPublication {
     Ordinary(bevy_ui_router_core::integration::PreparedCommit),
     Retained(bevy_ui_router_core::integration::PreparedRetainedCommit),
 }
 
-impl PreparedNormalPublication {
+impl PreparedPublication {
     pub(crate) fn validate(
         self,
         engine: &mut bevy_ui_router_core::integration::RouterEngine,
     ) -> Result<
-        ValidatedNormalPublication<'_>,
+        ValidatedPublication<'_>,
         (
             Option<bevy_ui_router_core::integration::PreparedRetainedCommit>,
             bevy_ui_router_core::integration::IntegrationError,
@@ -23,22 +23,22 @@ impl PreparedNormalPublication {
         match self {
             Self::Ordinary(prepared) => engine
                 .validate_publication(prepared)
-                .map(ValidatedNormalPublication::Ordinary)
+                .map(ValidatedPublication::Ordinary)
                 .map_err(|error| (None, error)),
             Self::Retained(prepared) => engine
                 .validate_retained_publication(prepared)
-                .map(ValidatedNormalPublication::Retained)
+                .map(ValidatedPublication::Retained)
                 .map_err(|(prepared, error)| (Some(prepared), error)),
         }
     }
 }
 
-pub(crate) enum ValidatedNormalPublication<'a> {
+pub(crate) enum ValidatedPublication<'a> {
     Ordinary(bevy_ui_router_core::integration::ValidatedCommit<'a>),
     Retained(bevy_ui_router_core::integration::ValidatedRetainedCommit<'a>),
 }
 
-impl ValidatedNormalPublication<'_> {
+impl ValidatedPublication<'_> {
     pub(crate) fn history_publication(
         &self,
     ) -> &bevy_ui_router_core::integration::HistoryPublicationFacts {

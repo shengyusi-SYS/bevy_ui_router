@@ -626,7 +626,7 @@ pub(super) fn publish_normal_work(
         }
         let presentation_plan = presentation.seal_commit(isolate_count)?;
         let prepared = if let Some(sealed) = sealed.take() {
-            crate::retained::PreparedNormalPublication::Ordinary(sealed.prepared)
+            crate::retained::PreparedPublication::Ordinary(sealed.prepared)
         } else if let Some(plan) = pending.retained_hit.take() {
             let task = pending
                 .final_task
@@ -639,7 +639,7 @@ pub(super) fn publish_normal_work(
                 .engine
                 .prepare_retained_hit_commit(task, *plan, manifest, owners)
             {
-                Ok(prepared) => crate::retained::PreparedNormalPublication::Retained(prepared),
+                Ok(prepared) => crate::retained::PreparedPublication::Retained(prepared),
                 Err(error) => {
                     let (task, plan, _manifest, owners, error) = error.into_parts();
                     pending.final_task = Some(task);
@@ -667,7 +667,7 @@ pub(super) fn publish_normal_work(
                 manifest,
                 owners,
             ) {
-                Ok(prepared) => crate::retained::PreparedNormalPublication::Retained(prepared),
+                Ok(prepared) => crate::retained::PreparedPublication::Retained(prepared),
                 Err(error) => {
                     let (_plan, _manifest, owners, error) = error.into_parts();
                     assert!(
@@ -690,7 +690,7 @@ pub(super) fn publish_normal_work(
                 .engine
                 .prepare_commit(pending.ticket.as_ref()?, manifest)
             {
-                Ok(prepared) => crate::retained::PreparedNormalPublication::Ordinary(prepared),
+                Ok(prepared) => crate::retained::PreparedPublication::Ordinary(prepared),
                 Err(error) => {
                     commit_authority_contradiction = Some(match error {
                         IntegrationError::InvalidManifest => {

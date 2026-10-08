@@ -118,7 +118,7 @@ fn fixture_with_dependency(
     nested: bool,
     dependency: bool,
 ) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
-    fixture_with_retention(failing, nested, dependency, 0)
+    fixture_with_retention(failing, nested, dependency, 0, false)
 }
 
 fn fixture_with_retention(
@@ -126,6 +126,7 @@ fn fixture_with_retention(
     nested: bool,
     dependency: bool,
     capacity: usize,
+    leaf_error: bool,
 ) -> (App, RouterHandle, Entity, Entity, Arc<AtomicBool>) {
     let mut app = App::new();
     if dependency {
@@ -203,13 +204,20 @@ fn fixture_with_retention(
         )
         .unwrap();
     if nested {
+        let mut child_options = RouteNodeOptions::new()
+            .with_view(view.clone())
+            .with_keep_alive(capacity > 0);
+        if leaf_error {
+            child_options = child_options.with_error_view(
+                ErrorBoundaryKey::named("cached-leaf-error").unwrap(),
+                fallback.clone(),
+            );
+        }
         routes
             .route_with_options(
                 routes.root_id().unwrap(),
                 RoutePattern::path(if capacity == 0 { "child" } else { "child/:id" }).unwrap(),
-                RouteNodeOptions::new()
-                    .with_view(view.clone())
-                    .with_keep_alive(capacity > 0),
+                child_options,
             )
             .unwrap();
         if capacity > 0 {
@@ -1437,10 +1445,156 @@ fn native_retained_root_failure_transfers_owner_then_allows_next_navigation() {
 }
 
 #[test]
-fn native_leaf_cache_survives_pending_failure_then_settles_on_host_loss() {
+fn native_bound_error_preserves_cache_in_the_surviving_parent_scope() {
+    let (mut app, router, host, protected, failure) =
+        fixture_with_retention(false, true, false, 2, true);
+    app.world_mut().entity_mut(host).add_child(protected);
+    for path in ["/child/1", "/child/2", "/child/3"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            &RequestStatus::Succeeded
+        );
+    }
+    let (version, top_slot, parent, parent_shell, history, cached, cached_entities, old_leaf) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let active = entry.active.as_ref().unwrap();
+        let cached = entry
+            .retained
+            .inventory()
+            .unwrap()
+            .iter()
+            .map(|owner| owner.projection().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(cached.len(), 2);
+        let cached_entities = cached
+            .iter()
+            .flat_map(|projection| {
+                entry
+                    .retained
+                    .branch(projection.id())
+                    .unwrap()
+                    .claims()
+                    .map(ExactRegistryClaim::entity)
+            })
+            .collect::<Vec<_>>();
+        let host = entry.host.as_ref().unwrap();
+        (
+            host.version.clone(),
+            host.top_slot,
+            active.frames()[0].frame().clone(),
+            active.frames()[0].shell(),
+            entry.engine.history().clone(),
+            cached,
+            cached_entities,
+            active
+                .frames()
+                .last()
+                .unwrap()
+                .claims()
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>(),
+        )
+    };
+    app.insert_resource(CleanFailure);
+    failure.store(true, Ordering::Relaxed);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/4"))
+        .unwrap();
+    settle(&mut app);
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+        let record = entry.engine.request(request).unwrap();
+        let RequestStatus::Failed(original) = record.status() else {
+            panic!("the leaf error view must finish the original failed request");
+        };
+        assert_eq!(original.kind(), NavigationFailureKind::Apply);
+        assert!(original.message().contains("native retained apply source"));
+        assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Error);
+        assert_eq!(entry.engine.active().failure(), Some(original));
+        assert_eq!(entry.engine.active().frames().len(), 2);
+        assert!(matches!(
+            entry.engine.active().frames()[1].origin(),
+            FrameOrigin::RouteError { .. }
+        ));
+        let active = entry.active.as_ref().unwrap();
+        assert_eq!(active.frames()[0].frame(), &parent);
+        assert_eq!(active.frames()[0].shell(), parent_shell);
+        assert_eq!(entry.host.as_ref().unwrap().version, version);
+        assert_eq!(entry.host.as_ref().unwrap().top_slot, top_slot);
+        assert_eq!(entry.engine.history(), &history);
+        assert_eq!(
+            entry
+                .retained
+                .inventory()
+                .unwrap()
+                .iter()
+                .map(|owner| owner.projection())
+                .collect::<Vec<_>>(),
+            cached.iter().collect::<Vec<_>>()
+        );
+        assert!(entry.pending_commit.is_none() && entry.pending_failed_branch.is_none());
+        assert!(entry.cleanup_ledger.is_none() && entry.authority_protocol_residual.is_none());
+        assert!(
+            entry.native_residuals.is_empty()
+                && entry.engine.snapshot().running_request().is_none()
+        );
+    }
+    let gate = app.world().resource::<RouterInputGate>();
+    assert!(
+        cached_entities
+            .iter()
+            .all(|entity| app.world().get_entity(*entity).is_ok()
+                && !gate.allows_pointer(*entity)
+                && !gate.allows_keyboard(*entity)
+                && !gate.allows_gamepad(*entity))
+    );
+    assert!(
+        old_leaf
+            .iter()
+            .all(|entity| app.world().get_entity(*entity).is_err())
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+        Some(host)
+    );
+    failure.store(false, Ordering::Relaxed);
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(next)
+            .unwrap()
+            .status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn native_leaf_cache_settles_after_failure_or_host_loss() {
     for host_loss in [false, true] {
         let (mut app, router, host, protected, failure) =
-            fixture_with_retention(false, true, false, 2);
+            fixture_with_retention(false, true, false, 2, false);
         app.world_mut().entity_mut(host).add_child(protected);
         for path in ["/child/1", "/child/2", "/child/3"] {
             let request = app
@@ -1587,6 +1741,67 @@ fn native_leaf_cache_survives_pending_failure_then_settles_on_host_loss() {
                 owned[original_owned..]
                     .iter()
                     .all(|entity| app.world().get_entity(*entity).is_err())
+            );
+            let top_slot = entry.host.as_ref().unwrap().top_slot;
+            settle(&mut app);
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            assert_eq!(
+                entry.engine.snapshot().availability(),
+                &RouterAvailability::Ready,
+                "fallback must replace the old parent scope without losing host authority"
+            );
+            assert!(matches!(entry.engine.request(request).unwrap().status(),
+                RequestStatus::Failed(error) if error.kind() == NavigationFailureKind::Apply
+                    && error.message().contains("native retained apply source")));
+            assert_eq!(entry.engine.active().kind(), ActivePresentationKind::Error);
+            assert_eq!(
+                entry.engine.active().frames()[0].origin(),
+                &FrameOrigin::RouterFallback
+            );
+            assert_eq!(
+                entry.engine.active().requested(),
+                Some(&RouteLocation::new("/broken/4"))
+            );
+            assert_eq!(entry.engine.history(), &history);
+            assert!(entry.retained.is_empty() && entry.cleanup_ledger.is_none());
+            assert!(entry.pending_commit.is_none() && entry.pending_failed_branch.is_none());
+            assert!(
+                entry.authority_protocol_residual.is_none() && entry.native_residuals.is_empty()
+            );
+            assert!(entry.engine.snapshot().running_request().is_none());
+            assert_eq!(entry.host.as_ref().unwrap().version, version);
+            assert_eq!(
+                app.world()
+                    .resource::<NativeFallbackCalls>()
+                    .0
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert!(
+                owned
+                    .iter()
+                    .filter(|entity| **entity != top_slot)
+                    .all(|entity| app.world().get_entity(*entity).is_err())
+            );
+            assert!(app.world().get_entity(host).is_ok());
+            assert_eq!(
+                app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+                Some(host)
+            );
+            failure.store(false, Ordering::Relaxed);
+            let next = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/child/1"))
+                .unwrap();
+            settle(&mut app);
+            assert_eq!(
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .engine
+                    .request(next)
+                    .unwrap()
+                    .status(),
+                &RequestStatus::Succeeded
             );
             continue;
         }

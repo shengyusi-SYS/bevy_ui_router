@@ -43075,38 +43075,21 @@ fn root_fallback_live_host_binding_drift_is_source_drift() {
 
 #[test]
 fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
-    let source = include_str!("navigation.rs");
     let normal = include_str!("navigation/normal_publication.rs");
-    let commit = source
-        .split_once("pub(crate) fn commit_presentation_system")
-        .unwrap()
-        .1
-        .split_once("pub(crate) fn settle_cleanup_system")
-        .unwrap()
-        .0;
-
-    assert!(
-        [commit, normal]
-            .iter()
-            .all(|source| !source.contains("cleanup_batch_matches"))
-    );
-    assert_eq!(
-        commit
-            .match_indices(".validate_publication(prepared)")
-            .count(),
-        1,
-        "projectionless publication exact-refreezes before consuming ECS owners"
-    );
-    assert_eq!(
-        normal
-            .matches("prepared.validate(&mut entry.engine)")
-            .count(),
-        1
-    );
+    let projectionless = include_str!("navigation/projectionless_publication.rs");
+    for source in [normal, projectionless] {
+        assert!(!source.contains("cleanup_batch_matches"));
+        assert_eq!(
+            source
+                .matches("prepared.validate(&mut entry.engine)")
+                .count(),
+            1
+        );
+    }
     let retained = include_str!("retained.rs");
     assert!(retained.contains(".validate_publication(prepared)"));
     assert!(retained.contains(".validate_retained_publication(prepared)"));
-    let publish_tails = [commit, normal]
+    let publish_tails = [normal, projectionless]
         .into_iter()
         .flat_map(|source| {
             source.match_indices("engine.publish(").map(|(start, _)| {
