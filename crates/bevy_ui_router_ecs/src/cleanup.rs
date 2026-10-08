@@ -7737,30 +7737,65 @@ impl PreparedAuthorityHostEdge {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthorityPresentationRole {
+    RouterVisual,
+    #[cfg(feature = "bsn")]
+    NativeContent,
+}
+
+impl AuthorityPresentationRole {
+    fn observe(world: &World, entity: Entity) -> Self {
+        #[cfg(feature = "bsn")]
+        if crate::presentation::native_frame::is_native_content(world, entity) {
+            return Self::NativeContent;
+        }
+        #[cfg(not(feature = "bsn"))]
+        let _ = (world, entity);
+        Self::RouterVisual
+    }
+}
+
 struct PreparedAuthorityPresentation {
-    claims: Vec<ExactRegistryClaim>,
+    claims: Vec<(ExactRegistryClaim, AuthorityPresentationRole)>,
 }
 
 impl PreparedAuthorityPresentation {
     fn prepare(world: &World, claims: Vec<ExactRegistryClaim>) -> Option<Self> {
-        claims
+        if !claims
             .iter()
             .all(|claim| cleanup_claim_is_inert_and_exact(world, claim, true))
-            .then_some(Self { claims })
+        {
+            return None;
+        }
+        Some(Self {
+            claims: claims
+                .into_iter()
+                .map(|claim| {
+                    let role = AuthorityPresentationRole::observe(world, claim.entity());
+                    (claim, role)
+                })
+                .collect(),
+        })
     }
 
     fn apply(self, world: &mut World) {
-        for claim in self.claims {
-            *world
-                .get_mut::<Visibility>(claim.entity())
-                .expect("prepared authority quarantine retains Visibility") = Visibility::Hidden;
-            *world
-                .get_mut::<Pickable>(claim.entity())
-                .expect("prepared authority quarantine retains Pickable") = Pickable::IGNORE;
-            *world
-                .get_mut::<RouterInputBarrier>(claim.entity())
-                .expect("prepared authority quarantine retains input barrier") =
-                RouterInputBarrier::deny_all();
+        for (claim, role) in self.claims {
+            // Native authored content inherits isolation from its shell. Its
+            // own visual/input components are not part of this write set.
+            if role == AuthorityPresentationRole::RouterVisual {
+                *world
+                    .get_mut::<Visibility>(claim.entity())
+                    .expect("prepared authority quarantine retains Visibility") =
+                    Visibility::Hidden;
+                *world
+                    .get_mut::<Pickable>(claim.entity())
+                    .expect("prepared authority quarantine retains Pickable") = Pickable::IGNORE;
+                *world
+                    .get_mut::<RouterInputBarrier>(claim.entity())
+                    .expect("prepared authority quarantine retains input barrier") =
+                    RouterInputBarrier::deny_all();
+            }
             match claim.owner() {
                 RegistryOwner::Committed(
                     EntityOwner::FrameShell(_)
@@ -7791,9 +7826,10 @@ impl PreparedAuthorityPresentation {
     }
 
     fn is_current(&self, world: &World) -> bool {
-        self.claims
-            .iter()
-            .all(|claim| cleanup_claim_is_inert_and_exact(world, claim, false))
+        self.claims.iter().all(|(claim, role)| {
+            AuthorityPresentationRole::observe(world, claim.entity()) == *role
+                && cleanup_claim_is_inert_and_exact(world, claim, false)
+        })
     }
 }
 
@@ -7821,6 +7857,11 @@ impl PreparedAuthorityPickableRepair {
             ))
             .map_err(|_| AuthorityCleanupFailureKind::RetryableCapacity)?;
         missing.extend(claims.iter().filter_map(|claim| {
+            if AuthorityPresentationRole::observe(world, claim.entity())
+                != AuthorityPresentationRole::RouterVisual
+            {
+                return None;
+            }
             world
                 .get::<Pickable>(claim.entity())
                 .is_none()
@@ -11664,10 +11705,17 @@ impl CleanupLedger {
         }
     }
 
-    /// Finishes only disposal already proven by the original removal receipts.
-    /// A changed protected partition remains stopped evidence; this does not
-    /// certify preservation or authorize any further physical mutation.
-    pub(crate) fn finish_disposed_retained_invalidation(&mut self, world: &World) -> bool {
+    /// Settles the original cache token after a removal observer changed the
+    /// protected partition. Removed targets keep their observed receipts. The
+    /// only remaining target accepted here is its exact, empty, inert shell;
+    /// that shell moves into the existing residual lease instead of resuming
+    /// the stopped deletion plan. The original stop and invalidation source
+    /// remain owned until Core accepts the original token's completion.
+    pub(crate) fn settle_stopped_retained_invalidation(
+        &mut self,
+        world: &mut World,
+        invalidation: &RetainedInvalidationEvidence,
+    ) -> bool {
         let Some(CleanupStopReason::Settlement(evidence)) = self.stopped.as_ref() else {
             return false;
         };
@@ -11699,6 +11747,7 @@ impl CleanupLedger {
         let root_claim = frame.claims().find(|claim| claim.entity() == root);
         let shell_claim = frame.claims().find(|claim| claim.entity() == frame.shell());
         if world.get_entity(root).is_ok()
+            || !invalidation.matches_payload(frame, &payload.child_slots)
             || root_claim.is_none_or(|claim| {
                 claim.owner()
                     != &RegistryOwner::Committed(EntityOwner::FrameContentTarget(
@@ -11744,6 +11793,7 @@ impl CleanupLedger {
         {
             return false;
         }
+        let mut remaining_shell = None;
         for (index, obligation) in self.obligations.iter().enumerate() {
             let source_is_exact = match &obligation.identity {
                 CleanupTargetIdentity::Registered(claim) => {
@@ -11753,11 +11803,34 @@ impl CleanupLedger {
                     Some(root) == root_claim && Some(shell) == shell_claim
                 }
             };
-            let Some(receipt) = self.receipts[index].as_ref() else {
+            if !source_is_exact || obligation.terminal_mode != CleanupTerminalMode::Normal {
                 return false;
+            }
+            let Some(receipt) = self.receipts[index].as_ref() else {
+                let Some(claim) = obligation.identity.registered() else {
+                    return false;
+                };
+                if Some(claim) != shell_claim
+                    || remaining_shell.replace(index).is_some()
+                    || !cleanup_claim_has_exact_authority(world, claim)
+                    || registry
+                        .record(claim.entity())
+                        .is_none_or(|record| record.claim() != *claim)
+                    || !observed_children(world, claim.entity()).is_empty()
+                    || world.get::<Visibility>(claim.entity()) != Some(&Visibility::Hidden)
+                    || world.get::<Pickable>(claim.entity()) != Some(&Pickable::IGNORE)
+                    || !world
+                        .get::<RouterInputBarrier>(claim.entity())
+                        .is_some_and(RouterInputBarrier::denies_all)
+                    || world
+                        .get::<Node>(claim.entity())
+                        .is_none_or(|node| node.display != bevy_ui::Display::None)
+                {
+                    return false;
+                }
+                continue;
             };
-            if !source_is_exact
-                || receipt.ledger_domain != self.ledger_domain
+            if receipt.ledger_domain != self.ledger_domain
                 || receipt.obligation != index
                 || receipt.attempt_revision == 0
                 || receipt.attempt_revision >= self.next_attempt
@@ -11768,9 +11841,6 @@ impl CleanupLedger {
                         | CleanupDisposition::RemovedDetached
                         | CleanupDisposition::AlreadyAbsent
                 )
-                || obligation.entity() == root
-                    && receipt.disposition != CleanupDisposition::AlreadyAbsent
-                || obligation.terminal_mode != CleanupTerminalMode::Normal
                 || receipt.binding
                     != receipt_binding(
                         receipt.ledger_domain,
@@ -11790,6 +11860,49 @@ impl CleanupLedger {
             .is_some_and(|digest| digest != completion_digest(&self.receipts))
         {
             return false;
+        }
+        if let Some(index) = remaining_shell {
+            // Freeze only the original unreceipted target. This does not
+            // revive removal authority or change the old receipts. Existing
+            // quarantine guards keep its mount relationship unchanged; the
+            // ordinary authority continuation owns any later host-edge work.
+            let revision = self.next_attempt;
+            let Some(next_attempt) = revision.checked_add(1) else {
+                return false;
+            };
+            let evidence = collect_evidence(world, &self.obligations, &self.receipts);
+            if !matches!(evidence.as_slice(), [(candidate, CleanupEvidence::Exact {
+                actual_parent: Some(parent), foreign_descendants, relationship_cycle: false, ..
+            })] if *candidate == index
+                && *parent == self.obligations[index].expected_parent
+                && foreign_descendants.is_empty())
+                || !self.mount_parents_physical_match(world)
+            {
+                return false;
+            }
+            self.next_attempt = next_attempt;
+            let attempt = CleanupAttempt {
+                ledger_domain: self.ledger_domain,
+                revision,
+                manifest_digest: self.manifest_digest,
+                unsettled_digest: unsettled_digest(
+                    self.manifest_digest,
+                    &self.obligations,
+                    &self.receipts,
+                ),
+                evidence,
+                mount_parents_exact: true,
+            };
+            self.issued_attempt = Some(attempt.clone());
+            let transferred = self.quarantine_residual(
+                world,
+                &attempt,
+                CleanupDisposition::QuarantinedProtectedParent,
+            );
+            self.issued_attempt = None;
+            if !transferred {
+                return false;
+            }
         }
         self.finish_if_settled();
         true

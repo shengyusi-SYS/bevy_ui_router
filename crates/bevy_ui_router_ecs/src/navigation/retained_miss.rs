@@ -279,12 +279,15 @@ pub(super) fn drive(world: &mut World, entry: &mut RouterEntry) -> bool {
         }
     }
     if !installed.ledger.is_settled() && installed.ledger.is_stopped() {
-        // The last target removal can change protected facts through an app
-        // observer. Confirm only the completed original disposal; its stopped
-        // evidence remains with the ledger until the exact Core completion.
+        // The stopped removal cannot resume. Settle only the original token's
+        // removed prefix and exact inert shell residual, preserving its source.
         installed
             .ledger
-            .finish_disposed_retained_invalidation(world);
+            .settle_stopped_retained_invalidation(world, &installed.invalidation);
+        if let Err(error) = observe_receipts(entry, &mut installed) {
+            reject_cleanup(entry, installed, Rejection::Receipt(error));
+            return true;
+        }
     }
     if !installed.ledger.is_settled() {
         reject_cleanup(entry, installed, Rejection::Settlement);

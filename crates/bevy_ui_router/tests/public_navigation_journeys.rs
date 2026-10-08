@@ -4071,6 +4071,177 @@ fn retained_native_invalid_non_target_own_outlet_preserves_fresh_sibling_navigat
 }
 
 #[test]
+fn retained_native_host_loss_during_invalid_cache_root_cleanup_settles_and_readmits() {
+    use bevy_ecs::prelude::{Commands, Despawn};
+
+    let InvalidRetainedOutletFixture {
+        mut fixture,
+        cached_root,
+        active_root,
+        layout_root,
+        ..
+    } = invalid_retained_outlet_fixture();
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let authored_visibility = fixture.app.world().get::<Visibility>(layout_root).copied();
+    let authored_pickable = fixture
+        .app
+        .world()
+        .get::<Pickable>(layout_root)
+        .map(|pickable| (pickable.should_block_lower, pickable.is_hoverable));
+    let effects = fixture.control.effects();
+    let host = fixture.host_fingerprint.host;
+    let old_top_slot = fixture.host_fingerprint.top_slot.unwrap();
+    let cleanup_root_removals = Arc::new(AtomicUsize::new(0));
+    let observed = cleanup_root_removals.clone();
+    fixture.app.world_mut().add_observer(
+        move |event: On<Despawn, LocalState>, mut commands: Commands| {
+            if event.entity == cached_root {
+                observed.fetch_add(1, Ordering::Relaxed);
+                commands.entity(host).remove::<RouterHostRegistration>();
+            }
+        },
+    );
+    *fixture.app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(active_root);
+    let a = RouteLocation::new("/catalog/items/1");
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, a.clone())
+        .unwrap();
+
+    let lost = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost),
+    );
+    let failed = request_snapshot(&fixture.app, fixture.router, request);
+    assert_failed(&failed, NavigationFailureKind::HostLost);
+    assert_eq!(failed.requested(), Some(&a));
+    assert_eq!(cleanup_root_removals.load(Ordering::Relaxed), 1);
+    for kind in [
+        NavigationTraceEventKind::FrameTaskIssued,
+        NavigationTraceEventKind::RequestTerminal,
+    ] {
+        assert_eq!(
+            failed
+                .trace()
+                .iter()
+                .filter(|event| event.kind() == kind)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        failed
+            .trace()
+            .iter()
+            .all(|event| event.kind() != NavigationTraceEventKind::CommitPublished)
+    );
+    assert!(
+        failed
+            .trace()
+            .iter()
+            .any(|event| event.cleanup_disposition().is_some())
+    );
+    assert_eq!(lost.history(), before.history());
+    assert_eq!(lost.active().kind(), ActivePresentationKind::None);
+    assert!(fixture.app.world().get_entity(cached_root).is_err());
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(layout_root),
+        Some(&LocalState(73))
+    );
+    assert_eq!(
+        fixture.app.world().get::<Visibility>(layout_root).copied(),
+        authored_visibility
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<Pickable>(layout_root)
+            .map(|pickable| { (pickable.should_block_lower, pickable.is_hoverable) }),
+        authored_pickable,
+    );
+    assert_eq!(fixture.app.world().resource::<InputFocus>().get(), None);
+    let gate = fixture.app.world().resource::<RouterInputGate>();
+    for inactive in [cached_root, active_root] {
+        assert!(!gate.allows_pointer(inactive));
+        assert!(!gate.allows_keyboard(inactive));
+        assert!(!gate.allows_gamepad(inactive));
+    }
+    assert_eq!(fixture.control.effects(), effects);
+    // A stopped cache may retain private inert physical state, but the old
+    // router edge must be settled and the app-owned host must remain intact.
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(old_top_slot)
+            .is_none_or(|parent| parent.parent() != host)
+    );
+    let mut retired_host = fixture.host_fingerprint.clone();
+    retired_host.top_slot = None;
+    assert_host_after_registration_loss(&fixture.app, &retired_host);
+
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(fixture.router));
+    let ready = drive_recovery_r3_availability(
+        &mut fixture.app,
+        fixture.router,
+        &RouterAvailability::Ready,
+    );
+    assert_ne!(ready.host().version(), before.host().version());
+    assert_eq!(ready.history(), before.history());
+    assert_eq!(ready.active().kind(), ActivePresentationKind::None);
+    assert_eq!(fixture.control.effects(), effects);
+    assert_eq!(
+        request_snapshot(&fixture.app, fixture.router, request),
+        failed
+    );
+    fixture.host_fingerprint.top_slot = fixture
+        .app
+        .world()
+        .get::<Children>(host)
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|child| !fixture.host_fingerprint.existing_children.contains(child));
+
+    let next = push_and_settle(&mut fixture.app, fixture.router, a.clone(), None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, next));
+    let settled = router_snapshot(&fixture.app, fixture.router);
+    assert!(settled.running_request().is_none());
+    assert!(settled.pending_phase().is_none());
+    assert!(!settled.cleanup().foreground_pending());
+    let fresh_a = active_native_retained_leaf(&mut fixture.app);
+    assert_ne!(fresh_a, cached_root);
+    assert_ne!(fresh_a, active_root);
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(fresh_a),
+        Some(&LocalState(0))
+    );
+    assert_eq!(
+        settled.history().entries(),
+        [
+            RouteLocation::new("/catalog/items/1/detail"),
+            a.clone(),
+            RouteLocation::new("/catalog/items/2"),
+            a,
+        ]
+    );
+    assert_eq!(fixture.control.effects().len(), effects.len() + 2);
+    assert_eq!(
+        request_snapshot(&fixture.app, fixture.router, request),
+        failed
+    );
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
 fn retained_native_lru_evicts_the_oldest_inactive_leaf_and_rebuilds_on_return() {
     let mut fixture =
         nested_fixture_with_retention(RoutePattern::path("/:section").unwrap(), Vec::new(), 2);
