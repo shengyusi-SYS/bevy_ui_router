@@ -175,6 +175,7 @@ enum Departure {
     Back,
     Fallback,
     LoseHost,
+    KeepAlive,
 }
 
 fn native_input_journey(departure: Departure, focus_on_application: bool) {
@@ -219,20 +220,56 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
         })
         .unwrap();
     let view = RouteViewKey::new("native-input").unwrap();
-    let routes = RouteTree::builder()
-        .root_with_options(
-            RoutePattern::path("/").unwrap(),
-            RouteNodeOptions::new().with_view(view.clone()),
-        )
-        .unwrap()
-        .build()
-        .unwrap();
     let mut views = RouteViewRegistry::new();
     views
         .insert(view.clone(), RouteViewDescriptor::new(driver))
         .unwrap();
+    let root_view = if matches!(departure, Departure::KeepAlive) {
+        let layout = app
+            .register_bsn_view(ViewDriverKey::new("native-input-layout").unwrap(), |_| {
+                Ok(bsn! {
+                    Node { width: Val::Percent(100.0), height: Val::Percent(100.0) }
+                    bevy_picking::Pickable { should_block_lower: false, is_hoverable: false }
+                    DefaultOutlet
+                })
+            })
+            .unwrap();
+        let key = RouteViewKey::new("native-input-layout").unwrap();
+        views
+            .insert(key.clone(), RouteViewDescriptor::new(layout))
+            .unwrap();
+        key
+    } else {
+        view.clone()
+    };
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(root_view),
+        )
+        .unwrap();
+    if matches!(departure, Departure::KeepAlive) {
+        routes
+            .route_with_options(
+                routes.root_id().unwrap(),
+                RoutePattern::path("items/:id").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(view.clone())
+                    .with_slot(RouteSlotKey::default())
+                    .with_keep_alive(true),
+            )
+            .unwrap();
+    }
+    let capacity = if matches!(departure, Departure::KeepAlive) {
+        2
+    } else {
+        0
+    };
     let router = app
-        .add_ui_router(RouterConfig::new(routes, views, view))
+        .add_ui_router(
+            RouterConfig::new(routes.build().unwrap(), views, view)
+                .with_keep_alive_capacity(capacity),
+        )
         .unwrap();
     let host = app
         .world_mut()
@@ -257,10 +294,15 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
         })
         .id();
     app.update();
+    let initial_location = if matches!(departure, Departure::KeepAlive) {
+        "/items/1"
+    } else {
+        "/"
+    };
     let initial = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/"))
+        .push(router, RouteLocation::new(initial_location))
         .unwrap();
     await_success(&mut app, router, initial);
     if matches!(departure, Departure::Back) {
@@ -477,6 +519,31 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
                     .allows_pointer(next_target)
             );
         }
+        Departure::KeepAlive => {
+            let second = app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .push(router, RouteLocation::new("/items/2"))
+                .unwrap();
+            await_success(&mut app, router, second);
+            assert!(
+                app.world().get::<NativeInputPage>(router_target).is_some(),
+                "retention must keep the original native Entity"
+            );
+            let pages = app
+                .world_mut()
+                .query_filtered::<Entity, With<NativeInputPage>>()
+                .iter(app.world())
+                .collect::<Vec<_>>();
+            assert_eq!(pages.len(), 2);
+            assert!(pages.iter().any(|target| {
+                *target != router_target
+                    && app
+                        .world()
+                        .resource::<RouterInputGate>()
+                        .allows_pointer(*target)
+            }));
+        }
         Departure::LoseHost => {
             // Loss while idle must be observed without enqueuing another request.
             app.world_mut()
@@ -593,6 +660,100 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
         app.world().resource::<InputFocus>().get(),
         focus_on_application.then_some(application_target)
     );
+
+    if matches!(departure, Departure::KeepAlive) {
+        let cached_other = app
+            .world_mut()
+            .query_filtered::<Entity, With<NativeInputPage>>()
+            .iter(app.world())
+            .find(|target| *target != router_target)
+            .unwrap();
+        let hit = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        await_success(&mut app, router, hit);
+        app.update();
+        assert!(app.world().get::<NativeInputPage>(router_target).is_some());
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(gate.allows_pointer(router_target));
+        assert!(gate.allows_keyboard(router_target));
+        assert!(gate.allows_gamepad(router_target));
+        assert_target_revoked(app.world(), cached_other);
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            focus_on_application.then_some(application_target),
+            "reactivation must not replay historical focus"
+        );
+        let restored_location = location_at(app.world(), window, router_target);
+        send_inputs(
+            &mut app,
+            [PointerInput::new(
+                router_pointer,
+                restored_location.clone(),
+                PointerAction::Move { delta: Vec2::ZERO },
+            )],
+        );
+        assert!(
+            app.world()
+                .resource::<HoverMap>()
+                .get(&router_pointer)
+                .is_some_and(|hits| hits.contains_key(&router_target))
+        );
+        let before_new_gesture = app.world().resource::<PointerDeliveries>().0.clone();
+        send_inputs(
+            &mut app,
+            [PointerInput::new(
+                router_pointer,
+                restored_location.clone(),
+                PointerAction::Press(PointerButton::Primary),
+            )],
+        );
+        let restored_moved = Location {
+            position: restored_location.position + Vec2::X,
+            ..restored_location
+        };
+        send_inputs(
+            &mut app,
+            [PointerInput::new(
+                router_pointer,
+                restored_moved.clone(),
+                PointerAction::Move { delta: Vec2::X },
+            )],
+        );
+        send_inputs(
+            &mut app,
+            [PointerInput::new(
+                router_pointer,
+                restored_moved,
+                PointerAction::Release(PointerButton::Primary),
+            )],
+        );
+        let deliveries = &app.world().resource::<PointerDeliveries>().0;
+        let before = before_new_gesture[&router_target];
+        assert_eq!(
+            deliveries[&router_target],
+            Deliveries {
+                presses: before.presses + 1,
+                drags: before.drags + 1,
+                releases: before.releases + 1,
+                clicks: before.clicks + 1,
+                drag_ends: before.drag_ends + 1,
+            }
+        );
+        assert_eq!(
+            deliveries[&application_target],
+            before_new_gesture[&application_target]
+        );
+    }
+}
+
+#[test]
+fn native_keep_alive_revokes_old_input_and_accepts_a_new_gesture_after_hit() {
+    for focus_on_application in [false, true] {
+        native_input_journey(Departure::KeepAlive, focus_on_application);
+    }
 }
 
 #[test]

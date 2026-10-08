@@ -4,12 +4,13 @@
 
 按结果顺序交付。Core 决定 history 与 lifecycle，ECS 持有实体、滚动数据和物理 owner；沿用现有 publication/cleanup 协议。只在实际改动处拆分私有模块，不整体重写 navigation。默认关闭新增能力时保持现有行为。
 
-entry 滚动、A→B→A 命中、LRU 淘汰，以及闲置、normal 提交前、pending failure 和 postcommit 期间 host loss 的缓存结算已闭合。缓存内容根删除已有同请求清理后重建、接受前 host loss、最终 shell 删除触发 host loss 的完整 Native 旅程；这不代表所有自身失效已完成。后续按以下顺序收尾，不扩张功能范围：
+entry 滚动、A→B→A 命中、LRU 淘汰、各阶段 host loss 和缓存内容根删除后的同请求重建已闭合。公开活动查询、真实输入及多 entry 滚动/缓存组合已有运行证据。后续按以下顺序收尾，不扩张功能范围：
 
-1. 收口仍有物理残留的真实失效路径，完成一个活动资格查询入口。
-2. 验证多 entry 滚动与缓存组合、真实输入/窗口和性能，更新合同及 consumer。
+1. 按现有生产路径复核剩余 scope/key 失效边界，补实际遗漏，避免重做已闭合矩阵。
+2. 扩展示例，完成真实窗口与性能对照。
+3. 更新所属合同与指南，移除已完成的实施计划入口。
 
-近期问题共同来自“当前物理分支就是完整生命周期库存”的旧假设。调整实施接缝，将完整库存选择、原 owner 移交和物理 manifest 组合集中到现有 retained/cleanup 职责；不同来源的 history、失败 continuation 和 cleanup receipt 仍由原合同持有：
+近期问题来自两个旧假设：当前物理分支等于完整生命周期库存，以及 Back 的成功目标总是 fresh branch。调整实施接缝，将完整库存、原 owner 移交和 manifest 组合集中到 retained/cleanup；启用缓存的 Back 命中与 fresh 成功共用 normal publisher，原 history/continuation 在 seal 前配对并冻结，原 capability 只在最终验证时移交。失败仍使用已有 typed 路径，不复制缓存状态机：
 
 - Core 在 `engine/retained.rs` 集中 retained 库存和移交 owner 的 exact 核对；normal 按 next scope、idle 按 exact host 明确分区，保留各自已有 history/host owner 和 continuation，不为每种失败增加独立缓存状态机。
 - ECS 在 `retained.rs` 统一原 owner/physical payload 的选择、预分配、移交与返还；选定内容进入既有 cleanup manifest/physical forest。normal 与 projectionless publication 分别在私有模块编排，共用 publication holder，主 navigation 仅分派到对应入口。
@@ -44,7 +45,7 @@ entry 滚动、A→B→A 命中、LRU 淘汰，以及闲置、normal 提交前�
 
 - [x] Route 显式启用 keep-alive，Router 设置 inactive leaf 容量；默认关闭，容量零禁用。Core 决定 retain/reactivate/dispose，ECS 私有模块持有长期 retained owner 与实体。
 - [ ] 按 exact parent frame/generation、outlet、slot binding、host incarnation 和 route/view/params/raw search/raw fragment 判定；只缓存 normal leaf，保持 fragment 替换与 search 重建合同。
-- [ ] 离场同次撤销 pointer 历史 hover/已开始手势、keyboard/gamepad 和 focus，再隐藏并退出布局。提供一个最小活动资格查询入口，应用可据此决定后台工作。
+- [x] 离场同次撤销 pointer 历史 hover/已开始手势、keyboard/gamepad 和 focus，再隐藏并退出布局。唯一公开 `RouteActivity::is_active` 查询依据 active/claim、host incarnation 和真实父链，应用可据此决定后台工作；不等同输入 gate。
 - [x] 命中决策发生在 fresh factory/Scene apply 前，消费本次 Core task 与原缓存 owner，保留 Entity、局部组件及 handles；在 Ready 前完成 claim rebind、owner 组合、输入及恢复准备。其他缓存始终 protected。
 - [x] 按失活时刻维护 LRU；命中移出 inactive 库存，再失活时加入队尾。满容量淘汰最旧实例，原 owner 经既有 cleanup token 结算；其他缓存与 app-owned host 保留。
 - [ ] 完成 parent/outlet/slot 与 cache 自身失效的剩余分类。cache 自身失效与 current authority loss 分别处理；准备或写后发布失败返还原 owner 或有界隔离清理，安全结算后可 fresh build。
@@ -60,16 +61,16 @@ fallback 已验证旧父 scope 与缓存在同一普通 cleanup batch 退役，�
 
 postcommit 已由一次真实多层 scope 导航验证两类库存同时结算：已绑定原 normal token 的退休项留在原 ledger，Live 缓存及原 owners/payload 进入 authority 第二批，联合完成分别结算两个 exact token，保留已提交结果与 history；app-owned host 保留并可重新接纳。完整库存归入既有 receiver projection，首次执行与 retry 共用接线，拒绝沿原 holder 保有唯一 owner。延迟 proof 删除包只移除 exact 选定项，双 Router 旅程验证不会覆盖其他 Router 后续建立的缓存。
 
-缓存局部失效不进入会撤销 active/host 的通用 authority failure 路径。Core 将原 task、缓存 owner 与独立 cleanup token 单次组合，完成后返还原 task；ECS 复用原 cleanup ledger，只选择该缓存。所有目标已有 exact removal receipt 且 Entity/registry 均消失时，可以只读完成原账本，保留写后 stop 证据至 Core completion，再由原 driver 判断实际 authority。来源变化与清理可接受性分别核对，不能把同源的永久矛盾当可重试准备失败。尚有目标存活时不能套用这一 completion；容量重试跨 update 后的真实 protected 变化仍待收口。应用动态内容继续按现有内容边界处理，不扩展为任意 router-owned shell 篡改后的自动恢复。
+缓存局部失效不撤销有效 active/host。Core 将原 task、缓存 owner 与独立 cleanup token 单次组合，完成后返还原 task；ECS 只清理该缓存。内容根已删除的路径在 Core 接受前准备原 ledger attempt、removal、receipts 和父边界交换；接受后先结算 absent receipts，再移除唯一存活 shell，不保留跨 update 的物理容量重试窗口。写后变化只在全部 exact receipt 和 Entity/registry 消失后完成原账本，保留 stop 证据至 Core completion，再交原 driver 判断 authority。永久矛盾保留原 owner，不当作 retry；不扩展为任意 router-owned shell 篡改后的自动恢复。
 
 永久协议矛盾的 residual/transfer 保持原 owner；这类保存句柄的路径不算可恢复结算，也不扩展为新的自动恢复需求。
 
 ## 5. 组合、真实输入与交付
 
-现有独立滚动和原生输入/focus 回归尚未启用 keep-alive，不作为以下组合验收的完成证据。活动资格也不能直接等同输入 gate：活动布局可能没有交互目标，查询应基于现有 active/claim 事实。
+组合验收沿公开入口和正常更新调度；活动资格另外验证非交互内容、应用系统的可变 Query、动态内容、父布局 reparent 与 host incarnation 撤权。
 
-- [ ] 同 key 多 entry 各自保存位置，分别覆盖 cache hit、miss 与淘汰；证明共享 Entity 不会覆盖另一 entry 的位置。
-- [ ] 通过真实 pointer/显式 gate 管线验证正向命中、失活拒绝、已开始手势撤权、focus 释放、重新激活以及其他有效目标保留。
+- [x] 同 key 多 entry 各自保存位置，容量 0/1/2 的同一 A→B→A→C→Back 旅程覆盖 hit、miss 与淘汰；验证共享 Entity 的二维、多容器及 preserved prefix 位置独立。
+- [x] 通过真实 pointer/显式 gate 管线验证正向命中、失活拒绝、已开始手势撤权、focus 释放、原 Entity 重新激活后的新手势以及其他有效目标保留。
 - [ ] 扩展示例与独立 consumer，经应用内 BRP 验证窗口；实际记录默认关闭、miss/hit、idle、淘汰和连续往返的性能及活实体/retained owner 稳定性。计时包含 cleanup，不将 hit 收益冒充 miss 优化。
 - [ ] 将已交付行为归入 overview、所属专题合同、架构与接入/验证指南；保留未运行环境的准确边界。计划完成后退出默认文档树，由 Git 追溯。
 
