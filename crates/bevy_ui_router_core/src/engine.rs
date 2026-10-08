@@ -67,7 +67,7 @@ use crate::request::{
 };
 use crate::route_tree::RouteTree;
 use crate::trace::{MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind};
-use crate::view_input::RouteViewInput;
+use crate::view_input::{RouteInputRef, RouteViewInput};
 use crate::view_key::RouteViewKey;
 use crate::{HostVersion, slot::RouteSlotKey};
 
@@ -2008,6 +2008,7 @@ impl std::fmt::Debug for SealedCommit {
 
 struct PublicationPlan {
     state: RouterNavigationState,
+    inputs: Vec<(RouteFrameVersion, RouteViewInput)>,
     history: Option<PreparedHistoryPublication>,
     history_publication: HistoryPublicationFacts,
     retained_update: Option<Vec<retained::RetainedRegistryEntry>>,
@@ -3078,6 +3079,8 @@ impl AttemptKind {
 struct BoundErrorAttempt {
     binding: FrozenErrorViewBinding,
     matched: MatchedRoute,
+    // Target facts for both preserved and freshly prepared normal ancestors.
+    normal_prefix: Vec<MatchedRoute>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
 }
 
@@ -4332,6 +4335,7 @@ pub(crate) struct RouterEngine {
     pending_retained_transfer: Option<retained::PreparedRetainedTransfer>,
     pending_retained_miss_cleanup: Option<CleanupBatchToken>,
     state: RouterNavigationState,
+    published_inputs: Vec<(RouteFrameVersion, RouteViewInput)>,
     host_admission_source: HostAdmissionSourceProjection,
     host_admission_source_open: bool,
     pending_host_admission: Option<CorePendingHostAdmission>,
@@ -4393,6 +4397,7 @@ impl RouterEngine {
             pending_retained_transfer: None,
             pending_retained_miss_cleanup: None,
             state: RouterNavigationState::new(router),
+            published_inputs: Vec::new(),
             host_admission_source,
             host_admission_source_open: true,
             pending_host_admission: None,
@@ -13511,6 +13516,7 @@ impl RouterEngine {
         } = owner;
         let PublicationPlan {
             state,
+            inputs,
             history,
             history_publication: _,
             retained_update,
@@ -13523,6 +13529,7 @@ impl RouterEngine {
         mutation();
         self.records[record_index] = published_record;
         self.state = state;
+        self.published_inputs = inputs;
         self.active_branch = active_branch;
         self.active_child_slots = active_child_slots;
         if let Some(registry) = retained_update {
@@ -14015,6 +14022,18 @@ impl RouterEngine {
 
     pub(crate) const fn active(&self) -> &ActivePresentation {
         self.state.active()
+    }
+
+    pub(crate) fn current_input(&self, frame: &RouteFrameVersion) -> Option<RouteInputRef<'_>> {
+        if self.state.availability() != &crate::presentation::RouterAvailability::Ready
+            || !self.state.active().frames().contains(frame)
+        {
+            return None;
+        }
+        self.published_inputs
+            .iter()
+            .find(|(version, _)| version == frame)
+            .map(|(_, input)| RouteInputRef::new(input))
     }
 
     pub(crate) const fn availability(&self) -> &crate::presentation::RouterAvailability {
@@ -15454,6 +15473,7 @@ impl RouterEngine {
             .clone();
         let binding = recovery.binding;
         let boundary_index = binding.branch_index();
+        let normal_prefix = target_branch.routes()[..boundary_index].to_vec();
         let origin = FrameOrigin::RouteError(binding.boundary_route());
         let generation = RouteGeneration::initial();
         let projected_slot = match &recovery.mount {
@@ -15547,6 +15567,7 @@ impl RouterEngine {
                         bound_error: Some(BoundErrorAttempt {
                             binding,
                             matched,
+                            normal_prefix,
                             active_child_slots,
                         }),
                     },
@@ -15672,6 +15693,7 @@ impl RouterEngine {
                 bound_error: Some(BoundErrorAttempt {
                     binding,
                     matched: matched.clone(),
+                    normal_prefix,
                     active_child_slots,
                 }),
             },
@@ -16223,6 +16245,94 @@ impl RouterEngine {
             .cloned()
             .expect("a publishable request has resolved its requested target");
 
+        // All input allocation belongs to preparation, never the atomic tail.
+        let inputs = match &current.attempt {
+            AttemptKind::Normal(_) => current
+                .target_frames
+                .iter()
+                .map(|frame| {
+                    let matched = current
+                        .branch
+                        .as_ref()
+                        .expect("normal work retains its branch")
+                        .routes()
+                        .iter()
+                        .find(|matched| {
+                            frame.origin() == &FrameOrigin::MatchedRoute(matched.route())
+                        })
+                        .expect("normal target retains exact matched route facts");
+                    (
+                        frame.clone(),
+                        RouteViewInput::new(
+                            location.clone(),
+                            Some(matched.route()),
+                            matched.params().clone(),
+                            frame.origin().clone(),
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+            AttemptKind::Fallback {
+                original_failure,
+                bound_error: None,
+            } => current
+                .target_frames
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.clone(),
+                        RouteViewInput::new(
+                            location.clone(),
+                            None,
+                            RouteParams::new(),
+                            frame.origin().clone(),
+                            Some(original_failure.clone()),
+                        ),
+                    )
+                })
+                .collect(),
+            AttemptKind::Fallback {
+                original_failure,
+                bound_error: Some(bound),
+            } => current
+                .target_frames
+                .iter()
+                .map(|frame| {
+                    let (matched, failure) = match frame.origin() {
+                        FrameOrigin::MatchedRoute(route) => (
+                            bound
+                                .normal_prefix
+                                .iter()
+                                .find(|matched| matched.route() == *route)
+                                .expect("bound error retains target normal prefix facts"),
+                            None,
+                        ),
+                        FrameOrigin::RouteError(route) => {
+                            assert_eq!(
+                                *route,
+                                bound.matched.route(),
+                                "bound error retains its exact boundary"
+                            );
+                            (&bound.matched, Some(original_failure.clone()))
+                        }
+                        FrameOrigin::RouterFallback => {
+                            unreachable!("bound error cannot contain router fallback")
+                        }
+                    };
+                    (
+                        frame.clone(),
+                        RouteViewInput::new(
+                            location.clone(),
+                            Some(matched.route()),
+                            matched.params().clone(),
+                            frame.origin().clone(),
+                            failure,
+                        ),
+                    )
+                })
+                .collect(),
+        };
         let mut state = self.state.clone();
         let (active, active_branch, active_child_slots) = match &current.attempt {
             AttemptKind::Normal(_) => {
@@ -16320,6 +16430,7 @@ impl RouterEngine {
 
         Ok(PublicationPlan {
             state,
+            inputs,
             history,
             history_publication,
             retained_update: None,

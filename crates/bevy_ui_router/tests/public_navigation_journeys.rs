@@ -19,6 +19,7 @@ use bevy_ecs::{
     lifecycle::Insert,
     observer::On,
     prelude::Component,
+    system::RunSystemOnce,
     template::{FromTemplate, Template, TemplateContext},
 };
 use bevy_input_focus::InputFocus;
@@ -31,6 +32,221 @@ const NORMAL_CONTENT_WIDTH: u16 = 31;
 const FALLBACK_CONTENT_WIDTH: u16 = 79;
 const PARTIAL_CONTENT_WIDTH: u16 = 199;
 const RECOVERY_PARTIAL_CONTENT_WIDTH: u16 = 197;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CurrentInputSnapshot {
+    route: Option<RouteId>,
+    params: RouteParams,
+    location: RouteLocation,
+    origin: FrameOrigin,
+    failure: Option<NavigationFailure>,
+}
+
+fn current_input(app: &mut App, target: Entity) -> Option<CurrentInputSnapshot> {
+    app.world_mut()
+        .run_system_once(move |inputs: RouteInputs| {
+            inputs.current(target).map(|input| CurrentInputSnapshot {
+                route: input.route(),
+                params: input.params().clone(),
+                location: input.location().clone(),
+                origin: input.origin().clone(),
+                failure: input.failure().cloned(),
+            })
+        })
+        .unwrap()
+}
+
+#[test]
+fn current_inputs_preserve_queued_values_and_publish_complete_location_at_update() {
+    let mut fixture = root_fixture("/items/:id");
+    let old_location = RouteLocation::new("/items/1")
+        .with_search("?x=1&x=2")
+        .with_fragment("old");
+    push_and_settle(&mut fixture.app, fixture.router, old_location, None, None);
+    let old_entity = node_entities_with_width(&mut fixture.app, NORMAL_CONTENT_WIDTH)[0];
+    let old_input = current_input(&mut fixture.app, old_entity).unwrap();
+    fixture
+        .control
+        .set_mode(&fixture.normal, FixtureMode::Success { width: 37 });
+    let requested = RouteLocation::new("/items/2")
+        .with_search("?x=2&x=1")
+        .with_fragment("new");
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, requested.clone())
+        .unwrap();
+    assert_eq!(
+        current_input(&mut fixture.app, old_entity).as_ref(),
+        Some(&old_input)
+    );
+    let mut settled = false;
+    for _ in 0..16 {
+        fixture.app.update();
+        let snapshot = request_snapshot(&fixture.app, fixture.router, request);
+        let published = snapshot
+            .trace()
+            .iter()
+            .any(|event| event.kind() == NavigationTraceEventKind::CommitPublished);
+        let terminal = matches!(
+            snapshot.status(),
+            RequestStatus::Succeeded | RequestStatus::Failed(_)
+        );
+        if !published {
+            assert_eq!(
+                current_input(&mut fixture.app, old_entity).as_ref(),
+                Some(&old_input)
+            );
+            for entity in node_entities_with_width(&mut fixture.app, 37) {
+                assert!(
+                    current_input(&mut fixture.app, entity).is_none(),
+                    "entering content is not published"
+                );
+            }
+        } else {
+            let entity = node_entities_with_width(&mut fixture.app, 37)[0];
+            let input = current_input(&mut fixture.app, entity).unwrap();
+            assert_eq!(input.location, requested);
+            assert_eq!(input.params.get("id"), Some("2"));
+            assert!(input.failure.is_none());
+            assert!(current_input(&mut fixture.app, old_entity).is_none());
+        }
+        if terminal {
+            assert_succeeded(&snapshot);
+            settled = true;
+            break;
+        }
+    }
+
+    assert!(settled);
+}
+
+#[test]
+fn current_inputs_for_router_fallback_exclude_failed_leaf_params_and_history() {
+    let mut fixture = root_fixture("/known/:id");
+    let first_location = RouteLocation::new("/known/one");
+    push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        first_location.clone(),
+        None,
+        None,
+    );
+    fixture
+        .control
+        .set_mode(&fixture.normal, FixtureMode::ApplyFailure);
+    let requested = RouteLocation::new("/known/two")
+        .with_search("?a=2&a=1")
+        .with_fragment("#error");
+    let request = push_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        requested.clone(),
+        None,
+        None,
+    );
+    let failed = request_snapshot(&fixture.app, fixture.router, request);
+    assert_failed(&failed, NavigationFailureKind::Apply);
+    let content = node_entities_with_width(&mut fixture.app, FALLBACK_CONTENT_WIDTH)[0];
+    let input = current_input(&mut fixture.app, content).expect("published fallback is queryable");
+    assert_eq!(input.route, None);
+    assert!(input.params.is_empty());
+    assert_eq!(input.location, requested);
+    assert_eq!(input.origin, FrameOrigin::RouterFallback);
+    let RequestStatus::Failed(original) = failed.status() else {
+        unreachable!()
+    };
+    assert_eq!(input.failure.as_ref(), Some(original));
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .history()
+            .current(),
+        Some(&first_location)
+    );
+}
+
+#[test]
+fn current_inputs_for_route_error_cover_preserved_and_fresh_normal_prefixes() {
+    for org in ["7", "8"] {
+        let mut fixture = recovery_r1_fixture_with_patterns(
+            "input-error",
+            RoutePattern::path("orgs/:org").unwrap(),
+            RoutePattern::path("sections/:section").unwrap(),
+        );
+        let first_location = RouteLocation::new("/orgs/7/sections/10/items/1")
+            .with_search("?a=2&a=1")
+            .with_fragment("old");
+        push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            first_location.clone(),
+            None,
+            None,
+        );
+        let old_root = node_entities_with_width(&mut fixture.app, 51)[0];
+        let old_factory_effects = fixture.control.effects();
+        fixture
+            .control
+            .set_mode(&fixture.leaf, FixtureMode::BuildFailure);
+        let requested = RouteLocation::new(format!("/orgs/{org}/sections/11/items/2"))
+            .with_search("?a=2&a=1")
+            .with_fragment("failed");
+        let request = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            requested.clone(),
+            None,
+            None,
+        );
+        let failed = request_snapshot(&fixture.app, fixture.router, request);
+        assert_failed(&failed, NavigationFailureKind::Build);
+        let root = node_entities_with_width(&mut fixture.app, 51)[0];
+        assert_eq!(root == old_root, org == "7");
+        let prefix =
+            current_input(&mut fixture.app, root).expect("normal error prefix is queryable");
+        assert_eq!(prefix.location, requested);
+        assert_eq!(prefix.route, Some(fixture.root_route));
+        assert_eq!(prefix.params.get("org"), Some(org));
+        assert_eq!(prefix.params.get("section"), None);
+        assert_eq!(prefix.params.get("id"), None);
+        assert_eq!(prefix.origin, FrameOrigin::MatchedRoute(fixture.root_route));
+        assert_eq!(prefix.failure, None);
+        let error = node_entities_with_width(&mut fixture.app, 57)[0];
+        let input = current_input(&mut fixture.app, error).expect("route error is queryable");
+        assert_eq!(input.location, requested);
+        assert_eq!(input.route, Some(fixture.boundary_route));
+        assert_eq!(input.params.get("section"), Some("11"));
+        assert_eq!(input.params.get("org"), None);
+        assert_eq!(input.params.get("id"), None);
+        assert_eq!(
+            input.origin,
+            FrameOrigin::RouteError(fixture.boundary_route)
+        );
+        let RequestStatus::Failed(original) = failed.status() else {
+            unreachable!()
+        };
+        assert_eq!(input.failure.as_ref(), Some(original));
+        assert_eq!(
+            router_snapshot(&fixture.app, fixture.router)
+                .history()
+                .current(),
+            Some(&first_location)
+        );
+        let effects = fixture.control.effects();
+        assert_eq!(
+            &effects[..old_factory_effects.len()],
+            old_factory_effects.as_slice()
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| effect.route == Some(fixture.root_route))
+                .count(),
+            if org == "7" { 1 } else { 2 }
+        );
+    }
+}
 
 #[derive(Component, Debug, Eq, PartialEq)]
 struct HostSentinel(u32);
@@ -474,6 +690,18 @@ fn remove_recovery_host(fixture: &mut RecoveryR1Fixture, kind: RecoveryR2LossKin
 }
 
 fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
+    recovery_r1_fixture_with_patterns(
+        label,
+        RoutePattern::pathless(),
+        RoutePattern::path("section").unwrap(),
+    )
+}
+
+fn recovery_r1_fixture_with_patterns(
+    label: &str,
+    root_pattern: RoutePattern,
+    boundary_pattern: RoutePattern,
+) -> RecoveryR1Fixture {
     let mut app = native_app();
 
     let root = RouteViewKey::new(format!("{label}-normal-root")).unwrap();
@@ -495,7 +723,7 @@ fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
 
     let mut routes = RouteTree::builder()
         .root_with_options(
-            RoutePattern::pathless(),
+            root_pattern,
             RouteNodeOptions::new().with_view(root.clone()),
         )
         .unwrap();
@@ -503,7 +731,7 @@ fn recovery_r1_fixture(label: &str) -> RecoveryR1Fixture {
     let boundary_route = routes
         .route_with_options(
             root_route,
-            RoutePattern::path("section").unwrap(),
+            boundary_pattern,
             RouteNodeOptions::new()
                 .with_view(section.clone())
                 .with_slot(RouteSlotKey::default())
@@ -1116,6 +1344,17 @@ fn drive_r1_request_to_terminal_preserving_old_active(
     request: NavigationRequestId,
     old_active: Option<&ActivePresentation>,
 ) -> (NavigationRequestSnapshot, usize) {
+    let old_inputs = {
+        let entities = app
+            .world_mut()
+            .query::<Entity>()
+            .iter(app.world())
+            .collect::<Vec<_>>();
+        entities
+            .into_iter()
+            .filter_map(|entity| current_input(app, entity).map(|input| (entity, input)))
+            .collect::<Vec<_>>()
+    };
     let mut precommit_observations = 0;
     for _ in 0..24 {
         app.update();
@@ -1138,6 +1377,13 @@ fn drive_r1_request_to_terminal_preserving_old_active(
                     old_active,
                     "the previously published presentation remains visible before error commit"
                 );
+                for (entity, input) in &old_inputs {
+                    assert_eq!(
+                        current_input(app, *entity).as_ref(),
+                        Some(input),
+                        "pending or rejected work cannot change old published input"
+                    );
+                }
                 precommit_observations += 1;
             }
         }

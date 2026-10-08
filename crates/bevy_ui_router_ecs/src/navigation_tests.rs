@@ -48,6 +48,7 @@ use bevy_ecs::{
     prelude::Resource,
     query::With,
     schedule::IntoScheduleConfigs,
+    system::RunSystemOnce,
 };
 use bevy_input_focus::InputFocus;
 use bevy_internal::{
@@ -7047,6 +7048,90 @@ fn reconciliation_truncate_retain_empty_commits_once_without_retry() {
     ));
 }
 
+fn current_input_location(app: &mut App, entity: Entity) -> Option<RouteLocation> {
+    app.world_mut()
+        .run_system_once(move |inputs: crate::RouteInputs| {
+            inputs.current(entity).map(|input| input.location().clone())
+        })
+        .unwrap()
+}
+
+#[test]
+fn current_inputs_are_visible_after_commit_before_cleanup_terminal() {
+    let mut app = App::new();
+    app.add_plugins(BevyUiRouterPlugin::default());
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = install_nested_router(&mut app, observed, true);
+    app.update();
+    commit_initial_nested_branch(&mut app, router);
+    let old_shells = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .frames()
+        .iter()
+        .map(|frame| frame.shell())
+        .collect::<Vec<_>>();
+    let requested = RouteLocation::new("/items/2");
+    let request = prepare_nested_branch_for_commit(&mut app, router, requested.clone());
+    for shell in &old_shells {
+        assert_eq!(
+            current_input_location(&mut app, *shell),
+            Some(RouteLocation::new("/items/1"))
+        );
+    }
+    let entering = app.world().resource::<RouterNavigation>().entries[0]
+        .pending_commit
+        .as_ref()
+        .unwrap()
+        .branch
+        .frames()
+        .iter()
+        .map(|frame| frame.shell())
+        .collect::<Vec<_>>();
+    assert!(!entering.is_empty());
+    for shell in entering {
+        assert_eq!(current_input_location(&mut app, shell), None);
+    }
+    commit_presentation_system(app.world_mut());
+    {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert!(!matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Succeeded | RequestStatus::Failed(_)
+        ));
+        assert_eq!(
+            entry.engine.request(request).unwrap().status(),
+            &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+        );
+    }
+    let active = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .frames()
+        .iter()
+        .map(|frame| frame.shell())
+        .collect::<Vec<_>>();
+    assert_eq!(active[0], old_shells[0]);
+    for shell in &active {
+        assert_eq!(
+            current_input_location(&mut app, *shell),
+            Some(requested.clone())
+        );
+    }
+    assert_eq!(current_input_location(&mut app, old_shells[1]), None);
+    settle_cleanup_system(app.world_mut());
+    assert!(matches!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(request)
+            .unwrap()
+            .status(),
+        RequestStatus::Succeeded
+    ));
+}
+
 #[test]
 fn replace_equivalent_retained_empty_is_physical_no_op() {
     let mut app = App::new();
@@ -7118,6 +7203,8 @@ fn replace_equivalent_retained_empty_is_physical_no_op() {
         )
     };
 
+    let input_before = current_input_location(&mut app, shell_before);
+    assert_eq!(input_before, Some(truncated.clone()));
     let repeated = prepare_nested_replace_for_commit(&mut app, router, truncated.clone());
     {
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -7144,6 +7231,7 @@ fn replace_equivalent_retained_empty_is_physical_no_op() {
         Vec::<TestCommitMutation>::new(),
         "an unchanged PreparedInert RetainEmpty role must not reach presentation apply"
     );
+    assert_eq!(current_input_location(&mut app, shell_before), input_before);
     settle_cleanup_system(app.world_mut());
 
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
@@ -18107,6 +18195,36 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
     collect_navigation_system(app.world_mut());
     drive_navigation_system(app.world_mut());
     publish_snapshots_system(app.world_mut());
+    let capture_inputs = |entry: &RouterEntry| {
+        entry
+            .engine
+            .active()
+            .frames()
+            .iter()
+            .map(|frame| {
+                let input = entry
+                    .engine
+                    .current_input(frame)
+                    .expect("active frame has published input");
+                (
+                    frame.clone(),
+                    input.location().clone(),
+                    input.route(),
+                    input.params().clone(),
+                    input.origin().clone(),
+                    input.failure().cloned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let inputs_before = capture_inputs(
+        app.world()
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .find(|entry| entry.handle == router)
+            .unwrap(),
+    );
 
     let (
         engine_before,
@@ -18176,6 +18294,11 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
             .iter()
             .find(|entry| entry.handle == router)
             .expect("stale replay retains the newer RouterEntry");
+        assert_eq!(
+            capture_inputs(entry),
+            inputs_before,
+            "stale artifacts cannot overwrite published input fields"
+        );
         let current = entry
             .engine
             .request(current_back)

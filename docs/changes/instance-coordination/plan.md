@@ -1,6 +1,6 @@
 # 实例协调实施计划
 
-状态：未实施，与[设计草案](design.md)配套供审阅；本轮仅编写文档。执行者按交付使用 `subagent-driven-development` 或 `executing-plans`，根代理统一 index/提交与 Cargo 验证。沿当前 main 推进，不新建分支。
+状态：第 1 步已完成并通过完整门禁；步骤 2–5 尚未实施。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理只读交叉审查。沿当前 main 推进，不新建分支。
 
 **目标：** 先交付当前已发布输入，再将 leaf 保留替换为按实例和 exact 父依赖的协调，闭合混合激活/fresh、失败及依赖淘汰。
 
@@ -24,17 +24,19 @@
 
 ## 1. 当前已发布输入（4–7 人日）
 
-文件：修改 `crates/bevy_ui_router_core/src/{view_input.rs,engine.rs,integration.rs,lib.rs}`、`crates/bevy_ui_router_ecs/src/{activity.rs,navigation.rs,lib.rs}`、`crates/bevy_ui_router/src/lib.rs`；新建 `crates/bevy_ui_router_ecs/src/{active_scope.rs,route_inputs.rs}`。测试扩展 `crates/bevy_ui_router/tests/{public_activity.rs,public_navigation_journeys.rs,consumers/ecs.rs,consumers/bsn.rs}` 和 `crates/bevy_ui_router_view/tests/public_api.rs`。
+文件：修改 `crates/bevy_ui_router_core/src/{view_input.rs,engine.rs,integration.rs,lib.rs}`、`crates/bevy_ui_router_ecs/src/{activity.rs,lib.rs}`、`crates/bevy_ui_router/src/lib.rs`；新建 `crates/bevy_ui_router_ecs/src/{active_scope.rs,route_inputs.rs}`。测试扩展 `crates/bevy_ui_router/tests/{public_activity.rs,public_navigation_journeys.rs,consumers/ecs.rs,consumers/bsn.rs}` 和 `crates/bevy_ui_router_view/tests/public_api.rs`。
 
 输入：当前 matched/error/fallback publication 的确切事实及 live registry/hierarchy。产出：设计中的 `RouteInputs::current(Entity) -> Option<RouteInputRef<'_>>` 和五个只读 getters；Core prepared publication 的逐 frame 输入集合，生命周期与 frame 保持一致。
 
-- [ ] 先在公开 fixture 增加父/子 route-local params、preserved 父新 location、旧 factory 快照和 mutable Query 并用断言；初始执行应因 API 缺失失败，确认验证的是真实公开入口。
-- [ ] 在 `view_input.rs` 分离可持有的 published value 与借用 ref，保留 `RouteViewInput` 的单次构建快照合同。Core 为正常、preserved、error/fallback 各 frame 准备确切值；公开旅程同时断言 normal 前缀的 failure 为 None、错误 frame 为原 failure，不从成功 history 反推错误输入。
-- [ ] 从 `activity.rs` 提取同证明目的的 exact active-frame resolver，让 RouteActivity 与 RouteInputs 共用；补最近 inactive 边界、动态后代、同 Entity 实例替换及其它 Router 的真实事实回归。
-- [ ] 将输入接入现有 publication preparation/tail，验证 pending/stale 保持旧值、发布后 terminal 前读新值及 no-op 零物理写入。输入存储提前准备，tail 不插组件、不运行可失败查询。
-- [ ] 导出 ECS facade/prelude，View public API 验证中立借用形状，独立 consumer 仅依赖 facade 使用查询。更新当前导航/输入合同与接入指南后提交 `feat: expose current published route inputs`。
+- [x] 先在公开 fixture 增加父/子 route-local params、preserved 父新 location、旧 factory 快照和 mutable Query 并用断言；初始执行应因 API 缺失失败，确认验证的是真实公开入口。
+- [x] 在 `view_input.rs` 分离可持有的 published value 与借用 ref，保留 `RouteViewInput` 的单次构建快照合同。Core 为正常、preserved、error/fallback 各 frame 准备确切值；公开旅程同时断言 normal 前缀的 failure 为 None、错误 frame 为原 failure，不从成功 history 反推错误输入。
+- [x] 从 `activity.rs` 提取同证明目的的 exact active-frame resolver，让 RouteActivity 与 RouteInputs 共用；补最近 inactive 边界、动态后代、同 Entity 实例替换及其它 Router 的真实事实回归。
+- [x] 将输入接入现有 publication preparation/tail，验证 pending/stale 保持旧值、发布后 terminal 前读新值及 no-op 零物理写入。输入存储提前准备，tail 不插组件、不运行可失败查询。
+- [x] 导出 ECS facade/prelude，View public API 验证中立借用形状，独立 consumer 仅依赖 facade 使用查询。更新当前导航/输入合同与接入指南后提交 `feat: expose current published route inputs`。
 
 局部运行 Core/View 完整测试和 facade `public_activity`、`public_navigation_journeys`、`facade_consumers`；该步 publication 变更还须执行下文完整交付门禁。
+
+时序与零写证据扩展 ECS `src/navigation_tests.rs`：真实 prepare/commit/settle 阶段验证进入内容无输入、旧 active 保持旧值、publication 后 `PostCommitCleanup` 终结前读新值；既有 no-op mutation trace 和 stale Back report/receipt/publication 回归同时核对已发布输入。公开普通 `App::update()` 可能在同轮完成发布和清理，不以更新后的样本冒充内部阶段观察。View API 测试是借用形状的编译证据；无 BSN consumer 仅验证接线与 host 拒绝，成功导航消费由独立 BSN consumer 和公开旅程证明。
 
 ## 2. 实例事实与物理 payload 等价迁移（计入库存 10–16 人日）
 
@@ -112,4 +114,4 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 
 每次交付由独立代理只读复核 Core 选择/continuation 与 ECS 原 owner/写集/publication，另一视角核对公开行为。实现 shared publication 的修改错开；审查一致不能替代成功命令输出。根代理检查 exact staged 文件和 diff 后提交 main，不纳入职责外变更。
 
-原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。当前源码尚无上述新接口，文档审查通过只代表方案可进入实施审阅，不代表 runtime 已交付。
+原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。第 1 步的当前输入接口已实现；其余实例协调接口仍待实施，设计审查不代表 runtime 已交付。

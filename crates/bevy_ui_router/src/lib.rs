@@ -36,7 +36,7 @@ pub mod core {
     pub use bevy_ui_router_core::trace::{
         CleanupDisposition, MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind,
     };
-    pub use bevy_ui_router_core::view_input::RouteViewInput;
+    pub use bevy_ui_router_core::view_input::{RouteInputRef, RouteViewInput};
     pub use bevy_ui_router_core::view_key::{RouteViewKey, RouteViewKeyError};
     pub use bevy_ui_router_core::{
         CleanupSummary, HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion,
@@ -55,10 +55,11 @@ pub mod view {
 pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteScroll, RouterConfig,
-        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
-        RouterSnapshots, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
+        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
     };
 }
 
@@ -88,10 +89,11 @@ pub mod prelude {
         NavigationPhase, NavigationRequestId, NavigationTraceEvent, NavigationTraceEventKind,
         ReportDisposition, RequestStatus, RouteBranchFingerprint, RouteError, RouteErrorKind,
         RouteErrorSourceCategory, RouteExplicitKey, RouteFrameId, RouteFrameStatus,
-        RouteFrameVersion, RouteGeneration, RouteHostId, RouteId, RouteLocation, RouteMatcher,
-        RouteMeta, RouteNodeOptions, RouteParams, RoutePathSegment, RoutePattern, RoutePatternKind,
-        RouteSlotId, RouteSlotKey, RouteTree, RouteTreeBuilder, RouteViewInput, RouteViewKey,
-        RouteViewKeyError, RouterAvailability, RouterInstanceId, RouterUnavailableReason,
+        RouteFrameVersion, RouteGeneration, RouteHostId, RouteId, RouteInputRef, RouteLocation,
+        RouteMatcher, RouteMeta, RouteNodeOptions, RouteParams, RoutePathSegment, RoutePattern,
+        RoutePatternKind, RouteSlotId, RouteSlotKey, RouteTree, RouteTreeBuilder, RouteViewInput,
+        RouteViewKey, RouteViewKeyError, RouterAvailability, RouterInstanceId,
+        RouterUnavailableReason,
     };
 
     #[cfg(feature = "view")]
@@ -103,8 +105,8 @@ pub mod prelude {
     #[cfg(feature = "ecs")]
     pub use crate::ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteScroll, RouterConfig,
-        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
+        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
         RouterInstallErrorKind, RouterNavigation, RouterSnapshot, RouterSnapshots,
         ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };

@@ -1,0 +1,25 @@
+{
+  "exclude": [
+    "src/**/*tests.rs",
+    "src/test_support.rs",
+    "src/navigation.rs",
+    "src/cleanup.rs",
+    "src/cleanup/**",
+    "src/presentation.rs",
+    "src/presentation/**",
+    "src/host.rs",
+    "src/mount.rs",
+    "src/frame_local.rs",
+    "src/navigation/{authority_isolation,idle_host_loss,retained_miss}.rs",
+    "src/{scroll,native_focus,input,bsn}.rs"
+  ],
+  "id": "ecs-publication",
+  "include": [
+    "../../AGENTS.md",
+    "../../docs/changes/instance-coordination/*.md",
+    "../../docs/contracts/{lifecycle,input-focus}.md",
+    "../../docs/architecture/{runtime,lifecycle}.md",
+    "../bevy_ui_router_core/src/view_input.rs"
+  ],
+  "responsibility": "ECS exact active-frame只读解析、SystemParam借用、输入可见时刻与prepared publication/tail。navigation.rs/cleanup.rs及Core巨型文件未整体纳入，缺失的owner/control-flow结论需主代理提供原文核查。"
+}

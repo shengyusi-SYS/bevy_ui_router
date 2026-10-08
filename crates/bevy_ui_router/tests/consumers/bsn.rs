@@ -20,7 +20,7 @@ struct HostSentinel(u32);
 struct NativeLayout;
 
 #[derive(Component, Clone, Default)]
-struct ToolbarState(u32);
+struct ToolbarState(u32, Option<RouteLocation>);
 
 #[derive(Component, Clone, Default)]
 struct NativeLeaf {
@@ -112,6 +112,8 @@ fn observe_snapshots(
     tracked: Option<Res<TrackedRequest>>,
     snapshots: Res<RouterSnapshots>,
     activity: RouteActivity,
+    inputs: RouteInputs,
+    mut toolbar: Query<(Entity, &mut ToolbarState)>,
     gate: Res<RouterInputGate>,
     native: Query<(Entity, Option<&NativeLeaf>, Has<ErrorPage>)>,
     mut observation: ResMut<SnapshotObservation>,
@@ -123,8 +125,31 @@ fn observe_snapshots(
         RequestLookup::NotRetained => panic!("tracked request was evicted"),
     };
     let published = published_native(tracked.native, &gate, native.iter());
+    let router = snapshots.get(tracked.router).unwrap();
+    for (entity, mut state) in &mut toolbar {
+        state.1 = inputs.current(entity).map(|input| {
+            assert!(input.params().is_empty(), "parent parameters stay route-local");
+            assert!(input.failure().is_none());
+            assert_eq!(Some(input.location()), router.active().location());
+            input.location().clone()
+        });
+    }
     if let Some(entity) = published {
         assert!(activity.is_active(entity));
+        let input = inputs.current(entity).expect("input is published with native content");
+        assert_eq!(Some(input.location()), router.active().location().or_else(|| router.active().requested()));
+        assert_eq!(input.origin(), router.active().frames().last().unwrap().origin());
+        assert_eq!(input.failure(), router.active().failure());
+        match tracked.native {
+            ExpectedNative::Leaf(_) => {
+                assert!(input.route().is_some());
+                assert_eq!(input.params().get("id"), Some(native.get(entity).unwrap().1.unwrap().item.as_str()));
+            },
+            ExpectedNative::Error => {
+                assert_eq!(input.route(), None);
+                assert!(input.params().is_empty());
+            },
+        }
     }
     observation.0 = Some(UpdateObservation {
         request,
@@ -220,6 +245,7 @@ fn assert_preserved_layout(app: &mut App, layout: Entity, anchor: Entity, toolba
     assert_eq!(only::<DefaultOutlet>(app), anchor);
     assert_eq!(only::<ToolbarState>(app), toolbar);
     assert_eq!(app.world().get::<ToolbarState>(toolbar).unwrap().0, 73);
+    assert_eq!(app.world().get::<ToolbarState>(toolbar).unwrap().1.as_ref(), observed_router(app).active().location());
     assert_eq!(
         app.world().get::<ChildOf>(anchor).map(ChildOf::parent),
         Some(layout)

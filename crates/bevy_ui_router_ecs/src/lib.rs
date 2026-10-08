@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod active_scope;
 mod activity;
 mod app_ext;
 #[cfg(test)]
@@ -23,6 +24,7 @@ mod plugin;
 mod presentation;
 mod registry;
 mod retained;
+mod route_inputs;
 mod scroll;
 mod snapshots;
 #[cfg(test)]
@@ -40,6 +42,7 @@ pub use bsn::AppBsnExt;
 pub use input::RouterInputGate;
 pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterNavigation};
 pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet};
+pub use route_inputs::RouteInputs;
 pub use scroll::RouteScroll;
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
 
@@ -48,9 +51,10 @@ pub mod prelude {
     pub use crate::AppBsnExt;
     pub use crate::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteScroll, RouterConfig,
-        RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterSnapshot,
-        RouterSnapshots, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
+        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
     };
 }

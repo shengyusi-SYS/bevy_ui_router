@@ -4,6 +4,7 @@ use crate::ids::RouteId;
 use crate::location::RouteLocation;
 use crate::request::NavigationFailure;
 
+/// Owned snapshot passed to a fresh view factory. It never changes after build.
 pub struct RouteViewInput {
     location: RouteLocation,
     route: Option<RouteId>,
@@ -56,6 +57,41 @@ impl RouteViewInput {
 
     pub fn failure(&self) -> Option<&NavigationFailure> {
         self.failure.as_ref()
+    }
+}
+
+/// Borrowed, renderer-neutral input for one currently published active frame.
+///
+/// This grants no lifecycle or publication authority. Copy application data out
+/// before mutating the World; the reference cannot outlive its query borrow.
+#[derive(Clone, Copy)]
+pub struct RouteInputRef<'a> {
+    input: &'a RouteViewInput,
+}
+
+impl<'a> RouteInputRef<'a> {
+    pub(crate) const fn new(input: &'a RouteViewInput) -> Self {
+        Self { input }
+    }
+
+    pub fn location(&self) -> &'a RouteLocation {
+        self.input.location()
+    }
+
+    pub fn route(&self) -> Option<RouteId> {
+        self.input.route()
+    }
+
+    pub fn params(&self) -> &'a RouteParams {
+        self.input.params()
+    }
+
+    pub fn origin(&self) -> &'a FrameOrigin {
+        self.input.origin()
+    }
+
+    pub fn failure(&self) -> Option<&'a NavigationFailure> {
+        self.input.failure()
     }
 }
 

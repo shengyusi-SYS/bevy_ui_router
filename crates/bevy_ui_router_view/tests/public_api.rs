@@ -1,7 +1,31 @@
-use bevy_ui_router_core::prelude::{RouteViewInput, RouteViewKey};
+use bevy_ui_router_core::prelude::{
+    FrameOrigin, NavigationFailure, RouteId, RouteInputRef, RouteLocation, RouteParams,
+    RouteViewInput, RouteViewKey,
+};
 use bevy_ui_router_view::{
     RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey, ViewRequestId,
 };
+
+#[test]
+fn current_input_ref_is_a_borrowed_renderer_neutral_projection() {
+    fn project<'a>(
+        input: RouteInputRef<'a>,
+    ) -> (
+        &'a RouteLocation,
+        &'a RouteParams,
+        &'a FrameOrigin,
+        Option<&'a NavigationFailure>,
+    ) {
+        let _: Option<RouteId> = input.route();
+        (
+            input.location(),
+            input.params(),
+            input.origin(),
+            input.failure(),
+        )
+    }
+    let _ = project;
+}
 
 #[test]
 fn final_view_registry_and_effect_types_are_public_without_authority() {

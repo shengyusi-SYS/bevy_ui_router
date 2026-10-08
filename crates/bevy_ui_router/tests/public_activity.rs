@@ -13,6 +13,9 @@ struct AppWork {
     page: u32,
     ticks: usize,
     active: bool,
+    factory_location: Option<RouteLocation>,
+    current_location: Option<RouteLocation>,
+    current_params: Option<RouteParams>,
 }
 
 impl AppWork {
@@ -22,18 +25,41 @@ impl AppWork {
             page,
             ticks: 0,
             active: false,
+            factory_location: None,
+            current_location: None,
+            current_params: None,
         }
     }
 }
 
 // This is an ordinary application system with mutable application state. The
 // Router query must not borrow all components or depend on input eligibility.
-fn perform_active_work(activity: RouteActivity, mut work: Query<(Entity, &mut AppWork)>) {
+fn perform_active_work(
+    activity: RouteActivity,
+    inputs: RouteInputs,
+    mut work: Query<(Entity, &mut AppWork)>,
+) {
     for (entity, mut work) in &mut work {
         work.active = activity.is_active(entity);
+        let input = inputs.current(entity);
+        assert_eq!(
+            input.is_some(),
+            work.active,
+            "activity and inputs must share exact qualification for {entity}"
+        );
+        work.current_location = input.as_ref().map(|input| input.location().clone());
+        work.current_params = input.as_ref().map(|input| input.params().clone());
         if work.active {
             work.ticks += 1;
         }
+    }
+}
+
+fn observe_current_inputs(inputs: RouteInputs, mut work: Query<(Entity, &mut AppWork)>) {
+    for (entity, mut work) in &mut work {
+        let current = inputs.current(entity);
+        work.current_location = current.as_ref().map(|input| input.location().clone());
+        work.current_params = current.as_ref().map(|input| input.params().clone());
     }
 }
 
@@ -41,6 +67,7 @@ struct PageScene {
     router: &'static str,
     page: u32,
     outlet: bool,
+    factory_location: RouteLocation,
 }
 
 impl Scene for PageScene {
@@ -53,7 +80,9 @@ impl Scene for PageScene {
         let children = root.get_or_insert_related_resolved_scenes::<ChildOf>();
         let mut background = ResolvedScene::default();
         // A non-visual content entity still belongs to the active page.
-        background.push_template(AppWork::new(self.router, self.page));
+        let mut work = AppWork::new(self.router, self.page);
+        work.factory_location = Some(self.factory_location);
+        background.push_template(work);
         children.scenes.push(background);
         if self.outlet {
             let mut outlet = ResolvedScene::default();
@@ -81,6 +110,7 @@ fn install_router(app: &mut App, name: &'static str) -> (RouterHandle, Entity) {
                         input.params().get("id").unwrap_or("99").parse().unwrap()
                     },
                     outlet,
+                    factory_location: input.location().clone(),
                 })
             })
             .unwrap();
@@ -93,7 +123,7 @@ fn install_router(app: &mut App, name: &'static str) -> (RouterHandle, Entity) {
     }
     let mut routes = RouteTree::builder()
         .root_with_options(
-            RoutePattern::path("/").unwrap(),
+            RoutePattern::path("/orgs/:org").unwrap(),
             RouteNodeOptions::new()
                 .with_view(RouteViewKey::new(format!("activity-{name}-layout")).unwrap()),
         )
@@ -133,7 +163,7 @@ fn navigate(app: &mut App, router: RouterHandle, id: u32) {
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new(format!("/items/{id}")))
+        .push(router, RouteLocation::new(format!("/orgs/7/items/{id}")))
         .unwrap();
     for _ in 0..16 {
         app.update();
@@ -162,6 +192,114 @@ fn target(app: &mut App, router: &'static str, page: u32) -> Entity {
 
 fn work(app: &App, target: Entity) -> &AppWork {
     app.world().get::<AppWork>(target).unwrap()
+}
+
+#[test]
+fn current_inputs_update_preserved_content_without_replacing_factory_snapshot() {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+        BevyUiRouterPlugin,
+    ));
+    app.add_systems(
+        Update,
+        observe_current_inputs.after(RouterScheduleSet::PublishSnapshots),
+    );
+    let (router, host) = install_router(&mut app, "inputs");
+    app.update();
+    navigate(&mut app, router, 1);
+    let parent = target(&mut app, "inputs", 0);
+    let old_leaf = target(&mut app, "inputs", 1);
+    let first = RouteLocation::new("/orgs/7/items/1");
+    assert_eq!(work(&app, parent).current_location.as_ref(), Some(&first));
+    assert_eq!(
+        work(&app, parent)
+            .current_params
+            .as_ref()
+            .unwrap()
+            .get("org"),
+        Some("7")
+    );
+    assert_eq!(
+        work(&app, parent)
+            .current_params
+            .as_ref()
+            .unwrap()
+            .get("id"),
+        None
+    );
+    assert_eq!(
+        work(&app, old_leaf)
+            .current_params
+            .as_ref()
+            .unwrap()
+            .get("id"),
+        Some("1")
+    );
+    assert_eq!(
+        work(&app, old_leaf)
+            .current_params
+            .as_ref()
+            .unwrap()
+            .get("org"),
+        None
+    );
+    assert!(work(&app, host).current_location.is_none());
+
+    navigate(&mut app, router, 2);
+    let leaf = target(&mut app, "inputs", 2);
+    let second = RouteLocation::new("/orgs/7/items/2");
+    assert_eq!(target(&mut app, "inputs", 0), parent);
+    assert_eq!(work(&app, parent).current_location.as_ref(), Some(&second));
+    assert_eq!(work(&app, leaf).current_location.as_ref(), Some(&second));
+    assert_eq!(
+        work(&app, leaf).current_params.as_ref().unwrap().get("id"),
+        Some("2")
+    );
+    assert_eq!(work(&app, parent).factory_location.as_ref(), Some(&first));
+    assert!(work(&app, old_leaf).current_location.is_none());
+}
+
+#[test]
+fn nearest_inactive_registered_boundary_never_borrows_active_ancestor_inputs() {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+        BevyUiRouterPlugin,
+    ));
+    let (router, _) = install_router(&mut app, "boundary");
+    app.update();
+    navigate(&mut app, router, 1);
+    let old_leaf = target(&mut app, "boundary", 1);
+    let old_root = app.world().get::<ChildOf>(old_leaf).unwrap().parent();
+    navigate(&mut app, router, 2);
+    let active_leaf = target(&mut app, "boundary", 2);
+    let active_root = app.world().get::<ChildOf>(active_leaf).unwrap().parent();
+    // A current ancestry path to active content is not ownership qualification.
+    // Query immediately, before observation/cleanup can repair the changed edge.
+    app.world_mut()
+        .entity_mut(old_root)
+        .insert(ChildOf(active_root));
+    let dynamic = app
+        .world_mut()
+        .spawn((AppWork::new("boundary", 101), ChildOf(old_root)))
+        .id();
+    app.world_mut()
+        .run_system_once(perform_active_work)
+        .unwrap();
+    assert!(!work(&app, old_leaf).active);
+    assert!(!work(&app, dynamic).active);
+    assert!(work(&app, old_leaf).current_location.is_none());
+    assert!(work(&app, dynamic).current_location.is_none());
+    assert!(work(&app, active_leaf).active);
+    assert_eq!(
+        work(&app, active_leaf).current_location.as_ref(),
+        Some(&RouteLocation::new("/orgs/7/items/2"))
+    );
 }
 
 #[test]
@@ -210,7 +348,27 @@ fn application_query_tracks_active_content_retention_and_exact_router_host() {
     assert_eq!(work(&app, a).ticks, inactive_ticks);
     assert!(!work(&app, inactive_dynamic).active);
     assert!(work(&app, active_dynamic).active);
+    assert_eq!(
+        work(&app, active_dynamic)
+            .current_params
+            .as_ref()
+            .unwrap()
+            .get("id"),
+        Some("2")
+    );
+    assert_eq!(
+        work(&app, active_dynamic)
+            .current_params
+            .as_ref()
+            .unwrap()
+            .get("org"),
+        None
+    );
     assert!(work(&app, other_router).active);
+    assert_eq!(
+        work(&app, other_router).current_location.as_ref(),
+        Some(&RouteLocation::new("/orgs/7/items/7"))
+    );
 
     navigate(&mut app, first, 1);
     assert_eq!(target(&mut app, "first", 1), a);

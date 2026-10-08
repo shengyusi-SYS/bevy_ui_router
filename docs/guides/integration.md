@@ -151,6 +151,25 @@ fn update_pages(activity: RouteActivity, mut pages: Query<(Entity, &mut PageStat
 
 activity 的范围和调度见[输入与活动合同](../contracts/input-focus.md#页面活动查询)；它可以与应用的可变组件查询共用，隐藏不会自动暂停系统。输入资格仍使用下面的专用 gate。完整用法见[公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs)。
 
+保留的布局或缓存命中的页面若需要本次路由位置，使用 `RouteInputs`，不要读取上次 factory 的 `RouteViewInput` 当作当前输入：
+
+```rust
+fn update_route_labels(inputs: RouteInputs, mut labels: Query<(Entity, &mut Text)>) {
+    for (entity, mut text) in &mut labels {
+        if let Some(input) = inputs.current(entity) {
+            text.0 = input.location().path().to_owned();
+        }
+    }
+}
+
+app.add_systems(
+    Update,
+    update_route_labels.after(RouterScheduleSet::PublishSnapshots),
+);
+```
+
+`RouteInputs` 和中立借用类型 `RouteInputRef` 从 facade/prelude 导入。`params()` 为所属 frame 的 route-local 参数，不自动合并祖先参数；`location()` 包含完整 path/search/fragment。错误呈现的 `failure()` 和 `origin()` 按该 frame 定义，正常前缀的 failure 仍为 None；fallback 的 `route()` 为 None、params 为空。非活动或失效归属返回 None，范围与 `RouteActivity` 相同。这是只读观察，不推进生命周期，也不替代输入 gate；跨 World mutation/await 前复制所需普通值。真实 Scene consumer 见[独立 BSN 消费者](../../crates/bevy_ui_router/tests/consumers/bsn.rs)。
+
 标准 UI pointer 使用原生 UI picking。Router 在正常提交和后续输入刷新时维护
 非活动内容隔离，并撤销历史手势状态；应用无需另建一套 pointer 路由。
 运行时新增、隐藏或移动内容，应在输入刷新前完成，供当前 containment 判断使用。

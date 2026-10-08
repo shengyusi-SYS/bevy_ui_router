@@ -1,6 +1,6 @@
 # 实例协调与当前路由输入
 
-状态：设计草案，未实施。本文定义待改变的行为与跨层接缝；现行行为仍见[导航合同](../../contracts/navigation.md)、[Scene 合同](../../contracts/scene.md)和[生命周期合同](../../contracts/lifecycle.md)。执行拆分见[实施计划](plan.md)，选型原因与其它专题见[长期评估](../navigation-experience/assessment.md)。
+状态：当前只读输入已实现并通过完整门禁；父实例保留、独立子库存与依赖淘汰仍为待实施设计。本文定义本专题的行为与跨层接缝；现行行为见[导航合同](../../contracts/navigation.md)、[Scene 合同](../../contracts/scene.md)和[生命周期合同](../../contracts/lifecycle.md)。执行拆分见[实施计划](plan.md)，选型原因与其它专题见[长期评估](../navigation-experience/assessment.md)。
 
 ## 目标与范围
 
@@ -60,7 +60,7 @@
 
 ## 当前只读输入接缝
 
-拟新增 renderer-neutral 的 `RouteInputRef<'a>` 借用视图，以及 ECS 只读 SystemParam。以下是待实现接口，当前源码尚未提供：
+已实现 renderer-neutral 的 `RouteInputRef<'a>` 借用视图，以及 ECS 只读 SystemParam。以下是第 1 步公共接口：
 
 ```rust
 impl RouteInputs<'_, '_> {

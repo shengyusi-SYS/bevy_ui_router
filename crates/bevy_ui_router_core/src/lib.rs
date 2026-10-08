@@ -67,7 +67,7 @@ pub mod prelude {
     pub use crate::trace::{
         CleanupDisposition, MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind,
     };
-    pub use crate::view_input::RouteViewInput;
+    pub use crate::view_input::{RouteInputRef, RouteViewInput};
     pub use crate::view_key::{RouteViewKey, RouteViewKeyError};
     pub use crate::{
         CleanupSummary, HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion,

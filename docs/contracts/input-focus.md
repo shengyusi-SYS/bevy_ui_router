@@ -24,8 +24,10 @@ pending Scene 的 `InputFocus::set`/AutoFocus 只形成候选，不授予权限�
 
 facade/prelude 的 `RouteActivity` SystemParam 提供 `is_active(Entity)`，用于应用决定页面 timer、Query 或其他后台工作是否执行。它读取已发布 active assignment、最近已登记边界的 exact claim、同一 host registration incarnation 和当前内容挂载/containment；cached、pending、leaving、failed、quarantine 与无关 app-owned host 返回 false，不能借活动父布局获得资格。
 
-普通原生页面后代和非交互 Entity 也可查询。该参数只读取 Router 元数据与相关层级组件，可与应用自己的 `Query<(Entity, &mut T)>` 共用；本轮 publication 后的活动状态可在 `RouterScheduleSet::PublishSnapshots` 之后读取。
+`RouteInputs::current(Entity)` 与 `RouteActivity` 共用 exact active-frame 解析，返回该 frame 的借用 `RouteInputRef`；不存在有效活动归属时返回 None。两者还核对 Core 为 Ready 且 exact frame 仍在逻辑 active 集合中，不把尚未清理的物理内容当作活动页面。遇到最近已登记的非活动或失效边界即拒绝，不继续向 active 祖先借资格；其它 Router 的有效内容按自身 scope 读取。
+
+普通原生页面后代和非交互 Entity 也可查询，目标无需附加路由组件。两个参数只读取 Router 元数据与相关层级组件，可与应用自己的 `Query<(Entity, &mut T)>` 共用；本轮 publication 后的活动状态与输入可在 `RouterScheduleSet::PublishSnapshots` 之后读取。输入引用仅在 SystemParam 借用期间有效，跨 World mutation 或 await 前须复制普通数据；不提供 lifecycle 或 publication 权限。字段和发布语义见[导航合同](navigation.md#匹配与-location-更新)。
 
 activity 独立于 authored visibility 和输入资格，也不是完整 frame-local 内容健康检查。Router 不会因隐藏缓存而暂停应用系统、observer 或任意副作用；应用选择是否执行自己的工作。pointer/keyboard/gamepad 仍遵守上面的输入边界，不以 activity 查询替代 gate。
 
-实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[activity](../../crates/bevy_ui_router_ecs/src/activity.rs) 与 [公开调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。
+实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[activity](../../crates/bevy_ui_router_ecs/src/activity.rs)、[当前输入](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) 与 [公开调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。

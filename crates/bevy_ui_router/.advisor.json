@@ -1,0 +1,14 @@
+{
+  "id": "public-consumer",
+  "include": [
+    "../../AGENTS.md",
+    "../../docs/changes/instance-coordination/*.md",
+    "../../docs/contracts/{navigation,input-focus,scene}.md",
+    "../../docs/guides/integration.md",
+    "../../docs/development/verification.md",
+    "../bevy_ui_router_view/tests/public_api.rs",
+    "../bevy_ui_router_ecs/src/{activity,route_inputs}.rs",
+    "../bevy_ui_router_core/src/view_input.rs"
+  ],
+  "responsibility": "公开facade/consumer验收、父子输入与factory快照、动态后代及应用mutable Query共存，核对文档与真实接入。内部生命周期实现不在本范围，不由高层绿色测试推定完整owner证明。"
+}

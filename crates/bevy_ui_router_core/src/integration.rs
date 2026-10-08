@@ -204,7 +204,7 @@ use crate::request::{
 use crate::route_tree::RouteTree;
 use crate::slot::RouteSlotKey;
 use crate::trace::{CleanupDisposition, MountRejectionKind, NavigationTraceEvent};
-use crate::view_input::RouteViewInput;
+use crate::view_input::{RouteInputRef, RouteViewInput};
 use crate::view_key::RouteViewKey;
 use crate::{
     HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion,
@@ -10226,6 +10226,14 @@ impl RouterEngine {
 
     pub fn active(&self) -> &ActivePresentation {
         self.inner.active()
+    }
+
+    pub fn availability(&self) -> &RouterAvailability {
+        self.inner.availability()
+    }
+
+    pub fn current_input(&self, frame: &RouteFrameVersion) -> Option<RouteInputRef<'_>> {
+        self.inner.current_input(frame)
     }
 
     #[doc(hidden)]

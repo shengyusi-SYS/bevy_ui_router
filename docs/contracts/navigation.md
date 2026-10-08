@@ -22,7 +22,11 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 | 仅 fragment 变化 | 保留祖先，重建最深 normal frame；frame/slot 身份保持，generation 推进 |
 | canonical path/search/fragment 全部等价 | normal presentation 保持原结构，history 仍按命令语义提交；显式滚动恢复可写入位置 |
 
-新建或重建 view 得到本次 input。保留 layout 和命中的 cached leaf 不重新调用 factory，其局部内容维持原状态；active snapshot 的 location 更新不表示历史 factory input 被原位更新。
+新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留 layout 和命中的 cached leaf 不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用通过 `RouteInputs::current(Entity)` 读取所属 active frame 的本次已发布输入，而不是把旧 factory 快照当作当前值。
+
+`RouteInputRef` 提供 `route()`、`params()`、`location()`、`origin()`、`failure()` 五个只读 getters；search/fragment 经 `location()` 读取。每层 params 仅属于该 route，完整 location 属于本次 presentation。normal frame 的 failure 为 None；route-error frame 使用错误边界 route/local params 和原 failure，正常前缀不继承 failure；router fallback 的 route 为 None、params 为空、failure 为原失败。error/fallback location 是失败请求位置，不能从未推进的成功 history 反推。
+
+每次 publication 同时切换目标各层输入，包括 preserved 和缓存命中的内容。pending/stale/rejected 工作不改旧 active 输入，非活动内容不能读取当前值；发布后即可读取新值，不等请求 terminal。结构 no-op 不为输入更新增加物理写入。Entity 查询范围与借用边界见[页面活动查询](input-focus.md#页面活动查询)。
 
 active error presentation 不走 normal 等价导航优化。复用判定包含路由树 provenance、route/slot/explicit key 等身份，不能只比较路径字符串。
 
