@@ -25,6 +25,30 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 
 先比较相同工作下的绝对 p50/p95、update 数与波动，再决定 profile 或重构。CI 仅运行上述 smoke，不设置共享机器上的耗时阈值。
 
+## Keep-alive 对照
+
+使用同一 benchmark 的独立模式；不改变默认模式的 48 行 CSV，也不把旧 `retained_requests` 列当作缓存实例数：
+
+```sh
+ROUTER_BENCH_MODE=keep_alive cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > keep-alive-flat.csv
+ROUTER_BENCH_MODE=keep_alive ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > keep-alive-nested.csv
+```
+
+行为 smoke 使用相同环境变量与 `cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test`。样本数仍由 `ROUTER_BENCH_SAMPLES` 控制；正式比较至少重复两轮，同一轮记录 flat/nested 的完整输出和构建身份。每种形状输出 24 行，覆盖相同的 1/32/128 内容预算。
+
+| 场景前缀 | 真实工作与计时外检查 |
+| --- | --- |
+| `disabled` | 默认容量 0、路由不 opt-in，a/b 连续 Replace；每次 factory 调用一次，旧 Page 消失 |
+| `miss` | 容量 2，a→b 首次 Replace miss；每次样本前在计时外离开父 scope 再建立 a，避免混入容量淘汰；一次 factory 调用、一个 inactive Page |
+| `hit` | 容量 2，预热后 a/b 连续 Replace 往返；原 Page Entity 复用，计时操作不调用 factory |
+| `lru` | 容量 2，a/b/c/d 四页循环 Replace；容量满后每次 fresh 构建并淘汰最旧 inactive 实例，其余两个实例保留 |
+
+每组输出 `*_replace` 与 `*_idle`。导航计时仍包含 enqueue 到请求终态、`running_request=None` 和 foreground cleanup 清空；idle 沿用每样本 32 次 update 的均值。所有场景使用同一个内容 builder 和 `/:section` 父路由，父参数在往返期间不变；初始化、预热、miss 的父 scope 重置和详细断言在计时外。
+
+独立 CSV 报告 `capacity`、`live_entities`、`active_pages`、`inactive_pages` 与 `factory_builds`。页面及内容的 activity census 通过公共 `RouteActivity` 读取，另核对输入资格、稳定实体总数、history 仅一项、父布局/工具栏身份与局部状态。`factory_builds` 只累计计时导航中的 factory 调用，不包含初始化、预热或 miss 重置；对应 idle 为 0。每组结束再次离开父 scope，确认原 Page/Content Entity 与旧父布局均已释放，app-owned host 仍存在。
+
+这些列观察 authored 页面、内容和活实体；不测 heap，也不暴露或推定 Core 内部 owner 数量。导航与 idle 的差异包含相应驻留内容和公开 Router 机制，不能单凭时间差归因到某个内部步骤。该模式同样没有 UI layout、GPU、窗口或 I/O。
+
 ## 计时边界
 
 Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `App::update` 和 snapshots 驱动。路由树固定为父布局及两个子路由，页面含 1/32/128 个 authored `Node + Content` 子节点，另有布局、工具栏和内部 outlet。它不测路由表规模。

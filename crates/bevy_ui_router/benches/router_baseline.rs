@@ -1,11 +1,18 @@
 //! Public-API, headless Router CPU-side elapsed-time baseline. See docs/performance.md.
 //! No renderer, UI layout, OS events, async I/O, or frame pacing is installed.
 //! ROUTER_BENCH_SHAPE=flat (default) or nested selects equal-sized content trees.
-use std::time::{Duration, Instant};
+//! ROUTER_BENCH_MODE=keep_alive selects the separate retention comparison CSV.
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use bevy_app::{App, TaskPoolPlugin};
 use bevy_asset::AssetPlugin;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{prelude::*, system::RunSystemOnce};
 use bevy_scene::{ResolvedScene, SceneFunction, ScenePlugin, bsn};
 use bevy_ui::Node;
 use bevy_ui_router::prelude::*;
@@ -132,6 +139,7 @@ struct Fixture {
     content: usize,
     shape: ContentShape,
     issued: Vec<NavigationRequestId>,
+    factory_calls: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,7 +157,13 @@ struct Sample {
 
 impl Fixture {
     fn new(content: usize, shape: ContentShape) -> Self {
+        Self::configured(content, shape, None)
+    }
+
+    fn configured(content: usize, shape: ContentShape, capacity: Option<usize>) -> Self {
         let mut app = base_app();
+        let factory_calls = capacity.map(|_| Arc::new(AtomicUsize::new(0)));
+        let page_calls = factory_calls.clone();
         let layout = app
             .register_bsn_view(ViewDriverKey::new("layout").unwrap(), |_| {
                 Ok(bsn! { Node Layout Children [(Node Toolbar(73)), (Node DefaultOutlet)] })
@@ -157,6 +171,9 @@ impl Fixture {
             .unwrap();
         let page = app
             .register_bsn_view(ViewDriverKey::new("page").unwrap(), move |input| {
+                if let Some(calls) = &page_calls {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                }
                 let id = input.params().get("id").unwrap().to_owned();
                 Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
                     root.push_template(Node::default());
@@ -205,27 +222,30 @@ impl Fixture {
         }
         let mut routes = RouteTree::builder()
             .root_with_options(
-                RoutePattern::path("/").unwrap(),
+                RoutePattern::path(if capacity.is_some() { "/:section" } else { "/" }).unwrap(),
                 RouteNodeOptions::new().with_view(layout_key),
             )
             .unwrap();
         let root = routes.root_id().unwrap();
-        for (path, key) in [("items/:id", "page"), ("broken", "broken")] {
+        let page_pattern = if capacity.is_some() {
+            ":id"
+        } else {
+            "items/:id"
+        };
+        for (path, key) in [(page_pattern, "page"), ("broken", "broken")] {
+            let mut options = RouteNodeOptions::new().with_view(RouteViewKey::new(key).unwrap());
+            if key == "page" && capacity.is_some_and(|capacity| capacity > 0) {
+                options = options.with_keep_alive(true);
+            }
             routes
-                .route_with_options(
-                    root,
-                    RoutePattern::path(path).unwrap(),
-                    RouteNodeOptions::new().with_view(RouteViewKey::new(key).unwrap()),
-                )
+                .route_with_options(root, RoutePattern::path(path).unwrap(), options)
                 .unwrap();
         }
-        let router = app
-            .add_ui_router(RouterConfig::new(
-                routes.build().unwrap(),
-                views,
-                fallback_key,
-            ))
-            .unwrap();
+        let mut config = RouterConfig::new(routes.build().unwrap(), views, fallback_key);
+        if let Some(capacity) = capacity.filter(|capacity| *capacity > 0) {
+            config = config.with_keep_alive_capacity(capacity);
+        }
+        let router = app.add_ui_router(config).unwrap();
         let host = app
             .world_mut()
             .spawn((Node::default(), RouterHostRegistration::new(router)))
@@ -238,6 +258,7 @@ impl Fixture {
             content,
             shape,
             issued: Vec::new(),
+            factory_calls,
         };
         fixture.navigate(Action::Push, "/items/a", false);
         fixture.assert_page("a", 1, 0);
@@ -440,14 +461,7 @@ fn idle(app: &mut App, samples: usize) -> Vec<Sample> {
         .collect()
 }
 
-fn report(
-    name: &str,
-    content: usize,
-    batch: usize,
-    samples: &[Sample],
-    live: u32,
-    retained: usize,
-) {
+fn timing_columns(samples: &[Sample]) -> String {
     let mut times = samples
         .iter()
         .map(|s| s.elapsed.as_secs_f64() * 1e6)
@@ -456,14 +470,250 @@ fn report(
     let percentile = |p: usize| times[(times.len() * p).div_ceil(100) - 1];
     let min_updates = samples.iter().map(|s| s.updates).min().unwrap();
     let max_updates = samples.iter().map(|s| s.updates).max().unwrap();
-    println!(
-        "{name},{content},{batch},{},{:.3},{:.3},{:.3},{:.3},{min_updates},{max_updates},{live},{retained}",
+    format!(
+        "{},{:.3},{:.3},{:.3},{:.3},{min_updates},{max_updates}",
         samples.len(),
         times.iter().sum::<f64>() / times.len() as f64,
         percentile(50),
         percentile(95),
         times.last().unwrap()
+    )
+}
+
+fn report(
+    name: &str,
+    content: usize,
+    batch: usize,
+    samples: &[Sample],
+    live: u32,
+    retained: usize,
+) {
+    println!(
+        "{name},{content},{batch},{},{live},{retained}",
+        timing_columns(samples)
     );
+}
+
+struct PageCensus {
+    pages: Vec<(Entity, bool)>,
+    active_content: usize,
+    inactive_content: usize,
+    live: u32,
+}
+
+impl PageCensus {
+    fn active_page(&self) -> Entity {
+        self.pages.iter().find(|(_, active)| *active).unwrap().0
+    }
+    fn inactive_pages(&self) -> usize {
+        self.pages.iter().filter(|(_, active)| !active).count()
+    }
+}
+
+impl Fixture {
+    fn factory_count(&self) -> usize {
+        self.factory_calls.as_ref().unwrap().load(Ordering::Relaxed)
+    }
+
+    fn census(&mut self, id: &str, inactive: usize) -> PageCensus {
+        let (pages, active_content, inactive_content) = self
+            .app
+            .world_mut()
+            .run_system_once(
+                |activity: RouteActivity,
+                 pages: Query<Entity, With<Page>>,
+                 content: Query<Entity, With<Content>>| {
+                    let pages = pages
+                        .iter()
+                        .map(|entity| (entity, activity.is_active(entity)))
+                        .collect::<Vec<_>>();
+                    let active_content = content
+                        .iter()
+                        .filter(|entity| activity.is_active(*entity))
+                        .count();
+                    (
+                        pages,
+                        active_content,
+                        content.iter().count() - active_content,
+                    )
+                },
+            )
+            .unwrap();
+        let census = PageCensus {
+            pages,
+            active_content,
+            inactive_content,
+            live: self.app.world().entities().count_spawned(),
+        };
+        assert_eq!(census.pages.len(), inactive + 1);
+        assert_eq!(census.inactive_pages(), inactive);
+        assert_eq!(census.active_content, self.content);
+        assert_eq!(census.inactive_content, self.content * inactive);
+        let active = census.active_page();
+        assert_eq!(self.app.world().get::<Page>(active).unwrap().0, id);
+        let gate = self.app.world().resource::<RouterInputGate>();
+        for (entity, active) in &census.pages {
+            assert_eq!(gate.allows_keyboard(*entity), *active);
+        }
+        let snapshot = self.snapshot();
+        let location = RouteLocation::new(format!("/items/{id}"));
+        assert_eq!(snapshot.active().location(), Some(&location));
+        assert_eq!(snapshot.history().current(), Some(&location));
+        assert_eq!(snapshot.history().entries().len(), 1);
+        assert_eq!(snapshot.history().cursor(), Some(0));
+        census
+    }
+
+    fn release_parent_scope(&mut self) {
+        let old = self
+            .app
+            .world_mut()
+            .query_filtered::<Entity, Or<(With<Page>, With<Content>)>>()
+            .iter(self.app.world())
+            .collect::<Vec<_>>();
+        let layout = only::<Layout>(&mut self.app);
+        self.navigate(Action::Replace, "/outside", false);
+        assert!(
+            old.into_iter()
+                .all(|entity| self.app.world().get_entity(entity).is_err())
+        );
+        assert!(self.app.world().get_entity(layout).is_err());
+        assert_eq!(
+            self.app
+                .world_mut()
+                .query_filtered::<Entity, Or<(With<Page>, With<Content>)>>()
+                .iter(self.app.world())
+                .count(),
+            0
+        );
+        assert!(self.app.world().get_entity(self.host).is_ok());
+    }
+}
+
+fn report_keep_alive(
+    name: &str,
+    content: usize,
+    capacity: usize,
+    samples: &[Sample],
+    census: &PageCensus,
+    builds: usize,
+) {
+    println!(
+        "{name},{content},{capacity},{},{},1,{},{builds}",
+        timing_columns(samples),
+        census.live,
+        census.inactive_pages()
+    );
+}
+
+fn keep_alive(content: usize, shape: ContentShape, samples: usize) {
+    for (name, capacity, ids, inactive) in [
+        ("disabled", 0, &["b", "a"][..], 0),
+        ("miss", 2, &["b"][..], 1),
+        ("hit", 2, &["b", "a"][..], 1),
+        ("lru", 2, &["b", "c", "d", "a"][..], 2),
+    ] {
+        let mut fixture = Fixture::configured(content, shape, Some(capacity));
+        let mut values = Vec::with_capacity(samples);
+        let mut builds = 0;
+        let mut stable_live = None;
+        for index in 0..WARMUP_CYCLES + samples {
+            if name == "miss" && index != 0 {
+                // A first miss is measured separately from full-capacity eviction.
+                fixture.release_parent_scope();
+                fixture.navigate(Action::Replace, "/items/a", false);
+            }
+            let id = ids[index % ids.len()];
+            let previous = fixture
+                .app
+                .world_mut()
+                .query::<(Entity, &Page)>()
+                .iter(fixture.app.world())
+                .map(|(entity, page)| (entity, page.0.clone()))
+                .collect::<Vec<_>>();
+            let layout = only::<Layout>(&mut fixture.app);
+            let toolbar = only::<Toolbar>(&mut fixture.app);
+            let before_builds = fixture.factory_count();
+            let sample = fixture.navigate(Action::Replace, &format!("/items/{id}"), false);
+            let built = fixture.factory_count() - before_builds;
+            let census = fixture.census(id, inactive.min(index + 1));
+            assert_eq!(only::<Layout>(&mut fixture.app), layout);
+            assert_eq!(only::<Toolbar>(&mut fixture.app), toolbar);
+            assert_eq!(fixture.app.world().get::<Toolbar>(toolbar).unwrap().0, 73);
+            if name == "hit" && index > 0 {
+                assert_eq!(built, 0);
+                let original = previous.iter().find(|(_, page)| page == id).unwrap().0;
+                assert_eq!(census.active_page(), original);
+            } else {
+                assert_eq!(built, 1);
+                assert!(
+                    previous
+                        .iter()
+                        .all(|(entity, _)| *entity != census.active_page())
+                );
+            }
+            if name == "disabled" {
+                assert!(
+                    previous.iter().all(|(entity, _)| fixture
+                        .app
+                        .world()
+                        .get_entity(*entity)
+                        .is_err())
+                );
+            }
+            if name == "lru" && index >= 2 {
+                let oldest_id = ids[(index + 1) % ids.len()];
+                let oldest = previous.iter().find(|(_, id)| id == oldest_id).unwrap().0;
+                assert!(fixture.app.world().get_entity(oldest).is_err());
+                assert_eq!(previous.len(), 3);
+                assert_eq!(
+                    previous
+                        .iter()
+                        .filter(|(entity, _)| fixture.app.world().get_entity(*entity).is_err())
+                        .count(),
+                    1
+                );
+                // The other two instances survive the selected oldest eviction.
+                assert_eq!(
+                    census
+                        .pages
+                        .iter()
+                        .filter(|(entity, _)| previous.iter().any(|(old, _)| old == entity))
+                        .count(),
+                    2
+                );
+            }
+            if index >= WARMUP_CYCLES {
+                assert_eq!(census.live, *stable_live.get_or_insert(census.live));
+                values.push(sample);
+                builds += built;
+            }
+        }
+        let current = ids[(WARMUP_CYCLES + samples - 1) % ids.len()];
+        let census = fixture.census(current, inactive);
+        report_keep_alive(
+            &format!("{name}_replace"),
+            content,
+            capacity,
+            &values,
+            &census,
+            builds,
+        );
+        let before_builds = fixture.factory_count();
+        let values = idle(&mut fixture.app, samples);
+        let after = fixture.census(current, inactive);
+        assert_eq!(after.live, census.live);
+        assert_eq!(fixture.factory_count(), before_builds);
+        report_keep_alive(
+            &format!("{name}_idle"),
+            content,
+            capacity,
+            &values,
+            &after,
+            0,
+        );
+        fixture.release_parent_scope();
+    }
 }
 
 fn main() {
@@ -498,6 +748,19 @@ fn main() {
             "CPU-side wall time, no GPU/layout/I/O"
         }
     );
+    match std::env::var("ROUTER_BENCH_MODE") {
+        Ok(mode) if mode == "keep_alive" => {
+            println!(
+                "scenario,content_children,capacity,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,active_pages,inactive_pages,factory_builds"
+            );
+            for content in [1, 32, 128] {
+                keep_alive(content, shape, samples);
+            }
+            return;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        mode => panic!("ROUTER_BENCH_MODE must be unset or keep_alive, got {mode:?}"),
+    }
     println!(
         "scenario,content_children,batch,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,retained_requests"
     );
