@@ -12622,7 +12622,29 @@ impl RouterEngine {
         let current = self
             .current
             .as_ref()
-            .expect("commit identity was validated");
+            .expect("commit identity was validated")
+            .clone_pre_retirement()
+            .ok_or(CommitError::Stale)?;
+        self.seal_prepared_commit_partition(ticket, seal, retention, current, None)
+    }
+
+    fn seal_prepared_commit_partition(
+        &mut self,
+        ticket: &CommitTicket,
+        seal: CleanupManifestSeal,
+        retention: Option<(
+            &retained::RetainedCommitPlan,
+            Vec<retained::RetainedRegistryEntry>,
+        )>,
+        mut current: CurrentWork,
+        next_record: Option<NavigationRequestRecord>,
+    ) -> Result<SealedCommit, CommitError> {
+        if current.stage != WorkStage::ReadyToCommit
+            || current.identity != ticket.identity
+            || !self.reconciliation_matches_active_for(&current)
+        {
+            return Err(CommitError::Stale);
+        }
         let expected_roots = retention
             .as_ref()
             .map_or(current.cleanup_roots.as_slice(), |(plan, _)| {
@@ -12632,7 +12654,11 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
 
-        let mut current = current.clone_pre_retirement().ok_or(CommitError::Stale)?;
+        let mut sealed_hit_current = if next_record.is_some() {
+            Some(current.clone_pre_retirement().ok_or(CommitError::Stale)?)
+        } else {
+            None
+        };
         if let Some((plan, _)) = &retention {
             // Only the independent next publication is changed. The observed
             // current remains intact on every preparation failure.
@@ -12655,23 +12681,27 @@ impl RouterEngine {
             debug_assert!(self.current_history_capability.is_none());
             None
         };
-        let mut publication =
-            match self.precompute_publication(current, cleanup.clone(), history_capability) {
-                Ok(publication) => publication,
-                Err(error) => {
-                    debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
-                    self.pending_history_preparation_error = Some(error);
-                    let failure = self.begin_failure_cleanup(
-                        PendingFailureKind::AuthorityLost,
-                        NavigationFailure::new(
-                            NavigationFailureKind::AuthorityLost,
-                            "canonical history source or execution binding drifted",
-                        ),
-                    );
-                    self.action = Some(EngineAction::FailureCleanup(failure));
-                    return Err(CommitError::Stale);
-                }
-            };
+        let mut publication = match self.precompute_publication(
+            current,
+            cleanup.clone(),
+            history_capability,
+            next_record.clone(),
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
+                self.pending_history_preparation_error = Some(error);
+                let failure = self.begin_failure_cleanup(
+                    PendingFailureKind::AuthorityLost,
+                    NavigationFailure::new(
+                        NavigationFailureKind::AuthorityLost,
+                        "canonical history source or execution binding drifted",
+                    ),
+                );
+                self.action = Some(EngineAction::FailureCleanup(failure));
+                return Err(CommitError::Stale);
+            }
+        };
         if let Some((plan, mut registry)) = retention {
             Self::bind_retained_retirements(&mut registry, plan, &cleanup);
             publication.retained_update = Some(registry);
@@ -12688,20 +12718,55 @@ impl RouterEngine {
                 .as_ref()
                 .map(PreparedHistoryPublication::source_revision),
         };
-        self.current
-            .as_mut()
-            .expect("current work was validated")
-            .stage = WorkStage::CommitSealed {
-            token: cleanup.clone(),
+        let mut hit_state = None;
+        let source = if let Some(current) = &mut sealed_hit_current {
+            current.stage = WorkStage::CommitSealed {
+                token: cleanup.clone(),
+            };
+            let mut state = self.state.clone();
+            state.set_request(Some(RequestStatus::Running(NavigationPhase::ReadyToSwitch)));
+            let source = self.observe_prepared_publication_source_from(
+                Some(current),
+                next_record.as_ref(),
+                &state,
+            );
+            hit_state = Some(state);
+            source
+        } else {
+            self.current
+                .as_mut()
+                .expect("current work was validated")
+                .stage = WorkStage::CommitSealed {
+                token: cleanup.clone(),
+            };
+            self.observe_prepared_publication_source(publication.record_index)
         };
-        let source = self.observe_prepared_publication_source(publication.record_index);
-        Ok(SealedCommit {
+        let sealed = SealedCommit {
             identity: ticket.identity.clone(),
             cleanup,
             publication,
             evidence,
             source,
-        })
+        };
+        if let Some(current) = sealed_hit_current {
+            // Validate the independently prepared receiver before installing it.
+            // No failure below this point may put the cached frame into the
+            // original fresh task's cleanup classification.
+            if !sealed.source.accepts(&sealed)
+                || sealed
+                    .publication
+                    .history
+                    .as_ref()
+                    .is_some_and(|history| !history.matches_canonical_source(&self.history))
+            {
+                return Err(self.retain_rejected_publication(sealed, CommitError::Stale));
+            }
+            self.current = Some(current);
+            self.records[sealed.publication.record_index] =
+                next_record.expect("a hit has its prepared record");
+            self.state = hit_state.expect("a hit has its prepared state");
+        }
+        Ok(sealed)
     }
 
     pub(crate) fn inspect_commit_identity(&self, ticket: &CommitTicket) -> Result<(), CommitError> {
@@ -12936,13 +13001,17 @@ impl RouterEngine {
         if let Err(error) = self.validate_prepared_publication_owner(&sealed) {
             return Err(self.retain_rejected_publication(sealed, error));
         }
+        Ok(self.install_prepared_publication(sealed))
+    }
+
+    fn install_prepared_publication(&mut self, sealed: SealedCommit) -> PreparedPublication {
         let evidence = sealed.evidence.clone();
         let history_publication = sealed.publication.history_publication.clone();
         self.prepared_publication_authority = Some(PreparedPublicationAuthority::Ready(sealed));
-        Ok(PreparedPublication {
+        PreparedPublication {
             evidence,
             history_publication,
-        })
+        }
     }
 
     fn validate_prepared_publication_owner(
@@ -13016,11 +13085,23 @@ impl RouterEngine {
         &self,
         record_index: usize,
     ) -> PreparedPublicationObservation {
-        let current = self.current.as_ref();
+        self.observe_prepared_publication_source_from(
+            self.current.as_ref(),
+            self.records.get(record_index),
+            &self.state,
+        )
+    }
+
+    fn observe_prepared_publication_source_from(
+        &self,
+        current: Option<&CurrentWork>,
+        record: Option<&NavigationRequestRecord>,
+        state: &RouterNavigationState,
+    ) -> PreparedPublicationObservation {
         PreparedPublicationObservation {
             identity: current.map(|current| current.identity.clone()),
             stage: current.map(|current| current.stage.projection()),
-            record: self.records.get(record_index).cloned(),
+            record: record.cloned(),
             history_revision: self.history.revision(),
             history_execution: current.and_then(|current| match &current.attempt {
                 AttemptKind::Normal(_) => Some(self.current_history_execution_projection(current)),
@@ -13032,10 +13113,10 @@ impl RouterEngine {
                 .map(|current| current.target_frames.clone())
                 .unwrap_or_default(),
             current_reconciliation: current.and_then(|current| current.reconciliation.clone()),
-            state: self.state.clone(),
-            host: self.state.host().cloned(),
-            top_slot: self.state.top_slot(),
-            active: self.state.active().clone(),
+            state: state.clone(),
+            host: state.host().cloned(),
+            top_slot: state.top_slot(),
+            active: state.active().clone(),
             active_branch: self.active_branch.clone(),
             active_child_slots: self.active_child_slots.clone(),
             retained_leaves: self.retained_leaves.clone(),
@@ -16022,6 +16103,7 @@ impl RouterEngine {
         mut current: CurrentWork,
         cleanup: CleanupBatchToken,
         history_capability: Option<HistoryCommitCapability>,
+        next_record: Option<NavigationRequestRecord>,
     ) -> Result<PublicationPlan, HistoryPreparationError> {
         let request = current.identity.request;
         let location = self
@@ -16071,7 +16153,8 @@ impl RouterEngine {
             .iter()
             .position(|record| record.id() == request)
             .expect("running record is retained");
-        let mut published_record = self.records[record_index].clone();
+        let mut published_record =
+            next_record.unwrap_or_else(|| self.records[record_index].clone());
         for frame in &current.applied_frames {
             published_record
                 .append_trace(NavigationTraceEvent::frame_activated(frame.clone()))

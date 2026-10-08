@@ -21,6 +21,7 @@ pub struct RetainedLeafProjection {
     segment_reuse_key: RouteSegmentReuseKey,
     view: RouteViewKey,
     location: RouteLocation,
+    empty_child_slots: Vec<LogicalChildSlotBinding>,
 }
 
 impl RetainedLeafProjection {
@@ -50,6 +51,9 @@ impl RetainedLeafProjection {
     }
     pub const fn location(&self) -> &RouteLocation {
         &self.location
+    }
+    pub(crate) fn logical_empty_child_slots(&self) -> &[LogicalChildSlotBinding] {
+        &self.empty_child_slots
     }
 }
 
@@ -94,6 +98,30 @@ impl RetainedCommitPlan {
     }
     pub fn preserved(&self) -> &[RetainedLeafProjection] {
         &self.preserved
+    }
+}
+
+/// A frozen hit before any cached content is moved or the fresh task is consumed.
+#[derive(Debug)]
+pub struct RetainedHitPlan {
+    hit: RetainedLeafProjection,
+    target_frames: Vec<RouteFrameVersion>,
+    reconciliation: RouteReconciliationProjection,
+    commit_plan: RetainedCommitPlan,
+}
+
+impl RetainedHitPlan {
+    pub const fn hit(&self) -> &RetainedLeafProjection {
+        &self.hit
+    }
+    pub const fn target_frame(&self) -> &RouteFrameVersion {
+        self.hit.frame()
+    }
+    pub const fn commit_plan(&self) -> &RetainedCommitPlan {
+        &self.commit_plan
+    }
+    pub(crate) const fn reconciliation_projection(&self) -> &RouteReconciliationProjection {
+        &self.reconciliation
     }
 }
 
@@ -182,11 +210,24 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
         let current = self.current.as_ref().ok_or(CommitError::Stale)?;
+        let mut plan = self.retained_commit_partition(current, None)?;
+        self.issue_retained_candidate(&mut plan)?;
+        Ok(plan)
+    }
+
+    fn retained_commit_partition(
+        &self,
+        current: &CurrentWork,
+        hit: Option<&RetainedLeafProjection>,
+    ) -> Result<RetainedCommitPlan, CommitError> {
         let next_slots = publication_slots(current);
         let host = self.state.host().ok_or(CommitError::Stale)?;
         let mut retiring = Vec::new();
         let mut preserved = Vec::new();
         for entry in &self.retained_leaves {
+            if hit.is_some_and(|hit| hit == &entry.projection) {
+                continue;
+            }
             if scope_survives(&entry.projection, host, &current.target_frames, &next_slots) {
                 preserved.push(entry.projection.clone());
             } else {
@@ -198,18 +239,6 @@ impl RouterEngine {
         } else {
             None
         };
-        let retained = if let Some(mut candidate) = retained {
-            let sequence = self.next_retained_instance;
-            self.next_retained_instance = sequence.checked_add(1).ok_or(CommitError::Stale)?;
-            candidate.id = RetainedLeafId {
-                router: self.router,
-                sequence,
-            };
-            Some(candidate)
-        } else {
-            None
-        };
-        let current = self.current.as_ref().ok_or(CommitError::Stale)?;
         let original_roots = current.cleanup_roots.clone();
         let mut disposable_roots = original_roots
             .iter()
@@ -231,7 +260,7 @@ impl RouterEngine {
         let record_index = self
             .records
             .iter()
-            .position(|record| record.id() == ticket.identity.request)
+            .position(|record| record.id() == current.identity.request)
             .ok_or(CommitError::Stale)?;
         Ok(RetainedCommitPlan {
             source: self.observe_prepared_publication_source(record_index),
@@ -242,6 +271,289 @@ impl RouterEngine {
             retiring,
             preserved,
         })
+    }
+
+    fn issue_retained_candidate(
+        &mut self,
+        plan: &mut RetainedCommitPlan,
+    ) -> Result<(), CommitError> {
+        if let Some(candidate) = &mut plan.retained {
+            let sequence = self.next_retained_instance;
+            self.next_retained_instance = sequence.checked_add(1).ok_or(CommitError::Stale)?;
+            candidate.id = RetainedLeafId {
+                router: self.router,
+                sequence,
+            };
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_retained_hit_plan(
+        &mut self,
+        task: &FrameTask,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<Option<RetainedHitPlan>, CommitError> {
+        self.inspect_view_report_identity(task.identity())
+            .map_err(|_| CommitError::Stale)?;
+        if self.pending_retained_transfer.is_some()
+            || self.prepared_publication_authority.is_some()
+            || !self.current_reconciliation_matches_active()
+            || self.retained_leaves.iter().any(|entry| !entry.is_live())
+        {
+            return Err(CommitError::Stale);
+        }
+        if !owner_projections_match(
+            inventory.iter().copied(),
+            self.retained_leaves
+                .iter()
+                .map(RetainedRegistryEntry::projection),
+        ) {
+            return Err(CommitError::InvalidManifest);
+        }
+        if !self.retained_hit_task_eligible(task) {
+            return Ok(None);
+        }
+        let mut hits = self
+            .retained_leaves
+            .iter()
+            .map(RetainedRegistryEntry::projection)
+            .filter(|projection| self.retained_hit_matches(task, projection));
+        let Some(hit) = hits.next().cloned() else {
+            return Ok(None);
+        };
+        if hits.next().is_some() {
+            return Err(CommitError::InvalidManifest);
+        }
+        let next = self.retained_hit_next(task, &hit)?;
+        let mut commit_plan = self.retained_commit_partition(&next, Some(&hit))?;
+        self.issue_retained_candidate(&mut commit_plan)?;
+        Ok(Some(RetainedHitPlan {
+            hit,
+            target_frames: next.target_frames,
+            reconciliation: next
+                .reconciliation
+                .expect("a hit has a matched reconciliation"),
+            commit_plan,
+        }))
+    }
+
+    fn retained_hit_task_eligible(&self, task: &FrameTask) -> bool {
+        let Some(current) = self.current.as_ref() else {
+            return false;
+        };
+        let Some(branch) = current.branch.as_ref() else {
+            return false;
+        };
+        let Some(projection) = current.reconciliation.as_ref() else {
+            return false;
+        };
+        let [entering] = projection.entering() else {
+            return false;
+        };
+        let index = task.identity.branch_index;
+        let Some(matched) = branch.routes().get(index) else {
+            return false;
+        };
+        let fragment_only = self.state.active().location().is_some_and(|active| {
+            active.path() == task.location.path()
+                && active.search() == task.location.search()
+                && active.fragment() != task.location.fragment()
+        }) && self
+            .active_branch
+            .as_ref()
+            .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
+        self.keep_alive_capacity > 0
+            && matches!(current.attempt, AttemptKind::Normal(_))
+            && self.action.is_none()
+            && current.stage == WorkStage::Applying
+            && current.pending_mount.is_none()
+            && current.applied_frames.is_empty()
+            && index > 0
+            && index + 1 == branch.routes().len()
+            && projection.preserved().len() == index
+            && entering.branch_index() == index
+            && entering.slot() == ProjectedEnteringSlot::Existing(task.frame.slot())
+            && entering.frame() == task.frame.frame()
+            && entering.generation() == task.frame.generation()
+            && current.target_frames.get(index) == Some(&task.frame)
+            && current.current_target == task.target
+            && current.location == task.location
+            && task.matched.as_ref().map(MatchedRoute::segment_reuse_key)
+                == Some(matched.segment_reuse_key())
+            && self.matcher.view_binding(matched.route()) == Some(&task.view)
+            && self.matcher.keep_alive(matched.route())
+            && !fragment_only
+    }
+
+    fn retained_hit_matches(&self, task: &FrameTask, hit: &RetainedLeafProjection) -> bool {
+        let Some(current) = self.current.as_ref() else {
+            return false;
+        };
+        let Some(host) = self.state.host() else {
+            return false;
+        };
+        let Some(matched) = task.matched.as_ref() else {
+            return false;
+        };
+        let Some(parent) = current
+            .target_frames
+            .get(task.identity.branch_index.saturating_sub(1))
+        else {
+            return false;
+        };
+        hit.id.router == self.router
+            && hit.frame.origin() == &FrameOrigin::MatchedRoute(matched.route())
+            && &hit.parent == parent
+            && hit.outlet == *matched.slot()
+            && hit.slot == task.frame.slot()
+            && &hit.host == host
+            && hit.segment_reuse_key == *matched.segment_reuse_key()
+            && hit.view == task.view
+            && hit.location.search() == task.location.search()
+            && hit.location.fragment() == task.location.fragment()
+            && scope_survives(
+                hit,
+                host,
+                &current.target_frames,
+                &publication_slots(current),
+            )
+    }
+
+    fn retained_hit_next(
+        &self,
+        task: &FrameTask,
+        hit: &RetainedLeafProjection,
+    ) -> Result<CurrentWork, CommitError> {
+        if !self.retained_hit_task_eligible(task) || !self.retained_hit_matches(task, hit) {
+            return Err(CommitError::Stale);
+        }
+        let mut next = self
+            .current
+            .as_ref()
+            .and_then(CurrentWork::clone_pre_retirement)
+            .ok_or(CommitError::Stale)?;
+        next.reconciliation = Some(
+            next.reconciliation
+                .as_ref()
+                .ok_or(CommitError::Stale)?
+                .retarget_retained_leaf(&hit.frame, &hit.empty_child_slots)
+                .ok_or(CommitError::InvalidManifest)?,
+        );
+        next.target_frames[task.identity.branch_index] = hit.frame.clone();
+        next.identity.frame = hit.frame.frame();
+        next.identity.generation = hit.frame.generation();
+        next.identity.origin = hit.frame.origin().clone();
+        next.applied_frames.push(hit.frame.clone());
+        next.stage = WorkStage::ReadyToCommit;
+        Ok(next)
+    }
+
+    pub(crate) fn prepare_retained_hit_publication(
+        &mut self,
+        task: FrameTask,
+        plan: &RetainedHitPlan,
+        seal: CleanupManifestSeal,
+        owners: Vec<RetainedLeafOwner>,
+    ) -> Result<
+        (PreparedPublication, CleanupBatchToken),
+        (FrameTask, Vec<RetainedLeafOwner>, CommitError),
+    > {
+        let record_index = match self
+            .records
+            .iter()
+            .position(|record| record.id() == task.identity.request)
+        {
+            Some(index) => index,
+            None => return Err((task, owners, CommitError::Stale)),
+        };
+        if self.pending_retained_transfer.is_some()
+            || self.prepared_publication_authority.is_some()
+            || self.inspect_view_report_identity(task.identity()).is_err()
+            || !self
+                .observe_prepared_publication_source(record_index)
+                .same_source(&plan.commit_plan.source)
+        {
+            return Err((task, owners, CommitError::Stale));
+        }
+        let next = match self.retained_hit_next(&task, &plan.hit) {
+            Ok(next) => next,
+            Err(error) => return Err((task, owners, error)),
+        };
+        if next.target_frames != plan.target_frames
+            || next.reconciliation.as_ref() != Some(&plan.reconciliation)
+            || !self.retained_plan_partition_matches(&plan.commit_plan, &next, Some(&plan.hit))
+        {
+            return Err((task, owners, CommitError::Stale));
+        }
+        let mut expected = plan
+            .commit_plan
+            .retiring
+            .iter()
+            .chain(std::iter::once(&plan.hit))
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|projection| projection.id());
+        if !owner_projections_match(owners.iter(), expected.into_iter())
+            || seal.logical_roots() != plan.commit_plan.disposable_roots()
+        {
+            return Err((task, owners, CommitError::InvalidManifest));
+        }
+        let mut registry = self
+            .retained_leaves
+            .iter()
+            .filter(|entry| entry.projection.id != plan.hit.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(projection) = &plan.commit_plan.retained {
+            registry.push(RetainedRegistryEntry {
+                projection: projection.clone(),
+                retirement: None,
+            });
+        }
+        let retained = plan
+            .commit_plan
+            .retained
+            .clone()
+            .map(|projection| RetainedLeafOwner { projection });
+        let mut next_record = self.records[record_index].clone();
+        next_record
+            .transition(RequestStatus::Running(NavigationPhase::ReadyToSwitch))
+            .expect("the task's request is open");
+        next_record
+            .append_trace(NavigationTraceEvent::request_phase_changed(
+                NavigationPhase::ReadyToSwitch,
+            ))
+            .expect("the task's trace is open");
+        next_record
+            .push_diagnostic(DiagnosticEvent::reported(
+                task.identity.request,
+                task.frame.clone(),
+                ReportDisposition::Accepted,
+                "accepted retained leaf handoff",
+            ))
+            .expect("the task's diagnostics are open");
+        let ticket = CommitTicket {
+            identity: next.identity.clone(),
+        };
+        let sealed = match self.seal_prepared_commit_partition(
+            &ticket,
+            seal,
+            Some((&plan.commit_plan, registry)),
+            next,
+            Some(next_record),
+        ) {
+            Ok(sealed) => sealed,
+            Err(error) => return Err((task, owners, error)),
+        };
+        self.report_dispositions.push(ReportDispositionRecord {
+            identity: task.identity,
+            disposition: ReportDisposition::Accepted,
+            target: DiagnosticTarget::Request(ticket.identity.request),
+        });
+        let cleanup = self.hold_retained_transfer(&sealed, retained, owners);
+        // The independent next receiver was fully validated by the seal. The
+        // original task and cache owners now move once into the existing Ready.
+        let publication = self.install_prepared_publication(sealed);
+        Ok((publication, cleanup))
     }
 
     pub(super) fn retention_candidate(
@@ -296,6 +608,12 @@ impl RouterEngine {
             segment_reuse_key: matched.segment_reuse_key().clone(),
             view: self.matcher.view_binding(*route)?.clone(),
             location: self.state.active().location()?.clone(),
+            empty_child_slots: self
+                .active_child_slots
+                .iter()
+                .filter(|binding| binding.parent() == frame && binding.child().is_none())
+                .cloned()
+                .collect(),
         };
         scope_survives(&candidate, host, &current.target_frames, next_slots).then_some(candidate)
     }
@@ -304,6 +622,15 @@ impl RouterEngine {
         let Some(current) = self.current.as_ref() else {
             return false;
         };
+        self.retained_plan_partition_matches(plan, current, None)
+    }
+
+    fn retained_plan_partition_matches(
+        &self,
+        plan: &RetainedCommitPlan,
+        current: &CurrentWork,
+        hit: Option<&RetainedLeafProjection>,
+    ) -> bool {
         let Some(host) = self.state.host() else {
             return false;
         };
@@ -317,6 +644,7 @@ impl RouterEngine {
             .retained_leaves
             .iter()
             .map(|entry| &entry.projection)
+            .filter(|projection| hit != Some(*projection))
             .partition(|projection| {
                 scope_survives(projection, host, &current.target_frames, &next_slots)
             });
@@ -406,12 +734,17 @@ impl RouterEngine {
             Ok(sealed) => sealed,
             Err(error) => return Err((retiring, error)),
         };
-        let cleanup = sealed.cleanup().clone();
-        self.pending_retained_transfer = Some(PreparedRetainedTransfer {
-            evidence: sealed.evidence.clone(),
-            retained,
-            retiring,
-        });
+        self.prepare_retained_transfer(sealed, retained, retiring)
+    }
+
+    fn prepare_retained_transfer(
+        &mut self,
+        sealed: SealedCommit,
+        retained: Option<RetainedLeafOwner>,
+        retiring: Vec<RetainedLeafOwner>,
+    ) -> Result<(PreparedPublication, CleanupBatchToken), (Vec<RetainedLeafOwner>, CommitError)>
+    {
+        let cleanup = self.hold_retained_transfer(&sealed, retained, retiring);
         match self.prepare_publication(sealed) {
             Ok(publication) => Ok((publication, cleanup)),
             Err(error) => {
@@ -422,6 +755,21 @@ impl RouterEngine {
                 Err((transfer.retiring, error))
             }
         }
+    }
+
+    fn hold_retained_transfer(
+        &mut self,
+        sealed: &SealedCommit,
+        retained: Option<RetainedLeafOwner>,
+        retiring: Vec<RetainedLeafOwner>,
+    ) -> CleanupBatchToken {
+        let cleanup = sealed.cleanup().clone();
+        self.pending_retained_transfer = Some(PreparedRetainedTransfer {
+            evidence: sealed.evidence.clone(),
+            retained,
+            retiring,
+        });
+        cleanup
     }
 
     pub(crate) fn validate_retained_publication(

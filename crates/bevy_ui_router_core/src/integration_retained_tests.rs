@@ -13,13 +13,20 @@ fn engine_with_lease(capacity: usize, opt_in: bool) -> (RouterEngine, HostLease)
         )
         .unwrap();
     let parent = builder.root_id().unwrap();
-    builder
+    let leaf = builder
         .route_with_options(
             parent,
             RoutePattern::path(":id").unwrap(),
             RouteNodeOptions::new()
                 .with_view(RouteViewKey::new("leaf").unwrap())
                 .with_keep_alive(opt_in),
+        )
+        .unwrap();
+    builder
+        .route_with_options(
+            leaf,
+            RoutePattern::path("detail").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("detail").unwrap()),
         )
         .unwrap();
     let mut engine = RouterEngine::install(
@@ -119,6 +126,113 @@ fn navigate(engine: &mut RouterEngine, path: &str, owners: &mut Vec<RetainedLeaf
     let ticket = ticket(engine, path);
     let prepared = prepare(engine, &ticket, owners);
     publish(engine, prepared, owners);
+}
+
+fn retained_hit_task(engine: &mut RouterEngine, path: &str) -> FrameTask {
+    engine.push(RouteLocation::new(path)).unwrap();
+    engine.collect();
+    let EngineAction::FrameTask(task) = engine.action().expect("preserved parent dispatches leaf")
+    else {
+        panic!("the retained leaf must be selected before its factory runs")
+    };
+    task
+}
+
+#[test]
+fn retained_hit_reuses_original_frames_and_empty_slots_with_fresh_history_entries() {
+    let mut engine = engine(1, true);
+    let mut owners = Vec::new();
+    // Leaving a real child produces a Core-owned empty slot on the cached leaf.
+    navigate(&mut engine, "/items/1/detail", &mut owners);
+    navigate(&mut engine, "/items/1", &mut owners);
+    let first = engine.active().frames().last().unwrap().clone();
+    let first_entry = engine.canonical_history().current_entry().unwrap();
+    navigate(&mut engine, "/items/2", &mut owners);
+    let second = engine.active().frames().last().unwrap().clone();
+    assert_eq!(owners[0].projection().empty_child_slots().count(), 1);
+
+    for (path, expected, departing) in
+        [("/items/1", &first, &second), ("/items/2", &second, &first)]
+    {
+        let task = retained_hit_task(&mut engine, path);
+        assert_ne!(
+            task.frame(),
+            expected,
+            "the dispatched task is a fresh attempt"
+        );
+        let plan = engine
+            .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+            .unwrap()
+            .expect("the same exact parent has the requested retained leaf");
+        assert_eq!(plan.hit().frame(), expected);
+        assert_eq!(plan.target_frame(), expected);
+        assert!(plan.commit_plan().disposable_roots().is_empty());
+        assert!(plan.commit_plan().retiring().is_empty());
+        assert_eq!(plan.commit_plan().retained().unwrap().frame(), departing);
+        let prepared = engine
+            .prepare_retained_hit_commit(
+                task,
+                plan,
+                CleanupManifest::empty(),
+                std::mem::take(&mut owners),
+            )
+            .unwrap();
+        assert_eq!(
+            prepared
+                .history_publication()
+                .target_frames()
+                .last()
+                .unwrap()
+                .frame(),
+            expected
+        );
+        publish(&mut engine, prepared, &mut owners);
+        assert_eq!(engine.active().frames().last(), Some(expected));
+        assert_eq!(owners.len(), 1, "the active hit releases one capacity slot");
+        assert_eq!(owners[0].projection().frame(), departing);
+        assert_ne!(
+            engine.canonical_history().current_entry(),
+            Some(first_entry)
+        );
+    }
+    assert_eq!(owners[0].projection().empty_child_slots().count(), 1);
+}
+
+#[test]
+fn retained_hit_source_rejection_returns_original_task_and_owners_without_history_change() {
+    let mut engine = engine(1, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    navigate(&mut engine, "/items/2", &mut owners);
+    let original = owners[0].projection().clone();
+    let history = engine.history().clone();
+    let task = retained_hit_task(&mut engine, "/items/1");
+    let fresh_frame = task.frame().clone();
+    let request = task.request();
+    let plan = engine
+        .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    engine = engine.with_keep_alive_capacity(0);
+    let (task, plan, manifest, returned, error) = engine
+        .prepare_retained_hit_commit(task, plan, CleanupManifest::empty(), owners)
+        .unwrap_err()
+        .into_parts();
+    assert_eq!(error, IntegrationError::Stale);
+    assert_eq!(task.request(), request);
+    assert_eq!(task.frame(), &fresh_frame);
+    assert_eq!(returned[0].projection(), &original);
+    assert_eq!(engine.history(), &history);
+    engine.inspect_report_identity(&task).unwrap();
+    assert_eq!(engine.active().location().unwrap().path(), "/items/2");
+
+    engine = engine.with_keep_alive_capacity(1);
+    let prepared = engine
+        .prepare_retained_hit_commit(task, plan, manifest, returned)
+        .unwrap();
+    owners = Vec::new();
+    publish(&mut engine, prepared, &mut owners);
+    assert_eq!(engine.active().frames().last(), Some(original.frame()));
 }
 
 #[test]

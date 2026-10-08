@@ -4041,8 +4041,63 @@ pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> 
 }
 
 pub use crate::engine::retained::{
-    RetainedCommitPlan, RetainedLeafId, RetainedLeafOwner, RetainedLeafProjection,
+    RetainedCommitPlan, RetainedHitPlan, RetainedLeafId, RetainedLeafOwner, RetainedLeafProjection,
 };
+
+impl RetainedHitPlan {
+    pub fn reconciliation(&self) -> ReconciliationProjectionView<'_> {
+        ReconciliationProjectionView {
+            inner: self.reconciliation_projection(),
+        }
+    }
+}
+
+impl RetainedLeafProjection {
+    pub fn empty_child_slots(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ReconciliationChildSlotBindingView<'_>> {
+        self.logical_empty_child_slots()
+            .iter()
+            .map(|inner| ReconciliationChildSlotBindingView { inner })
+    }
+}
+
+/// A rejected hit returns the original task and every original cache owner.
+pub struct RetainedHitPreparationError {
+    task: FrameTask,
+    plan: RetainedHitPlan,
+    manifest: CleanupManifest,
+    owners: Vec<RetainedLeafOwner>,
+    error: IntegrationError,
+}
+
+impl std::fmt::Debug for RetainedHitPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedHitPreparationError")
+            .field("request", &self.task.request())
+            .field("frame", self.task.frame())
+            .field("plan", &self.plan)
+            .field("manifest", &self.manifest.projection())
+            .field("owners", &self.owners)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl RetainedHitPreparationError {
+    pub fn into_parts(
+        self,
+    ) -> (
+        FrameTask,
+        RetainedHitPlan,
+        CleanupManifest,
+        Vec<RetainedLeafOwner>,
+        IntegrationError,
+    ) {
+        (self.task, self.plan, self.manifest, self.owners, self.error)
+    }
+}
 
 /// Preparation rejection returns the complete original physical responsibility.
 pub struct RetainedCommitPreparationError {
@@ -8574,6 +8629,53 @@ impl RouterEngine {
         self.inner
             .prepare_retained_commit_plan(&ticket.inner, inventory)
             .map_err(map_commit_error)
+    }
+
+    /// Selects a normal retained leaf before factory dispatch without moving its owner.
+    pub fn prepare_retained_hit_plan(
+        &mut self,
+        task: &FrameTask,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<Option<RetainedHitPlan>, IntegrationError> {
+        self.inner
+            .prepare_retained_hit_plan(&task.inner, inventory)
+            .map_err(map_commit_error)
+    }
+
+    pub fn prepare_retained_hit_commit(
+        &mut self,
+        task: FrameTask,
+        plan: RetainedHitPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+    ) -> Result<PreparedRetainedCommit, RetainedHitPreparationError> {
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(manifest.manifest_digest),
+            manifest.obligation_count,
+        );
+        let retained = plan.commit_plan().retained().cloned();
+        match self
+            .inner
+            .prepare_retained_hit_publication(task.inner, &plan, seal, owners)
+        {
+            Ok((publication, token)) => Ok(PreparedRetainedCommit {
+                publication,
+                cleanup: CleanupBatch {
+                    inner: token,
+                    manifest_digest: manifest.manifest_digest,
+                    obligation_count: manifest.obligation_count,
+                },
+                retained,
+            }),
+            Err((task, owners, error)) => Err(RetainedHitPreparationError {
+                task: FrameTask { inner: task },
+                plan,
+                manifest,
+                owners,
+                error: map_commit_error(error),
+            }),
+        }
     }
 
     pub fn prepare_commit_with_retention(

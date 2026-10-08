@@ -940,6 +940,50 @@ impl RouteReconciliationProjection {
         })
     }
 
+    pub(crate) fn retarget_retained_leaf(
+        &self,
+        frame: &RouteFrameVersion,
+        empty_slots: &[LogicalChildSlotBinding],
+    ) -> Option<Self> {
+        let [entering] = self.entering.as_slice() else {
+            return None;
+        };
+        if entering.branch_index == 0
+            || entering.branch_index != self.preserved.len()
+            || entering.origin != *frame.origin()
+            || frame.router_identity() != self.baseline.router
+            || frame.host() != self.baseline.host
+            || entering.slot != ProjectedEnteringSlot::Existing(frame.slot())
+            || self.target != ReconciliationProjectionTarget::MatchedBranch
+        {
+            return None;
+        }
+        let mut next = self.clone();
+        next.entering[0].frame = frame.frame();
+        next.entering[0].generation = frame.generation();
+        for (index, binding) in empty_slots.iter().enumerate() {
+            if binding.parent() != frame
+                || binding.parent_branch_index() != entering.branch_index
+                || binding.child().is_some()
+                || empty_slots[..index].iter().any(|previous| {
+                    previous.slot() == binding.slot() || previous.outlet() == binding.outlet()
+                })
+                || next
+                    .child_slots
+                    .iter()
+                    .filter_map(|role| role.binding())
+                    .any(|existing| existing.slot() == binding.slot())
+            {
+                return None;
+            }
+            next.child_slots.push(ProjectedChildSlotRole::existing(
+                ProjectedChildSlotRoleKind::RetainEmpty,
+                binding.clone(),
+            ));
+        }
+        Some(next)
+    }
+
     pub(crate) fn matches_matched_target(&self, target: &MatchedBranch) -> bool {
         self.target == ReconciliationProjectionTarget::MatchedBranch
             && target.branch_fingerprint() == &self.target_fingerprint
