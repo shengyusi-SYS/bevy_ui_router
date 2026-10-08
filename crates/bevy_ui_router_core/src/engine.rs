@@ -6827,6 +6827,7 @@ impl RouterEngine {
             cause,
             seal,
             None,
+            None,
             authority_mutation,
         )
     }
@@ -7079,6 +7080,7 @@ impl RouterEngine {
             cause,
             seal,
             Some(source),
+            None,
             authority_mutation,
         )
     }
@@ -7169,11 +7171,20 @@ impl RouterEngine {
         cause: PreCommitAuthorityCause,
         seal: CleanupManifestSeal,
         failed: Option<FailedAuthoritySettlementSource>,
+        retention: Option<&retained::RetainedAuthoritySettlementPlan>,
         authority_mutation: F,
     ) -> Result<CleanupBatchToken, BeginAuthoritySettlementError>
     where
         F: FnOnce(&Self, CleanupBatchToken),
     {
+        if retention.is_none()
+            && (!self.retained_leaves.is_empty() || self.pending_retained_transfer.is_some())
+        {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::WrongPhase,
+                lease,
+            ));
+        }
         let Some(version) = self.state.host().cloned() else {
             return Err(BeginAuthoritySettlementError::new(
                 BeginAuthoritySettlementErrorKind::Stale,
@@ -7257,7 +7268,11 @@ impl RouterEngine {
                     .expect("authority settlement phase was preflighted")
                     .identity
                     .clone();
-                (identity, self.authority_settlement_logical_roots())
+                let roots = retention.map_or_else(
+                    || self.authority_settlement_logical_roots(),
+                    |plan| plan.logical_roots().to_vec(),
+                );
+                (identity, roots)
             }
         };
         let failure = cause.running_failure();
@@ -7284,6 +7299,11 @@ impl RouterEngine {
             seal.manifest_digest(),
             seal.obligation_count(),
         );
+        let retained_update = retention.map(|plan| {
+            let mut registry = self.retained_leaves.clone();
+            Self::bind_retained_retirements(&mut registry, plan.retiring(), &cleanup);
+            registry
+        });
         let mut recovering_record = self
             .request(request.request())
             .expect("authority settlement request remains retained")
@@ -7327,6 +7347,9 @@ impl RouterEngine {
         };
         assert!(retired.matches(self.router, &version, top_slot));
         authority_mutation(self, cleanup.clone());
+        if let Some(registry) = retained_update {
+            self.retained_leaves = registry;
+        }
         assert!(self.state.begin_authority_recovery(&version, top_slot));
         let current = self
             .current
@@ -12703,7 +12726,7 @@ impl RouterEngine {
             }
         };
         if let Some((plan, mut registry)) = retention {
-            Self::bind_retained_retirements(&mut registry, plan, &cleanup);
+            Self::bind_retained_retirements(&mut registry, plan.retiring(), &cleanup);
             publication.retained_update = Some(registry);
         }
         let evidence = SealedCommitEvidence {

@@ -475,7 +475,7 @@ fn retained_leaf_capacity_change_invalidates_an_unconsumed_plan() {
 }
 
 #[test]
-fn retained_leaf_same_source_rejection_returns_original_owners_after_authority_settlement() {
+fn retained_leaf_rejected_publication_cannot_bypass_inventory_and_keeps_original_owners() {
     let (mut engine, lease) = engine_with_lease(2, true);
     let mut owners = Vec::new();
     for path in ["/items/1", "/items/2", "/items/3"] {
@@ -511,20 +511,31 @@ fn retained_leaf_same_source_rejection_returns_original_owners_after_authority_s
     assert_eq!(error, IntegrationError::Stale);
     assert_eq!(engine.inner.testing_retained_transfer_owners(), original);
 
-    // Consume the original host lease through the production authority path.
-    // Its publication retires the rejected history owner; only then may the
-    // independent transit holder return every original retained owner.
+    // The legacy authority entry cannot claim to settle a batch that omitted
+    // these original owners. It must return the unchanged host lease.
     let roots = engine.authority_settlement_logical_roots();
     let count = roots.len();
-    let mut authority_published = false;
-    let cleanup = engine
-        .begin_authority_settlement_retaining(
-            lease,
-            CleanupManifest::new(roots, 0x7163, count),
-            |_| authority_published = true,
-        )
-        .unwrap();
-    assert!(authority_published);
+    let error = match engine.begin_authority_settlement_retaining(
+        lease,
+        CleanupManifest::new(roots, 0x7163, count),
+        |_| panic!("the legacy entry cannot bypass the transit owners"),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("transit owners require an explicit inventory transfer"),
+    };
+    assert_eq!(error.kind(), BeginAuthoritySettlementErrorKind::WrongPhase);
+    assert_eq!(engine.inner.testing_retained_transfer_owners(), original);
+
+    // This test explicitly chooses the existing permanent protocol sink. It
+    // preserves unique ownership; it does not model a recoverable registration
+    // loss or prove that the returned physical payloads have been disposed.
+    engine
+        .fail_closed_authority_protocol_retaining(Some(error.into_owner()), || {})
+        .unwrap_or_else(|_| panic!("the original lease retires at the protocol sink"));
+    assert_eq!(
+        engine.snapshot().availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::RegistryInvariantViolation)
+    );
     let returned = engine
         .take_unpublished_retained_owners_for_settlement()
         .unwrap();
@@ -542,10 +553,8 @@ fn retained_leaf_same_source_rejection_returns_original_owners_after_authority_s
         Err(IntegrationError::Stale)
     ));
 
-    // Returning a unique owner does not settle its physical cleanup. The
-    // authority batch and the returned owners remain separate responsibilities.
-    assert_eq!(cleanup.obligation_count(), count);
-    drop((prepared, cleanup, returned));
+    // Returning a unique owner does not settle its physical cleanup.
+    drop((prepared, returned));
 }
 
 fn retained_idle_fixture() -> (RouterEngine, HostLease, Vec<RetainedLeafOwner>) {
@@ -556,6 +565,113 @@ fn retained_idle_fixture() -> (RouterEngine, HostLease, Vec<RetainedLeafOwner>) 
     }
     assert_eq!(owners.len(), 2);
     (engine, lease, owners)
+}
+
+#[test]
+fn retained_foreground_host_loss_binds_original_owners_to_the_authority_cleanup() {
+    let (mut engine, lease, owners) = retained_idle_fixture();
+    let history = engine.history().clone();
+    let keys = engine.canonical_history();
+    let originals = owners
+        .iter()
+        .map(|owner| owner.projection().clone())
+        .collect::<Vec<_>>();
+    let task = retained_hit_task(&mut engine, "/items/1");
+    let fresh_frame = task.frame().clone();
+    let hit = engine
+        .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    assert!(
+        engine
+            .authority_settlement_logical_roots()
+            .contains(&fresh_frame)
+    );
+    let error = match engine.begin_authority_settlement_for_cause_retaining(
+        lease,
+        PreCommitAuthorityCause::HostLost,
+        CleanupManifest::new(engine.authority_settlement_logical_roots(), 0x8370, 3),
+        |_| panic!("the old entry cannot bypass retained owner transfer"),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("live owners require an explicit inventory transfer"),
+    };
+    let lease = error.into_owner();
+    let plan = engine
+        .prepare_retained_authority_settlement_plan(&lease, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let mut roots = engine.authority_settlement_logical_roots();
+    roots.extend(
+        originals
+            .iter()
+            .map(|projection| projection.frame().clone()),
+    );
+    assert_eq!(plan.logical_roots(), roots);
+    assert_eq!(plan.retiring(), originals);
+    let manifest = CleanupManifest::new(roots.clone(), 0x8371, 5);
+
+    // Changing a real source input must return every original capability before
+    // the callback installs any physical authority-cleanup owner.
+    engine = engine.with_keep_alive_capacity(1);
+    let error = match engine.begin_authority_settlement_with_retention(
+        lease,
+        PreCommitAuthorityCause::HostLost,
+        plan,
+        manifest,
+        owners,
+        |_| panic!("source drift must not publish authority cleanup"),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("source drift must return all original inputs"),
+    };
+    let (lease, plan, manifest, owners, kind) = error.into_parts();
+    assert_eq!(kind, BeginAuthoritySettlementErrorKind::Stale);
+    assert_eq!(plan.logical_roots(), roots);
+    assert_eq!(
+        owners
+            .iter()
+            .map(|owner| owner.projection())
+            .collect::<Vec<_>>(),
+        originals.iter().collect::<Vec<_>>()
+    );
+    engine.inspect_report_identity(&task).unwrap();
+    assert_eq!(engine.history(), &history);
+    engine = engine.with_keep_alive_capacity(2);
+    let mut installed = None;
+    let cleanup = engine
+        .begin_authority_settlement_with_retention(
+            lease,
+            PreCommitAuthorityCause::HostLost,
+            plan,
+            manifest,
+            owners,
+            |batch| installed = Some(batch),
+        )
+        .unwrap();
+    assert_eq!(installed.unwrap().inner, cleanup.inner);
+    assert_eq!(
+        engine.snapshot().availability(),
+        &RouterAvailability::RecoveringAuthority
+    );
+    assert_eq!(engine.history(), &history);
+    engine
+        .complete_authority_cleanup(cleanup.complete(0x8372, 5), || {})
+        .unwrap();
+    assert_eq!(engine.history(), &history);
+    assert_eq!(engine.canonical_history(), keys);
+    assert!(engine.snapshot().running_request().is_none());
+    drop((task, hit));
+
+    let lease = readmit_after_host_loss(&mut engine);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/other/1", &mut owners);
+    navigate(&mut engine, "/other/2", &mut owners);
+    assert_eq!(
+        owners.len(),
+        1,
+        "the original authority token cleared the old inventory"
+    );
+    drop(lease);
 }
 
 #[test]
@@ -617,6 +733,18 @@ fn retained_idle_host_loss_transfers_original_owners_and_readmits_without_changi
     assert_eq!(engine.canonical_history(), entry_keys);
     assert!(engine.snapshot().running_request().is_none());
 
+    let lease = readmit_after_host_loss(&mut engine);
+    navigate(&mut engine, "/other/1", &mut owners);
+    navigate(&mut engine, "/other/2", &mut owners);
+    assert_eq!(
+        owners.len(),
+        1,
+        "idle completion releases the retired host's capacity"
+    );
+    drop(lease);
+}
+
+fn readmit_after_host_loss(engine: &mut RouterEngine) -> HostLease {
     let HostAdmissionSourcePermitOutcome::Ineligible { source, .. } =
         engine.issue_host_admission_source_permit()
     else {
@@ -665,14 +793,7 @@ fn retained_idle_host_loss_transfers_original_owners_and_readmits_without_changi
     else {
         panic!("the new exact grant confirms one real host lease")
     };
-    navigate(&mut engine, "/other/1", &mut owners);
-    navigate(&mut engine, "/other/2", &mut owners);
-    assert_eq!(
-        owners.len(),
-        1,
-        "idle completion releases the retired host's capacity"
-    );
-    drop(lease);
+    lease
 }
 
 #[test]

@@ -101,6 +101,26 @@ impl RetainedCommitPlan {
     }
 }
 
+/// Frozen transfer of the current host's inactive leaves to its foreground
+/// authority-cleanup batch. It contains no lifecycle capability.
+#[derive(Debug)]
+pub struct RetainedAuthoritySettlementPlan {
+    source: PreparedPublicationObservation,
+    inventory: HostAdmissionUnavailableOwnerInventoryProjection,
+    logical_roots: Vec<RouteFrameVersion>,
+    retiring: Vec<RetainedLeafProjection>,
+}
+
+impl RetainedAuthoritySettlementPlan {
+    pub fn logical_roots(&self) -> &[RouteFrameVersion] {
+        &self.logical_roots
+    }
+
+    pub fn retiring(&self) -> &[RetainedLeafProjection] {
+        &self.retiring
+    }
+}
+
 /// A frozen hit before any cached content is moved or the fresh task is consumed.
 #[derive(Debug)]
 pub struct RetainedHitPlan {
@@ -186,6 +206,157 @@ impl ValidatedRetainedPublication<'_> {
 }
 
 impl RouterEngine {
+    fn retained_authority_settlement_eligible(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| {
+            matches!(current.attempt, AttemptKind::Normal(_))
+                && matches!(
+                    current.stage,
+                    WorkStage::Applying | WorkStage::ReadyToCommit | WorkStage::CommitSealed { .. }
+                )
+                && current.reconciliation.is_some()
+                && current.retired_host.is_none()
+        }) && self.state.availability() == &RouterAvailability::Ready
+            && self.action.is_none()
+            && self.current_reconciliation_matches_active()
+            && self.pending_retained_transfer.is_none()
+            && self
+                .retained_leaves
+                .iter()
+                .all(RetainedRegistryEntry::is_live)
+            && !matches!(
+                self.prepared_publication_authority,
+                Some(PreparedPublicationAuthority::Rejected(_))
+            )
+    }
+
+    pub(crate) fn prepare_retained_authority_settlement_plan(
+        &self,
+        lease: &HostLease,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedAuthoritySettlementPlan, BeginAuthoritySettlementErrorKind> {
+        let (Some(host), Some(slot)) = (self.state.host(), self.state.top_slot()) else {
+            return Err(BeginAuthoritySettlementErrorKind::Stale);
+        };
+        if !lease.matches(self.router, host, slot) {
+            return Err(BeginAuthoritySettlementErrorKind::Foreign);
+        }
+        if !self.retained_authority_settlement_eligible() {
+            return Err(BeginAuthoritySettlementErrorKind::WrongPhase);
+        }
+        if !owner_projections_match(
+            inventory.iter().copied(),
+            self.retained_leaves
+                .iter()
+                .map(RetainedRegistryEntry::projection),
+        ) {
+            return Err(BeginAuthoritySettlementErrorKind::InvalidManifest);
+        }
+        let mut retiring = Vec::new();
+        for entry in &self.retained_leaves {
+            if entry.projection.host() == host {
+                if !scope_survives(
+                    &entry.projection,
+                    host,
+                    self.state.active().frames(),
+                    &self.active_child_slots,
+                ) {
+                    return Err(BeginAuthoritySettlementErrorKind::InvalidManifest);
+                }
+                retiring.push(entry.projection.clone());
+            }
+        }
+        let mut logical_roots = self.authority_settlement_logical_roots();
+        logical_roots.extend(retiring.iter().map(|projection| projection.frame().clone()));
+        if logical_roots
+            .iter()
+            .enumerate()
+            .any(|(index, frame)| logical_roots[..index].contains(frame))
+        {
+            return Err(BeginAuthoritySettlementErrorKind::InvalidManifest);
+        }
+        let current = self
+            .current
+            .as_ref()
+            .expect("the authority source is current");
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == current.identity.request)
+            .ok_or(BeginAuthoritySettlementErrorKind::Stale)?;
+        Ok(RetainedAuthoritySettlementPlan {
+            source: self.observe_prepared_publication_source(record_index),
+            inventory: self.observed_unavailable_owner_inventory(),
+            logical_roots,
+            retiring,
+        })
+    }
+
+    pub(crate) fn begin_authority_settlement_with_retention<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        cause: PreCommitAuthorityCause,
+        plan: &RetainedAuthoritySettlementPlan,
+        seal: CleanupManifestSeal,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<
+        CleanupBatchToken,
+        (
+            HostLease,
+            Vec<RetainedLeafOwner>,
+            BeginAuthoritySettlementErrorKind,
+        ),
+    >
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
+        let record_index = self.current.as_ref().and_then(|current| {
+            self.records
+                .iter()
+                .position(|record| record.id() == current.identity.request)
+        });
+        if !self.retained_authority_settlement_eligible()
+            || record_index.is_none_or(|index| {
+                !self
+                    .observe_prepared_publication_source(index)
+                    .same_source(&plan.source)
+            })
+            || self.observed_unavailable_owner_inventory() != plan.inventory
+        {
+            return Err((lease, owners, BeginAuthoritySettlementErrorKind::Stale));
+        }
+        if seal.logical_roots() != plan.logical_roots()
+            || !owner_projections_match(owners.iter(), plan.retiring.iter())
+        {
+            return Err((
+                lease,
+                owners,
+                BeginAuthoritySettlementErrorKind::InvalidManifest,
+            ));
+        }
+        match self.begin_authority_settlement_publication(
+            issuer,
+            lease,
+            cause,
+            seal,
+            None,
+            Some(plan),
+            authority_mutation,
+        ) {
+            Ok(cleanup) => {
+                // The accepted exact batch now owns these lifecycle obligations.
+                // CurrentWork retains only its cloneable token, never the owners.
+                drop(owners);
+                Ok(cleanup)
+            }
+            Err(error) => {
+                let kind = error.kind();
+                Err((error.into_owner(), owners, kind))
+            }
+        }
+    }
+
     pub(crate) fn prepare_retained_commit_plan(
         &mut self,
         ticket: &CommitTicket,
@@ -827,12 +998,11 @@ impl RouterEngine {
 
     pub(super) fn bind_retained_retirements(
         registry: &mut [RetainedRegistryEntry],
-        plan: &RetainedCommitPlan,
+        retiring: &[RetainedLeafProjection],
         cleanup: &CleanupBatchToken,
     ) {
         for entry in registry {
-            if plan
-                .retiring
+            if retiring
                 .iter()
                 .any(|retiring| retiring.id == entry.projection.id)
             {

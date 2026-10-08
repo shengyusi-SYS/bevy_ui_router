@@ -4041,8 +4041,45 @@ pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> 
 }
 
 pub use crate::engine::retained::{
-    RetainedCommitPlan, RetainedHitPlan, RetainedLeafId, RetainedLeafOwner, RetainedLeafProjection,
+    RetainedAuthoritySettlementPlan, RetainedCommitPlan, RetainedHitPlan, RetainedLeafId,
+    RetainedLeafOwner, RetainedLeafProjection,
 };
+
+/// Rejected authority transfer returns the unchanged host and every retained owner.
+#[must_use = "rejected authority transfer retains all original lifecycle responsibility"]
+pub struct RetainedAuthoritySettlementError {
+    lease: HostLease,
+    plan: RetainedAuthoritySettlementPlan,
+    manifest: CleanupManifest,
+    owners: Vec<RetainedLeafOwner>,
+    kind: BeginAuthoritySettlementErrorKind,
+}
+
+impl std::fmt::Debug for RetainedAuthoritySettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedAuthoritySettlementError")
+            .field("plan", &self.plan)
+            .field("manifest", &self.manifest.projection())
+            .field("owners", &self.owners)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedAuthoritySettlementError {
+    pub fn into_parts(
+        self,
+    ) -> (
+        HostLease,
+        RetainedAuthoritySettlementPlan,
+        CleanupManifest,
+        Vec<RetainedLeafOwner>,
+        BeginAuthoritySettlementErrorKind,
+    ) {
+        (self.lease, self.plan, self.manifest, self.owners, self.kind)
+    }
+}
 
 impl RetainedHitPlan {
     pub fn reconciliation(&self) -> ReconciliationProjectionView<'_> {
@@ -7584,6 +7621,85 @@ impl RouterEngine {
             manifest_digest,
             obligation_count,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_retained_authority_settlement_plan(
+        &self,
+        lease: &HostLease,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedAuthoritySettlementPlan, BeginAuthoritySettlementErrorKind> {
+        self.inner
+            .prepare_retained_authority_settlement_plan(&lease.inner, inventory)
+            .map_err(map_begin_authority_settlement_error)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_authority_settlement_with_retention<F>(
+        &mut self,
+        lease: HostLease,
+        cause: PreCommitAuthorityCause,
+        plan: RetainedAuthoritySettlementPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, RetainedAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        if self.host_trace.try_reserve(2).is_err() {
+            return Err(RetainedAuthoritySettlementError {
+                lease,
+                plan,
+                manifest,
+                owners,
+                kind: BeginAuthoritySettlementErrorKind::RetryablePreparation,
+            });
+        }
+        let version = self.inner.host().cloned();
+        let slot = self.inner.top_slot();
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(manifest_digest),
+            obligation_count,
+        );
+        let host_trace = &mut self.host_trace;
+        let result = self.inner.begin_authority_settlement_with_retention(
+            &mut self.admission,
+            lease.inner,
+            cause.inner(),
+            &plan,
+            seal,
+            owners,
+            |_, inner| {
+                authority_mutation(CleanupBatch {
+                    inner,
+                    manifest_digest,
+                    obligation_count,
+                });
+                host_trace.push(HostTraceEvent::project(
+                    HostTraceEventKind::SettlementStarted,
+                    version,
+                    slot,
+                ));
+            },
+        );
+        match result {
+            Ok(inner) => Ok(CleanupBatch {
+                inner,
+                manifest_digest,
+                obligation_count,
+            }),
+            Err((lease, owners, kind)) => Err(RetainedAuthoritySettlementError {
+                lease: HostLease { inner: lease },
+                plan,
+                manifest,
+                owners,
+                kind: map_begin_authority_settlement_error(kind),
+            }),
+        }
     }
 
     #[doc(hidden)]
