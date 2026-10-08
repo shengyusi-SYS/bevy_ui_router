@@ -568,6 +568,111 @@ fn retained_idle_fixture() -> (RouterEngine, HostLease, Vec<RetainedLeafOwner>) 
 }
 
 #[test]
+fn retained_failed_task_authority_preserves_owners_on_trigger_drift_and_settles_one_batch() {
+    let (mut engine, lease, mut owners) = retained_idle_fixture();
+    owners.reverse();
+    let history = engine.history().clone();
+    let keys = engine.canonical_history();
+    let originals = owners
+        .iter()
+        .map(|owner| owner.projection().clone())
+        .collect::<Vec<_>>();
+    let task = retained_hit_task(&mut engine, "/items/4");
+    let base_roots = vec![task.frame().clone()];
+    let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+    let plan = engine
+        .prepare_retained_failed_authority_settlement_plan(
+            &lease,
+            &trigger,
+            &base_roots,
+            &owners.iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let mut roots = base_roots.clone();
+    let mut canonical = originals.iter().collect::<Vec<_>>();
+    canonical.sort_by_key(|projection| projection.id());
+    roots.extend(
+        canonical
+            .iter()
+            .map(|projection| projection.frame().clone()),
+    );
+    assert_eq!(plan.logical_roots(), roots);
+    assert_eq!(plan.retiring().iter().collect::<Vec<_>>(), canonical);
+
+    // A new real trigger changes the frozen owner inventory without changing
+    // the failed task, active presentation, or cache payloads.
+    let newer_trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+    let manifest = CleanupManifest::new(roots.clone(), 0x8470, 5);
+    let error = match engine.begin_failed_authority_settlement_with_retention(
+        lease,
+        newer_trigger,
+        PreCommitAuthorityCause::HostLost,
+        plan,
+        manifest,
+        owners,
+        |_| panic!("a different trigger revision must not install cleanup"),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("the full frozen inventory must reject trigger drift"),
+    };
+    let (lease, plan, manifest, owners, kind) = error.into_parts();
+    assert_eq!(kind, BeginAuthoritySettlementErrorKind::Stale);
+    assert_eq!(plan.logical_roots(), roots);
+    assert_eq!(
+        owners
+            .iter()
+            .map(|owner| owner.projection())
+            .collect::<Vec<_>>(),
+        originals.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(engine.history(), &history);
+    engine.inspect_report_identity(&task).unwrap();
+    drop((trigger, plan));
+
+    let trigger = engine.failed_authority_trigger_for_task(&task).unwrap();
+    let plan = engine
+        .prepare_retained_failed_authority_settlement_plan(
+            &lease,
+            &trigger,
+            &base_roots,
+            &owners.iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let mut installed = None;
+    let cleanup = engine
+        .begin_failed_authority_settlement_with_retention(
+            lease,
+            trigger,
+            PreCommitAuthorityCause::HostLost,
+            plan,
+            manifest,
+            owners,
+            |batch| installed = Some(batch),
+        )
+        .unwrap();
+    assert_eq!(installed.unwrap().inner, cleanup.inner);
+    assert_eq!(engine.history(), &history);
+    engine
+        .complete_authority_cleanup(cleanup.complete(0x8471, 5), || {})
+        .unwrap();
+    assert_eq!(engine.history(), &history);
+    assert_eq!(engine.canonical_history(), keys);
+    assert!(engine.snapshot().running_request().is_none());
+    drop(task);
+
+    let lease = readmit_after_host_loss(&mut engine);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/other/1", &mut owners);
+    navigate(&mut engine, "/other/2", &mut owners);
+    assert_eq!(
+        owners.len(),
+        1,
+        "the exact authority batch cleared the cache"
+    );
+    drop(lease);
+}
+
+#[test]
 fn retained_foreground_host_loss_binds_original_owners_to_the_authority_cleanup() {
     let (mut engine, lease, owners) = retained_idle_fixture();
     let history = engine.history().clone();

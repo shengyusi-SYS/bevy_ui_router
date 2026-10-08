@@ -107,6 +107,7 @@ impl RetainedCommitPlan {
 pub struct RetainedAuthoritySettlementPlan {
     source: PreparedPublicationObservation,
     inventory: HostAdmissionUnavailableOwnerInventoryProjection,
+    failed_base_roots: Option<Vec<RouteFrameVersion>>,
     logical_roots: Vec<RouteFrameVersion>,
     retiring: Vec<RetainedLeafProjection>,
 }
@@ -118,6 +119,10 @@ impl RetainedAuthoritySettlementPlan {
 
     pub fn retiring(&self) -> &[RetainedLeafProjection] {
         &self.retiring
+    }
+
+    pub(super) fn failed_base_roots(&self) -> Option<&[RouteFrameVersion]> {
+        self.failed_base_roots.as_deref()
     }
 }
 
@@ -206,16 +211,11 @@ impl ValidatedRetainedPublication<'_> {
 }
 
 impl RouterEngine {
-    fn retained_authority_settlement_eligible(&self) -> bool {
-        self.current.as_ref().is_some_and(|current| {
-            matches!(current.attempt, AttemptKind::Normal(_))
-                && matches!(
-                    current.stage,
-                    WorkStage::Applying | WorkStage::ReadyToCommit | WorkStage::CommitSealed { .. }
-                )
-                && current.reconciliation.is_some()
-                && current.retired_host.is_none()
-        }) && self.state.availability() == &RouterAvailability::Ready
+    fn retained_authority_settlement_source_eligible(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.retired_host.is_none())
+            && self.state.availability() == &RouterAvailability::Ready
             && self.action.is_none()
             && self.current_reconciliation_matches_active()
             && self.pending_retained_transfer.is_none()
@@ -227,6 +227,20 @@ impl RouterEngine {
                 self.prepared_publication_authority,
                 Some(PreparedPublicationAuthority::Rejected(_))
             )
+    }
+
+    fn retained_authority_settlement_eligible(&self) -> bool {
+        self.retained_authority_settlement_source_eligible()
+            && self.current.as_ref().is_some_and(|current| {
+                matches!(current.attempt, AttemptKind::Normal(_))
+                    && current.reconciliation.is_some()
+                    && matches!(
+                        current.stage,
+                        WorkStage::Applying
+                            | WorkStage::ReadyToCommit
+                            | WorkStage::CommitSealed { .. }
+                    )
+            })
     }
 
     pub(crate) fn prepare_retained_authority_settlement_plan(
@@ -243,6 +257,49 @@ impl RouterEngine {
         if !self.retained_authority_settlement_eligible() {
             return Err(BeginAuthoritySettlementErrorKind::WrongPhase);
         }
+        self.freeze_retained_authority_settlement_plan(
+            host,
+            inventory,
+            self.authority_settlement_logical_roots(),
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_retained_failed_authority_settlement_plan(
+        &self,
+        lease: &HostLease,
+        trigger: &FailedAuthoritySettlementTrigger,
+        base_logical_roots: &[RouteFrameVersion],
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedAuthoritySettlementPlan, BeginAuthoritySettlementErrorKind> {
+        let (Some(host), Some(slot)) = (self.state.host(), self.state.top_slot()) else {
+            return Err(BeginAuthoritySettlementErrorKind::Stale);
+        };
+        if !lease.matches(self.router, host, slot) {
+            return Err(BeginAuthoritySettlementErrorKind::Foreign);
+        }
+        if !self.retained_authority_settlement_source_eligible() {
+            return Err(BeginAuthoritySettlementErrorKind::WrongPhase);
+        }
+        self.inspect_failed_authority_trigger(trigger)?;
+        if !trigger.terminal.accepts_logical_roots(base_logical_roots) {
+            return Err(BeginAuthoritySettlementErrorKind::InvalidManifest);
+        }
+        self.freeze_retained_authority_settlement_plan(
+            host,
+            inventory,
+            base_logical_roots.to_vec(),
+            Some(base_logical_roots.to_vec()),
+        )
+    }
+
+    fn freeze_retained_authority_settlement_plan(
+        &self,
+        host: &HostVersion,
+        inventory: &[&RetainedLeafOwner],
+        mut logical_roots: Vec<RouteFrameVersion>,
+        failed_base_roots: Option<Vec<RouteFrameVersion>>,
+    ) -> Result<RetainedAuthoritySettlementPlan, BeginAuthoritySettlementErrorKind> {
         if !owner_projections_match(
             inventory.iter().copied(),
             self.retained_leaves
@@ -265,7 +322,6 @@ impl RouterEngine {
                 retiring.push(entry.projection.clone());
             }
         }
-        let mut logical_roots = self.authority_settlement_logical_roots();
         logical_roots.extend(retiring.iter().map(|projection| projection.frame().clone()));
         if logical_roots
             .iter()
@@ -286,6 +342,7 @@ impl RouterEngine {
         Ok(RetainedAuthoritySettlementPlan {
             source: self.observe_prepared_publication_source(record_index),
             inventory: self.observed_unavailable_owner_inventory(),
+            failed_base_roots,
             logical_roots,
             retiring,
         })
@@ -311,12 +368,83 @@ impl RouterEngine {
     where
         F: FnOnce(&Self, CleanupBatchToken),
     {
+        self.begin_retained_authority_settlement_from_source(
+            issuer,
+            lease,
+            None,
+            cause,
+            plan,
+            seal,
+            owners,
+            authority_mutation,
+        )
+    }
+
+    pub(crate) fn begin_failed_authority_settlement_with_retention<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        trigger: FailedAuthoritySettlementTrigger,
+        cause: PreCommitAuthorityCause,
+        plan: &RetainedAuthoritySettlementPlan,
+        seal: CleanupManifestSeal,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<
+        CleanupBatchToken,
+        (
+            HostLease,
+            Vec<RetainedLeafOwner>,
+            BeginAuthoritySettlementErrorKind,
+        ),
+    >
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
+        self.begin_retained_authority_settlement_from_source(
+            issuer,
+            lease,
+            Some(trigger),
+            cause,
+            plan,
+            seal,
+            owners,
+            authority_mutation,
+        )
+    }
+
+    fn begin_retained_authority_settlement_from_source<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: HostLease,
+        trigger: Option<FailedAuthoritySettlementTrigger>,
+        cause: PreCommitAuthorityCause,
+        plan: &RetainedAuthoritySettlementPlan,
+        seal: CleanupManifestSeal,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<
+        CleanupBatchToken,
+        (
+            HostLease,
+            Vec<RetainedLeafOwner>,
+            BeginAuthoritySettlementErrorKind,
+        ),
+    >
+    where
+        F: FnOnce(&Self, CleanupBatchToken),
+    {
         let record_index = self.current.as_ref().and_then(|current| {
             self.records
                 .iter()
                 .position(|record| record.id() == current.identity.request)
         });
-        if !self.retained_authority_settlement_eligible()
+        let eligible = if trigger.is_some() {
+            plan.failed_base_roots.is_some() && self.retained_authority_settlement_source_eligible()
+        } else {
+            plan.failed_base_roots.is_none() && self.retained_authority_settlement_eligible()
+        };
+        if !eligible
             || record_index.is_none_or(|index| {
                 !self
                     .observe_prepared_publication_source(index)
@@ -335,12 +463,19 @@ impl RouterEngine {
                 BeginAuthoritySettlementErrorKind::InvalidManifest,
             ));
         }
+        let failed = match trigger {
+            Some(trigger) => match self.consume_failed_authority_trigger(trigger) {
+                Ok(source) => Some(source),
+                Err(kind) => return Err((lease, owners, kind)),
+            },
+            None => None,
+        };
         match self.begin_authority_settlement_publication(
             issuer,
             lease,
             cause,
             seal,
-            None,
+            failed,
             Some(plan),
             authority_mutation,
         ) {

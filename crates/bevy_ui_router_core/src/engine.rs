@@ -615,6 +615,26 @@ enum FailedAuthoritySettlementTerminal {
     },
 }
 
+impl FailedAuthoritySettlementTerminal {
+    fn accepts_logical_roots(&self, roots: &[RouteFrameVersion]) -> bool {
+        match self {
+            Self::Task {
+                current_roots,
+                target_and_current_roots,
+                ..
+            } => {
+                current_roots == roots
+                    || target_and_current_roots
+                        .as_ref()
+                        .is_some_and(|expected| expected == roots)
+            }
+            Self::ProjectionlessFallbackWithActive(source) => source.logical_roots == roots,
+            Self::FailureCleanup(request) => request.logical_roots == roots,
+            Self::RegistrationBegin { logical_roots, .. } => logical_roots == roots,
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 struct ProjectionlessFallbackAuthoritySource {
     identity: FrameTaskIdentity,
@@ -682,21 +702,21 @@ enum FailedAuthoritySettlementLogicalRoots {
 impl FailedAuthoritySettlementSource {
     fn select_logical_roots(
         self,
-        seal: &CleanupManifestSeal,
+        expected: &[RouteFrameVersion],
     ) -> Option<(FrameTaskIdentity, Vec<RouteFrameVersion>)> {
         let selected = match self.logical_roots {
             FailedAuthoritySettlementLogicalRoots::Exact(roots)
             | FailedAuthoritySettlementLogicalRoots::ProjectionlessFallbackWithActive(roots) => {
-                (roots.as_slice() == seal.logical_roots()).then_some(roots)
+                (roots.as_slice() == expected).then_some(roots)
             }
             FailedAuthoritySettlementLogicalRoots::Task {
                 current,
                 target_and_current,
             } => {
-                if current.as_slice() == seal.logical_roots() {
+                if current.as_slice() == expected {
                     Some(current)
                 } else {
-                    target_and_current.filter(|roots| roots.as_slice() == seal.logical_roots())
+                    target_and_current.filter(|roots| roots.as_slice() == expected)
                 }
             }
         }?;
@@ -7085,17 +7105,16 @@ impl RouterEngine {
         )
     }
 
-    fn consume_failed_authority_trigger(
-        &mut self,
-        trigger: FailedAuthoritySettlementTrigger,
-    ) -> Result<FailedAuthoritySettlementSource, BeginAuthoritySettlementErrorKind> {
+    fn inspect_failed_authority_trigger(
+        &self,
+        trigger: &FailedAuthoritySettlementTrigger,
+    ) -> Result<(), BeginAuthoritySettlementErrorKind> {
         if trigger.router != self.router {
             return Err(BeginAuthoritySettlementErrorKind::Foreign);
         }
         if self.live_failed_authority_trigger_revision != Some(trigger.revision) {
             return Err(BeginAuthoritySettlementErrorKind::Stale);
         }
-        self.live_failed_authority_trigger_revision = None;
         let terminal_ref = match &trigger.terminal {
             FailedAuthoritySettlementTerminal::ProjectionlessFallbackWithActive(source) => {
                 FailedAuthoritySettlementTerminalRef::ProjectionlessFallbackWithActive(
@@ -7127,6 +7146,22 @@ impl RouterEngine {
         if refrozen != trigger.terminal {
             return Err(BeginAuthoritySettlementErrorKind::Stale);
         }
+        Ok(())
+    }
+
+    fn consume_failed_authority_trigger(
+        &mut self,
+        trigger: FailedAuthoritySettlementTrigger,
+    ) -> Result<FailedAuthoritySettlementSource, BeginAuthoritySettlementErrorKind> {
+        let inspected = self.inspect_failed_authority_trigger(&trigger);
+        if trigger.router == self.router
+            && self.live_failed_authority_trigger_revision == Some(trigger.revision)
+        {
+            // A current trigger remains a single attempt even when its terminal
+            // refreeze rejects. Foreign or superseded triggers consume nothing.
+            self.live_failed_authority_trigger_revision = None;
+        }
+        inspected?;
         let (identity, logical_roots) = match trigger.terminal {
             FailedAuthoritySettlementTerminal::ProjectionlessFallbackWithActive(source) => (
                 source.identity,
@@ -7253,13 +7288,26 @@ impl RouterEngine {
 
         let (current_identity, logical_roots) = match failed {
             Some(source) => {
-                let Some((identity, logical_roots)) = source.select_logical_roots(&seal) else {
+                let base_roots = match retention {
+                    Some(plan) => {
+                        let Some(roots) = plan.failed_base_roots() else {
+                            return Err(BeginAuthoritySettlementError::new(
+                                BeginAuthoritySettlementErrorKind::WrongPhase,
+                                lease,
+                            ));
+                        };
+                        roots
+                    }
+                    None => seal.logical_roots(),
+                };
+                let Some((identity, base_roots)) = source.select_logical_roots(base_roots) else {
                     return Err(BeginAuthoritySettlementError::new(
                         BeginAuthoritySettlementErrorKind::InvalidManifest,
                         lease,
                     ));
                 };
-                (identity, logical_roots)
+                let roots = retention.map_or(base_roots, |plan| plan.logical_roots().to_vec());
+                (identity, roots)
             }
             None => {
                 let identity = self
@@ -7472,6 +7520,7 @@ impl RouterEngine {
         self.current = None;
         self.pending_post_commit_terminal = None;
         self.pending_post_commit_settlement_trace = None;
+        self.live_failed_authority_trigger_revision = None;
         self.action = None;
         self.active_branch = None;
         self.active_child_slots.clear();

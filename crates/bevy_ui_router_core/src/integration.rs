@@ -7634,10 +7634,81 @@ impl RouterEngine {
             .map_err(map_begin_authority_settlement_error)
     }
 
+    /// Borrows the current failed trigger after physical preparation. The plan
+    /// freezes its exact revision and preserves the failed source's base roots.
+    #[doc(hidden)]
+    pub fn prepare_retained_failed_authority_settlement_plan(
+        &self,
+        lease: &HostLease,
+        trigger: &FailedAuthoritySettlementTrigger,
+        base_logical_roots: &[RouteFrameVersion],
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedAuthoritySettlementPlan, BeginAuthoritySettlementErrorKind> {
+        self.inner
+            .prepare_retained_failed_authority_settlement_plan(
+                &lease.inner,
+                &trigger.inner,
+                base_logical_roots,
+                inventory,
+            )
+            .map_err(map_begin_authority_settlement_error)
+    }
+
     #[doc(hidden)]
     pub fn begin_authority_settlement_with_retention<F>(
         &mut self,
         lease: HostLease,
+        cause: PreCommitAuthorityCause,
+        plan: RetainedAuthoritySettlementPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, RetainedAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        self.begin_authority_settlement_with_retained_trigger(
+            lease,
+            None,
+            cause,
+            plan,
+            manifest,
+            owners,
+            authority_mutation,
+        )
+    }
+
+    /// Consumes one failed-trigger attempt; rejection returns every long-lived
+    /// owner while the caller retains its original failed task or cleanup request.
+    #[doc(hidden)]
+    pub fn begin_failed_authority_settlement_with_retention<F>(
+        &mut self,
+        lease: HostLease,
+        trigger: FailedAuthoritySettlementTrigger,
+        cause: PreCommitAuthorityCause,
+        plan: RetainedAuthoritySettlementPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, RetainedAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        self.begin_authority_settlement_with_retained_trigger(
+            lease,
+            Some(trigger),
+            cause,
+            plan,
+            manifest,
+            owners,
+            authority_mutation,
+        )
+    }
+
+    fn begin_authority_settlement_with_retained_trigger<F>(
+        &mut self,
+        lease: HostLease,
+        trigger: Option<FailedAuthoritySettlementTrigger>,
         cause: PreCommitAuthorityCause,
         plan: RetainedAuthoritySettlementPlan,
         manifest: CleanupManifest,
@@ -7666,26 +7737,39 @@ impl RouterEngine {
             obligation_count,
         );
         let host_trace = &mut self.host_trace;
-        let result = self.inner.begin_authority_settlement_with_retention(
-            &mut self.admission,
-            lease.inner,
-            cause.inner(),
-            &plan,
-            seal,
-            owners,
-            |_, inner| {
-                authority_mutation(CleanupBatch {
-                    inner,
-                    manifest_digest,
-                    obligation_count,
-                });
-                host_trace.push(HostTraceEvent::project(
-                    HostTraceEventKind::SettlementStarted,
-                    version,
-                    slot,
-                ));
-            },
-        );
+        let publication = |_: &CoreRouterEngine, inner| {
+            authority_mutation(CleanupBatch {
+                inner,
+                manifest_digest,
+                obligation_count,
+            });
+            host_trace.push(HostTraceEvent::project(
+                HostTraceEventKind::SettlementStarted,
+                version,
+                slot,
+            ));
+        };
+        let result = match trigger {
+            Some(trigger) => self.inner.begin_failed_authority_settlement_with_retention(
+                &mut self.admission,
+                lease.inner,
+                trigger.inner,
+                cause.inner(),
+                &plan,
+                seal,
+                owners,
+                publication,
+            ),
+            None => self.inner.begin_authority_settlement_with_retention(
+                &mut self.admission,
+                lease.inner,
+                cause.inner(),
+                &plan,
+                seal,
+                owners,
+                publication,
+            ),
+        };
         match result {
             Ok(inner) => Ok(CleanupBatch {
                 inner,
