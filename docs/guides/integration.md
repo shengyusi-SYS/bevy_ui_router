@@ -127,8 +127,6 @@ let router = app.add_ui_router(config)?;
 
 命中继续使用原实体与组件状态，应用的后台系统通过下述 `RouteActivity` 查询决定是否工作；布局仍由正常 Bevy UI 管线执行，滚动接入不需要另换容器或记录接口。
 
-缓存自身失效清理途中 host loss 的结算缺口见[当前修复项](../roadmap.md#完成缓存失效清理的有界结算)。
-
 ## 滚动恢复
 
 在 Scene 的滚动容器上同时声明 `RouteScroll::new("body")`、Bevy 的 `ScrollPosition` 和配置了 scroll overflow 的 `Node`；`RouteScroll` 从 facade/prelude 导入。多个容器使用不同稳定 key，例如 `"body"` 和 `"sidebar"`，子页面可重复父布局的 key。

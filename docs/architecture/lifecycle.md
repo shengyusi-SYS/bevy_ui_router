@@ -13,9 +13,11 @@ Core 的 [engine](../../crates/bevy_ui_router_core/src/engine.rs) 决定下一�
 | `CommitTicket` 或最后一个 `final_task` | current/next projection 对接为 sealed reconciliation；准备物理切换、claim rebind、输入/focus 和 cleanup owner | publication work 消费预备状态，Core 最后发布；leaving 责任交给 cleanup |
 | `FailureCleanup` | failed branch 冻结 manifest，预留 ledger，再与 Core cleanup batch 绑定 | 逐项物理 receipt 形成 typed completion；Core 消费原 continuation 决定恢复或 terminal |
 | `BackResolution` | history authority 与 capacity reservation 配对，保存完整 source evidence，分别准备 target/no-target | 有目标进入既有执行与 publication；无目标不运行 view，完成明确的失败/authority 结算 |
-| `RetainedMissCleanupOwner` | 缓存自身失效时，`retained_miss` 持有原 fresh task、独立 cleanup token、物理 ledger、原失效证据与 pending continuation | 清理完成后返还原 task；当前拒绝 holder 的部分完成/host loss 后继仍有[待修复缺口](../roadmap.md#完成缓存失效清理的有界结算)，不能把保存 owner 等同于有界结算 |
+| `RetainedMissCleanupOwner` | 缓存自身失效时，`retained_miss` 持有原 fresh task、独立 cleanup token、物理 ledger、原失效证据与 pending continuation | 正常完成返还原 task；受控停止路径先结算原 receipt 与已证明 inert 的残留，再返还原 task，由既有 authority 路径处理 host loss |
 
 拒绝、容量不足或 completion error 必须返还原 owner 给对应 holder；不能重新签发一个看似等价的 task。已发布 active、pending branch、cleanup ledger 和私有 residual 是不同责任，不以任一容器是否为空替代协议完成。
+
+缓存失效删除计划停止后不恢复旧删除权限。已删除目标保留原 receipt；受控停止路径核对原失效来源、已完成义务及剩余 exact 空 shell，确认其视觉与输入隔离后，将 shell 转交已有私有 residual 责任并完成原 cleanup token。原 fresh task 随后回到既有 authority 观察与结算；此路径不把任意 drift 解释为 cache miss。
 
 history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)。publication 后的 compound settlement 在 Core [post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs) 与 ECS navigation 中，保留已发布结果。已退役缓存继续由原 normal token/ledger 持有，Live 缓存进入 authority 第二批；完整库存随原 receiver 冻结，联合完成分别结算两个 token。延迟删除非权威 preservation proof 时只移除原选定项，保留其他 Router 的合法变化。无运行请求的 host loss 则由 Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) 和 ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs) 持有独立 settlement owner，不重开 terminal 请求。
 

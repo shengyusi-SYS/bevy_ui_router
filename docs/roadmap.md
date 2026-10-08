@@ -1,18 +1,10 @@
 # 发布与后续范围
 
-功能范围以 [专题合同](contracts/README.md) 为准；已有运行证据及平台限制见 [验证指南](development/verification.md)。已完成的 MVP 计划不重新启用；新发现的问题按下述优先级处理。
+功能范围以 [专题合同](contracts/README.md) 为准；已有运行证据及平台限制见 [验证指南](development/verification.md)。已完成的计划和修复由 Git 追溯，后续扩展按需求与证据确定。
 
 ## 当前优先级
 
 生产参考反馈只用于发现通用场景；问题必须在本项目公开入口独立验证，不引入参考应用的页面、业务状态或返回逻辑。
-
-### 完成缓存失效清理的有界结算
-
-自身失效缓存清理途中撤销 host registration，原请求仍运行且 availability 保持 Ready，普通更新不能推进拒绝 holder。该问题已有公开旅程回归，仍待修复。
-
-保留原 task、cleanup token、已形成 receipt 与失效来源；停止旧物理删除计划后，为原剩余义务建立当前证明及明确残留责任，再接回已有 HostLost 结算和重新接纳。不能伪造 completion、重建 owner 或将永久保存前台 owner 视为完成。无法证明安全交接的分支须与容量不足区分；不承诺任意 World 修改都能恢复为 cache miss。
-
-先闭合已复现的部分完成场景，验证 history 不推进、单一请求终态、输入/focus 撤权、app-owned host 保持以及后续合法请求。沿现有 preparation/publication/cleanup 管线处理，不新增缓存状态机；按[验证指南](development/verification.md)重跑受影响完整 crate 和 public journey/consumer。
 
 ### 按需确定延迟滚动恢复的最小合同
 
@@ -42,6 +34,6 @@ Windows 原生、最低 Rust、物理 GPU 与硬件输入尚未验证。它们�
 
 增加能力前先证明消费者需求，说明与现有生命周期合同的关系，再确定最小实现及验收。
 
-按 history entry 的显式滚动恢复和同父 leaf 保留已交付，并具有组合、独立 consumer、窗口与性能证据；尚未闭合的失效清理结算以上述修复项为准。行为归[导航合同](contracts/navigation.md)，方法和边界归[验证](development/verification.md)与[性能记录](performance.md)。已完成的设计/实施材料退出默认文档树，由 Git 追溯。
+按 history entry 的显式滚动恢复和同父 leaf 保留已交付，并具有组合、独立 consumer、窗口与性能证据。行为归[导航合同](contracts/navigation.md)，方法和边界归[验证](development/verification.md)与[性能记录](performance.md)。已完成的设计/实施材料退出默认文档树，由 Git 追溯。
 
 query 更新时的布局保留与标准键盘插件接线，分别按消费者需求确定最小范围；它们不作为本轮交付或首次发布的隐式前置。浏览器 URL/history adapter、异步 factory 与过渡动画仍未排期。

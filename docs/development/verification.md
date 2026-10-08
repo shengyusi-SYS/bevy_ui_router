@@ -42,11 +42,11 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 | --- | --- | --- |
 | Core：匹配、branch diff、请求、history | [Core tests](../../crates/bevy_ui_router_core/tests)、`src/engine_tests.rs` | [公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) 的嵌套切换、参数/search/fragment、Back、失败及恢复 |
 | View：renderer-neutral 输入与 binding | [View public API](../../crates/bevy_ui_router_view/tests/public_api.rs) | [view consumer](../../crates/bevy_ui_router/tests/consumers/view.rs) 的独立使用 |
-| ECS：host、identity、staging、publication、cleanup | [ECS public API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、`src/navigation_tests.rs`、`src/cleanup_tests.rs` | 公开导航旅程的旧内容清理、布局保留、host loss/readmission 与后续请求 |
+| ECS：host、identity、staging、publication、cleanup | [ECS public API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、`src/navigation_tests.rs`、`src/cleanup_tests.rs` | 公开导航旅程的旧内容清理、布局保留、失效缓存部分清理后的 host loss/readmission 与后续请求 |
 | BSN：factory、resolve/apply、outlet、containment | [BSN facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs) | [BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) 及两个原样示例 |
 | 输入与焦点 | [原生 pointer 测试](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus 测试](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 窗口中的点击/Space、跨页手势与独立目标保护 |
 | 保留页与普通页交接 | [公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | route opt-in 与容量独立；混用 Back/Push、命中后继续导航、LRU 后 fresh→fresh，保留身份与父布局 |
-| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的二维位置、缩放/裁剪、preserved prefix、失败来源、host 重接纳及 stale settlement 拒绝 |
+| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的二维位置、缩放/裁剪、布局暂缺与身份撤销、preserved prefix、失败来源、host 重接纳及 stale settlement 拒绝 |
 | 页面活动资格 | [公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 非交互内容、可变应用 Query、缓存失活/恢复、动态后代和 exact 父链/host registration |
 | facade 与 feature/依赖边界 | [独立 consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 最小依赖的独立应用运行与逐 case 编译拒绝 |
 
@@ -104,7 +104,9 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
-历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；覆盖混用 Back/Push、淘汰后的后续普通导航，以及暂缺布局后正常离场。上述公开回归与非目标缓存自身失效旅程已随修复通过；清理中途 host loss 的回归仍失败，见[当前修复项](../roadmap.md#完成缓存失效清理的有界结算)，不能把跳过该用例的检查称为全量通过。
+历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；组合回归覆盖混用 Back/Push、淘汰后的后续普通导航、非目标缓存自身失效、暂缺布局后正常离场，以及部分清理中途 host loss 后的同 host 重新接纳与后续 fresh 导航。authority 隔离还须核对 native 内容根的 authored Visibility、Pickable 与应用局部状态保持。不能把跳过失败用例的检查称为全量通过。
+
+修复源码 `c570e125c943643c8ebf128b100e61b371a92148` 已通过 workspace 格式、all-targets/all-features 静态检查及未跳过用例的全特性测试，包含公开导航、保留、滚动、原生输入/focus 和独立 consumer；ECS 无 BSN 及独立窗口全特性检查也通过。当前版本在 Linux/WSLg、960×640、软件渲染的 `ui-debug` 窗口重跑了缓存身份/计数、Back 滚动、focus/跨页手势撤权和 fallback 后 fresh 恢复，并核对 renderer 截图。
 
 2026-10-08 的缓存/滚动组合已在窗口源码 `1a30dc58d41c91dd3bcadc3d9795edbdd129a6ad` 验证：Linux/WSLg、960×640、软件渲染、debug `ui-debug`，通过应用内 BRP 发送真实 WindowEvent 与 typed messages。已验证原 Entity/页面和布局计数保留、多 entry 各自恢复位置、旧手势与 focus 撤权、命中后的新点击/Space，以及 fallback 清理旧库存后重新构建；renderer 截图检查最终呈现。库侧完成 workspace 全特性、独立 consumer、无 BSN 和新旧性能夹具行为检查；正式耗时结果归[性能基线](../performance.md)。
 

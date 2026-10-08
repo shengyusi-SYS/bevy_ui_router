@@ -26,7 +26,7 @@ Back 的成功目标既可能 fresh，也可能 retained。共享接收器若仍
 
 重新激活、非目标保护与安全处置回答不同问题。缺少原 outlet 声明可能阻止激活，不自动撤销受保护身份或阻止按原 owner 安全处置；各路径分别证明当前 authority、角色、目标写集与原义务，不能把任意 drift 都降成 miss。
 
-cleanup 决定物理义务如何处置，continuation 决定原请求如何结束或恢复。后者来自原失败与 attempt，不能由保留了旧 active、剩余实体数或删除结果反推。仅真实容量或可完成前置不足可以重试；永久矛盾必须有界结算。
+cleanup 决定物理义务如何处置，continuation 决定原请求如何结束或恢复。后者来自原失败与 attempt，不能由保留了旧 active、剩余实体数或删除结果反推。停止删除不等于责任已结清：部分完成路径须保存原 receipt 与失效来源，重新证明剩余原义务，只将已证明 inert 的残留转交私有责任，再接回原 continuation。仅真实容量或可完成前置不足可以重试；永久矛盾必须有界结算。
 
 ## 线性 owner 与 preparation 边界不能靠快照补救
 
@@ -44,7 +44,7 @@ Bevy 的便利借用 API 也要检查实际副作用。资源 take/reinsert、sc
 
 创建期先登记 exact allocation obligations，覆盖尚未挂接的产物；成功 adoption 后按当前 containment 管理普通内容。普通组件新增不是 ownership 转移，普通内容也不必临时转成永久登记结构。
 
-relationship 与组件写入可能同步触发 hook/observer，正常 UI propagation 也会改变派生组件。每次相关写后重建 target/protected partition，再验证授权写集和保留值；不以全局白名单、旧快照或遍历顺序掩盖角色差异。只读 preservation 不应套用 mutation 的封闭 child-set 假设。
+relationship 与组件写入可能同步触发 hook/observer，正常 UI propagation 也会改变派生组件。每次相关写后重建 target/protected partition，再验证授权写集和保留值；不以全局白名单、旧快照或遍历顺序掩盖角色差异。只读 preservation 不应套用 mutation 的封闭 child-set 假设。视觉隔离与 lifecycle 写入也按冻结的实体 role 分开，避免把 native 内容根当作 Router shell 改写应用状态。
 
 ## 活动资格、输入权限与后台工作各有边界
 

@@ -101,6 +101,7 @@ Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决�
 再推进明确的 error boundary、fallback 或 authority settlement。
 cleanup target 与 protected closure 分开冻结，写后重新确认；无法安全删除的残留
 由私有隔离责任持有，不继续占用终态请求的前台 lifecycle capability。
+authority 隔离使用预先冻结的实体 role：native Scene 内容根仅推进 lifecycle，保留 authored Node、Visibility 与 Pickable；视觉与输入撤权由 Router shell 和 gate 承担。
 当前没有后台 reaper 自动回收这些残留。
 
 ## Bevy 调度与输入
