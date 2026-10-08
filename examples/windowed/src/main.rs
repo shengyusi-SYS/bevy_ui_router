@@ -2,7 +2,7 @@
 #[cfg(all(debug_assertions, feature = "ui-debug"))]
 mod ui_debug;
 use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
-use bevy_internal::{picking::Pickable, prelude::*};
+use bevy_internal::{input::mouse::MouseScrollUnit, picking::Pickable, prelude::*};
 use bevy_scene::{Scene, bsn};
 use bevy_ui_router::{
     ecs::{RouterInputSet, RouterScheduleSet},
@@ -39,7 +39,7 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            title: "Bevy UI Router - MVP".into(),
+            title: "Bevy UI Router - retained pages and history scroll".into(),
             resolution: (960, 640).into(),
             focused: !cfg!(all(debug_assertions, feature = "ui-debug")),
             ..default()
@@ -85,16 +85,31 @@ fn main() {
             Ok(bsn! {
                 Node {
                     width: Val::Percent(100.0), height: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column, row_gap: Val::Px(20.0),
-                    padding: UiRect::all(Val::Px(24.0)),
+                    flex_direction: FlexDirection::Column, row_gap: Val::Px(10.0),
+                    padding: UiRect::all(Val::Px(12.0)),
                 }
-                BackgroundColor(color)
+                BackgroundColor(color) Name::new(name)
                 Children [
-                    (Text({name.to_owned()}) TextFont { font_size: FontSize::Px(28.0) } Pickable { should_block_lower: false, is_hoverable: false }),
-                    (Text({"Click the button to focus it; Space increments only the focused, active page.".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }),
-                    (Button Node { width: Val::Px(440.0), height: Val::Px(52.0), padding: UiRect::all(Val::Px(12.0)) }
+                    (Text({name.to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable { should_block_lower: false, is_hoverable: false }),
+                    (Text({"Click / Space adds one. Scroll, switch pages, then Back.".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }),
+                    (Button Node { width: Val::Px(440.0), height: Val::Px(44.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(8.0)) }
                         BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton
-                        Children [(Text({"Page count: 0 (click / Space)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false })])
+                        Children [(Text({"Page count: 0 (click / Space)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false })]),
+                    (Node {
+                        width: Val::Percent(100.0), height: Val::Px(120.0), flex_shrink: 0.0,
+                        overflow: Overflow::scroll_y(),
+                    }
+                    Name::new(format!("{name}-scroll")) RouteScroll::new("list")
+                    BackgroundColor(Color::srgb(0.06, 0.10, 0.16))
+                    Children [(Node {
+                        width: Val::Percent(100.0), height: Val::Px(720.0), flex_shrink: 0.0,
+                        padding: UiRect::all(Val::Px(12.0)),
+                        flex_direction: FlexDirection::Column, justify_content: JustifyContent::SpaceBetween,
+                    } Pickable::IGNORE Children [
+                        (Text({format!("{name} list / top")}) Pickable::IGNORE),
+                        (Text({format!("{name} list / middle")}) Pickable::IGNORE),
+                        (Text({format!("{name} list / bottom")}) Pickable::IGNORE)
+                    ])])
                 ]
             })
         });
@@ -102,7 +117,9 @@ fn main() {
             .route_with_options(
                 root,
                 RoutePattern::path(name).unwrap(),
-                RouteNodeOptions::new().with_view(view),
+                RouteNodeOptions::new()
+                    .with_view(view)
+                    .with_keep_alive(true),
             )
             .unwrap();
     }
@@ -128,7 +145,9 @@ fn main() {
         })
     });
     let router = app
-        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .add_ui_router(
+            RouterConfig::new(routes.build().unwrap(), views, fallback).with_keep_alive_capacity(2),
+        )
         .unwrap();
     app.insert_resource(Demo {
         router,
@@ -140,11 +159,14 @@ fn main() {
     .add_systems(PreUpdate, keyboard.after(RouterInputSet::Ready))
     .add_systems(
         Update,
-        update_status.after(RouterScheduleSet::PublishSnapshots),
+        (start_initial_navigation, update_status)
+            .chain()
+            .after(RouterScheduleSet::PublishSnapshots),
     )
     .add_observer(click)
     .add_observer(press)
     .add_observer(release)
+    .add_observer(scroll)
     .run();
 }
 
@@ -303,6 +325,24 @@ fn keyboard(
     }
 }
 
+// This is application input behavior; RouteScroll only opts into history storage.
+fn scroll(
+    event: On<Pointer<Scroll>>,
+    gate: Res<RouterInputGate>,
+    mut positions: Query<&mut ScrollPosition, With<RouteScroll>>,
+) {
+    let target = event.event_target();
+    if gate.allows_pointer(target)
+        && let Ok(mut position) = positions.get_mut(target)
+    {
+        let unit = match event.unit {
+            MouseScrollUnit::Line => 32.0,
+            MouseScrollUnit::Pixel => 1.0,
+        };
+        position.0.y = (position.0.y - event.y * unit).max(0.0);
+    }
+}
+
 fn press(event: On<Pointer<Press>>, pages: Query<(), With<PageButton>>) {
     if pages.contains(event.event_target()) {
         println!("Page press {:?}", event.event_target());
@@ -315,14 +355,29 @@ fn release(event: On<Pointer<Release>>, pages: Query<(), With<PageButton>>) {
     }
 }
 
-fn update_status(
+fn start_initial_navigation(
     mut demo: ResMut<Demo>,
     snapshots: Res<RouterSnapshots>,
     mut navigation: ResMut<RouterNavigation>,
+) {
+    if !demo.initial_requested
+        && snapshots
+            .get(demo.router)
+            .is_some_and(|snapshot| snapshot.availability() == &RouterAvailability::Ready)
+    {
+        demo.initial_requested = true;
+        navigate(Action::Overview, &mut demo, &mut navigation);
+    }
+}
+
+fn update_status(
+    mut demo: ResMut<Demo>,
+    snapshots: Res<RouterSnapshots>,
     focus: Res<InputFocus>,
     layouts: Query<Entity, With<Layout>>,
     counters: Query<(&Counter, &Children)>,
-    pages: Query<(&PageButton, &Children)>,
+    pages: Query<(Entity, &PageButton, &Children)>,
+    activity: RouteActivity,
     mut texts: Query<&mut Text>,
     status: Query<Entity, With<Status>>,
     mut last_state: Local<String>,
@@ -330,10 +385,6 @@ fn update_status(
     let Some(snapshot) = snapshots.get(demo.router) else {
         return;
     };
-    if !demo.initial_requested && snapshot.availability() == &RouterAvailability::Ready {
-        demo.initial_requested = true;
-        navigate(Action::Overview, &mut demo, &mut navigation);
-    }
     if let Some(request) = demo.last_request
         && let RequestLookup::Found(result) = snapshots.request(demo.router, request)
         && matches!(
@@ -351,7 +402,11 @@ fn update_status(
             }
         }
     }
-    for (page, children) in &pages {
+    for (entity, page, children) in &pages {
+        // Retained entities remain in ordinary application queries.
+        if !activity.is_active(entity) {
+            continue;
+        }
         for child in children {
             if let Ok(mut text) = texts.get_mut(*child) {
                 text.0 = format!("Page count: {} (click / Space)", page.0);

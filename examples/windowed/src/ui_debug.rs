@@ -3,6 +3,7 @@
 
 use std::{io::Cursor, net::Ipv4Addr};
 
+use bevy_input_focus::InputFocus;
 use bevy_internal::{
     diagnostic::FrameCount,
     prelude::*,
@@ -10,6 +11,7 @@ use bevy_internal::{
     render::view::window::screenshot::{Screenshot, ScreenshotCaptured},
     window::{PrimaryWindow, WindowEvent},
 };
+use bevy_ui_router::prelude::{RouteActivity, RouterInputGate};
 use serde_json::{Value, json};
 
 /// Exposes BRP on localhost:15703 and keeps the development window processing requests.
@@ -79,11 +81,25 @@ fn keep_debug_window_running(mut settings: ResMut<bevy_internal::winit::WinitSet
     }
 }
 
-fn snapshot(_: In<Option<Value>>, world: &mut World) -> BrpResult {
-    let frame = world.resource::<FrameCount>().0;
-    let windows: Vec<_> = world
-        .query_filtered::<(Entity, &Window), With<PrimaryWindow>>()
-        .iter(world)
+fn snapshot(
+    _: In<Option<Value>>,
+    frame: Res<FrameCount>,
+    activity: RouteActivity,
+    gate: Res<RouterInputGate>,
+    focus: Res<InputFocus>,
+    windows: Query<(Entity, &Window), With<PrimaryWindow>>,
+    nodes: Query<(
+        Entity,
+        &ComputedNode,
+        &UiGlobalTransform,
+        Option<&Name>,
+        Option<&Text>,
+        Option<&ChildOf>,
+        Option<&ScrollPosition>,
+    )>,
+) -> BrpResult {
+    let windows: Vec<_> = windows
+        .iter()
         .map(|(entity, window)| {
             json!({
                 "entity": entity.to_bits(), "width": window.width(),
@@ -91,27 +107,26 @@ fn snapshot(_: In<Option<Value>>, world: &mut World) -> BrpResult {
             })
         })
         .collect();
-    let nodes: Vec<_> = world
-        .query::<(
-            Entity,
-            &ComputedNode,
-            &UiGlobalTransform,
-            Option<&Name>,
-            Option<&Text>,
-            Option<&ChildOf>,
-        )>()
-        .iter(world)
-        .map(|(entity, node, transform, name, text, parent)| {
+    let nodes: Vec<_> = nodes
+        .iter()
+        .map(|(entity, node, transform, name, text, parent, scroll)| {
+            let actual_scroll = node.scroll_position * node.inverse_scale_factor();
             json!({
                 "entity": entity.to_bits(), "name": name.map(Name::as_str),
                 "text": text.map(|text| text.0.as_str()),
                 "parent": parent.map(|parent| parent.parent().to_bits()),
                 "center_physical": [transform.translation.x, transform.translation.y],
-                "size_physical": [node.size().x, node.size().y]
+                "size_physical": [node.size().x, node.size().y],
+                "router_active": activity.is_active(entity),
+                "pointer_allowed": gate.allows_pointer(entity),
+                "keyboard_allowed": gate.allows_keyboard(entity),
+                "scroll_requested": scroll.map(|scroll| [scroll.0.x, scroll.0.y]),
+                "scroll_actual": [actual_scroll.x, actual_scroll.y]
             })
         })
         .collect();
-    Ok(json!({"frame": frame, "windows": windows, "nodes": nodes}))
+    Ok(json!({"frame": frame.0, "windows": windows, "nodes": nodes,
+        "focus": focus.get().map(Entity::to_bits)}))
 }
 
 #[derive(Resource, Default)]
