@@ -676,6 +676,15 @@ fn nested_fixture_with_retention(
     ancestors: Vec<RoutePattern>,
     capacity: usize,
 ) -> NestedFixture {
+    nested_fixture_with_retention_and_detail(root_pattern, ancestors, capacity, None)
+}
+
+fn nested_fixture_with_retention_and_detail(
+    root_pattern: RoutePattern,
+    ancestors: Vec<RoutePattern>,
+    capacity: usize,
+    detail: Option<RouteViewKey>,
+) -> NestedFixture {
     let mut app = native_app();
 
     let layout = RouteViewKey::new("nested-layout").unwrap();
@@ -718,9 +727,22 @@ fn nested_fixture_with_retention(
                 .with_keep_alive(capacity > 0),
         )
         .unwrap();
+    if let Some(detail) = &detail {
+        control.set_mode(detail, FixtureMode::Success { width: 47 });
+        routes
+            .route_with_options(
+                leaf_route,
+                RoutePattern::path("detail").unwrap(),
+                RouteNodeOptions::new().with_view(detail.clone()),
+            )
+            .unwrap();
+    }
+    let leaf_has_outlet = detail.is_some();
     let routes = routes.build().unwrap();
     let mut views = RouteViewRegistry::new();
-    for view in [layout.clone(), leaf.clone(), fallback.clone()] {
+    let mut fixture_views = vec![layout.clone(), leaf.clone(), fallback.clone()];
+    fixture_views.extend(detail);
+    for view in fixture_views {
         views
             .insert(
                 view.clone(),
@@ -728,7 +750,7 @@ fn nested_fixture_with_retention(
                     &mut app,
                     &control,
                     &view,
-                    view == layout,
+                    view == layout || (leaf_has_outlet && view == leaf),
                 )),
             )
             .unwrap();
@@ -3403,6 +3425,455 @@ fn retained_native_hit_preserves_state_and_skips_factory_and_scene_apply() {
     assert_succeeded(&request_snapshot(&fixture.app, fixture.router, outside));
     assert!(fixture.app.world().get_entity(original).is_err());
     assert!(fixture.app.world().get_entity(second_entity).is_err());
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn retained_native_empty_slot_hit_preserves_fragment_and_raw_search_contracts() {
+    let detail = RouteViewKey::new("nested-detail").unwrap();
+    let mut fixture = nested_fixture_with_retention_and_detail(
+        RoutePattern::path("/:section").unwrap(),
+        Vec::new(),
+        2,
+        Some(detail.clone()),
+    );
+    let location = |path: &str, fragment: &str| {
+        RouteLocation::new(path)
+            .with_search("?tag=a&tag=b")
+            .with_fragment(fragment)
+    };
+    let push = |fixture: &mut NestedFixture, target: RouteLocation| {
+        let request = push_and_settle(&mut fixture.app, fixture.router, target, None, None);
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+    };
+    let active_leaf = |app: &mut App| {
+        let leaves = node_entities_with_width(app, 43);
+        let gate = app.world().resource::<RouterInputGate>();
+        let active = leaves
+            .into_iter()
+            .filter(|entity| gate.allows_pointer(*entity))
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        active[0]
+    };
+
+    push(&mut fixture, location("/catalog/items/1/detail", "#first"));
+    let initial_frames = router_snapshot(&fixture.app, fixture.router)
+        .active()
+        .frames()
+        .to_vec();
+    assert_eq!(initial_frames.len(), 3);
+    let layout = node_entities_with_width(&mut fixture.app, 41)[0];
+    let original = active_leaf(&mut fixture.app);
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(original)
+        .unwrap()
+        .0 = 91;
+    let first_detail = node_entities_with_width(&mut fixture.app, 47)[0];
+    let first_detail_shell = fixture
+        .app
+        .world()
+        .get::<ChildOf>(first_detail)
+        .unwrap()
+        .parent();
+    let empty_slot = fixture
+        .app
+        .world()
+        .get::<ChildOf>(first_detail_shell)
+        .unwrap()
+        .parent();
+    let own_anchor = fixture
+        .app
+        .world()
+        .get::<ChildOf>(empty_slot)
+        .unwrap()
+        .parent();
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<DefaultOutlet>(own_anchor)
+            .is_some()
+    );
+
+    // A real child departure leaves its parent's original, now empty slot.
+    push(&mut fixture, location("/catalog/items/1", "#first"));
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .active()
+            .frames(),
+        &initial_frames[..2]
+    );
+    assert!(fixture.app.world().get_entity(first_detail).is_err());
+    assert!(fixture.app.world().get_entity(first_detail_shell).is_err());
+    assert!(fixture.app.world().get_entity(empty_slot).is_ok());
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<Children>(empty_slot)
+            .is_none_or(|children| children.is_empty())
+    );
+    assert_eq!(active_leaf(&mut fixture.app), original);
+
+    push(&mut fixture, location("/catalog/items/2", "#first"));
+    let other_leaf = active_leaf(&mut fixture.app);
+    assert_ne!(other_leaf, original);
+    assert!(fixture.app.world().get_entity(original).is_ok());
+    assert!(fixture.app.world().get_entity(empty_slot).is_ok());
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(original)
+    );
+    let effects_before_hit = fixture.control.effects();
+
+    push(&mut fixture, location("/catalog/items/1", "#first"));
+    assert_eq!(active_leaf(&mut fixture.app), original);
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(original),
+        Some(&LocalState(91))
+    );
+    assert_eq!(fixture.control.effects(), effects_before_hit);
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(empty_slot)
+            .unwrap()
+            .parent(),
+        own_anchor
+    );
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<Children>(empty_slot)
+            .is_none_or(|children| children.is_empty())
+    );
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .active()
+            .frames(),
+        &initial_frames[..2]
+    );
+
+    push(&mut fixture, location("/catalog/items/1/detail", "#first"));
+    let appended_frames = router_snapshot(&fixture.app, fixture.router)
+        .active()
+        .frames()
+        .to_vec();
+    assert_eq!(&appended_frames[..2], &initial_frames[..2]);
+    assert_eq!(appended_frames[2].slot(), initial_frames[2].slot());
+    let second_detail = node_entities_with_width(&mut fixture.app, 47)[0];
+    assert_ne!(second_detail, first_detail);
+    let second_detail_shell = fixture
+        .app
+        .world()
+        .get::<ChildOf>(second_detail)
+        .unwrap()
+        .parent();
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(second_detail_shell)
+            .unwrap()
+            .parent(),
+        empty_slot
+    );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<Children>(empty_slot)
+            .unwrap()
+            .as_ref(),
+        &[second_detail_shell]
+    );
+    assert_eq!(active_leaf(&mut fixture.app), original);
+    let effects_after_append = fixture.control.effects();
+    assert_eq!(effects_after_append.len(), effects_before_hit.len() + 1);
+    assert_eq!(effects_after_append.last().unwrap().view, detail);
+    push(&mut fixture, location("/catalog/items/1", "#first"));
+    assert!(fixture.app.world().get_entity(second_detail).is_err());
+    assert!(fixture.app.world().get_entity(empty_slot).is_ok());
+    assert_eq!(fixture.control.effects(), effects_after_append);
+
+    // Even when the earlier fragment is cached, fragment-only replacement
+    // rebuilds the deepest leaf and preserves the published parent instance.
+    let mut prior_entity = original;
+    let mut prior_frame = initial_frames[1].clone();
+    for fragment in ["#next", "#first"] {
+        let effects = fixture.control.effects();
+        let request = replace_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            location("/catalog/items/1", fragment),
+            None,
+        );
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+        let frames = router_snapshot(&fixture.app, fixture.router)
+            .active()
+            .frames()
+            .to_vec();
+        assert_eq!(frames[0], initial_frames[0]);
+        assert_eq!(frames[1].frame(), prior_frame.frame());
+        assert_eq!(frames[1].slot(), prior_frame.slot());
+        assert_eq!(
+            frames[1].generation().raw(),
+            prior_frame.generation().raw() + 1
+        );
+        let current = active_leaf(&mut fixture.app);
+        assert_ne!(current, prior_entity);
+        assert_ne!(
+            current, original,
+            "fragment replacement must not reactivate cached A"
+        );
+        let after = fixture.control.effects();
+        assert_eq!(after.len(), effects.len() + 1);
+        assert_eq!(&after[..effects.len()], effects.as_slice());
+        assert_eq!(after.last().unwrap().view, fixture.leaf);
+        assert_eq!(after.last().unwrap().fragment.as_deref(), Some(fragment));
+        prior_entity = current;
+        prior_frame = frames[1].clone();
+    }
+    assert!(fixture.app.world().get_entity(original).is_ok());
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(original),
+        Some(&LocalState(91))
+    );
+    let old_leaves = node_entities_with_width(&mut fixture.app, 43);
+    assert_eq!(
+        old_leaves.len(),
+        3,
+        "two inactive leaves remain before scope replacement"
+    );
+    let before_search = router_snapshot(&fixture.app, fixture.router)
+        .active()
+        .frames()
+        .to_vec();
+    let effects = fixture.control.effects();
+    let changed_search = RouteLocation::new("/catalog/items/1")
+        .with_search("?tag=b&tag=a")
+        .with_fragment("#first");
+    let request = replace_and_settle(
+        &mut fixture.app,
+        fixture.router,
+        changed_search.clone(),
+        None,
+    );
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let after_search = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after_search.active().location(), Some(&changed_search));
+    for (old, new) in before_search.iter().zip(after_search.active().frames()) {
+        assert_ne!(
+            old.frame(),
+            new.frame(),
+            "raw search changes rebuild the entire branch"
+        );
+    }
+    for old in old_leaves
+        .into_iter()
+        .chain([layout, empty_slot, own_anchor])
+    {
+        assert!(
+            fixture.app.world().get_entity(old).is_err(),
+            "old scope Entity {old:?} must settle"
+        );
+    }
+    assert_eq!(node_entities_with_width(&mut fixture.app, 41).len(), 1);
+    assert_eq!(node_entities_with_width(&mut fixture.app, 43).len(), 1);
+    let after = fixture.control.effects();
+    assert_eq!(after.len(), effects.len() + 2);
+    assert_eq!(&after[..effects.len()], effects.as_slice());
+    assert_eq!(after[effects.len()].view, fixture.layout);
+    assert_eq!(after[effects.len() + 1].view, fixture.leaf);
+    for effect in &after[effects.len()..] {
+        assert_eq!(effect.search.as_deref(), Some("?tag=b&tag=a"));
+        assert_eq!(effect.fragment.as_deref(), Some("#first"));
+    }
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+}
+
+#[test]
+fn retained_native_missing_own_outlet_settles_cache_and_resumes_the_original_request() {
+    let detail = RouteViewKey::new("nested-detail").unwrap();
+    let mut fixture = nested_fixture_with_retention_and_detail(
+        RoutePattern::path("/:section").unwrap(),
+        Vec::new(),
+        2,
+        Some(detail),
+    );
+    let a = RouteLocation::new("/catalog/items/1");
+    let b = RouteLocation::new("/catalog/items/2");
+    let detail_location = RouteLocation::new("/catalog/items/1/detail");
+    let active_leaf = |app: &mut App| {
+        let leaves = node_entities_with_width(app, 43);
+        let gate = app.world().resource::<RouterInputGate>();
+        let active = leaves
+            .into_iter()
+            .filter(|entity| gate.allows_pointer(*entity))
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        active[0]
+    };
+
+    for target in [detail_location.clone(), a.clone()] {
+        let request = push_and_settle(&mut fixture.app, fixture.router, target, None, None);
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+        assert_terminal_owner_closure(&fixture.app, fixture.router);
+    }
+    let original_a = active_leaf(&mut fixture.app);
+    let layout = node_entities_with_width(&mut fixture.app, 41)[0];
+    let parent_frame = router_snapshot(&fixture.app, fixture.router)
+        .active()
+        .frames()[0]
+        .clone();
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(original_a)
+        .unwrap()
+        .0 = 91;
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(layout)
+        .unwrap()
+        .0 = 73;
+    let container = fixture.app.world().get::<Children>(original_a).unwrap()[0];
+    let own_anchor = fixture.app.world().get::<Children>(container).unwrap()[0];
+    let own_slot = fixture.app.world().get::<Children>(own_anchor).unwrap()[0];
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<DefaultOutlet>(own_anchor)
+            .is_some()
+    );
+    assert!(
+        fixture
+            .app
+            .world()
+            .get::<Children>(own_slot)
+            .is_none_or(|children| children.is_empty())
+    );
+    assert!(node_entities_with_width(&mut fixture.app, 47).is_empty());
+
+    let request = push_and_settle(&mut fixture.app, fixture.router, b.clone(), None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let original_b = active_leaf(&mut fixture.app);
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalState>(original_b)
+        .unwrap()
+        .0 = 92;
+    assert_ne!(original_a, original_b);
+    assert!(fixture.app.world().get_entity(original_a).is_ok());
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(original_a)
+    );
+    let before = router_snapshot(&fixture.app, fixture.router);
+    let effects = fixture.control.effects();
+
+    // Only ordinary Native content changes. The cached shell, owned empty
+    // slot, registry claims, shared parent outlet and active B stay untouched.
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(own_anchor)
+        .remove::<DefaultOutlet>();
+    assert_eq!(active_leaf(&mut fixture.app), original_b);
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get::<ChildOf>(own_slot)
+            .unwrap()
+            .parent(),
+        own_anchor
+    );
+
+    let resumed = push_and_settle(&mut fixture.app, fixture.router, a.clone(), None, None);
+    let resumed_request = request_snapshot(&fixture.app, fixture.router, resumed);
+    assert_succeeded(&resumed_request);
+    assert_eq!(resumed_request.requested(), Some(&a));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    let fresh_a = active_leaf(&mut fixture.app);
+    assert_ne!(fresh_a, original_a);
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(fresh_a),
+        Some(&LocalState(0))
+    );
+    for old in [original_a, container, own_anchor, own_slot] {
+        assert!(
+            fixture.app.world().get_entity(old).is_err(),
+            "old cache Entity {old:?} must settle"
+        );
+    }
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(original_b),
+        Some(&LocalState(92))
+    );
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(layout),
+        Some(&LocalState(73))
+    );
+    let after = router_snapshot(&fixture.app, fixture.router);
+    assert_eq!(after.active().frames()[0], parent_frame);
+    assert_eq!(before.active().frames()[0], parent_frame);
+    assert_eq!(
+        after.history().entries(),
+        [detail_location, a.clone(), b.clone(), a.clone()]
+    );
+    let after_effects = fixture.control.effects();
+    assert_eq!(after_effects.len(), effects.len() + 1);
+    assert_eq!(&after_effects[..effects.len()], effects.as_slice());
+    assert_eq!(after_effects.last().unwrap().view, fixture.leaf);
+    assert_eq!(after_effects.last().unwrap().id_param.as_deref(), Some("1"));
+    assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+
+    let hit_b = push_and_settle(&mut fixture.app, fixture.router, b, None, None);
+    assert_succeeded(&request_snapshot(&fixture.app, fixture.router, hit_b));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_eq!(active_leaf(&mut fixture.app), original_b);
+    assert_eq!(fixture.control.effects(), after_effects);
+    let back = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(fixture.router)
+        .unwrap();
+    let back_request = drive_request_to_terminal(&mut fixture.app, fixture.router, back);
+    assert_succeeded(&back_request);
+    assert_eq!(back_request.requested(), Some(&a));
+    assert_terminal_owner_closure(&fixture.app, fixture.router);
+    assert_eq!(active_leaf(&mut fixture.app), fresh_a);
+    assert_eq!(fixture.control.effects(), after_effects);
+    assert_eq!(
+        fixture.app.world().get::<LocalState>(original_b),
+        Some(&LocalState(92))
+    );
+    assert_eq!(
+        router_snapshot(&fixture.app, fixture.router)
+            .active()
+            .frames()[0],
+        parent_frame
+    );
     assert_host_intact(&fixture.app, &fixture.host_fingerprint);
 }
 

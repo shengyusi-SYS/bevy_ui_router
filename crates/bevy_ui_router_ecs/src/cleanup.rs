@@ -2972,8 +2972,8 @@ impl FrozenCleanupManifest {
         )
     }
 
-    /// A cache-only retirement keeps the original inert claims, including the
-    /// exact registered claim of its externally removed native root.
+    /// A cache-only retirement keeps the original inert claims. Native authored
+    /// content need not retain the outlet marker required for reactivation.
     pub(crate) fn from_retained_invalidation(
         world: &World,
         registry: &RouteEntityRegistry,
@@ -2983,7 +2983,7 @@ impl FrozenCleanupManifest {
         let [frame] = branch.frames() else {
             return None;
         };
-        let root = evidence.missing_native_root()?;
+        let root = frame.native_root()?;
         if !evidence.matches_payload(frame, branch.child_slots())
             || !evidence.is_current(world)
             || !evidence.preservation_is_current(world)
@@ -8030,7 +8030,7 @@ impl PreparedCleanupLedger {
     }
 
     /// Prepares the complete first removal while the selected cache still owns
-    /// its capability and payload. Only its original shell may remain present.
+    /// its capability and payload, using the exact live or absent target facts.
     pub(crate) fn prepare_retained_invalidation_removal(
         self,
         world: &World,
@@ -8094,30 +8094,40 @@ impl PreparedCleanupLedger {
         // and first attempt so every prepared receipt survives activation intact.
         let mut ledger = CleanupLedger::activate_owner(self, None);
         let attempt = ledger.attempt(world).ok_or(InvalidSource)?;
+        // Disposal uses the complete current native closure, including its own
+        // empty slots. An authored outlet marker is required for activation,
+        // while every live disposal target still needs its exact original edge.
         if !attempt.mount_parents_exact
             || !ledger.related_protected_is_current(world)
-            || !observed_children(world, frame.shell()).is_empty()
-            || !attempt.evidence.iter().any(|(index, evidence)| {
-                ledger.obligations[*index].entity() == root
-                    && matches!(evidence, CleanupEvidence::AlreadyAbsent)
-            })
-            || attempt
-                .evidence
-                .iter()
-                .filter(|(_, evidence)| matches!(evidence, CleanupEvidence::Exact { .. }))
-                .count()
-                != 1
             || attempt
                 .evidence
                 .iter()
                 .any(|(index, evidence)| match evidence {
                     CleanupEvidence::AlreadyAbsent => false,
                     CleanupEvidence::Exact { actual_parent, .. } => {
-                        ledger.obligations[*index].entity() != frame.shell()
-                            || *actual_parent != Some(ledger.obligations[*index].expected_parent)
+                        *actual_parent != Some(ledger.obligations[*index].expected_parent)
                     }
                     _ => true,
                 })
+        {
+            return Err(InvalidSource);
+        }
+        let root_absent = attempt.evidence.iter().any(|(index, evidence)| {
+            ledger.obligations[*index].entity() == root
+                && matches!(evidence, CleanupEvidence::AlreadyAbsent)
+        });
+        if root_absent
+            && (!observed_children(world, frame.shell()).is_empty()
+                || attempt
+                    .evidence
+                    .iter()
+                    .filter(|(_, evidence)| matches!(evidence, CleanupEvidence::Exact { .. }))
+                    .count()
+                    != 1
+                || attempt.evidence.iter().any(|(index, evidence)| {
+                    matches!(evidence, CleanupEvidence::Exact { .. })
+                        && ledger.obligations[*index].entity() != frame.shell()
+                }))
         {
             return Err(InvalidSource);
         }
@@ -8146,13 +8156,15 @@ impl PreparedCleanupLedger {
                     CleanupRemovalPreparationError::Capacity => RetryableCapacity,
                     CleanupRemovalPreparationError::InvalidSource => InvalidSource,
                 })?;
-        // Settle every absent original member before the sole physical write.
-        // A shell observer can then stop on protected drift only after all
-        // original target receipts have been committed.
-        let targets = &removal.targets;
-        removal
-            .order
-            .sort_unstable_by_key(|row| (!targets[*row].absent, targets[*row].entity.to_bits()));
+        if root_absent {
+            // Settle every absent original member before the sole physical write.
+            // A shell observer can then stop on protected drift only after all
+            // original target receipts have been committed.
+            let targets = &removal.targets;
+            removal.order.sort_unstable_by_key(|row| {
+                (!targets[*row].absent, targets[*row].entity.to_bits())
+            });
+        }
         if !removal.targets_are_current(world, &ledger)
             || !ledger.mount_parents_physical_match(world)
             || !removal.current_focus_targets(world).is_empty()
@@ -12433,46 +12445,10 @@ impl CleanupLedger {
             focus,
             mount_parent_exchanges,
         } = step;
-        if self.issued_attempt.as_ref() != Some(&attempt)
-            || attempt.ledger_domain != self.ledger_domain
-            || attempt.manifest_digest != self.manifest_digest
-            || attempt.unsettled_digest
-                != unsettled_digest(self.manifest_digest, &self.obligations, &self.receipts)
+        if self
+            .current_settlement_attempt_evidence(world, &attempt)
+            .is_none()
         {
-            return false;
-        }
-        if self.cleanup_settlement_permanent_pending.is_some() {
-            self.retain_cleanup_settlement_permanent_evidence(world);
-            self.issued_attempt = None;
-            return false;
-        }
-        if self.back_no_target_authority_partition.is_some()
-            && !self.back_no_target_authority_partition_is_current(world)
-        {
-            self.issued_attempt = None;
-            return false;
-        }
-        if !self.prepare_related_protected(world) {
-            self.issued_attempt = None;
-            return false;
-        }
-        if !self.related_protected_is_current(world) {
-            self.retain_related_protected_drift(world);
-            self.issued_attempt = None;
-            return false;
-        }
-        let current_evidence = collect_evidence(world, &self.obligations, &self.receipts);
-        if current_evidence != attempt.evidence
-            || current_evidence
-                .iter()
-                .any(|(_, evidence)| matches!(evidence, CleanupEvidence::StaleClaim))
-        {
-            self.issued_attempt = None;
-            return false;
-        }
-        if !attempt.mount_parents_exact || !self.mount_parents_physical_match(world) {
-            self.retain_cleanup_settlement_permanent_evidence(world);
-            self.issued_attempt = None;
             return false;
         }
         release_cleanup_focus(world, &self.current_focus_closure(world, &focus));
@@ -12571,40 +12547,38 @@ impl CleanupLedger {
         }
     }
 
-    fn settle_with_failure_source(
+    fn current_settlement_attempt_evidence(
         &mut self,
-        world: &mut World,
-        attempt: CleanupAttempt,
-        failure_source: Option<&FailureCleanupSourceProjection>,
-        inherited_quarantine: Option<CleanupDisposition>,
-    ) -> bool {
-        if self.issued_attempt.as_ref() != Some(&attempt)
+        world: &World,
+        attempt: &CleanupAttempt,
+    ) -> Option<Vec<(usize, CleanupEvidence)>> {
+        if self.issued_attempt.as_ref() != Some(attempt)
             || attempt.ledger_domain != self.ledger_domain
             || attempt.manifest_digest != self.manifest_digest
             || attempt.unsettled_digest
                 != unsettled_digest(self.manifest_digest, &self.obligations, &self.receipts)
         {
-            return false;
+            return None;
         }
         if self.cleanup_settlement_permanent_pending.is_some() {
             self.retain_cleanup_settlement_permanent_evidence(world);
             self.issued_attempt = None;
-            return false;
+            return None;
         }
         if self.back_no_target_authority_partition.is_some()
             && !self.back_no_target_authority_partition_is_current(world)
         {
             self.issued_attempt = None;
-            return false;
+            return None;
         }
         if !self.prepare_related_protected(world) {
             self.issued_attempt = None;
-            return false;
+            return None;
         }
         if !self.related_protected_is_current(world) {
             self.retain_related_protected_drift(world);
             self.issued_attempt = None;
-            return false;
+            return None;
         }
         let current_evidence = collect_evidence(world, &self.obligations, &self.receipts);
         if current_evidence != attempt.evidence
@@ -12613,13 +12587,27 @@ impl CleanupLedger {
                 .any(|(_, evidence)| matches!(evidence, CleanupEvidence::StaleClaim))
         {
             self.issued_attempt = None;
-            return false;
+            return None;
         }
         if !attempt.mount_parents_exact || !self.mount_parents_physical_match(world) {
             self.retain_cleanup_settlement_permanent_evidence(world);
             self.issued_attempt = None;
-            return false;
+            return None;
         }
+        Some(current_evidence)
+    }
+
+    fn settle_with_failure_source(
+        &mut self,
+        world: &mut World,
+        attempt: CleanupAttempt,
+        failure_source: Option<&FailureCleanupSourceProjection>,
+        inherited_quarantine: Option<CleanupDisposition>,
+    ) -> bool {
+        let Some(current_evidence) = self.current_settlement_attempt_evidence(world, &attempt)
+        else {
+            return false;
+        };
         let focus_closure = self.focus_closure_for_attempt(
             world,
             quarantine_focus_closure(world, &current_evidence, &self.obligations),

@@ -667,14 +667,6 @@ impl RetainedInvalidationEvidence {
         &self.expected.projection
     }
 
-    pub(crate) fn missing_native_root(&self) -> Option<Entity> {
-        let root = self.expected.native_root?;
-        self.observed
-            .iter()
-            .any(|observed| observed.entity == root && !observed.present)
-            .then_some(root)
-    }
-
     pub(crate) fn matches_payload(
         &self,
         frame: &RealizedFrame,
