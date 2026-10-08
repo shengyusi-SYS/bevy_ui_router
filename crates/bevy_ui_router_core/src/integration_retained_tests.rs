@@ -289,14 +289,63 @@ fn retained_leaf_two_transfers_terminate_old_requests_and_parent_loss_disposes_e
 }
 
 #[test]
-fn retained_leaf_capacity_does_not_grow_without_eviction_support() {
+fn retained_leaf_lru_eviction_transfers_original_owner_to_its_cleanup_token() {
     let mut engine = engine(1, true);
     let mut owners = Vec::new();
-    for path in ["/items/1", "/items/2", "/items/3", "/items/4"] {
-        navigate(&mut engine, path, &mut owners);
-        assert!(owners.len() <= 1);
-    }
+    navigate(&mut engine, "/items/1", &mut owners);
+    let first = engine.active().frames().last().unwrap().clone();
+    navigate(&mut engine, "/items/2", &mut owners);
+    let second = engine.active().frames().last().unwrap().clone();
+    let evicted = owners[0].projection().clone();
+    assert_eq!(evicted.frame(), &first);
+
+    let third_ticket = ticket(&mut engine, "/items/3");
+    let plan = engine
+        .prepare_retained_commit_plan(&third_ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(plan.retiring(), std::slice::from_ref(&evicted));
+    assert!(plan.preserved().is_empty());
+    assert_eq!(plan.retained().unwrap().frame(), &second);
+    assert_eq!(plan.disposable_roots(), std::slice::from_ref(&first));
+    let manifest = CleanupManifest::new(plan.disposable_roots().to_vec(), 0x6163, 1);
+    let prepared = engine
+        .prepare_commit_with_retention(&third_ticket, plan, manifest, std::mem::take(&mut owners))
+        .unwrap();
+    assert_eq!(
+        engine.inner.testing_retained_transfer_owners(),
+        vec![evicted]
+    );
+    let cleanup = prepared.cleanup().clone();
+    assert_eq!(cleanup.obligation_count(), 1);
+    let validated = match engine.validate_retained_publication(prepared) {
+        Ok(validated) => validated,
+        Err(_) => panic!("the exact LRU owner transfer must validate"),
+    };
+    validated.publish(|owner| owners.extend(owner));
     assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].projection().frame(), &second);
+    engine
+        .complete_cleanup(cleanup.complete(0x6567, 1))
+        .unwrap();
+    assert!(engine.action().is_none());
+
+    // Completing that original token must remove its retirement metadata, so
+    // the sole surviving owner can form the next complete canonical inventory.
+    let third = engine.active().frames().last().unwrap().clone();
+    let fourth_ticket = ticket(&mut engine, "/items/4");
+    let plan = engine
+        .prepare_retained_commit_plan(&fourth_ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(
+        plan.retiring(),
+        std::slice::from_ref(owners[0].projection())
+    );
+    assert_eq!(plan.retained().unwrap().frame(), &third);
+    drop(plan);
+    let prepared = prepare(&mut engine, &fourth_ticket, &mut owners);
+    publish(&mut engine, prepared, &mut owners);
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].projection().frame(), &third);
 }
 
 #[test]

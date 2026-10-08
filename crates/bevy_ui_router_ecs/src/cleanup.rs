@@ -3115,8 +3115,12 @@ impl FrozenCleanupManifest {
         let mut parent_candidates = frames
             .iter()
             .map(|frame| {
-                let successor = exact_successor_for_mount(frame, successor)?;
-                frame_mount_parent_candidate(frame, successor)
+                if authorized_retired.contains(&frame.frame()) {
+                    retained_frame_mount_parent_candidate(world, frame)
+                } else {
+                    let successor = exact_successor_for_mount(frame, successor)?;
+                    frame_mount_parent_candidate(frame, successor)
+                }
             })
             .collect::<Option<Vec<_>>>()?;
         parent_candidates.extend(
@@ -5824,6 +5828,46 @@ fn frame_mount_parent_candidate(
         failed_parent_source: None,
         removed_child: frame.shell(),
         removed_child_was_attached: frame.shell_is_attached(),
+        children_before,
+        children_after,
+    })
+}
+
+fn retained_frame_mount_parent_candidate(
+    world: &World,
+    frame: &RealizedFrame,
+) -> Option<CleanupMountParentCandidate> {
+    // The caller admits only leaves with an exact current retained proof.
+    // Their shared slot can have acquired other siblings since first mount.
+    let slot = frame.mount_binding().slot();
+    let children_before = observed_children(world, slot);
+    if !frame.shell_is_attached()
+        || world.get::<ChildOf>(frame.shell()).map(ChildOf::parent) != Some(slot)
+        || children_before
+            .iter()
+            .filter(|child| **child == frame.shell())
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let children_after = children_before
+        .iter()
+        .copied()
+        .filter(|child| *child != frame.shell())
+        .collect();
+    let (expected_parent, expected_parent_claim) = frame.mount_binding().physical_parent();
+    Some(CleanupMountParentCandidate {
+        physical: slot,
+        binding: CleanupParentBinding::Structural {
+            upstream: frame.mount_binding().outlet_binding().cloned(),
+        },
+        claim: frame.mount_binding().slot_claim().clone(),
+        failed_claim_source: None,
+        supplied_parent: Some((expected_parent, expected_parent_claim.cloned())),
+        failed_parent_source: None,
+        removed_child: frame.shell(),
+        removed_child_was_attached: true,
         children_before,
         children_after,
     })

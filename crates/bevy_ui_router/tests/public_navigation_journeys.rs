@@ -3407,6 +3407,138 @@ fn retained_native_hit_preserves_state_and_skips_factory_and_scene_apply() {
 }
 
 #[test]
+fn retained_native_lru_evicts_the_oldest_inactive_leaf_and_rebuilds_on_return() {
+    let mut fixture =
+        nested_fixture_with_retention(RoutePattern::path("/:section").unwrap(), Vec::new(), 2);
+    let scene_writes = Arc::new(AtomicUsize::new(0));
+    let observed = scene_writes.clone();
+    fixture
+        .app
+        .world_mut()
+        .add_observer(move |_: On<Insert, LocalState>| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+    let mut originals = Vec::new();
+    for (step, (id, fresh)) in [
+        (1, true),
+        (2, true),
+        (3, true),
+        (1, false),
+        (4, true),
+        (1, false),
+        (2, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let effects_before = fixture.control.effects();
+        let writes_before = scene_writes.load(Ordering::Relaxed);
+        let request = push_and_settle(
+            &mut fixture.app,
+            fixture.router,
+            RouteLocation::new(format!("/catalog/items/{id}")),
+            None,
+            None,
+        );
+        assert_succeeded(&request_snapshot(&fixture.app, fixture.router, request));
+        let leaves = node_entities_with_width(&mut fixture.app, 43);
+        assert!(
+            leaves.len() <= 3,
+            "only two inactive leaves plus the active leaf may remain"
+        );
+        let gate = fixture.app.world().resource::<RouterInputGate>();
+        let active = leaves
+            .iter()
+            .copied()
+            .filter(|entity| gate.allows_pointer(*entity))
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        let current = active[0];
+        assert!(
+            leaves
+                .iter()
+                .filter(|entity| **entity != current)
+                .all(|entity| {
+                    !gate.allows_pointer(*entity)
+                        && !gate.allows_keyboard(*entity)
+                        && !gate.allows_gamepad(*entity)
+                })
+        );
+        if let Some((_, original)) = originals.iter().find(|(key, _)| *key == id) {
+            if fresh {
+                assert_ne!(current, *original, "an evicted leaf must be rebuilt");
+                assert!(fixture.app.world().get_entity(*original).is_err());
+            } else {
+                assert_eq!(current, *original, "an LRU hit keeps the original Entity");
+                assert_eq!(
+                    fixture.app.world().get::<LocalState>(current),
+                    Some(&LocalState(90 + id))
+                );
+            }
+        } else {
+            originals.push((id, current));
+            fixture
+                .app
+                .world_mut()
+                .get_mut::<LocalState>(current)
+                .unwrap()
+                .0 = 90 + id;
+        }
+        let effects_after = fixture.control.effects();
+        let fresh_leaf_calls = effects_after
+            .iter()
+            .filter(|effect| effect.view == fixture.leaf)
+            .count()
+            - effects_before
+                .iter()
+                .filter(|effect| effect.view == fixture.leaf)
+                .count();
+        assert_eq!(fresh_leaf_calls, usize::from(fresh));
+        if fresh {
+            assert!(scene_writes.load(Ordering::Relaxed) > writes_before);
+        } else {
+            assert_eq!(scene_writes.load(Ordering::Relaxed), writes_before);
+        }
+        if step == 4 {
+            let oldest = originals.iter().find(|(id, _)| *id == 2).unwrap().1;
+            let recently_used = originals.iter().find(|(id, _)| *id == 1).unwrap().1;
+            let other_cached = originals.iter().find(|(id, _)| *id == 3).unwrap().1;
+            assert!(
+                fixture.app.world().get_entity(oldest).is_err(),
+                "B is the oldest inactive leaf after A was reactivated"
+            );
+            assert!(fixture.app.world().get_entity(recently_used).is_ok());
+            assert_eq!(
+                fixture.app.world().get::<LocalState>(other_cached),
+                Some(&LocalState(93)),
+                "eviction must preserve the other inactive leaf"
+            );
+        }
+        assert_host_intact(&fixture.app, &fixture.host_fingerprint);
+    }
+    let leaf_calls = fixture
+        .control
+        .effects()
+        .into_iter()
+        .filter(|effect| effect.view == fixture.leaf)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        leaf_calls
+            .iter()
+            .filter(|effect| effect.id_param.as_deref() == Some("1"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        leaf_calls
+            .iter()
+            .filter(|effect| effect.id_param.as_deref() == Some("2"))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn retained_native_host_loss_cleans_cache_and_readmits_without_replay() {
     let mut fixture =
         nested_fixture_with_retention(RoutePattern::path("/:section").unwrap(), Vec::new(), 2);

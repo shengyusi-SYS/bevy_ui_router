@@ -86,6 +86,14 @@ pub struct RetainedCommitPlan {
     preserved: Vec<RetainedLeafProjection>,
 }
 
+/// Borrowed role selection shared by preparation and exact revalidation.
+struct RetainedCommitSelection<'a> {
+    retained: Option<RetainedLeafProjection>,
+    disposable_roots: Vec<RouteFrameVersion>,
+    retiring: Vec<&'a RetainedLeafProjection>,
+    preserved: Vec<&'a RetainedLeafProjection>,
+}
+
 impl RetainedCommitPlan {
     pub const fn retained(&self) -> Option<&RetainedLeafProjection> {
         self.retained.as_ref()
@@ -670,26 +678,71 @@ impl RouterEngine {
         hit: Option<&RetainedLeafProjection>,
     ) -> Result<RetainedCommitPlan, CommitError> {
         let next_slots = publication_slots(current);
+        let selection = self.retained_commit_selection(current, &next_slots, hit)?;
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.id() == current.identity.request)
+            .ok_or(CommitError::Stale)?;
+        Ok(RetainedCommitPlan {
+            source: self.observe_prepared_publication_source(record_index),
+            original_roots: current.cleanup_roots.clone(),
+            next_slots,
+            retained: selection.retained,
+            disposable_roots: selection.disposable_roots,
+            retiring: selection.retiring.into_iter().cloned().collect(),
+            preserved: selection.preserved.into_iter().cloned().collect(),
+        })
+    }
+
+    fn retained_commit_selection<'a>(
+        &'a self,
+        current: &CurrentWork,
+        next_slots: &[LogicalChildSlotBinding],
+        hit: Option<&RetainedLeafProjection>,
+    ) -> Result<RetainedCommitSelection<'a>, CommitError> {
         let host = self.state.host().ok_or(CommitError::Stale)?;
+        let retained = self.retention_candidate(current, next_slots);
+        let mut evictions = if retained.is_some() {
+            let surviving = self
+                .retained_leaves
+                .iter()
+                .map(RetainedRegistryEntry::projection)
+                .filter(|projection| {
+                    hit != Some(*projection)
+                        && scope_survives(projection, host, &current.target_frames, next_slots)
+                })
+                .count();
+            surviving.saturating_sub(self.keep_alive_capacity.saturating_sub(1))
+        } else {
+            0
+        };
         let mut retiring = Vec::new();
         let mut preserved = Vec::new();
-        for entry in &self.retained_leaves {
-            if hit.is_some_and(|hit| hit == &entry.projection) {
+        // Successful departures append, hits remove, and completion preserves
+        // the remaining order. Retire the oldest surviving inactive instances
+        // first, while emitting both roles in canonical registry order.
+        for projection in self
+            .retained_leaves
+            .iter()
+            .map(RetainedRegistryEntry::projection)
+        {
+            if hit == Some(projection) {
                 continue;
             }
-            if scope_survives(&entry.projection, host, &current.target_frames, &next_slots) {
-                preserved.push(entry.projection.clone());
+            let survives = scope_survives(projection, host, &current.target_frames, next_slots);
+            let evicted = survives && evictions > 0;
+            if evicted {
+                evictions -= 1;
+            }
+            if survives && !evicted {
+                preserved.push(projection);
             } else {
-                retiring.push(entry.projection.clone());
+                retiring.push(projection);
             }
         }
-        let retained = if preserved.len() < self.keep_alive_capacity {
-            self.retention_candidate(current, &next_slots)
-        } else {
-            None
-        };
-        let original_roots = current.cleanup_roots.clone();
-        let mut disposable_roots = original_roots
+        let mut disposable_roots = current
+            .cleanup_roots
             .iter()
             .filter(|frame| {
                 retained
@@ -698,7 +751,7 @@ impl RouterEngine {
             })
             .cloned()
             .collect::<Vec<_>>();
-        disposable_roots.extend(retiring.iter().map(|owner| owner.frame.clone()));
+        disposable_roots.extend(retiring.iter().map(|projection| projection.frame.clone()));
         if disposable_roots
             .iter()
             .enumerate()
@@ -706,15 +759,7 @@ impl RouterEngine {
         {
             return Err(CommitError::InvalidManifest);
         }
-        let record_index = self
-            .records
-            .iter()
-            .position(|record| record.id() == current.identity.request)
-            .ok_or(CommitError::Stale)?;
-        Ok(RetainedCommitPlan {
-            source: self.observe_prepared_publication_source(record_index),
-            original_roots,
-            next_slots,
+        Ok(RetainedCommitSelection {
             retained,
             disposable_roots,
             retiring,
@@ -1080,34 +1125,25 @@ impl RouterEngine {
         current: &CurrentWork,
         hit: Option<&RetainedLeafProjection>,
     ) -> bool {
-        let Some(host) = self.state.host() else {
-            return false;
-        };
         let next_slots = publication_slots(current);
         if current.cleanup_roots != plan.original_roots || next_slots != plan.next_slots {
             return false;
         }
-        // Rebuild the entire role partition from the current Core registry;
+        // Rebuild scope, LRU retirement, and roots from the complete registry;
         // individually valid owners or a caller's retiring subset are insufficient.
-        let (preserved, retiring): (Vec<_>, Vec<_>) = self
-            .retained_leaves
+        let Ok(mut selection) = self.retained_commit_selection(current, &next_slots, hit) else {
+            return false;
+        };
+        if !selection
+            .preserved
             .iter()
-            .map(|entry| &entry.projection)
-            .filter(|projection| hit != Some(*projection))
-            .partition(|projection| {
-                scope_survives(projection, host, &current.target_frames, &next_slots)
-            });
-        if !preserved.iter().copied().eq(plan.preserved.iter())
-            || !retiring.iter().copied().eq(plan.retiring.iter())
+            .copied()
+            .eq(plan.preserved.iter())
+            || !selection.retiring.iter().copied().eq(plan.retiring.iter())
         {
             return false;
         }
-        let mut candidate = if preserved.len() < self.keep_alive_capacity {
-            self.retention_candidate(current, &next_slots)
-        } else {
-            None
-        };
-        if let (Some(candidate), Some(frozen)) = (&mut candidate, &plan.retained) {
+        if let (Some(candidate), Some(frozen)) = (&mut selection.retained, &plan.retained) {
             if frozen.id.router != self.router
                 || frozen.id.sequence == 0
                 || frozen.id.sequence >= self.next_retained_instance
@@ -1116,25 +1152,7 @@ impl RouterEngine {
             }
             candidate.id = frozen.id;
         }
-        if candidate != plan.retained {
-            return false;
-        }
-        let mut roots = current
-            .cleanup_roots
-            .iter()
-            .filter(|frame| {
-                candidate
-                    .as_ref()
-                    .is_none_or(|candidate| candidate.frame() != *frame)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        roots.extend(
-            retiring
-                .into_iter()
-                .map(|projection| projection.frame.clone()),
-        );
-        roots == plan.disposable_roots
+        selection.retained == plan.retained && selection.disposable_roots == plan.disposable_roots
     }
 
     pub(crate) fn prepare_retained_publication(
