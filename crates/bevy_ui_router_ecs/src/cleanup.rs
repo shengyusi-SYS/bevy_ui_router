@@ -33,7 +33,10 @@ use crate::{
     lifecycle_preparation::LifecyclePreflightEvidence,
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
     navigation::{HostBinding, PendingFailedBranch, RetiredHostBinding},
-    presentation::{FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame},
+    presentation::{
+        FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame,
+        RetainedInvalidationEvidence,
+    },
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim,
         PreparedAuthorityLostResidualTerminalProjection, PreparedAuthorityLostResidualTransfer,
@@ -2967,6 +2970,84 @@ impl FrozenCleanupManifest {
             successor,
             &authorized_retired,
         )
+    }
+
+    /// A cache-only retirement keeps the original inert claims, including the
+    /// exact registered claim of its externally removed native root.
+    pub(crate) fn from_retained_invalidation(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        branch: &RealizedBranch,
+        evidence: &RetainedInvalidationEvidence,
+    ) -> Option<Self> {
+        let [frame] = branch.frames() else {
+            return None;
+        };
+        let root = evidence.missing_native_root()?;
+        if !evidence.matches_payload(frame, branch.child_slots())
+            || !evidence.is_current(world)
+            || !evidence.preservation_is_current(world)
+            || frame.frame() != evidence.projection().frame()
+            || frame.native_root() != Some(root)
+            || branch.claims().any(|claim| {
+                claim.lifecycle() != EntityLifecycle::Retained
+                    || registry
+                        .record(claim.entity())
+                        .is_none_or(|record| record.claim() != *claim)
+            })
+            || !frame.claims().any(|claim| {
+                claim.entity() == root
+                    && claim.owner()
+                        == &RegistryOwner::Committed(EntityOwner::FrameContentTarget(
+                            frame.frame().clone(),
+                        ))
+            })
+            || branch
+                .child_slots()
+                .iter()
+                .any(|slot| slot.parent() != frame.frame())
+        {
+            return None;
+        }
+        let claims = frame.claims().cloned().collect::<Vec<_>>();
+        let mut obligations = frame_obligations(registry, frame, &claims)?;
+        for slot in branch.child_slots() {
+            let record = registry.record(slot.slot())?;
+            obligations.push(CleanupObligation {
+                identity: CleanupTargetIdentity::Registered(slot.slot_claim().clone()),
+                manifest: record.manifest().clone(),
+                expected_parent: slot.anchor(),
+                unit_root: slot.slot(),
+                authorized_parent: slot.anchor(),
+                allow_missing_components: false,
+                terminal_mode: CleanupTerminalMode::Normal,
+            });
+        }
+        order_leaf_to_root(&mut obligations)?;
+        let mut candidates = vec![retained_frame_mount_parent_candidate(world, frame)?];
+        for slot in branch.child_slots() {
+            if !obligations
+                .iter()
+                .any(|obligation| obligation.entity() == slot.anchor())
+            {
+                candidates.push(mounted_anchor_parent_candidate(world, slot)?);
+            }
+        }
+        let mount_parents =
+            freeze_external_mount_parents(world, registry, &obligations, candidates)?;
+        let digest = frozen_manifest_digest(&obligations, &mount_parents);
+        let manifest = Self {
+            obligations,
+            mount_parents,
+            boundary_drifts: Vec::new(),
+            pending_boundary_loss_claims: Vec::new(),
+            digest,
+        };
+        let receipts = vec![None; manifest.obligations.len()];
+        let evidence = collect_evidence(world, &manifest.obligations, &receipts);
+        (manifest.preflight(world)
+            && quarantine_disposition(&evidence, &manifest.obligations).is_none())
+        .then_some(manifest)
     }
 
     fn from_leaving_branch_parts(
@@ -7838,6 +7919,7 @@ pub(crate) struct PreparedCleanupLedger {
     obligations: Vec<CleanupObligation>,
     mount_parents: Vec<CleanupMountParentSettlement>,
     failure_cleanup_partition: Option<FrozenFailureCleanupPartition>,
+    related_protected: Option<Vec<CleanupProtectedEntity>>,
     manifest_digest: u64,
     receipts: Vec<Option<CleanupReceipt>>,
     ledger_domain: u64,
@@ -7955,7 +8037,63 @@ struct CleanupProtectedEntity {
     display: Option<bevy_ui::Display>,
 }
 
+fn freeze_retained_invalidation_protected(
+    world: &World,
+    obligations: &[CleanupObligation],
+) -> Option<Vec<CleanupProtectedEntity>> {
+    let mut roots = HashSet::new();
+    for obligation in obligations {
+        let mut root = obligation.unit_root;
+        let mut seen = HashSet::new();
+        while let Some(parent) = world.get::<ChildOf>(root).map(ChildOf::parent) {
+            if !seen.insert(root) {
+                return None;
+            }
+            root = parent;
+        }
+        if world.get_entity(root).is_ok() {
+            roots.insert(root);
+        }
+    }
+    let targets = obligations
+        .iter()
+        .map(CleanupObligation::entity)
+        .collect::<HashSet<_>>();
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort_by_key(|entity| entity.to_bits());
+    let closure = freeze_failure_cleanup_closure(world, &roots, &[])?;
+    let registry = world.get_resource::<RouteEntityRegistry>()?;
+    Some(
+        closure
+            .into_iter()
+            .filter(|entity| !targets.contains(entity))
+            .map(|entity| CleanupProtectedEntity {
+                observed: FrozenFailureCleanupObservedEntity::observe(world, registry, entity),
+                display: world.get::<bevy_ui::Node>(entity).map(|node| node.display),
+            })
+            .collect(),
+    )
+}
+
 impl CleanupLedger {
+    /// Cache invalidation protects the whole related closure even when its
+    /// absent native root leaves no ordinary-content obligations to prepare.
+    pub(crate) fn reserve_retained_invalidation(
+        world: &World,
+        manifest: FrozenCleanupManifest,
+    ) -> Result<PreparedCleanupLedger, CleanupLedgerReserveError> {
+        let Some(protected) = freeze_retained_invalidation_protected(world, &manifest.obligations)
+        else {
+            return Err(CleanupLedgerReserveError::new(
+                CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts,
+                manifest,
+            ));
+        };
+        let mut prepared = Self::reserve(manifest)?;
+        prepared.related_protected = Some(protected);
+        Ok(prepared)
+    }
+
     fn prepare_related_protected(&mut self, world: &World) -> bool {
         if self.related_protected.is_some()
             || !self
@@ -10635,6 +10773,7 @@ impl CleanupLedger {
             obligations: manifest.obligations,
             mount_parents: manifest.mount_parents,
             failure_cleanup_partition: None,
+            related_protected: None,
             manifest_digest: manifest.digest,
             receipts,
             ledger_domain,
@@ -10930,7 +11069,7 @@ impl CleanupLedger {
             issued_attempt: None,
             completion_digest,
             quarantine_event_observed: false,
-            related_protected: None,
+            related_protected: prepared.related_protected,
             post_settlement_focus: Vec::new(),
             authority_host_children: None,
             back_no_target_authority_partition: None,
@@ -11260,6 +11399,137 @@ impl CleanupLedger {
             Some(CleanupStopReason::Settlement(evidence)) => Some(evidence),
             _ => None,
         }
+    }
+
+    /// Finishes only disposal already proven by the original removal receipts.
+    /// A changed protected partition remains stopped evidence; this does not
+    /// certify preservation or authorize any further physical mutation.
+    pub(crate) fn finish_disposed_retained_invalidation(&mut self, world: &World) -> bool {
+        let Some(CleanupStopReason::Settlement(evidence)) = self.stopped.as_ref() else {
+            return false;
+        };
+        let CleanupSettlementPermanentCause::RelatedProtectedPartition { targets, .. } =
+            evidence.cause.as_ref()
+        else {
+            return false;
+        };
+        let Some(CleanupOwner::Leaving(payload)) = self.owner.as_ref() else {
+            return false;
+        };
+        let [frame] = payload.frames() else {
+            return false;
+        };
+        let Some(root) = frame.native_root() else {
+            return false;
+        };
+        let Some(batch) = self.batch.as_ref() else {
+            return false;
+        };
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        let source_claims = || {
+            frame
+                .claims()
+                .chain(payload.child_slots.iter().map(MountedChildSlot::slot_claim))
+        };
+        let root_claim = frame.claims().find(|claim| claim.entity() == root);
+        let shell_claim = frame.claims().find(|claim| claim.entity() == frame.shell());
+        if world.get_entity(root).is_ok()
+            || root_claim.is_none_or(|claim| {
+                claim.owner()
+                    != &RegistryOwner::Committed(EntityOwner::FrameContentTarget(
+                        frame.frame().clone(),
+                    ))
+            })
+            || shell_claim.is_none_or(|claim| {
+                claim.owner()
+                    != &RegistryOwner::Committed(EntityOwner::FrameShell(frame.frame().clone()))
+            })
+            || source_claims().any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
+            || payload
+                .child_slots
+                .iter()
+                .any(|slot| slot.parent() != frame.frame())
+            || self.related_protected.is_none()
+            || self.failure_cleanup_partition.is_some()
+            || self.back_no_target_batch.is_some()
+            || self.back_no_target_capacity.is_some()
+            || self.back_no_target_authority_partition.is_some()
+            || self.authority_host_children.is_some()
+            || self.quarantine_detachment.is_some()
+            || self.cleanup_settlement_permanent_pending.is_some()
+            || self.issued_attempt.is_some()
+            || self.obligations.is_empty()
+            || self.receipts.len() != self.obligations.len()
+            || evidence.ledger_domain != self.ledger_domain
+            || evidence.manifest_digest != self.manifest_digest
+            || evidence.obligation_count != self.obligations.len()
+            || batch.manifest_digest() != self.manifest_digest
+            || batch.obligation_count() != self.obligations.len()
+            || !targets
+                .iter()
+                .copied()
+                .eq(self.obligations.iter().map(CleanupObligation::entity))
+            || source_claims().any(|claim| {
+                self.obligations
+                    .iter()
+                    .filter(|obligation| obligation.identity.registered() == Some(claim))
+                    .count()
+                    != 1
+            })
+        {
+            return false;
+        }
+        for (index, obligation) in self.obligations.iter().enumerate() {
+            let source_is_exact = match &obligation.identity {
+                CleanupTargetIdentity::Registered(claim) => {
+                    source_claims().filter(|source| *source == claim).count() == 1
+                }
+                CleanupTargetIdentity::ContainedContent { root, shell, .. } => {
+                    Some(root) == root_claim && Some(shell) == shell_claim
+                }
+            };
+            let Some(receipt) = self.receipts[index].as_ref() else {
+                return false;
+            };
+            if !source_is_exact
+                || receipt.ledger_domain != self.ledger_domain
+                || receipt.obligation != index
+                || receipt.attempt_revision == 0
+                || receipt.attempt_revision >= self.next_attempt
+                || !receipt.observed
+                || !matches!(
+                    receipt.disposition,
+                    CleanupDisposition::Removed
+                        | CleanupDisposition::RemovedDetached
+                        | CleanupDisposition::AlreadyAbsent
+                )
+                || obligation.entity() == root
+                    && receipt.disposition != CleanupDisposition::AlreadyAbsent
+                || obligation.terminal_mode != CleanupTerminalMode::Normal
+                || receipt.binding
+                    != receipt_binding(
+                        receipt.ledger_domain,
+                        receipt.attempt_revision,
+                        index,
+                        receipt.disposition,
+                        obligation,
+                    )
+                || world.get_entity(obligation.entity()).is_ok()
+                || registry.record(obligation.entity()).is_some()
+            {
+                return false;
+            }
+        }
+        if self
+            .completion_digest
+            .is_some_and(|digest| digest != completion_digest(&self.receipts))
+        {
+            return false;
+        }
+        self.finish_if_settled();
+        true
     }
 
     pub(crate) fn is_stopped(&self) -> bool {

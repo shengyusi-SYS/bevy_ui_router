@@ -2577,6 +2577,7 @@ struct PreparedPublicationObservation {
     active_branch: Option<MatchedBranch>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
     retained_leaves: Vec<retained::RetainedRegistryEntry>,
+    pending_retained_miss_cleanup: Option<CleanupBatchToken>,
     keep_alive_capacity: usize,
 }
 
@@ -2606,6 +2607,7 @@ impl PreparedPublicationObservation {
                 == Self::branch_fingerprint(expected.active_branch.as_ref())
             && self.active_child_slots == expected.active_child_slots
             && self.retained_leaves == expected.retained_leaves
+            && self.pending_retained_miss_cleanup == expected.pending_retained_miss_cleanup
             && self.keep_alive_capacity == expected.keep_alive_capacity
     }
 
@@ -3845,6 +3847,7 @@ struct HostAdmissionUnavailableOwnerInventoryProjection {
     pending_back_target_permanent_cleanup: Option<CoreBackTargetPermanentCleanupProjection>,
     pending_post_commit_terminal: Option<CorePreparedPostCommitTerminalSourceProjection>,
     pending_post_commit_settlement_trace: Option<CorePostCommitSettlementTraceProjection>,
+    pending_retained_miss_cleanup: Option<CleanupBatchToken>,
     live_failed_authority_trigger_revision: Option<u64>,
     mount_issuer: MountIssuerRequestProjection,
 }
@@ -3863,6 +3866,7 @@ impl HostAdmissionUnavailableOwnerInventoryProjection {
             && self.pending_back_target_permanent_cleanup.is_none()
             && self.pending_post_commit_terminal.is_none()
             && self.pending_post_commit_settlement_trace.is_none()
+            && self.pending_retained_miss_cleanup.is_none()
             && self.live_failed_authority_trigger_revision.is_none()
             && !self.mount_issuer.has_outstanding()
     }
@@ -4326,6 +4330,7 @@ pub(crate) struct RouterEngine {
     retained_leaves: Vec<retained::RetainedRegistryEntry>,
     next_retained_instance: u64,
     pending_retained_transfer: Option<retained::PreparedRetainedTransfer>,
+    pending_retained_miss_cleanup: Option<CleanupBatchToken>,
     state: RouterNavigationState,
     host_admission_source: HostAdmissionSourceProjection,
     host_admission_source_open: bool,
@@ -4386,6 +4391,7 @@ impl RouterEngine {
             retained_leaves: Vec::new(),
             next_retained_instance: 1,
             pending_retained_transfer: None,
+            pending_retained_miss_cleanup: None,
             state: RouterNavigationState::new(router),
             host_admission_source,
             host_admission_source_open: true,
@@ -4931,6 +4937,7 @@ impl RouterEngine {
                 .as_ref()
                 .map(CorePreparedPostCommitTerminalSourceProjection::from),
             pending_post_commit_settlement_trace: self.pending_post_commit_settlement_trace.clone(),
+            pending_retained_miss_cleanup: self.pending_retained_miss_cleanup.clone(),
             live_failed_authority_trigger_revision: self.live_failed_authority_trigger_revision,
             mount_issuer: self.mount.projection(),
         }
@@ -7233,6 +7240,12 @@ impl RouterEngine {
     where
         F: FnOnce(&Self, CleanupBatchToken),
     {
+        if self.pending_retained_miss_cleanup.is_some() {
+            return Err(BeginAuthoritySettlementError::new(
+                BeginAuthoritySettlementErrorKind::WrongPhase,
+                lease,
+            ));
+        }
         if retention.is_none()
             && (!self.retained_leaves.is_empty() || self.pending_retained_transfer.is_some())
         {
@@ -7485,6 +7498,9 @@ impl RouterEngine {
     where
         F: FnOnce() -> bool,
     {
+        if self.pending_retained_miss_cleanup.is_some() {
+            return false;
+        }
         let Some(current) = self.current.as_ref() else {
             return false;
         };
@@ -13213,6 +13229,7 @@ impl RouterEngine {
             active_branch: self.active_branch.clone(),
             active_child_slots: self.active_child_slots.clone(),
             retained_leaves: self.retained_leaves.clone(),
+            pending_retained_miss_cleanup: self.pending_retained_miss_cleanup.clone(),
             keep_alive_capacity: self.keep_alive_capacity,
         }
     }

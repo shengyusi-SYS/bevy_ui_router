@@ -4103,6 +4103,59 @@ impl RetainedLeafProjection {
     }
 }
 
+/// Unique cache-only cleanup continuation holding the original fresh task.
+pub struct RetainedMissCleanupOwner {
+    inner: crate::engine::retained::RetainedMissCleanupOwner,
+    cleanup: CleanupBatch,
+}
+
+impl RetainedMissCleanupOwner {
+    pub fn cleanup(&self) -> &CleanupBatch {
+        &self.cleanup
+    }
+}
+
+impl std::fmt::Debug for RetainedMissCleanupOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedMissCleanupOwner")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+/// A rejected completion keeps the sole task continuation and physical owner.
+#[must_use = "rejected cache cleanup completion retains its original owner"]
+pub struct RetainedMissCleanupCompletionError<Physical> {
+    owner: RetainedMissCleanupOwner,
+    completion: CleanupCompletion,
+    physical: Physical,
+    error: IntegrationError,
+}
+
+impl<Physical> RetainedMissCleanupCompletionError<Physical> {
+    pub fn into_parts(
+        self,
+    ) -> (
+        RetainedMissCleanupOwner,
+        CleanupCompletion,
+        Physical,
+        IntegrationError,
+    ) {
+        (self.owner, self.completion, self.physical, self.error)
+    }
+}
+
+impl<Physical> std::fmt::Debug for RetainedMissCleanupCompletionError<Physical> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedMissCleanupCompletionError")
+            .field("owner", &self.owner)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
 /// A rejected hit returns the original task and every original cache owner.
 pub struct RetainedHitPreparationError {
     task: FrameTask,
@@ -8867,6 +8920,98 @@ impl RouterEngine {
         self.inner
             .prepare_retained_hit_plan(&task.inner, inventory)
             .map_err(map_commit_error)
+    }
+
+    /// Retires only the selected cache instance before applying the original fresh task.
+    pub fn begin_retained_miss_cleanup<F>(
+        &mut self,
+        task: FrameTask,
+        plan: RetainedHitPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+        install: F,
+    ) -> Result<(), RetainedHitPreparationError>
+    where
+        F: FnOnce(RetainedMissCleanupOwner),
+    {
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(manifest.manifest_digest),
+            manifest.obligation_count,
+        );
+        let manifest_digest = manifest.manifest_digest;
+        let obligation_count = manifest.obligation_count;
+        match self
+            .inner
+            .begin_retained_miss_cleanup(task.inner, &plan, seal, owners, |inner| {
+                let cleanup = CleanupBatch {
+                    inner: inner.cleanup().clone(),
+                    manifest_digest,
+                    obligation_count,
+                };
+                install(RetainedMissCleanupOwner { inner, cleanup });
+            }) {
+            Ok(()) => Ok(()),
+            Err((task, owners, error)) => Err(RetainedHitPreparationError {
+                task: FrameTask { inner: task },
+                plan,
+                manifest,
+                owners,
+                error: map_commit_error(error),
+            }),
+        }
+    }
+
+    pub fn observe_retained_miss_cleanup_receipt(
+        &mut self,
+        owner: &mut RetainedMissCleanupOwner,
+        disposition: CleanupDisposition,
+    ) -> Result<(), IntegrationError> {
+        self.inner
+            .observe_retained_miss_cleanup_receipt(&mut owner.inner, disposition)
+            .map_err(map_cleanup_error)
+    }
+
+    pub fn complete_retained_miss_cleanup<Physical, F>(
+        &mut self,
+        owner: RetainedMissCleanupOwner,
+        completion: CleanupCompletion,
+        physical: Physical,
+        reclaim: F,
+    ) -> Result<FrameTask, RetainedMissCleanupCompletionError<Physical>>
+    where
+        F: FnOnce(Physical),
+    {
+        let RetainedMissCleanupOwner {
+            inner: owner,
+            cleanup,
+        } = owner;
+        let CleanupCompletion {
+            inner: completion,
+            manifest_digest,
+            completion_digest,
+            settled_count,
+        } = completion;
+        match self
+            .inner
+            .complete_retained_miss_cleanup(owner, completion, physical, reclaim)
+        {
+            Ok(inner) => Ok(FrameTask { inner }),
+            Err((owner, completion, physical, error)) => Err(RetainedMissCleanupCompletionError {
+                owner: RetainedMissCleanupOwner {
+                    inner: owner,
+                    cleanup,
+                },
+                completion: CleanupCompletion {
+                    inner: completion,
+                    manifest_digest,
+                    completion_digest,
+                    settled_count,
+                },
+                physical,
+                error: map_cleanup_error(error),
+            }),
+        }
     }
 
     pub fn prepare_retained_hit_commit(

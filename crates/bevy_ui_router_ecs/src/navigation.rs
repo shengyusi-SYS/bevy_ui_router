@@ -2208,6 +2208,7 @@ pub(crate) struct RouterEntry {
     pub(crate) active: Option<RealizedBranch>,
     pub(crate) scroll: crate::scroll::ScrollState,
     pub(crate) retained: crate::retained::RetainedLeaves,
+    retained_miss_cleanup: Option<Box<retained_miss::RetainedMissCleanup>>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
@@ -5682,6 +5683,7 @@ impl RouterEntry {
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
         self.cleanup_observation.summary(
             self.idle_host_loss.is_some()
+                || self.retained_miss_cleanup.is_some()
                 || self.cleanup_ledger.is_some()
                 || self.post_commit_compound.is_some()
                 || self.pending_failed_branch.is_some()
@@ -5803,6 +5805,7 @@ impl RouterNavigation {
             active: None,
             scroll: crate::scroll::ScrollState::default(),
             retained: crate::retained::RetainedLeaves::default(),
+            retained_miss_cleanup: None,
             cleanup_ledger: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
@@ -6340,6 +6343,9 @@ pub(crate) fn observe_authority_system(world: &mut World) {
             world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 'entry_work: {
                     let entry = &mut navigation.entries[index];
+                    if entry.retained_miss_cleanup.is_some() {
+                        break 'entry_work;
+                    }
                     if entry.pending_host_confirmation.is_some() {
                         break 'entry_work;
                     }
@@ -7495,7 +7501,8 @@ fn retain_host_admission_operation_failure(
 
 pub(crate) fn collect_navigation_system(world: &mut World) {
     for entry in &mut world.resource_mut::<RouterNavigation>().entries {
-        if entry.pending_back_resolution_action.is_none()
+        if entry.retained_miss_cleanup.is_none()
+            && entry.pending_back_resolution_action.is_none()
             && entry.pending_bound_back_resolution.is_none()
             && entry.pending_back_target_execution.is_none()
             && entry.pending_back_no_target_completion.is_none()
@@ -8912,6 +8919,9 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                         if only_entries.is_some_and(|entries| !entries.contains(&entry_index)) {
                             continue;
                         }
+                        if entry.retained_miss_cleanup.is_some() {
+                            continue;
+                        }
                         if let Some(pending_rejection) =
                             entry.pending_mount_mutation_rejection.take()
                         {
@@ -9186,6 +9196,12 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         .and_then(|inventory| entry.engine.prepare_retained_hit_plan(&task, &inventory));
                                     match hit {
                                         Ok(Some(plan)) => {
+                                            if let Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) =
+                                                retained_miss::classify(world, entry, &plan)
+                                            {
+                                                retained_miss::begin(entry, task, plan, pending, evidence);
+                                                continue;
+                                            }
                                             pending.retained_hit = Some(Box::new(plan));
                                             pending.final_task = Some(task);
                                             entry.pending_commit = Some(pending);
@@ -15411,7 +15427,7 @@ fn prepare_commit_entry(
     world: &mut World,
     entry: &mut RouterEntry,
 ) -> Option<PendingPublicationWork> {
-    if entry.authority_protocol_residual.is_some() {
+    if entry.authority_protocol_residual.is_some() || entry.retained_miss_cleanup.is_some() {
         return None;
     }
     if drive_back_target_root_commit(world, entry) {
@@ -15831,6 +15847,7 @@ fn settle_prepublication_authority_loss(
 }
 
 mod normal_publication;
+mod retained_miss;
 use normal_publication::{NormalPublicationSplice, publish_normal_work};
 mod projectionless_publication;
 use projectionless_publication::{
@@ -20891,6 +20908,9 @@ pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
+                if retained_miss::drive(world, entry) {
+                    continue;
+                }
                 if drive_post_commit_compound(world, entry) {
                     continue;
                 }

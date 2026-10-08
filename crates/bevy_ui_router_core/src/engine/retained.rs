@@ -74,6 +74,31 @@ impl RetainedLeafOwner {
     }
 }
 
+/// The original fresh task is unavailable until its selected cache miss settles.
+pub(crate) struct RetainedMissCleanupOwner {
+    task: FrameTask,
+    retained: RetainedLeafOwner,
+    cleanup: CleanupBatchToken,
+    source: PreparedPublicationObservation,
+}
+
+impl std::fmt::Debug for RetainedMissCleanupOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedMissCleanupOwner")
+            .field("task", &self.task.identity())
+            .field("retained", &self.retained.projection().id())
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
+}
+
+impl RetainedMissCleanupOwner {
+    pub(crate) const fn cleanup(&self) -> &CleanupBatchToken {
+        &self.cleanup
+    }
+}
+
 /// Frozen current/next partition. Only the issuing Core can turn it into a transfer.
 #[derive(Debug)]
 pub struct RetainedCommitPlan {
@@ -940,6 +965,171 @@ impl RouterEngine {
         next.applied_frames.push(hit.frame.clone());
         next.stage = WorkStage::ReadyToCommit;
         Ok(next)
+    }
+
+    pub(crate) fn begin_retained_miss_cleanup<F>(
+        &mut self,
+        task: FrameTask,
+        plan: &RetainedHitPlan,
+        seal: CleanupManifestSeal,
+        mut owners: Vec<RetainedLeafOwner>,
+        install: F,
+    ) -> Result<(), (FrameTask, Vec<RetainedLeafOwner>, CommitError)>
+    where
+        F: FnOnce(RetainedMissCleanupOwner),
+    {
+        let Some(record_index) = self
+            .records
+            .iter()
+            .position(|record| record.id() == task.identity.request)
+        else {
+            return Err((task, owners, CommitError::Stale));
+        };
+        if self.pending_retained_miss_cleanup.is_some()
+            || self.pending_retained_transfer.is_some()
+            || self.prepared_publication_authority.is_some()
+            || self.live_failed_authority_trigger_revision.is_some()
+            || self.inspect_view_report_identity(task.identity()).is_err()
+        {
+            return Err((task, owners, CommitError::Stale));
+        }
+        let mut source = self.observe_prepared_publication_source(record_index);
+        if !source.same_source(&plan.commit_plan.source)
+            || !self.retained_hit_task_eligible(&task)
+            || !self.retained_hit_matches(&task, &plan.hit)
+        {
+            return Err((task, owners, CommitError::Stale));
+        }
+        if !owner_projections_match(owners.iter(), std::iter::once(&plan.hit))
+            || seal.logical_roots() != std::slice::from_ref(plan.hit.frame())
+        {
+            return Err((task, owners, CommitError::InvalidManifest));
+        }
+        let batch = match self.ids.reserve_cleanup_batch() {
+            Ok(batch) => batch,
+            Err(_) => return Err((task, owners, CommitError::Stale)),
+        };
+        let cleanup = CleanupBatchToken::sealed(
+            task.identity.clone(),
+            batch,
+            seal.logical_roots(),
+            seal.manifest_digest(),
+            seal.obligation_count(),
+        );
+        let mut registry = self.retained_leaves.clone();
+        Self::bind_retained_retirements(&mut registry, std::slice::from_ref(&plan.hit), &cleanup);
+        let marker = cleanup.clone();
+        source.retained_leaves = registry.clone();
+        source.pending_retained_miss_cleanup = Some(marker.clone());
+        let retained = owners
+            .pop()
+            .expect("the exact selected cache owner was validated");
+        let owner = RetainedMissCleanupOwner {
+            task,
+            retained,
+            cleanup,
+            source,
+        };
+        // Only this cache obligation changes owner. The current normal task,
+        // active presentation and history execution remain otherwise intact.
+        self.retained_leaves = registry;
+        self.pending_retained_miss_cleanup = Some(marker);
+        install(owner);
+        Ok(())
+    }
+
+    fn retained_miss_cleanup_record(
+        &self,
+        owner: &RetainedMissCleanupOwner,
+    ) -> Result<usize, CleanupError> {
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.id() == owner.task.identity.request)
+            .ok_or(CleanupError::Stale)?;
+        if self.pending_retained_miss_cleanup.as_ref() != Some(&owner.cleanup)
+            || self
+                .inspect_view_report_identity(owner.task.identity())
+                .is_err()
+            || !self
+                .observe_prepared_publication_source(index)
+                .same_source(&owner.source)
+        {
+            return Err(CleanupError::Stale);
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn observe_retained_miss_cleanup_receipt(
+        &mut self,
+        owner: &mut RetainedMissCleanupOwner,
+        disposition: crate::trace::CleanupDisposition,
+    ) -> Result<(), CleanupError> {
+        let index = self.retained_miss_cleanup_record(owner)?;
+        let mut record = self.records[index].clone();
+        record
+            .append_trace(NavigationTraceEvent::cleanup_settled(Some(disposition)))
+            .map_err(|_| CleanupError::Invalid)?;
+        let expected_record = record.clone();
+        self.records[index] = record;
+        owner.source.record = Some(expected_record);
+        Ok(())
+    }
+
+    pub(crate) fn complete_retained_miss_cleanup<Physical, F>(
+        &mut self,
+        owner: RetainedMissCleanupOwner,
+        completion: CleanupCompletion,
+        physical: Physical,
+        reclaim: F,
+    ) -> Result<
+        FrameTask,
+        (
+            RetainedMissCleanupOwner,
+            CleanupCompletion,
+            Physical,
+            CleanupError,
+        ),
+    >
+    where
+        F: FnOnce(Physical),
+    {
+        let index = match self.retained_miss_cleanup_record(&owner) {
+            Ok(index) => index,
+            Err(error) => return Err((owner, completion, physical, error)),
+        };
+        if !completion.matches(&owner.cleanup) {
+            let error = self.cleanup_completion_mismatch(&completion);
+            return Err((owner, completion, physical, error));
+        }
+        if self.completed_cleanup.try_reserve(1).is_err() {
+            return Err((owner, completion, physical, CleanupError::Stale));
+        }
+        let mut record = self.records[index].clone();
+        if record
+            .append_trace(NavigationTraceEvent::cleanup_settled(None))
+            .is_err()
+        {
+            return Err((owner, completion, physical, CleanupError::Invalid));
+        }
+        let mut registry = self.retained_leaves.clone();
+        registry.retain(|entry| entry.retirement.as_ref() != Some(&owner.cleanup));
+        let RetainedMissCleanupOwner {
+            task,
+            retained,
+            cleanup,
+            source: _,
+        } = owner;
+        reclaim(physical);
+        self.records[index] = record;
+        self.retained_leaves = registry;
+        self.pending_retained_miss_cleanup = None;
+        self.completed_cleanup.push(CompletedCleanupTombstone {
+            request: task.identity.request,
+            token: cleanup,
+        });
+        drop(retained);
+        Ok(task)
     }
 
     pub(crate) fn prepare_retained_hit_publication(

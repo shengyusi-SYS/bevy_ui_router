@@ -8784,6 +8784,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         active: None,
         scroll: crate::scroll::ScrollState::default(),
         retained: crate::retained::RetainedLeaves::default(),
+        retained_miss_cleanup: None,
         cleanup_ledger: None,
         post_commit_compound: None,
         settled_retired_host_evidence: None,

@@ -1876,6 +1876,311 @@ fn native_bound_error_preserves_cache_in_the_surviving_parent_scope() {
 }
 
 #[test]
+fn native_invalid_cached_content_is_settled_before_the_same_request_builds_fresh() {
+    let (mut app, router, host, protected, _) =
+        fixture_with_retention(false, true, false, 2, false);
+    app.world_mut().entity_mut(host).add_child(protected);
+    for path in ["/child/1", "/child/2"] {
+        let request = app
+            .world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<RouterNavigation>().entries[0]
+                .engine
+                .request(request)
+                .unwrap()
+                .status(),
+            &RequestStatus::Succeeded
+        );
+    }
+    let (version, parent, active_root, cached_shell, cached_root, cached_claims) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let inventory = entry.retained.inventory().unwrap();
+        assert_eq!(inventory.len(), 1);
+        let cached = entry
+            .retained
+            .branch(inventory[0].projection().id())
+            .unwrap();
+        let active = entry.active.as_ref().unwrap();
+        (
+            entry.host.as_ref().unwrap().version.clone(),
+            active.frames()[0].frame().clone(),
+            active.frames().last().unwrap().native_root().unwrap(),
+            cached.frames()[0].shell(),
+            cached.frames()[0].native_root().unwrap(),
+            cached
+                .claims()
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert!(app.world_mut().despawn(cached_root));
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    for _ in 0..20 {
+        app.update();
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        assert_eq!(
+            entry.host.as_ref().map(|host| &host.version),
+            Some(&version)
+        );
+        assert_eq!(
+            entry.engine.snapshot().availability(),
+            &RouterAvailability::Ready
+        );
+        if entry.engine.active().location() == Some(&RouteLocation::new("/child/2")) {
+            assert!(
+                app.world()
+                    .resource::<RouterInputGate>()
+                    .allows_pointer(active_root)
+            );
+        }
+        if !matches!(
+            entry.engine.request(request).unwrap().status(),
+            RequestStatus::Running(_)
+        ) {
+            break;
+        }
+    }
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let record = entry.engine.request(request).unwrap();
+    assert_eq!(record.status(), &RequestStatus::Succeeded);
+    assert_eq!(
+        record
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::FrameTaskIssued)
+            .count(),
+        1,
+        "a cache miss resumes the original task"
+    );
+    assert_eq!(
+        record
+            .trace()
+            .iter()
+            .filter(|event| event.kind() == NavigationTraceEventKind::RequestTerminal)
+            .count(),
+        1
+    );
+    let active = entry.active.as_ref().unwrap();
+    assert_eq!(active.frames()[0].frame(), &parent);
+    assert_ne!(active.frames().last().unwrap().shell(), cached_shell);
+    let fresh_root = active.frames().last().unwrap().native_root().unwrap();
+    assert_ne!(fresh_root, cached_root);
+    assert!(
+        app.world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(fresh_root)
+    );
+    assert!(entry.cleanup_ledger.is_none() && entry.pending_commit.is_none());
+    assert!(entry.pending_failed_branch.is_none() && entry.native_residuals.is_empty());
+    assert!(entry.authority_protocol_residual.is_none());
+    assert!(cached_claims.iter().all(|entity| {
+        app.world().get_entity(*entity).is_err()
+            && app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(*entity)
+                .is_none()
+    }));
+    assert_eq!(
+        app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+        Some(host)
+    );
+    assert_eq!(
+        app.world().get::<Node>(protected).unwrap().width,
+        Val::Px(91.0)
+    );
+}
+
+#[test]
+fn native_invalid_cached_content_returns_its_task_when_authority_changes_before_acceptance() {
+    let (mut app, router, host, protected, _) =
+        fixture_with_retention(false, true, false, 2, false);
+    app.world_mut().entity_mut(host).add_child(protected);
+    for path in ["/child/1", "/child/2"] {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+    }
+    let (version, history, cached_root, owned) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let inventory = entry.retained.inventory().unwrap();
+        let cached = entry
+            .retained
+            .branch(inventory[0].projection().id())
+            .unwrap();
+        (
+            entry.host.as_ref().unwrap().version.clone(),
+            entry.engine.history().clone(),
+            cached.frames()[0].native_root().unwrap(),
+            entry
+                .active
+                .as_ref()
+                .unwrap()
+                .claims()
+                .chain(cached.claims())
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert!(app.world_mut().despawn(cached_root));
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    collect_navigation_system(app.world_mut());
+    drive_navigation_system(app.world_mut());
+    assert!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .retained_miss_cleanup
+            .is_some()
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .remove::<RouterHostRegistration>();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(matches!(entry.engine.request(request).unwrap().status(),
+        RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost));
+    assert_eq!(entry.engine.history(), &history);
+    assert!(entry.host.is_none() && entry.active.is_none());
+    assert!(entry.retained_miss_cleanup.is_none() && entry.retained.is_empty());
+    assert!(entry.cleanup_ledger.is_none() && entry.pending_commit.is_none());
+    assert!(entry.authority_protocol_residual.is_none());
+    assert!(
+        owned
+            .iter()
+            .all(|entity| app.world().get_entity(*entity).is_err())
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+        Some(host)
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    settle(&mut app);
+    assert_ne!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .host
+            .as_ref()
+            .unwrap()
+            .version,
+        version
+    );
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(next)
+            .unwrap()
+            .status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn native_invalid_cached_content_releases_its_completed_cleanup_before_host_recovery() {
+    use bevy_ecs::prelude::{Commands, Despawn, On};
+    let (mut app, router, host, protected, _) =
+        fixture_with_retention(false, true, false, 2, false);
+    app.world_mut().entity_mut(host).add_child(protected);
+    for path in ["/child/1", "/child/2"] {
+        app.world_mut()
+            .resource_mut::<RouterNavigation>()
+            .push(router, RouteLocation::new(path))
+            .unwrap();
+        settle(&mut app);
+    }
+    let (cached_shell, cached_root, history, owned) = {
+        let entry = &app.world().resource::<RouterNavigation>().entries[0];
+        let inventory = entry.retained.inventory().unwrap();
+        let cached = entry
+            .retained
+            .branch(inventory[0].projection().id())
+            .unwrap();
+        (
+            cached.frames()[0].shell(),
+            cached.frames()[0].native_root().unwrap(),
+            entry.engine.history().clone(),
+            cached
+                .claims()
+                .chain(entry.active.as_ref().unwrap().claims())
+                .map(ExactRegistryClaim::entity)
+                .collect::<Vec<_>>(),
+        )
+    };
+    // The real final shell removal causes host loss after its own receipt is
+    // committed. Completing this cache must not claim the old protected proof
+    // passed or prevent the normal driver from observing the changed host.
+    app.world_mut()
+        .add_observer(move |event: On<Despawn, Node>, mut commands: Commands| {
+            if event.entity == cached_shell {
+                commands.entity(host).remove::<RouterHostRegistration>();
+            }
+        });
+    assert!(app.world_mut().despawn(cached_root));
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    settle(&mut app);
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    assert!(matches!(entry.engine.request(request).unwrap().status(),
+        RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::HostLost));
+    assert_eq!(entry.engine.history(), &history);
+    assert!(entry.retained_miss_cleanup.is_none() && entry.retained.is_empty());
+    assert!(entry.host.is_none() && entry.active.is_none());
+    assert!(entry.cleanup_ledger.is_none() && entry.authority_protocol_residual.is_none());
+    assert!(owned.iter().all(|entity| {
+        app.world().get_entity(*entity).is_err()
+            && app
+                .world()
+                .resource::<RouteEntityRegistry>()
+                .record(*entity)
+                .is_none()
+    }));
+    assert_eq!(
+        app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+        Some(host)
+    );
+    app.world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(router));
+    settle(&mut app);
+    let next = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/child/1"))
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(next)
+            .unwrap()
+            .status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
 fn native_leaf_cache_settles_after_failure_or_host_loss() {
     for host_loss in [false, true] {
         let (mut app, router, host, protected, failure) =

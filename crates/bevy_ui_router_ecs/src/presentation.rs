@@ -29,7 +29,10 @@ use bevy_ui_router_core::{
 use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
     content::{AcceptedContentPlan, RealizedContentKind},
-    host::{ValidatedHostCandidate, validated_host_candidate_is_current},
+    host::{
+        ValidatedHostCandidate, ValidatedHostCandidateObservation,
+        observe_validated_host_candidate, validated_host_candidate_is_current,
+    },
     input::{
         PointerStateResources, PreparedPointerMutation, RouteFocusState, pointer_query,
         pointer_resource_entity,
@@ -613,6 +616,87 @@ pub(crate) struct RetainedBoundaryProof {
     empty_slots: Vec<RetainedEmptySlotBoundary>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedEntityObservation {
+    entity: Entity,
+    present: bool,
+    claim: Option<ExactRegistryClaim>,
+    manifest: Option<ComponentManifest>,
+    seal: Option<RouteOwnershipSeal>,
+    lifecycle: Option<FrameLifecycle>,
+    parent: Option<Entity>,
+    children: Vec<Entity>,
+}
+
+impl RetainedEntityObservation {
+    fn observe(world: &World, entity: Entity) -> Self {
+        Self {
+            entity,
+            present: world.get_entity(entity).is_ok(),
+            claim: world
+                .get_resource::<RouteEntityRegistry>()
+                .and_then(|registry| registry.record(entity))
+                .map(|record| record.claim()),
+            manifest: ComponentManifest::from_world(world, entity),
+            seal: world.get::<RouteOwnershipSeal>(entity).copied(),
+            lifecycle: world.get::<FrameLifecycle>(entity).copied(),
+            parent: world.get::<ChildOf>(entity).map(ChildOf::parent),
+            children: world
+                .get::<Children>(entity)
+                .map(|children| children.iter().copied().collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedInvalidationEvidence {
+    expected: RetainedBoundaryProof,
+    observed: Vec<RetainedEntityObservation>,
+    host: ValidatedHostCandidateObservation,
+}
+
+impl RetainedInvalidationEvidence {
+    pub(crate) const fn projection(&self) -> &RetainedLeafProjection {
+        &self.expected.projection
+    }
+
+    pub(crate) fn missing_native_root(&self) -> Option<Entity> {
+        let root = self.expected.native_root?;
+        self.observed
+            .iter()
+            .any(|observed| observed.entity == root && !observed.present)
+            .then_some(root)
+    }
+
+    pub(crate) fn matches_payload(
+        &self,
+        frame: &RealizedFrame,
+        slots: &[MountedChildSlot],
+    ) -> bool {
+        self.expected.matches_payload(frame, slots)
+    }
+
+    pub(crate) fn is_current(&self, world: &World) -> bool {
+        self.expected.shared_authority_is_current(world)
+            && self.host == observe_validated_host_candidate(world, &self.expected.host_candidate)
+            && self.observed.iter().all(|observed| {
+                *observed == RetainedEntityObservation::observe(world, observed.entity)
+            })
+    }
+
+    pub(crate) fn preservation_is_current(&self, world: &World) -> bool {
+        self.expected.preservation_is_current(world)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RetainedPayloadClassification {
+    Current,
+    OwnInvalid(RetainedInvalidationEvidence),
+    AuthorityLost(RetainedInvalidationEvidence),
+}
+
 impl RetainedBoundaryProof {
     pub(crate) fn prepare<'a>(
         projection: &RetainedLeafProjection,
@@ -758,7 +842,7 @@ impl RetainedBoundaryProof {
             .claim
     }
 
-    pub(crate) fn is_current(&self, world: &World) -> bool {
+    fn shared_authority_is_current(&self, world: &World) -> bool {
         let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
             return false;
         };
@@ -823,6 +907,136 @@ impl RetainedBoundaryProof {
         {
             return false;
         }
+        true
+    }
+
+    pub(crate) fn classify_payload(&self, world: &World) -> RetainedPayloadClassification {
+        let shared = self.shared_authority_is_current(world);
+        if shared && self.own_payload_is_current(world) {
+            return RetainedPayloadClassification::Current;
+        }
+        let mut observed_entities = self
+            .entities
+            .iter()
+            .map(|entity| entity.entity)
+            .chain(self.empty_slots.iter().map(|slot| slot.claim.entity()))
+            .chain([
+                self.host_candidate.host(),
+                self.mount.slot(),
+                self.mount.physical_parent().0,
+            ])
+            .chain(
+                self.mount
+                    .outlet_binding()
+                    .map(|binding| binding.source_claim().entity()),
+            )
+            .collect::<Vec<_>>();
+        observed_entities.sort_by_key(|entity| entity.to_bits());
+        observed_entities.dedup();
+        let evidence = RetainedInvalidationEvidence {
+            expected: self.clone(),
+            observed: observed_entities
+                .into_iter()
+                .map(|entity| RetainedEntityObservation::observe(world, entity))
+                .collect(),
+            host: observe_validated_host_candidate(world, &self.host_candidate),
+        };
+        if shared {
+            RetainedPayloadClassification::OwnInvalid(evidence)
+        } else {
+            RetainedPayloadClassification::AuthorityLost(evidence)
+        }
+    }
+
+    pub(crate) fn is_current(&self, world: &World) -> bool {
+        self.shared_authority_is_current(world) && self.own_payload_is_current(world)
+    }
+
+    /// Certifies only an inert, protected sibling boundary. Its content may
+    /// need retirement and is never authorized for activation by this proof.
+    pub(crate) fn preservation_is_current(&self, world: &World) -> bool {
+        let Some(shell) = self
+            .entities
+            .iter()
+            .find(|entity| entity.entity == self.shell)
+        else {
+            return false;
+        };
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        if !self.shared_authority_is_current(world)
+            || !registry
+                .record(self.shell)
+                .is_some_and(|record| record.claim() == shell.claim)
+            || world.get::<RouteOwnershipSeal>(self.shell)
+                != Some(&RouteOwnershipSeal::new(shell.claim.seal()))
+            || world.get::<FrameLifecycle>(self.shell)
+                != Some(&FrameLifecycle(EntityLifecycle::Retained))
+            || world.get::<FrameShell>(self.shell)
+                != Some(&FrameShell(self.projection.frame().clone()))
+            || world.get::<ChildOf>(self.shell).map(ChildOf::parent) != Some(self.mount.slot)
+            || world
+                .get::<Children>(self.mount.slot)
+                .into_iter()
+                .flat_map(|children| children.iter())
+                .filter(|child| **child == self.shell)
+                .count()
+                != 1
+            || world.get::<Visibility>(self.shell) != Some(&Visibility::Hidden)
+            || world.get::<Pickable>(self.shell) != Some(&Pickable::IGNORE)
+            || !world
+                .get::<RouterInputBarrier>(self.shell)
+                .is_some_and(RouterInputBarrier::denies_all)
+            || world.get::<Node>(self.shell)
+                != Some(&Node {
+                    display: bevy_ui::Display::None,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..Node::default()
+                })
+        {
+            return false;
+        }
+        let mut pending = vec![self.shell];
+        let mut seen = HashSet::new();
+        while let Some(entity) = pending.pop() {
+            if !seen.insert(entity) || world.get_entity(entity).is_err() {
+                return false;
+            }
+            if world
+                .get_resource::<crate::input::RouterInputGate>()
+                .is_some_and(|gate| {
+                    gate.allows_pointer(entity)
+                        || gate.allows_keyboard(entity)
+                        || gate.allows_gamepad(entity)
+                })
+                || world
+                    .get_resource::<InputFocus>()
+                    .is_some_and(|focus| focus.get() == Some(entity))
+                || world
+                    .get_resource::<RouteFocusState>()
+                    .is_some_and(|focus| focus.focused() == Some(entity))
+            {
+                return false;
+            }
+            if let Some(children) = world.get::<Children>(entity) {
+                for child in children.iter().copied() {
+                    if world.get::<ChildOf>(child).map(ChildOf::parent) != Some(entity) {
+                        return false;
+                    }
+                    pending.push(child);
+                }
+            }
+        }
+        true
+    }
+
+    fn own_payload_is_current(&self, world: &World) -> bool {
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        let frame = self.projection.frame();
         for entity in &self.entities {
             if !registry.record(entity.entity).is_some_and(|record| {
                 record.claim() == entity.claim

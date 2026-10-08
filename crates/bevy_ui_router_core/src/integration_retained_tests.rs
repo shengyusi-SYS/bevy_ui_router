@@ -236,6 +236,118 @@ fn retained_hit_source_rejection_returns_original_task_and_owners_without_histor
 }
 
 #[test]
+fn retained_miss_cleanup_returns_the_original_fresh_task_after_exact_completion() {
+    let (mut engine, lease) = engine_with_lease(1, true);
+    let mut owners = Vec::new();
+    navigate(&mut engine, "/items/1", &mut owners);
+    let cached = engine.active().frames().last().unwrap().clone();
+    navigate(&mut engine, "/items/2", &mut owners);
+    let active = engine.active().clone();
+    let history = engine.history().clone();
+    let task = retained_hit_task(&mut engine, "/items/1");
+    let original_identity = task.report_identity();
+    let original_frame = task.frame().clone();
+    let request = task.request();
+    let plan = engine
+        .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.hit().frame(), &cached);
+    let mut installed = None;
+    engine
+        .begin_retained_miss_cleanup(
+            task,
+            plan,
+            CleanupManifest::new(vec![cached], 0x7173, 1),
+            std::mem::take(&mut owners),
+            |owner| installed = Some(owner),
+        )
+        .unwrap();
+    let mut owner = installed.unwrap();
+    let batch = owner.cleanup().clone();
+    assert_eq!(engine.active(), &active);
+    assert_eq!(engine.history(), &history);
+    assert!(engine.action().is_none());
+    assert_eq!(
+        engine.complete_cleanup(batch.clone().complete(0x7577, 1)),
+        Err(IntegrationError::Stale),
+        "ordinary completion must still reject Applying"
+    );
+    let lease = engine
+        .begin_authority_settlement_for_cause_retaining(
+            lease,
+            PreCommitAuthorityCause::HostLost,
+            CleanupManifest::empty(),
+            |_| panic!("the live cache cleanup owner must not be bypassed"),
+        )
+        .err()
+        .expect("authority settlement must retain the cache-only responsibility")
+        .into_owner();
+    let mut protocol_callback_ran = false;
+    let lease = engine
+        .fail_closed_authority_protocol_retaining(Some(lease), || protocol_callback_ran = true)
+        .err()
+        .expect("protocol termination must retain the cache-only responsibility")
+        .expect("the original host lease must be returned");
+    assert!(!protocol_callback_ran);
+    engine
+        .observe_retained_miss_cleanup_receipt(&mut owner, CleanupDisposition::AlreadyAbsent)
+        .unwrap();
+    engine = engine.with_keep_alive_capacity(0);
+    let (owner, completion, physical, error) = engine
+        .complete_retained_miss_cleanup(owner, batch.complete(0x7577, 1), 73, |_| {
+            panic!("source drift must return the original owner and physical payload")
+        })
+        .err()
+        .unwrap()
+        .into_parts();
+    assert_eq!(error, IntegrationError::Stale);
+    assert_eq!(physical, 73);
+    assert_eq!(engine.active(), &active);
+    assert_eq!(engine.history(), &history);
+    engine = engine.with_keep_alive_capacity(1);
+    let mut reclaimed = None;
+    let task = engine
+        .complete_retained_miss_cleanup(owner, completion, physical, |value| {
+            reclaimed = Some(value)
+        })
+        .unwrap();
+    assert_eq!(reclaimed, Some(73));
+    assert!(task.report_identity() == original_identity);
+    assert_eq!(task.frame(), &original_frame);
+    assert_eq!(engine.active(), &active);
+    assert_eq!(engine.history(), &history);
+    assert!(
+        engine
+            .prepare_retained_hit_plan(&task, &[])
+            .unwrap()
+            .is_none()
+    );
+    let outlets = engine
+        .expected_child_outlet(&task)
+        .unwrap()
+        .into_iter()
+        .collect();
+    engine.report_applied_with_outlets(task, outlets).unwrap();
+    let EngineAction::Commit(ticket) = engine.action().unwrap() else {
+        panic!("the original fresh task must continue to normal publication");
+    };
+    let prepared = prepare(&mut engine, &ticket, &mut owners);
+    publish(&mut engine, prepared, &mut owners);
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert_eq!(engine.active().frames().last(), Some(&original_frame));
+    assert_eq!(owners.len(), 1);
+    assert_eq!(
+        owners[0].projection().frame(),
+        active.frames().last().unwrap()
+    );
+    drop(lease);
+}
+
+#[test]
 fn retained_leaf_defaults_and_capacity_are_real_policy_inputs() {
     assert!(!RouteNodeOptions::new().keep_alive());
     for (capacity, opt_in) in [(0, true), (2, false)] {

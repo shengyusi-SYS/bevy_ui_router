@@ -4,9 +4,9 @@
 
 按结果顺序交付。Core 决定 history 与 lifecycle，ECS 持有实体、滚动数据和物理 owner；沿用现有 publication/cleanup 协议。只在实际改动处拆分私有模块，不整体重写 navigation。默认关闭新增能力时保持现有行为。
 
-entry 滚动、A→B→A 命中、LRU 淘汰，以及闲置、normal 提交前、pending failure 和 postcommit 期间 host loss 的缓存结算已闭合。后续按以下顺序收尾，不扩张功能范围：
+entry 滚动、A→B→A 命中、LRU 淘汰，以及闲置、normal 提交前、pending failure 和 postcommit 期间 host loss 的缓存结算已闭合。缓存内容根删除已有同请求清理后重建、接受前 host loss、最终 shell 删除触发 host loss 的完整 Native 旅程；这不代表所有自身失效已完成。后续按以下顺序收尾，不扩张功能范围：
 
-1. 完成缓存自身失效与一个活动资格查询入口。
+1. 收口仍有物理残留的真实失效路径，完成一个活动资格查询入口。
 2. 验证多 entry 滚动与缓存组合、真实输入/窗口和性能，更新合同及 consumer。
 
 近期问题共同来自“当前物理分支就是完整生命周期库存”的旧假设。调整实施接缝，将完整库存选择、原 owner 移交和物理 manifest 组合集中到现有 retained/cleanup 职责；不同来源的 history、失败 continuation 和 cleanup receipt 仍由原合同持有：
@@ -59,6 +59,8 @@ normal 提交前与 pending failure 期间 host loss 已验证完整库存、原
 fallback 已验证旧父 scope 与缓存在同一普通 cleanup batch 退役，保留原 Apply 失败、history 与 host，后续导航成功。BoundError 验证 surviving parent 的 exact frame/slot 与缓存保留、非活动输入拒绝和后续合法请求，没有套用 fallback 的全退休政策。
 
 postcommit 已由一次真实多层 scope 导航验证两类库存同时结算：已绑定原 normal token 的退休项留在原 ledger，Live 缓存及原 owners/payload 进入 authority 第二批，联合完成分别结算两个 exact token，保留已提交结果与 history；app-owned host 保留并可重新接纳。完整库存归入既有 receiver projection，首次执行与 retry 共用接线，拒绝沿原 holder 保有唯一 owner。延迟 proof 删除包只移除 exact 选定项，双 Router 旅程验证不会覆盖其他 Router 后续建立的缓存。
+
+缓存局部失效不进入会撤销 active/host 的通用 authority failure 路径。Core 将原 task、缓存 owner 与独立 cleanup token 单次组合，完成后返还原 task；ECS 复用原 cleanup ledger，只选择该缓存。所有目标已有 exact removal receipt 且 Entity/registry 均消失时，可以只读完成原账本，保留写后 stop 证据至 Core completion，再由原 driver 判断实际 authority。来源变化与清理可接受性分别核对，不能把同源的永久矛盾当可重试准备失败。尚有目标存活时不能套用这一 completion；容量重试跨 update 后的真实 protected 变化仍待收口。应用动态内容继续按现有内容边界处理，不扩展为任意 router-owned shell 篡改后的自动恢复。
 
 永久协议矛盾的 residual/transfer 保持原 owner；这类保存句柄的路径不算可恢复结算，也不扩展为新的自动恢复需求。
 

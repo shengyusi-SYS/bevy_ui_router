@@ -706,6 +706,24 @@ impl RouteEntityRegistry {
             && boundary.is_current(world)
     }
 
+    pub(crate) fn classify_retained_payload(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+        frame: &crate::presentation::RealizedFrame,
+        slots: &[crate::mount::MountedChildSlot],
+    ) -> Option<crate::presentation::RetainedPayloadClassification> {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let boundary = matches.next()?;
+        if matches.next().is_some() || !boundary.matches_payload(frame, slots) {
+            return None;
+        }
+        Some(boundary.classify_payload(world))
+    }
+
     pub(crate) fn retained_shell_is_current(
         &self,
         world: &World,
@@ -719,7 +737,7 @@ impl RouteEntityRegistry {
         let Some(boundary) = matches.next() else {
             return false;
         };
-        matches.next().is_none() && boundary.is_current(world)
+        matches.next().is_none() && boundary.preservation_is_current(world)
     }
 
     pub(crate) fn retained_shell_claims_for_mount(
