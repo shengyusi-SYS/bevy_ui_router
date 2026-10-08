@@ -1,103 +1,77 @@
 # 设计理由与经验
 
-本页提炼本项目设计和修复中可复用的原因，帮助判断下一次改动该落在哪里。具体行为以 [专题合同](../contracts/README.md) 为准，当前实现关系见 [架构](../architecture/README.md)，协作规则归 [AGENTS.md](../../AGENTS.md)。
+本页只提炼 Bevy UI Router 可复用的因果与取舍。现行行为归[专题合同](../contracts/README.md)，实现关系归[架构](../architecture/README.md)，协作护栏归 [AGENTS.md](../../AGENTS.md)。经验帮助选择调查方向，不能代替当前代码和运行证据。
 
-## 分层是为了让决定只有一个来源
+## 决策集中，执行按职责拆分
 
-路由匹配、请求顺序、history 和逻辑生命周期相互关联，交给 Core 统一决定，能避免 view 或平台回调各自推进状态。ECS 负责把决定落实为 World 写入；Scene factory 负责生成内容。拆 crate 的价值在责任和可测试边界，而不是文件数量。
+路由、请求、history 与逻辑 lifecycle 相互关联，由 Core 统一决定；ECS 落实 World 写入，View 保持 renderer-neutral，adapter 使用受控合同构建内容。单一决策来源避免平台回调、Scene observer 或缓存各自推进路由。
 
-View 保持 renderer-neutral，使 Core 的行为可以独立验证，也让未来 renderer 有明确接入点。当前只交付一个生产 BSN adapter，不为可能出现的 renderer 提前建立通用插件框架。
+模块按稳定协议及其 owner 拆分，编排层只组合阶段与资源借用。拆 crate、提取文件或引入依赖，应该减少理解和修改成本；行数、理论扩展能力和审查次数本身不能证明需要重写架构。
 
-facade 的默认功能不拉入 Bevy runtime，应用显式选择 `ecs` / `bsn`。独立窗口 workspace 解决的是图形 feature 合并污染 headless 验证，而不是要求使用者采用某种应用 shell。
-
-## 嵌套路由的价值在局部保留
-
-用户需要的是切换子页时侧栏、工具栏和局部状态继续存在。common-prefix 保留与 suffix 替换直接服务这一需求；整 host 重建即使更易实现，也会改变用户行为。
-
-“单 default outlet”限制承载数量，不限制它必须位于 Scene 根。内部容器上的 outlet 才能表达普通布局。声明 marker 与实际 child slot 分离，让布局 authoring 不必持有挂载权限。
-
-path、route-local params、raw search 和 fragment 对复用的影响不同。判断复用时应遵守既有语义，而不是以“同一个 route id”或“location 变化”统一重建全部内容。
+优先使用 Bevy 的 Scene、布局与输入管线，以及标准容器。简单 LRU 不需要新 runtime；第三方依赖只有覆盖真实责任、减少自维护成本时才值得引入。共享工具也须有相同的证明目的、角色分区与失败语义，不能只因代码相似合并。
 
 ## 访问、页面实例与物理责任分别建模
 
-history entry 标识一次访问，缓存标识可复用页面，ECS owner 承担实体责任。相同 Entity 可服务多次访问，滚动记录不能绑定缓存实例；长期缓存可以超出原请求寿命，也不能继续占用该请求的前台 capability。当前 active branch 因而不再等于完整生命周期库存，清理必须纳入原缓存 owner。
+history entry 标识一次访问，页面实例保存 Entity 与局部状态，owner 承担物理责任；关系见[架构图](../architecture/README.md#访问实例与责任)。同一页面可服务多次访问，滚动位置必须按 entry 保存。长期 retained owner 可以超出原请求寿命，原请求仍应结清自己的前台 capability。
 
-Back 的目标可以是 fresh 或 retained。曾保留一条“成功目标总是 fresh”的专门发布路径，导致缓存命中卡在 Ready；让两者共用 retained publisher、保留原 Back history/continuation 配对，比新增缓存 Back 状态机更直接。复用准备工具仍须区分目的：缓存页自身空 slot 的 outlet 声明是重新激活条件，安全删除原内容并不要求该声明重新出现。
+嵌套路由保留 common prefix，服务的是布局与局部状态连续性；整 host 重建会改变这一用户行为。path、route-local params、search 和 fragment 的复用语义不同，不能仅按 route id 或 location 变化统一重建。
 
-## 可信应用不需要 World 沙箱
+active branch 因而不再等于完整生命周期库存。父 scope 退出、fallback 和 host loss 都要检查原 retained owner，而不是只递归删除当前 active；数量和树位置也不能代替 exact binding。
 
-Scene/template/observer 是应用代码，可以触发组件 hook、修改资源或创建自己的实体。Router 的事务只管理授权的路由内容与物理结构，不能承诺回滚任意应用副作用。
+缓存复用的是已实现页面，fresh Scene 仍是一次执行的构建输入。已有页面不应通过克隆 Scene 或重放旧 task 恢复；依赖保活、前台 capability 和残留隔离责任各有自己的结束边界。
 
-曾经冻结全 World 组件或 app-owned host 的无关组件，导致正常 Children observer 和销毁 hook 被误判成 authority drift。修复应围绕真实写入授权、关系和 exact ownership 收窄校验，而不是不断扩大白名单。
+## 共用完成路径，保留不同的失败语义
 
-应用拥有 host；Router 创建的 shell/slot 与 Scene 普通内容承担不同责任。后者在受管 containment 内由 Router 管理，移出后由应用承担。把所有普通内容临时转换成登记结构，会增加写入、清理和重复证明成本。
+Back 的成功目标既可能 fresh，也可能 retained。共享接收器若仍假设所有成功结果都 fresh，就会遗漏合法目标；应让它们进入既有 publication 管线，携带原 history authority、执行身份与 continuation，而不是补一套缓存 Back 状态机。
 
-## Scene 成功与路由发布是不同事件
+重新激活与安全处置回答不同问题。缺少原 outlet 声明可能阻止缓存重新激活，却不一定阻止按原 owner 安全清理；处理这类失效应分别证明当前 authority、目标写集和原义务，不能为处置强求激活条件重新成立，也不能把任意 drift 都降成 miss。
 
-同步代码驱动仍会执行 resolve/apply，依赖官方 Scene runtime；Cargo feature 不能证明 `AssetServer` 和 `Assets<ScenePatch>` 已经安装。
+cleanup 决定物理义务如何处置，continuation 决定原请求如何结束或恢复。后者来自原失败与 attempt，不能由保留了旧 active、剩余实体数或删除结果反推。仅真实容量或可完成前置不足可以重试；永久矛盾必须有界结算。
 
-apply 可以在 relationship 完整建立前失败。事后扫描 Children 不能找到所有本次创建产物，因此创建期先登记 exact allocation obligations，再在成功 adoption 后移交给内容边界管理。
+## 线性 owner 与 preparation 边界不能靠快照补救
 
-Scene patch 是构建期组合，不能替代 route reconciliation。局部 observer 适合按钮回调，不能成为 lifecycle 的第二权威。
+snapshot、projection 和 fingerprint 提供事实校验，不能重建 capability。会签发 owner 的接口也不是只读查询；所有 typed outcome 都必须完整消费或返还，否则一次空闲观察也可能遗失唯一 owner。
 
-pending 内容必须先隔离，成功完成整个发布准备后才可获得可见性和输入权。只使用父级 Visibility 曾不足以隔离原生 UI，Router 自控 shell 的 display 与原生输入缓存处置必须结合验证。
+current/next 独立冻结，延迟 action 核对完整 source projection。逐元素有效不能证明仍属于同一次操作；稀疏 slot 和 retained sibling 必须按自身 role/binding 判断。
 
-## capability 与事实投影不能互相替代
+Core 接纳线性责任前，先完成该协议要求的容量预留和 owner 交接准备。缓存自身失效再继续 fresh 的路径，还需提前备妥同次 removal/receipt 包，避免接纳后卡在物理准备；普通 cleanup 的实际 receipt 则随其 attempt 准备。publication 前完成所有可失败工作，tail 只提交预备状态，不能返回后补装 owner。
 
-snapshot、projection 和 fingerprint 描述观察到的事实，不代表持有 lifecycle owner。拒绝或准备失败应返还原 owner；根据“看起来相同”的数据重建 owner 会产生重复消费和 stale replay 风险。
+Bevy 的便利借用 API 也要检查实际副作用。资源 take/reinsert、scope 退出和 drop 可能改变 tick 或触发 hook；审查原子边界时要包含外层包装，不能只检查函数正文。需要只读 preparation 时使用适合该边界的联合借用。
 
-延迟 action 要比较完整 source projection。逐个元素分别有效，并不能证明它们仍属于同一次操作。current/next 独立冻结也避免在提交后从结构反推旧状态。
+## 保护内容边界，按真实写入复验
 
-稀疏 topology 表明数量和数组位置不能代表权限：slot-only、空 retained 结构、preserved parent 与 entering child 都要按各自 binding 和 role 判定。
+可信 Scene/template/observer 可以修改应用资源。Router 只管理自有结构与授权内容边界，不承诺回滚任意应用副作用，也不冻结 app-owned host 的无关组件。
 
-这些规则用于具体可达的生命周期问题；不应把理论计数器极限扩张成全新公开协议或常见上线风险。
+创建期先登记 exact allocation obligations，覆盖尚未挂接的产物；成功 adoption 后按当前 containment 管理普通内容。普通组件新增不是 ownership 转移，普通内容也不必临时转成永久登记结构。
 
-## 失败清理不是另一套路由决策
+relationship 与组件写入可能同步触发 hook/observer，正常 UI propagation 也会改变派生组件。每次相关写后重建 target/protected partition，再验证授权写集和保留值；不以全局白名单、旧快照或遍历顺序掩盖角色差异。只读 preservation 不应套用 mutation 的封闭 child-set 假设。
 
-cleanup 回答“哪些产物还需要处置”，continuation 回答“原请求接下来如何结束或恢复”。后者不能由剩余实体数、旧 active 是否保留或物理销毁结果反推。
+## 活动资格、输入权限与后台工作各有边界
 
-真实容量或尚未满足的前置事实可以等待；永久身份或关系矛盾不会因为重试更多次消失。永久停止物理写入也不能让前台请求永久 Running，残留隔离责任应与前台终结分开。
+隐藏 retained 页面不等于暂停应用 timer、Query 或 observer。应用用最小的 `RouteActivity` 查询决定自己的工作；查询须核对最近登记边界和完整父级挂载链，不能让 retained child 继承 active parent 的资格。activity 与 authored visibility、输入 gate 分开。
 
-不同路径可以复用 preparation 和 owner 移交工具，但 pending rejection、authority loss、已发布 normal 与 error 的来源和结果必须保持区别。减法的目标是删除重复机制，而不是抹平分支语义。
+接入真实 Bevy system 时检查资源借用。只读活动/状态展示与可变导航编排混在一个 system 会造成冲突；按职责拆成有明确顺序的 system，通常比用复杂借用包装更清晰。
 
-## 组件生命周期让旧快照很快失效
+不可见也不等于历史手势失效。撤权必须经过原生 picking、当前/前次 hover 和 press/click/drag 状态，并保护其它有效目标。focus 的延后候选与后发 set/clear 还包含操作顺序，最终值相等不能证明中间没有被覆盖。
 
-component、relationship 和销毁操作可能同步触发应用代码。目标图与 protected 图在一次操作开始时合法，不代表下一次破坏性写入时仍合法；写后复验是针对这一真实生产行为。
+## 验证沿真实用户旅程闭合
 
-复用校验函数前先比较证明目的。只读 preservation 不应套用 mutation 的封闭 child-set 假设，否则合法的 protected extras 会被误拒绝。
+私有测试定位精确 owner、drift 和调度边界；独立 consumer 使用自己的 feature 图证明 facade 装配；普通 `App::update` 的组合旅程证明实际收敛。各项单独通过，仍可能漏掉 fresh/hit Back、父 scope 替换和恢复的交接问题；不要用额外内部调用跳过真实刷新边界。
 
-正常 UI propagation 也会在 relationship 写入时增删派生组件，或在脱离父级后为新 UI root 补充传播组件。mutation 应冻结具体操作的派生差异并写后复验；只读残留保护只接纳已证明的 root 转换，不能把这些类型加入全局宽松名单。
+输入测试先证明正向命中，再建立真实按下/拖拽并验证撤权，重新激活后还要证明新的输入可用。负向无事件本身可能只是插件或调度未接通。
 
-原生输入同样存在历史状态。`Display::None` 阻止新命中，并不会自动撤销已经记录的 press/click/drag；撤权必须覆盖真实缓存和派发时序，并保护其它有效目标。
+fault seam 只改变生产 predicate 的真实输入。编译拒绝核对目标诊断来源；删除旧机制时先迁移必要行为，不保留只证明源码形状、固定清单或多份 Markdown 彼此同步的验证。反例按已确认范围、可达性和影响选择。
 
-焦点也不只是一个当前 Entity。pending AutoFocus、应用操作和延后 FocusGained/Lost 有顺序，必须经官方队列验证；无条件 clear 会丢掉应用后来的有效操作。
+设计审查、headless/crate、独立 consumer、窗口及平台原生验证分别报告。工具可用、命令成功和产品行为通过是不同事实，未执行项不能由其它层级推断。
 
-## 正确性证据必须到达用户入口
+## 性能先对齐工作与证据
 
-私有测试可以精准制造 drift 和 stale owner，但不能证明 public facade 已接通。独立 consumer 使用自己的依赖图，原样执行示例，能够发现仓库 dev feature 合并掩盖的问题。
+性能减法先消除重复采集、反复登记和重复分类；操作内共享计划不能省去真实写后失效的复验。容器或读取方式是否值得优化，以配对测量决定。
 
-只验证各项功能不足以证明组合正确。search 引发祖先重建后的 Back 曾因 mount continuation 漏执行而停滞；补充普通 `App::update` 的完整嵌套旅程才揭示问题。
+命中省去构建，首次 miss 保留旧页，关闭缓存则清理旧页，满容量淘汰又包含回收；这些工作不能仅凭耗时差归因到 Scene 优化。计时应覆盖请求终态、无 running 和前台 cleanup 清空，同时观察驻留内容有界及退出后的释放；活实体计数不能证明 heap 或内部 owner 无泄漏。
 
-输入负向测试应先证明正向管线确实命中，再验证撤权。否则插件缺失、错误 schedule 或零派发也会让“旧目标没有收到事件”成立。
+测量绑定源码、二进制、环境和完整配对数据，隔离插桩及并行构建影响。headless 导航、窗口主世界时间和屏幕呈现回答不同问题；方法及数据归[性能基线](../performance.md)。
 
-编译拒绝应核对目标错误来源；源码形状扫描、API 黄金文本和多份 Markdown 矩阵容易只证明彼此同步。它们曾增加维护成本，真实 consumer 和行为回归更接近所需边界。
+## 文档只维护当前答案
 
-## 性能减法先减少重复工作
-
-最初的持续退化来自永久增长的 consumed seal 历史查询；把发行与注册合并到唯一入口后，单调身份仍成立，历史列表不再必要。
-
-同一次只读采集重复构造未结算集合、普通内容退出时反复转换成 registry 结构、每个成员重新分类整批义务，都增加了与业务工作无关的成本。共享只读采集与操作内计划减少这些重复，同时保留真正写后失效的复验。
-
-容器微优化并非总有收益。固定小集合替换哈希有实测收益；后续 EntityRef 读取合并没有显示值得保留的收益，候选被放弃。不能仅凭减少调用或分配就宣布更快。
-
-同内容 BSN 对照能帮助区分引擎创建/删除与 Router 责任成本；headless 导航、小窗口和真实产品帧预算回答不同问题。方法及原始数据见 [性能基线](../performance.md)，类似路由实践见 [研究参考](../reference/router-benchmarks.md)。
-
-插桩二进制曾被共享 target 复用，宿主并行构建也曾污染配对结果。测量身份与环境需要确认，受干扰数据不能挑选一半来比较；诊断 probe 不构成正式性能结论。
-
-## 文档按职责维护当前答案
-
-早期设计、阶段合同、固定 API 清单与执行日志同时留在导航中，会把历史方案误读成当前需求，并诱发为已删除机制继续补丁。
-
-文档分别说明产品、架构、专题合同、集成、验证和测量。按功能建立多份设计或计划可以降低阅读成本；同一规则保持清楚归属，避免多处复制。经验记录可复用的因果与取舍，执行过程由 Git 和任务历史追溯；不要复制测试计数、临时路径或其它项目状态。
-
-下一次重构应从可复现问题、真实使用成本和现有责任边界出发。代码规模、过往审查次数或理论能力列表本身，都不足以证明需要新增机制。
+每条规则有明确归属，跨主题用链接。复杂功能按职责组织设计/计划，小修复不机械新建文档；交付后必要语义归位，已完成计划和日志由 Git 追溯。经验只保留可复用结论，不复制阶段状态、提交、测试计数、临时路径或其它项目内容。

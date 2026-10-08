@@ -40,6 +40,21 @@ BSN 的 `AppBsnExt` 实现在 ECS 的可选 bridge 中，再由 facade 导出。
 纯路由模型与 renderer-neutral 合同；当前可注册的生产 renderer 是 BSN。
 私有 Data executor 用于独立验证同一 Core/ECS 管线，不是外部 renderer 插件 API。
 
+## 访问、实例与责任
+
+这三个维度分别回答“回到哪次访问”“复用哪个页面”和“谁负责物理内容”。图中虚线表示不同时刻可能复用同一实例，不是 history 保存 Entity 或持有缓存的关系。
+
+```mermaid
+flowchart LR
+    E1["history entry A₁"] -->|opaque entry key| S1["A₁ 的滚动记录"]
+    E2["history entry A₂"] -->|opaque entry key| S2["A₂ 的滚动记录"]
+    E1 -.-> P["页面实例 A<br/>原 Entity 与局部状态"]
+    E2 -.-> P
+    O["物理责任 owner"] -->|线性持有| P
+```
+
+Core 拥有 history 与保留决策，ECS 按 opaque entry key 保存滚动位置，并持有原物理 payload。owner 随 active、retained 与 cleanup 的受控交接移动；页面仍存活，不意味着原请求还应持有前台 capability。active branch 只描述当前呈现，完整生命周期库存还包括 retained、pending、cleanup 和私有残留责任。精确行为归[导航](../contracts/navigation.md)与[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。
+
 ## 状态与源码入口
 
 下列状态属于不同维度，不能合并为一个全局线性状态机。
