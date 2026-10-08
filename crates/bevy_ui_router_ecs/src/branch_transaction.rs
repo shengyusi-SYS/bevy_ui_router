@@ -1292,6 +1292,16 @@ impl<'a> ReconciliationSpliceView<'a> {
         }
     }
 
+    pub(crate) fn prepare_root_cleanup_rebase(
+        &self,
+        world: &bevy_ecs::world::World,
+        cleanup: &crate::cleanup::FrozenCleanupManifest,
+    ) -> Option<PreparedRootRebase> {
+        Some(PreparedRootRebase {
+            frame: cleanup.prepare_successor_mount_rebase(world, self.entering.first_frame()?)?,
+        })
+    }
+
     pub(crate) fn prepare_claim_rebind(
         &self,
         claims: &[ExactRegistryClaim],

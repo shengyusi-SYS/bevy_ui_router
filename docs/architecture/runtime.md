@@ -93,6 +93,8 @@ snapshot 发布是每轮观察出口，与真正的 presentation publication 是
 
 Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定命中、容量分区和退休责任；ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 持有原物理 payload 与长期 owner。命中先借库存做全部准备，最后单次移交原 owner；拒绝保留原责任。容量按非活动库存计算，简单 LRU 复用同一离场/cleanup 管线。安全的缓存自身失效通过私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算该实例，再返还原 fresh task；当前 authority 失效仍走原 authority settlement。语义范围归[导航](../contracts/navigation.md#同父-leaf-保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
 
+共享 slot 的 cleanup 从当前 exact children 冻结选定删除边；activation 保留发布前校验快照，独立准备清理后的 mount prior，避免命中或 LRU 淘汰将旧 sibling 带入下一轮。
+
 显式滚动容器由 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 仅交接 opaque canonical entry key 及已准备 publication 的来源、目标和存活 entry 事实；位置记录不能签发路由权限。Back 的位置写入在原有 tail 前准备，正常 `PostUpdate` UI layout 后核对当前完整 branch 归属，再单次结算裁剪结果并采样实际逻辑像素位置。
 
 失败路径复用相同 Core 决策和 ECS ownership 边界：先处理该次失败的物理义务，

@@ -337,7 +337,6 @@ fn freeze_projectionless_leaving(
             None,
             &change.selected(&entry.retained).collect::<Vec<_>>(),
             resulting_claims,
-            Some(pending.branch.as_realized()),
         ),
         (Some(leaving), None) => FrozenCleanupManifest::from_leaving_branch(
             world,

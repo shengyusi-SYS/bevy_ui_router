@@ -34,7 +34,7 @@ use crate::{
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
     navigation::{HostBinding, PendingFailedBranch, RetiredHostBinding},
     presentation::{
-        FrameContentTarget, FrameLifecycle, FrameOutput, RealizedFrame,
+        FrameContentTarget, FrameLifecycle, FrameOutput, PreparedFrameMountRebase, RealizedFrame,
         RetainedInvalidationEvidence,
     },
     registry::{
@@ -2784,7 +2784,37 @@ pub(crate) enum FailedManifestBuildError {
     MountParentFreeze(FailedMountParentFreezeError),
 }
 
+enum LeavingMountProof<'a> {
+    FreshSuccessor(Option<&'a RealizedBranch>),
+    RetainedPartition,
+}
+
 impl FrozenCleanupManifest {
+    /// Prepare the entering owner's mount record for the selected cleanup.
+    /// Activation/preflight keeps its separate before-cleanup snapshot intact.
+    pub(crate) fn prepare_successor_mount_rebase(
+        &self,
+        world: &World,
+        successor: &RealizedFrame,
+    ) -> Option<PreparedFrameMountRebase> {
+        let slot = successor.mount_binding().slot();
+        let observed = observed_children(world, slot);
+        let mut removed = Vec::new();
+        for parent in self
+            .mount_parents
+            .iter()
+            .filter(|parent| parent.physical == slot)
+        {
+            if parent.children_before != observed {
+                return None;
+            }
+            if parent.removed_child_was_attached {
+                removed.push(parent.removed_child);
+            }
+        }
+        successor.prepare_mount_rebase_after_cleanup(world, &removed)
+    }
+
     pub(crate) fn observe_idle_host_residual(
         &self,
         world: &World,
@@ -2906,7 +2936,6 @@ impl FrozenCleanupManifest {
         retained: Option<&RetainedLeafProjection>,
         retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
         projected_claims: &[ExactRegistryClaim],
-        successor: Option<&RealizedBranch>,
     ) -> Option<Self> {
         if let Some(candidate) = retained {
             let mut frames = leaving
@@ -2967,7 +2996,7 @@ impl FrozenCleanupManifest {
             &frames,
             &slots,
             projected_claims,
-            successor,
+            LeavingMountProof::RetainedPartition,
             &authorized_retired,
         )
     }
@@ -3024,7 +3053,7 @@ impl FrozenCleanupManifest {
             });
         }
         order_leaf_to_root(&mut obligations)?;
-        let mut candidates = vec![retained_frame_mount_parent_candidate(world, frame)?];
+        let mut candidates = vec![attached_frame_mount_parent_candidate(world, frame)?];
         for slot in branch.child_slots() {
             if !obligations
                 .iter()
@@ -3066,7 +3095,7 @@ impl FrozenCleanupManifest {
             &frames,
             &child_slots,
             projected_claims,
-            successor,
+            LeavingMountProof::FreshSuccessor(successor),
             &[],
         )
     }
@@ -3077,7 +3106,7 @@ impl FrozenCleanupManifest {
         frames: &[&RealizedFrame],
         child_slots: &[&MountedChildSlot],
         projected_claims: &[ExactRegistryClaim],
-        successor: Option<&RealizedBranch>,
+        mount_proof: LeavingMountProof<'_>,
         authorized_retired: &[&RouteFrameVersion],
     ) -> Option<Self> {
         let obligation_count = frames.iter().try_fold(child_slots.len(), |count, frame| {
@@ -3195,10 +3224,11 @@ impl FrozenCleanupManifest {
 
         let mut parent_candidates = frames
             .iter()
-            .map(|frame| {
-                if authorized_retired.contains(&frame.frame()) {
-                    retained_frame_mount_parent_candidate(world, frame)
-                } else {
+            .map(|frame| match mount_proof {
+                LeavingMountProof::RetainedPartition => {
+                    attached_frame_mount_parent_candidate(world, frame)
+                }
+                LeavingMountProof::FreshSuccessor(successor) => {
                     let successor = exact_successor_for_mount(frame, successor)?;
                     frame_mount_parent_candidate(frame, successor)
                 }
@@ -5914,12 +5944,12 @@ fn frame_mount_parent_candidate(
     })
 }
 
-fn retained_frame_mount_parent_candidate(
+fn attached_frame_mount_parent_candidate(
     world: &World,
     frame: &RealizedFrame,
 ) -> Option<CleanupMountParentCandidate> {
-    // The caller admits only leaves with an exact current retained proof.
-    // Their shared slot can have acquired other siblings since first mount.
+    // Target ownership is admitted by the caller's partition. Mount peers are
+    // current physical facts, independent of the target's original mount order.
     let slot = frame.mount_binding().slot();
     let children_before = observed_children(world, slot);
     if !frame.shell_is_attached()

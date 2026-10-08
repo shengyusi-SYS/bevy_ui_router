@@ -472,30 +472,7 @@ pub(super) fn publish_normal_work(
     let registry_changes = transitions
         .iter()
         .any(|(claim, next)| claim.lifecycle() != *next);
-    let root_rebase = if !matches!(&splice, NormalPublicationSplice::Retained { .. })
-        && view.disposable_frames().next().is_some()
-        && !view.entering().frames().is_empty()
-    {
-        match view.prepare_root_rebase() {
-            Some(prepared) => Some(prepared),
-            None => {
-                let (active, entering, _roles) = splice.reject().into_parts();
-                let mut navigation = world.resource_mut::<RouterNavigation>();
-                let entry = navigation
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.handle == handle)
-                    .unwrap();
-                entry.active = had_active.then_some(active);
-                pending.branch = entering;
-                entry.pending_commit = Some(pending);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
+    let mut mount_rebase_contradiction = false;
     let cleanup_preparation = (|| {
         let registry = world.get_resource::<RouteEntityRegistry>()?;
         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
@@ -517,7 +494,6 @@ pub(super) fn publish_normal_work(
                 retained_projection.as_ref(),
                 &retired,
                 &resulting_claims,
-                (!view.entering().frames().is_empty()).then_some(view.entering()),
             )?
         } else if view.leaving().obligation_count() == 0 {
             FrozenCleanupManifest::empty()
@@ -531,7 +507,23 @@ pub(super) fn publish_normal_work(
             )?
         };
 
-        Some((frozen_manifest, registry_plan, resulting_claims))
+        let root_rebase = if view.entering().frames().is_empty() {
+            None
+        } else {
+            match view.prepare_root_cleanup_rebase(world, &frozen_manifest) {
+                Some(prepared) => Some(prepared),
+                None => {
+                    mount_rebase_contradiction = true;
+                    return None;
+                }
+            }
+        };
+        Some((
+            frozen_manifest,
+            registry_plan,
+            resulting_claims,
+            root_rebase,
+        ))
     })();
     #[cfg(feature = "bsn")]
     let native_focus = world.resource_scope(
@@ -546,11 +538,12 @@ pub(super) fn publish_normal_work(
     );
     let mut splice_owner = Some(splice);
     let mut cleanup_reserve_contradiction = None;
-    let mut commit_authority_contradiction = None;
+    let mut commit_authority_contradiction =
+        mount_rebase_contradiction.then_some(BeginAuthoritySettlementErrorKind::InvalidManifest);
     let mut retained_publication_contradiction = None;
     let mut rejected_retained_publication = None;
     let committed = (|| {
-        let (frozen_manifest, registry_plan, resulting_claims) = cleanup_preparation?;
+        let (frozen_manifest, registry_plan, resulting_claims, root_rebase) = cleanup_preparation?;
         if sealed
             .as_ref()
             .is_some_and(|sealed| sealed.manifest != frozen_manifest)

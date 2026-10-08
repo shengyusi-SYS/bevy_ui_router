@@ -1895,6 +1895,40 @@ impl RealizedFrame {
         })
     }
 
+    pub(crate) fn prepare_mount_rebase_after_cleanup(
+        &self,
+        world: &World,
+        removed: &[Entity],
+    ) -> Option<PreparedFrameMountRebase> {
+        let slot = self.mount.slot();
+        let children = world
+            .get::<Children>(slot)?
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        if !self.shell_is_attached()
+            || world.get::<ChildOf>(self.shell).map(ChildOf::parent) != Some(slot)
+            || children
+                .iter()
+                .filter(|child| **child == self.shell)
+                .count()
+                != 1
+            || removed.contains(&self.shell)
+            || removed.iter().enumerate().any(|(index, entity)| {
+                removed[index + 1..].contains(entity)
+                    || children.iter().filter(|child| *child == entity).count() != 1
+            })
+        {
+            return None;
+        }
+        Some(PreparedFrameMountRebase {
+            prior_mount_children: children
+                .into_iter()
+                .filter(|child| *child != self.shell && !removed.contains(child))
+                .collect(),
+        })
+    }
+
     pub(crate) fn apply_mount_rebase(&mut self, prepared: PreparedFrameMountRebase) {
         self.prior_mount_children = prepared.prior_mount_children;
     }
