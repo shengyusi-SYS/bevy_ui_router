@@ -310,7 +310,7 @@ pub(super) struct ProjectionlessPublicationWork {
     leaving_rebind: Option<crate::branch_transaction::PreparedBranchClaimRebind>,
     retiring: Vec<r3_core::RetainedLeafProjection>,
     retained_change: Option<crate::retained::PreparedRetainedChange>,
-    retiring_rebind: Vec<crate::branch_transaction::PreparedBranchClaimRebind>,
+    retiring_rebind: Vec<crate::instance::PreparedInstanceClaimRebind>,
     leaving_assembly: Option<crate::cleanup::PreparedLeavingAssembly>,
     retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
     expected_manifest: FrozenCleanupManifest,
@@ -343,7 +343,7 @@ fn freeze_projectionless_leaving(
             registry,
             leaving,
             resulting_claims,
-            Some(pending.branch.as_realized()),
+            Some(pending.branch.as_realized().as_payload_ref()),
         )
         .ok_or(crate::cleanup::RetainedPartitionManifestError::InvalidManifest),
         (None, None) => Ok(FrozenCleanupManifest::empty()),

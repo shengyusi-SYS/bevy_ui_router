@@ -50,10 +50,8 @@ pub(super) fn classify(
     entry: &RouterEntry,
     plan: &r3_core::RetainedHitPlan,
 ) -> Option<RetainedPayloadClassification> {
-    let branch = entry.retained.branch_for(plan.hit())?;
-    let [frame] = branch.frames() else {
-        return None;
-    };
+    let branch = entry.retained.payload_for(plan.hit())?;
+    let frame = branch.frame();
     world
         .get_resource::<RouteEntityRegistry>()?
         .classify_retained_payload(world, plan.hit(), frame, branch.child_slots())
@@ -84,7 +82,7 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
         return;
     }
     let projection = source.plan.hit().clone();
-    if entry.retained.branch_for(&projection).is_none() {
+    if entry.retained.payload_for(&projection).is_none() {
         reject_preparation(entry, source, Rejection::PhysicalSource);
         return;
     }
@@ -116,7 +114,7 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
     };
     let branch = entry
         .retained
-        .branch_for(&projection)
+        .payload_for(&projection)
         .expect("exact selection retains its payload");
     let Some(manifest) = FrozenCleanupManifest::from_retained_invalidation(
         world,

@@ -1850,7 +1850,7 @@ struct PreparedPostCommitPhysicalOwner {
     original_freeze: FrozenOriginalCleanupLedgerTransfer,
     authority: PreparedPostCommitAuthorityLedger,
     active: RealizedBranch,
-    retained: Vec<RealizedBranch>,
+    retained: Vec<crate::instance::InstancePayload>,
     retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
@@ -1883,7 +1883,7 @@ struct PostCommitCompoundPhysicalOwner {
     authority: CleanupLedger,
     partition: FrozenPostCommitAuthorityPartition,
     active: RealizedBranch,
-    retained: Vec<RealizedBranch>,
+    retained: Vec<crate::instance::InstancePayload>,
     retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
@@ -10853,7 +10853,8 @@ pub(crate) fn classify_back_target(
                     registry,
                     splice.leaving(),
                     resulting_claims,
-                    (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+                    (!splice.entering().frames().is_empty())
+                        .then_some(splice.entering().as_payload_ref()),
                 ) else {
                     let evidence = LifecyclePreflightEvidence::new(
                         LifecyclePreflightSource::TargetPartition,
@@ -11556,25 +11557,26 @@ fn freeze_back_target_preparation_physical(
         .map(|entity| observe_target_preparation_permanent_entity(world, registry, entity))
         .collect::<Vec<_>>();
 
-    let normal_frozen_manifest =
-        if authority_loss.is_some() || splice.leaving().obligation_count() == 0 {
-            FrozenCleanupManifest::empty()
-        } else {
-            let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
-                world,
-                registry,
-                splice.leaving(),
-                normal_registry_plan.resulting_claims(),
-                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
-            ) else {
-                return Err(mismatch(
-                    LifecyclePreflightSource::TargetPartition,
-                    LifecyclePreflightExpectation::ExactRelationshipClosure,
-                    LifecyclePreflightObserved::Contradictory,
-                ));
-            };
-            manifest
+    let normal_frozen_manifest = if authority_loss.is_some()
+        || splice.leaving().obligation_count() == 0
+    {
+        FrozenCleanupManifest::empty()
+    } else {
+        let Some(manifest) = FrozenCleanupManifest::from_leaving_branch(
+            world,
+            registry,
+            splice.leaving(),
+            normal_registry_plan.resulting_claims(),
+            (!splice.entering().frames().is_empty()).then_some(splice.entering().as_payload_ref()),
+        ) else {
+            return Err(mismatch(
+                LifecyclePreflightSource::TargetPartition,
+                LifecyclePreflightExpectation::ExactRelationshipClosure,
+                LifecyclePreflightObserved::Contradictory,
+            ));
         };
+        manifest
+    };
     let ecs_manifest = FrozenCleanupManifest::from_target_preparation_permanent(
         world,
         registry,
@@ -15117,7 +15119,8 @@ fn publish_ready_back_target(
                 &registry,
                 splice.leaving(),
                 &resulting_claims,
-                (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+                (!splice.entering().frames().is_empty())
+                    .then_some(splice.entering().as_payload_ref()),
             )?
         };
         if frozen_again != ready.frozen_manifest {
@@ -15604,9 +15607,9 @@ fn prepare_commit_entry(
     let splice = if let Some(plan) = pending.retained_hit.as_ref() {
         let entering_boundaries = entry
             .retained
-            .branch_for(plan.hit())
+            .payload_for(plan.hit())
             .into_iter()
-            .flat_map(RealizedBranch::claims)
+            .flat_map(crate::instance::InstancePayload::claims)
             .map(ExactRegistryClaim::entity)
             .collect::<Vec<_>>();
         let host_is_current = entry
@@ -15628,7 +15631,7 @@ fn prepare_commit_entry(
             );
             return None;
         }
-        let Some(branch) = entry.retained.branch_for(plan.hit()) else {
+        let Some(branch) = entry.retained.payload_for(plan.hit()) else {
             let (active, _, _) = sealed.reject().into_parts();
             entry.active = had_active.then_some(active);
             entry.pending_commit = Some(pending);
@@ -15739,7 +15742,7 @@ fn prepare_normal_registration_probe(
             registry,
             splice.leaving(),
             registry_plan.resulting_claims(),
-            (!splice.entering().frames().is_empty()).then_some(splice.entering()),
+            (!splice.entering().frames().is_empty()).then_some(splice.entering().as_payload_ref()),
         )?
     };
     if pending.ticket.is_none() {

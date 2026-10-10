@@ -789,7 +789,11 @@ fn cleanup_owner_snapshot(owner: Option<&CleanupOwner>) -> CleanupOwnerSnapshot 
     match owner {
         Some(CleanupOwner::IdleHostAuthority(owner)) => CleanupOwnerSnapshot::IdleHostAuthority {
             active_claims: owner.active.as_ref().map(&claims),
-            retained_claims: owner.retained.iter().map(&claims).collect(),
+            retained_claims: owner
+                .retained
+                .iter()
+                .map(|payload| payload.claims().cloned().collect())
+                .collect(),
             host: owner.host.host,
             top_slot: owner.host.top_slot,
             top_slot_claim: owner.host.top_slot_claim.clone(),
@@ -873,7 +877,7 @@ fn idle_retained_manifest_includes_every_owner_before_its_active_parent_slot() {
         .map(|owner| {
             (
                 owner.projection(),
-                entry.retained.branch(owner.projection().frame()).unwrap(),
+                entry.retained.payload(owner.projection().frame()).unwrap(),
             )
         })
         .collect::<Vec<_>>();
@@ -936,8 +940,8 @@ fn idle_retained_manifest_rejects_duplicate_mismatched_and_parentless_sources() 
     let inventory = entry.retained.inventory().unwrap();
     let first = inventory[0].projection();
     let second = inventory[1].projection();
-    let first_branch = entry.retained.branch(first.frame()).unwrap();
-    let second_branch = entry.retained.branch(second.frame()).unwrap();
+    let first_branch = entry.retained.payload(first.frame()).unwrap();
+    let second_branch = entry.retained.payload(second.frame()).unwrap();
     for (active, retiring) in [
         (
             entry.active.as_ref(),
@@ -968,7 +972,7 @@ fn idle_retained_manifest_classifies_real_seal_loss_without_readonly_authority()
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         let projection = entry.retained.inventory().unwrap()[0].projection().clone();
         (
-            entry.retained.branch(projection.frame()).unwrap().frames()[0].shell(),
+            entry.retained.payload(projection.frame()).unwrap().frames()[0].shell(),
             projection,
         )
     };
@@ -981,7 +985,7 @@ fn idle_retained_manifest_classifies_real_seal_loss_without_readonly_authority()
         .insert(RouteOwnershipSeal::new(changed_seal));
     let registry = app.world().resource::<RouteEntityRegistry>();
     let entry = &app.world().resource::<RouterNavigation>().entries[0];
-    let branch = entry.retained.branch(projection.frame()).unwrap();
+    let branch = entry.retained.payload(projection.frame()).unwrap();
     assert!(
         !registry.retained_shell_is_current(app.world(), shell, branch.frames()[0].top_slot(),)
     );
@@ -991,7 +995,7 @@ fn idle_retained_manifest_classifies_real_seal_loss_without_readonly_authority()
         .map(|owner| {
             (
                 owner.projection(),
-                entry.retained.branch(owner.projection().frame()).unwrap(),
+                entry.retained.payload(owner.projection().frame()).unwrap(),
             )
         })
         .collect::<Vec<_>>();

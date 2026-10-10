@@ -1222,7 +1222,7 @@ pub(super) fn prepare_failed_manifest_authority_isolation_with_retained(
     active: Option<&RealizedBranch>,
     failed: &PendingFailedBranch,
     host: Option<&HostBinding>,
-    retained: &[&RealizedBranch],
+    retained: &[&crate::instance::InstancePayload],
     targets: Vec<bevy_ecs::entity::Entity>,
 ) -> AuthorityIsolationPreparation {
     prepare_failed_branch_authority_isolation_with_retained(
@@ -1240,7 +1240,7 @@ fn prepare_failed_branch_authority_isolation_with_retained(
     active: Option<&RealizedBranch>,
     branch: &FailedPreparedBranch,
     host: Option<&HostBinding>,
-    retained: &[&RealizedBranch],
+    retained: &[&crate::instance::InstancePayload],
     frozen_targets: Option<Vec<bevy_ecs::entity::Entity>>,
 ) -> AuthorityIsolationPreparation {
     #[cfg(feature = "bsn")]

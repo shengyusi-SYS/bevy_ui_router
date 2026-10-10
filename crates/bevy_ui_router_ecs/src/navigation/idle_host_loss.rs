@@ -21,7 +21,7 @@ pub(super) struct ReservingIdleHostLoss {
 
 struct UnreservedIdleHost {
     active: Option<RealizedBranch>,
-    retained: Vec<RealizedBranch>,
+    retained: Vec<crate::instance::InstancePayload>,
     host: RetiredHostBinding,
     frozen: FrozenCleanupManifest,
     partition: crate::cleanup::FrozenBackNoTargetAuthorityPartition,

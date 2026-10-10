@@ -91,7 +91,7 @@ ECS 先将物理切换、输入/focus 和后续 cleanup owner 组合成准备好
 这时已发布页面和 history 已生效；清理失败不能回滚或改写原成功结果。
 snapshot 发布是每轮观察出口，与真正的 presentation publication 是不同步骤。
 
-Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定命中、容量分区和退休责任；ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 持有原物理 payload 与长期 owner。命中先借库存做全部准备，最后单次移交原 owner；拒绝保留原责任。容量按非活动库存计算，简单 LRU 复用同一离场/cleanup 管线。安全的缓存自身失效通过私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算该实例，再返还原 fresh task；当前 authority 失效仍走原 authority settlement。语义范围归[导航](../contracts/navigation.md#同父-leaf-保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
+Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定命中、容量分区和退休责任；ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 持有原物理 payload 与长期 owner。[instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) 的 payload 只含一个原 frame 及以它为 parent 的自有 slots，外部父 mount 是 alias，不进入子实例清理写集。active/fresh 分支仍是交易集合；激活与清理通过预分配接收器消费原 payload。命中先借库存做全部准备，最后单次移交原 owner；拒绝保留原责任。容量按非活动库存计算，简单 LRU 复用同一离场/cleanup 管线。安全的缓存自身失效通过私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算该实例，再返还原 fresh task；当前 authority 失效仍走原 authority settlement。语义范围归[导航](../contracts/navigation.md#同父-leaf-保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
 
 共享 slot 的 cleanup 从当前 exact children 冻结选定删除边；activation 保留发布前校验快照，独立准备清理后的 mount prior，避免命中或 LRU 淘汰将旧 sibling 带入下一轮。
 

@@ -264,44 +264,13 @@ pub(crate) fn validate_entering_mount_parent(
         )
 }
 
-pub(crate) fn validate_retained_entering_branch(
+pub(crate) fn validate_reconciliation_entering_branch<'payload>(
     world: &World,
-    entering: &RealizedBranch,
-    projection: &bevy_ui_router_core::integration::RetainedLeafProjection,
-) -> Result<(), FrameLocalError> {
-    let [frame] = entering.frames() else {
-        return Err(FrameLocalError::OwnershipDrift(
-            entering
-                .frames()
-                .first()
-                .map_or(Entity::PLACEHOLDER, |frame| frame.shell()),
-        ));
-    };
-    if let Some(slot) = entering.child_slots().iter().find(|slot| {
-        world
-            .get::<Children>(slot.slot())
-            .is_some_and(|children| !children.is_empty())
-    }) {
-        return Err(FrameLocalError::ForeignChildSlot(slot.slot()));
-    }
-    if world
-        .get_resource::<RouteEntityRegistry>()
-        .is_some_and(|registry| {
-            registry.retained_payload_is_current(world, projection, frame, entering.child_slots())
-        })
-    {
-        Ok(())
-    } else {
-        Err(FrameLocalError::OwnershipDrift(frame.shell()))
-    }
-}
-
-pub(crate) fn validate_reconciliation_entering_branch(
-    world: &World,
-    entering: &RealizedBranch,
+    entering: impl Into<crate::instance::PayloadRef<'payload>>,
     preserved: &RealizedBranch,
     leaving: &RealizedBranch,
 ) -> Result<(), FrameLocalError> {
+    let entering = entering.into();
     validate_reconciliation_entering_structure(entering, preserved)?;
     for slot in entering.child_slots() {
         if !validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert) {
@@ -369,15 +338,23 @@ pub(crate) fn validate_active_branch_with_entering(
     entering: Option<&RealizedBranch>,
     staging_allowance: Option<&SealedMountNewStagingAllowance>,
 ) -> Result<Vec<Entity>, FrameLocalError> {
-    validate_committed_branch_with_entering(world, branch, false, entering, staging_allowance, None)
+    validate_committed_branch_with_entering(
+        world,
+        branch,
+        false,
+        entering.map(Into::into),
+        staging_allowance,
+        None,
+    )
 }
 
-pub(crate) fn validate_active_branch_for_splice(
+pub(crate) fn validate_active_branch_for_splice<'payload>(
     world: &World,
     preserved: &RealizedBranch,
-    entering: &RealizedBranch,
+    entering: impl Into<crate::instance::PayloadRef<'payload>>,
     slot_roles: &[SealedReconciliationSlotRole],
 ) -> Result<Vec<Entity>, FrameLocalError> {
+    let entering = entering.into();
     validate_committed_branch_with_entering(
         world,
         preserved,
@@ -472,7 +449,7 @@ fn validate_committed_branch_with_entering(
     world: &World,
     branch: &RealizedBranch,
     leaving: bool,
-    entering: Option<&RealizedBranch>,
+    entering: Option<crate::instance::PayloadRef<'_>>,
     staging_allowance: Option<&SealedMountNewStagingAllowance>,
     sealed_slot_roles: Option<&[SealedReconciliationSlotRole]>,
 ) -> Result<Vec<Entity>, FrameLocalError> {
@@ -620,7 +597,7 @@ fn validate_committed_branch_with_entering(
         } else {
             let entering_shells = entering
                 .into_iter()
-                .flat_map(RealizedBranch::frames)
+                .flat_map(|payload| payload.frames())
                 .filter_map(|entering| entering.sealed_reconciliation_entering_shell_for(frame))
                 .cloned()
                 .collect::<Vec<_>>();
@@ -802,10 +779,11 @@ fn validate_mount_new_staging_allowance(
             == allowance.expected_anchor_children()
 }
 
-fn validate_reconciliation_entering_structure(
-    entering: &RealizedBranch,
+fn validate_reconciliation_entering_structure<'payload>(
+    entering: impl Into<crate::instance::PayloadRef<'payload>>,
     preserved: &RealizedBranch,
 ) -> Result<(), FrameLocalError> {
+    let entering = entering.into();
     if entering.frames().is_empty() {
         return entering.child_slots().first().map_or(Ok(()), |slot| {
             Err(FrameLocalError::ForeignChildSlot(slot.slot()))
@@ -892,10 +870,11 @@ fn validate_branch_structure(branch: &RealizedBranch) -> Result<(), FrameLocalEr
     Ok(())
 }
 
-fn child_slot_expectations(
-    branch: &RealizedBranch,
+fn child_slot_expectations<'payload>(
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
     frame: &RouteFrameVersion,
 ) -> Vec<(Entity, Vec<Entity>)> {
+    let branch = branch.into();
     branch
         .child_slots()
         .iter()
@@ -904,15 +883,16 @@ fn child_slot_expectations(
         .collect()
 }
 
-fn validate_frame_claim_set<'a>(
+fn validate_frame_claim_set<'a, 'payload>(
     world: &World,
     frame: &RouteFrameVersion,
     root: Entity,
     claims: impl Iterator<Item = &'a crate::registry::ExactRegistryClaim>,
-    branch: &RealizedBranch,
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
     manifest_policy: ManifestPolicy,
     external_boundaries: &[Entity],
 ) -> Result<(), FrameLocalError> {
+    let branch = branch.into();
     let registry = world
         .get_resource::<RouteEntityRegistry>()
         .ok_or(FrameLocalError::MissingRoot(root))?;
@@ -951,10 +931,11 @@ fn validate_frame_claim_set<'a>(
     Ok(())
 }
 
-pub(crate) fn validate_branch_descendants(
+pub(crate) fn validate_branch_descendants<'payload>(
     world: &World,
-    branch: &RealizedBranch,
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
 ) -> Result<Vec<Entity>, FrameLocalError> {
+    let branch = branch.into();
     validate_branch_descendants_allowing_entering(world, branch, &[], &[])
 }
 
@@ -966,12 +947,13 @@ fn validate_branch_descendants_with_boundaries(
     validate_branch_descendants_allowing_entering(world, branch, &[], opaque_boundaries)
 }
 
-fn validate_branch_descendants_allowing_entering(
+fn validate_branch_descendants_allowing_entering<'payload>(
     world: &World,
-    branch: &RealizedBranch,
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
     sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
     opaque_boundaries: &[Entity],
 ) -> Result<Vec<Entity>, FrameLocalError> {
+    let branch = branch.into();
     if branch.frames().is_empty() {
         return Ok(Vec::new());
     }

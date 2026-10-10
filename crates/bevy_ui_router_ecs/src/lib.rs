@@ -15,6 +15,7 @@ mod driver;
 mod frame_local;
 mod host;
 mod input;
+mod instance;
 mod lifecycle_preparation;
 mod mount;
 #[cfg(feature = "bsn")]

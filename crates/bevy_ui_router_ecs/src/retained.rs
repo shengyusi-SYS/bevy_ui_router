@@ -2,7 +2,7 @@
 use bevy_ui_router_core::frame::RouteFrameVersion;
 use bevy_ui_router_core::integration::{RetainedLeafOwner, RetainedLeafProjection};
 
-use crate::branch_transaction::RealizedBranch;
+use crate::instance::InstancePayload;
 
 pub(crate) enum PreparedPublication {
     Ordinary(bevy_ui_router_core::integration::PreparedCommit),
@@ -89,7 +89,7 @@ impl ValidatedPublication<'_> {
 pub(crate) struct RetainedLeaf {
     projection: RetainedLeafProjection,
     owner: Option<RetainedLeafOwner>,
-    branch: RealizedBranch,
+    payload: InstancePayload,
 }
 
 #[derive(Default)]
@@ -104,29 +104,29 @@ pub(crate) struct PreparedRetainedChange {
     hit: Option<usize>,
     removals: Vec<usize>,
     owners: Vec<RetainedLeafOwner>,
-    payloads: Vec<RealizedBranch>,
+    payloads: Vec<InstancePayload>,
 }
 
 pub(crate) struct RetainedPayloads {
-    pub(crate) hit: Option<RealizedBranch>,
-    pub(crate) retiring: Vec<RealizedBranch>,
+    pub(crate) hit: Option<InstancePayload>,
+    pub(crate) retiring: Vec<InstancePayload>,
 }
 
 impl PreparedRetainedChange {
     pub(crate) fn selected<'a>(
         &'a self,
         leaves: &'a RetainedLeaves,
-    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a RealizedBranch)> {
+    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a InstancePayload)> {
         self.indices.iter().map(move |index| {
             let entry = &leaves.entries[*index];
-            (&entry.projection, &entry.branch)
+            (&entry.projection, &entry.payload)
         })
     }
 
     pub(crate) fn selected_mut<'a>(
         &'a self,
         leaves: &'a mut RetainedLeaves,
-    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a mut RealizedBranch)> {
+    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a mut InstancePayload)> {
         leaves
             .entries
             .iter_mut()
@@ -135,7 +135,7 @@ impl PreparedRetainedChange {
                 self.indices
                     .binary_search(&index)
                     .is_ok()
-                    .then_some((&entry.projection, &mut entry.branch))
+                    .then_some((&entry.projection, &mut entry.payload))
             })
     }
 
@@ -153,9 +153,9 @@ impl PreparedRetainedChange {
         std::mem::take(&mut self.owners)
     }
 
-    pub(crate) fn into_payloads(mut self, leaves: &mut RetainedLeaves) -> Vec<RealizedBranch> {
+    pub(crate) fn into_payloads(mut self, leaves: &mut RetainedLeaves) -> Vec<InstancePayload> {
         for index in self.removals.into_iter().rev() {
-            self.payloads.push(leaves.entries.remove(index).branch);
+            self.payloads.push(leaves.entries.remove(index).payload);
         }
         self.payloads
     }
@@ -163,11 +163,11 @@ impl PreparedRetainedChange {
     pub(crate) fn into_hit_and_payloads(mut self, leaves: &mut RetainedLeaves) -> RetainedPayloads {
         let mut hit = None;
         for index in self.removals.into_iter().rev() {
-            let branch = leaves.entries.remove(index).branch;
+            let payload = leaves.entries.remove(index).payload;
             if Some(index) == self.hit {
-                hit = Some(branch);
+                hit = Some(payload);
             } else {
-                self.payloads.push(branch);
+                self.payloads.push(payload);
             }
         }
         RetainedPayloads {
@@ -257,10 +257,10 @@ impl RetainedLeaves {
         })
     }
 
-    pub(crate) fn branch_for(
+    pub(crate) fn payload_for(
         &self,
         projection: &RetainedLeafProjection,
-    ) -> Option<&RealizedBranch> {
+    ) -> Option<&InstancePayload> {
         self.entries
             .iter()
             .find(|entry| {
@@ -270,7 +270,7 @@ impl RetainedLeaves {
                         .as_ref()
                         .is_some_and(|owner| owner.projection() == projection)
             })
-            .map(|entry| &entry.branch)
+            .map(|entry| &entry.payload)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -289,11 +289,11 @@ impl RetainedLeaves {
     }
 
     #[cfg(test)]
-    pub(crate) fn branch(&self, frame: &RouteFrameVersion) -> Option<&RealizedBranch> {
+    pub(crate) fn payload(&self, frame: &RouteFrameVersion) -> Option<&InstancePayload> {
         self.entries
             .iter()
             .find(|entry| entry.projection.frame() == frame)
-            .map(|entry| &entry.branch)
+            .map(|entry| &entry.payload)
     }
 
     pub(crate) fn restore_owners(
@@ -332,12 +332,12 @@ impl RetainedLeaves {
         &mut self,
         projection: RetainedLeafProjection,
         owner: Option<RetainedLeafOwner>,
-        branch: RealizedBranch,
+        payload: InstancePayload,
     ) {
         self.entries.push(RetainedLeaf {
             projection,
             owner,
-            branch,
+            payload,
         });
     }
 }

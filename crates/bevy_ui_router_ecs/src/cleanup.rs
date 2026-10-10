@@ -30,6 +30,7 @@ use crate::{
         RouterInputBarrier,
     },
     input::{RouteFocusState, observed_descendant_closure, prepare_focus_mutation},
+    instance::{InstancePayload, PayloadRef},
     lifecycle_preparation::LifecyclePreflightEvidence,
     mount::{ChildSlotResidual, MountedChildSlot, residual_child_slot_is_isolated},
     navigation::{HostBinding, PendingFailedBranch, RetiredHostBinding},
@@ -2792,7 +2793,7 @@ pub(crate) enum FailedManifestBuildError {
 }
 
 enum LeavingMountProof<'a> {
-    FreshSuccessor(Option<&'a RealizedBranch>),
+    FreshSuccessor(Option<PayloadRef<'a>>),
     RetainedPartition,
 }
 
@@ -2924,7 +2925,7 @@ impl FrozenCleanupManifest {
         registry: &RouteEntityRegistry,
         branch: &RealizedBranch,
         projected_claims: &[ExactRegistryClaim],
-        successor: Option<&RealizedBranch>,
+        successor: Option<PayloadRef<'_>>,
     ) -> Option<Self> {
         Self::from_leaving_branch_parts(
             world,
@@ -2941,7 +2942,7 @@ impl FrozenCleanupManifest {
         registry: &RouteEntityRegistry,
         leaving: &RealizedBranch,
         retained: Option<&RetainedLeafProjection>,
-        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+        retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
         projected_claims: &[ExactRegistryClaim],
     ) -> Result<Self, RetainedPartitionManifestError> {
         if let Some(candidate) = retained {
@@ -2968,9 +2969,7 @@ impl FrozenCleanupManifest {
             .collect::<Vec<_>>();
         let mut authorized_retired = Vec::with_capacity(retiring.len());
         for (projection, branch) in retiring {
-            let [frame] = branch.frames() else {
-                return Err(RetainedPartitionManifestError::InvalidManifest);
-            };
+            let frame = branch.frame();
             if frame.frame() != projection.frame()
                 || !frame.mount_binding().matches_retained_scope(projection)
                 || branch
@@ -3023,12 +3022,10 @@ impl FrozenCleanupManifest {
     pub(crate) fn from_retained_invalidation(
         world: &World,
         registry: &RouteEntityRegistry,
-        branch: &RealizedBranch,
+        branch: &InstancePayload,
         evidence: &RetainedInvalidationEvidence,
     ) -> Option<Self> {
-        let [frame] = branch.frames() else {
-            return None;
-        };
+        let frame = branch.frame();
         let root = frame.native_root()?;
         if !evidence.matches_payload(frame, branch.child_slots())
             || !evidence.is_current(world)
@@ -3102,7 +3099,7 @@ impl FrozenCleanupManifest {
         frames: &[RealizedFrame],
         child_slots: &[MountedChildSlot],
         projected_claims: &[ExactRegistryClaim],
-        successor: Option<&RealizedBranch>,
+        successor: Option<PayloadRef<'_>>,
     ) -> Option<Self> {
         let frames = frames.iter().collect::<Vec<_>>();
         let child_slots = child_slots.iter().collect::<Vec<_>>();
@@ -3322,7 +3319,7 @@ impl FrozenCleanupManifest {
         pending: &crate::branch_transaction::PreparedBranch,
         active: &RealizedBranch,
         host: &HostBinding,
-        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+        retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
     ) -> Result<Self, AuthoritySettlementManifestError> {
         let mut obligations = Vec::new();
         append_exact_authority_branch(
@@ -3393,7 +3390,7 @@ impl FrozenCleanupManifest {
         registry: &RouteEntityRegistry,
         active: Option<&RealizedBranch>,
         host: &HostBinding,
-        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+        retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
     ) -> Result<Self, AuthoritySettlementManifestError> {
         let mut obligations = Vec::new();
         append_retained_authority_branches(
@@ -3548,7 +3545,7 @@ impl FrozenCleanupManifest {
         active: Option<&RealizedBranch>,
         host: &HostBinding,
         bindings: Vec<FailedAuthorityBoundaryBinding>,
-        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+        retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
     ) -> Result<Self, AuthoritySettlementManifestError> {
         if !self.pending_boundary_loss_claims.is_empty()
             || bindings.len() != self.boundary_drifts.len()
@@ -5405,7 +5402,7 @@ fn append_retained_authority_branches(
     registry: &RouteEntityRegistry,
     active: Option<&RealizedBranch>,
     host: &HostBinding,
-    retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+    retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
     obligations: &mut Vec<CleanupObligation>,
 ) -> Result<(), AuthoritySettlementManifestError> {
     if retiring.is_empty() {
@@ -5430,9 +5427,7 @@ fn append_retained_authority_branches(
         primary_entities.extend(active.claims().map(ExactRegistryClaim::entity));
     }
     for (index, (projection, branch)) in retiring.iter().enumerate() {
-        let [frame] = branch.frames() else {
-            return Err(AuthoritySettlementManifestError::InvalidTopology);
-        };
+        let frame = branch.frame();
         let active = active.ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
         let mut parents = active
             .frames()
@@ -5846,11 +5841,11 @@ fn current_exact_frame_obligations(
 
 fn exact_successor_for_mount<'a>(
     frame: &RealizedFrame,
-    successor: Option<&'a RealizedBranch>,
+    successor: Option<PayloadRef<'a>>,
 ) -> Option<Option<&'a RealizedFrame>> {
     let mut matches = successor
         .into_iter()
-        .flat_map(RealizedBranch::frames)
+        .flat_map(|payload| payload.frames())
         .filter(|candidate| {
             candidate
                 .mount_binding()
@@ -8016,6 +8011,7 @@ pub(crate) struct PreparedCleanupLedger {
 /// A passive first removal. It has reserved physical storage, but no Core
 /// cleanup batch and no physical owner until the original transfer is accepted.
 pub(crate) struct PreparedRetainedInvalidationRemoval {
+    payload_frames: Vec<RealizedFrame>,
     ledger: CleanupLedger,
     step: PreparedRetainedInvalidationRemovalStep,
 }
@@ -8045,10 +8041,15 @@ impl PreparedRetainedInvalidationRemoval {
     pub(crate) fn activate(
         mut self,
         batch: CleanupBatch,
-        branch: RealizedBranch,
+        instance: InstancePayload,
     ) -> (CleanupLedger, PreparedRetainedInvalidationRemovalStep) {
         self.ledger.batch = Some(batch);
-        self.ledger.owner = Some(CleanupOwner::Leaving(LeavingPayload::from_branch(branch)));
+        let (frame, child_slots) = instance.into_owned_parts();
+        self.payload_frames.push(frame);
+        self.ledger.owner = Some(CleanupOwner::Leaving(LeavingPayload {
+            frames: self.payload_frames,
+            child_slots,
+        }));
         (self.ledger, self.step)
     }
 }
@@ -8122,13 +8123,11 @@ impl PreparedCleanupLedger {
     pub(crate) fn prepare_retained_invalidation_removal(
         self,
         world: &World,
-        branch: &RealizedBranch,
+        branch: &InstancePayload,
     ) -> Result<PreparedRetainedInvalidationRemoval, RetainedInvalidationRemovalPreparationError>
     {
         use RetainedInvalidationRemovalPreparationError::{InvalidSource, RetryableCapacity};
-        let [frame] = branch.frames() else {
-            return Err(InvalidSource);
-        };
+        let frame = branch.frame();
         let Some(root) = frame.native_root() else {
             return Err(InvalidSource);
         };
@@ -8259,7 +8258,12 @@ impl PreparedCleanupLedger {
         {
             return Err(InvalidSource);
         }
+        let mut payload_frames = Vec::new();
+        payload_frames
+            .try_reserve_exact(1)
+            .map_err(|_| RetryableCapacity)?;
         Ok(PreparedRetainedInvalidationRemoval {
+            payload_frames,
             ledger,
             step: PreparedRetainedInvalidationRemovalStep {
                 attempt,
@@ -10467,11 +10471,14 @@ impl PreparedLeavingAssembly {
     pub(crate) fn assemble(
         mut self,
         leaving: RealizedBranch,
-        retired: Vec<RealizedBranch>,
+        retired: Vec<InstancePayload>,
     ) -> LeavingPayload {
-        for branch in std::iter::once(leaving).chain(retired) {
-            let (mut frames, mut child_slots) = branch.into_owned_parts();
-            self.frames.append(&mut frames);
+        let (mut frames, mut child_slots) = leaving.into_owned_parts();
+        self.frames.append(&mut frames);
+        self.child_slots.append(&mut child_slots);
+        for instance in retired {
+            let (frame, mut child_slots) = instance.into_owned_parts();
+            self.frames.push(frame);
             self.child_slots.append(&mut child_slots);
         }
         LeavingPayload {
@@ -10524,7 +10531,7 @@ pub(crate) enum CleanupOwner {
 
 pub(crate) struct IdleHostAuthorityCleanupOwner {
     active: Option<RealizedBranch>,
-    retained: Vec<RealizedBranch>,
+    retained: Vec<crate::instance::InstancePayload>,
     pub(crate) host: RetiredHostBinding,
 }
 
@@ -10655,7 +10662,7 @@ pub(crate) struct CompletedFailedPreparedOwner {
 
 pub(crate) struct AuthoritySettlementOwner {
     active: Option<RealizedBranch>,
-    retained: Vec<RealizedBranch>,
+    retained: Vec<crate::instance::InstancePayload>,
     pending: AuthoritySettlementPendingOwner,
     host: RetiredHostBinding,
 }
@@ -10975,7 +10982,7 @@ impl CleanupLedger {
         host: RetiredHostBinding,
         host_children: Vec<Entity>,
         partition: FrozenBackNoTargetAuthorityPartition,
-        retained: Vec<RealizedBranch>,
+        retained: Vec<crate::instance::InstancePayload>,
     ) -> Self {
         let mut ledger = Self::activate_owner(
             prepared,
@@ -11207,7 +11214,7 @@ impl CleanupLedger {
         pending: FailedPreparedBranch,
         host: RetiredHostBinding,
         host_children: Vec<Entity>,
-        retained: Vec<RealizedBranch>,
+        retained: Vec<crate::instance::InstancePayload>,
     ) -> Self {
         let mut ledger = Self::activate_owner(
             prepared,
@@ -11230,7 +11237,7 @@ impl CleanupLedger {
         failed: PendingFailedBranch,
         host: RetiredHostBinding,
         host_children: Vec<Entity>,
-        retained: Vec<RealizedBranch>,
+        retained: Vec<crate::instance::InstancePayload>,
     ) -> Self {
         let mut ledger = Self::activate_owner(
             prepared,
@@ -15220,7 +15227,7 @@ impl PreparedPostCommitAuthorityLedger {
         active: &RealizedBranch,
         host: &HostBinding,
         original: &FrozenOriginalCleanupLedgerTransfer,
-        retiring: &[(&RetainedLeafProjection, &RealizedBranch)],
+        retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
     ) -> Result<Self, PostCommitAuthorityFreezeFailure> {
         let original_entities = original.partition_entities();
         let registry = world.get_resource::<RouteEntityRegistry>().ok_or_else(|| {

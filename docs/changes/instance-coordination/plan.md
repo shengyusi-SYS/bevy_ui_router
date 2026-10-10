@@ -1,6 +1,6 @@
 # 实例协调实施计划
 
-状态：第 1 步已完成；第 2 步进行中，Core 已统一原实例身份并分离激活选择与 fresh 创建事实，ECS frame-local payload 与唯一 owner 迁移待做；步骤 3–5 尚未实施。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理只读交叉审查。沿当前 main 推进，不新建分支。
+状态：第 1、2 步已完成并通过完整门禁；Core 原实例身份、激活/创建事实与 ECS 单实例 payload/原 owner 的等价迁移已闭合。步骤 3–5 尚未实施。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理只读交叉审查。沿当前 main 推进，不新建分支。
 
 **目标：** 先交付当前已发布输入，再将 leaf 保留替换为按实例和 exact 父依赖的协调，闭合混合激活/fresh、失败及依赖淘汰。
 
@@ -10,7 +10,7 @@
 
 ## 交付顺序与模块接缝
 
-`1 当前输入 → 2 实例/payload 等价迁移 → 3 混合来源与父保留 → 4 内部库存/依赖淘汰 → 5 组合收口`。步骤 3/4 是一个行为发布单元，共计库存预算 10–16 人日（含步骤 2）；3 是开发审查点，4 闭合后统一提交。各提交保持可运行，结构迁移和行为扩展分开，不能中间交付“保父但无条件退休内部子库存”的临时语义。
+`1 当前输入 → 2 实例/payload 等价迁移 → 3 混合来源与父保留 → 4 内部库存/依赖淘汰 → 5 组合收口`。步骤 3/4 是一个行为发布单元；3 是开发审查点，4 闭合后统一提交。剩余预算统一归[路线图](../../roadmap.md#工作量风险与-roi)。各提交保持可运行，结构迁移和行为扩展分开，不能中间交付“保父但无条件退休内部子库存”的临时语义。
 
 | 模块 | 输入 → 输出 | 唯一职责 |
 | --- | --- | --- |
@@ -38,7 +38,7 @@
 
 时序与零写证据扩展 ECS `src/navigation_tests.rs`：真实 prepare/commit/settle 阶段验证进入内容无输入、旧 active 保持旧值、publication 后 `PostCommitCleanup` 终结前读新值；既有 no-op mutation trace 和 stale Back report/receipt/publication 回归同时核对已发布输入。公开普通 `App::update()` 可能在同轮完成发布和清理，不以更新后的样本冒充内部阶段观察。View API 测试是借用形状的编译证据；无 BSN consumer 仅验证接线与 host 拒绝，成功导航消费由独立 BSN consumer 和公开旅程证明。
 
-## 2. 实例事实与物理 payload 等价迁移（计入库存 10–16 人日）
+## 2. 实例事实与物理 payload 等价迁移
 
 文件：新建 `crates/bevy_ui_router_core/src/engine/instances.rs`、`crates/bevy_ui_router_ecs/src/instance.rs`；修改 Core `src/{frame.rs,engine.rs,integration.rs,engine/retained.rs}` 与 ECS `src/{lib.rs,retained.rs,branch_transaction.rs,frame_local.rs,navigation/normal_publication.rs,cleanup.rs}`。测试沿用 `crates/bevy_ui_router_core/src/integration_retained_tests.rs`、ECS `src/navigation/native_tests.rs`、facade `tests/retained_navigation.rs`。
 
@@ -46,13 +46,13 @@
 
 - [x] 保留 leaf 命中、fragment 精确匹配、LRU、Back、拒绝返还、host loss/readmission 的现有回归，补齐原实例激活后再次离场的身份/LRU 回归。覆盖 Core `retained_hit_matches`、`retained_plan_partition_matches`、`owner_projections_match` 和 ECS `retained_payload_is_current`，不直接注入分类结果。
 - [x] 将 Core 实例事实归并为原 `RouteFrameVersion` + `HostVersion` 与 exact 父依赖，删除 retained 身份发号。owner 集合按原身份对比，库存仍按成功离场的 LRU 顺序；冻结 source/seal 和旧计划失效语义不变。
-- [ ] 引入 frame-local payload，迁移唯一 owner 的持有位置。库存依赖只存身份，外部父 slot 仅作 mount alias；保持 existing source projection、seal 和原 owner 的线性转移。
+- [x] 引入 frame-local payload，迁移唯一 owner 的持有位置。库存依赖只存身份，外部父 slot 仅作 mount alias；保持 existing source projection、seal 和原 owner 的线性转移。
 - [x] 将 current target steps 与 fresh creation obligations 分开；leaf 激活不再进入 fresh `applied_frames`/failure roots。现阶段同一协议选择单个 leaf，保证拒绝原 owner 返回与 cleanup 写集不变。
-- [ ] 迁移后删除被替代的 leaf 身份权威、重复 payload 容器及 facade 内部假设；保留必要投影/证据，不因重命名丢失错误来源。通过门禁后以 `refactor: unify retained instance ownership` 独立提交。
+- [x] 迁移后删除被替代的 retained 身份发号、库存专属 `RealizedBranch` 容器/单帧方法及消费端的 branch 形状假设；保留必要投影/证据，不因重命名丢失错误来源。active/fresh/failed 的分支交易集合、single-hit 政策和 Fresh/Retained 发布分类留至步骤 3。通过门禁后以 `refactor: unify retained instance ownership` 独立提交。
 
 审查重点是等价性和 owner 迁移，不在这一步顺带放宽 params/search、增加父保留或更改失败 continuation。
 
-## 3. 混合来源与父实例保留（计入库存 10–16 人日）
+## 3. 混合来源与父实例保留
 
 文件：Core `src/{engine/instances.rs,frame.rs,engine.rs,integration.rs}`；ECS `src/{instance.rs,branch_transaction.rs,presentation.rs,frame_local.rs,navigation.rs,navigation/normal_publication.rs,cleanup.rs}`。测试扩展 Core `src/integration_retained_tests.rs`、ECS `src/navigation/native_tests.rs`、facade `tests/retained_navigation.rs`、`tests/public_navigation_journeys.rs`。
 
@@ -68,7 +68,7 @@
 
 这一步的控制流和 failure receiver 必须能表达多实例来源，不能先叠加一个 P 专用临时状态机再在下一步推翻。
 
-## 4. 内部子库存、容量与依赖清理（计入库存 10–16 人日）
+## 4. 内部子库存、容量与依赖清理
 
 文件：Core `src/{engine/instances.rs,engine/retained.rs,engine.rs,integration.rs}`；ECS `src/{retained.rs,instance.rs,presentation.rs,registry.rs,frame_local.rs,cleanup.rs,navigation/retained_miss.rs,navigation/normal_publication.rs}`；测试沿用步骤 3 的三个层级。
 
@@ -115,4 +115,4 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 
 每次交付由独立代理只读复核 Core 选择/continuation 与 ECS 原 owner/写集/publication，另一视角核对公开行为。实现 shared publication 的修改错开；审查一致不能替代成功命令输出。根代理检查 exact staged 文件和 diff 后提交 main，不纳入职责外变更。
 
-原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。第 1 步的当前输入接口已实现；其余实例协调接口仍待实施，设计审查不代表 runtime 已交付。
+原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。第 1、2 步已实现；父保留、混合来源与内部库存仍待实施，设计审查不代表 runtime 已交付。

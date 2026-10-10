@@ -15,7 +15,7 @@ impl NormalPublicationSplice {
     ) -> Option<crate::branch_transaction::ReconciliationSpliceView<'a>> {
         match self {
             Self::Fresh(splice) => Some(splice.view()),
-            Self::Retained { prepared, hit } => Some(prepared.view(retained.branch_for(hit)?)),
+            Self::Retained { prepared, hit } => Some(prepared.view(retained.payload_for(hit)?)),
         }
     }
 
@@ -34,7 +34,7 @@ impl NormalPublicationSplice {
         match self {
             Self::Fresh(splice) => splice.retain_leaf(projection),
             Self::Retained { prepared, hit } => retained
-                .branch_for(hit)
+                .payload_for(hit)
                 .is_some_and(|branch| prepared.retain_leaf(branch, projection)),
         }
     }
@@ -50,7 +50,7 @@ impl NormalPublicationSplice {
         }
     }
 
-    fn finish(self, hit: Option<RealizedBranch>) -> SealedReconciliationSplice {
+    fn finish(self, hit: Option<crate::instance::InstancePayload>) -> SealedReconciliationSplice {
         match self {
             Self::Fresh(splice) => splice,
             Self::Retained { prepared, .. } => prepared.finish_retained_entering(

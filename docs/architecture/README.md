@@ -72,6 +72,7 @@ Core 拥有 history 与保留决策，ECS 按 opaque entry key 保存滚动位�
 | Core 决策与跨 crate 协议 | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs)、[integration.rs](../../crates/bevy_ui_router_core/src/integration.rs) |
 | history authority、post-commit 与 idle settlement | [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)、[post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs)、[idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) |
 | leaf 保留、命中/LRU 与自身失效 continuation | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs)、[retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) |
+| 单实例物理 payload 与预分配转移接收器 | ECS [instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs)；只读 payload 投影不持有 owner |
 | entry 滚动与页面活动资格 | ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs)、[activity.rs](../../crates/bevy_ui_router_ecs/src/activity.rs) |
 | View registry 与 effect | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs)、[effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |
 | 注册、调度、导航、快照 | [app_ext.rs](../../crates/bevy_ui_router_ecs/src/app_ext.rs)、[plugin.rs](../../crates/bevy_ui_router_ecs/src/plugin.rs)、[navigation.rs](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[snapshots.rs](../../crates/bevy_ui_router_ecs/src/snapshots.rs) |
