@@ -1,12 +1,12 @@
 # 实例协调实施计划
 
-状态：第 1 步已完成并通过完整门禁；步骤 2–5 尚未实施。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理只读交叉审查。沿当前 main 推进，不新建分支。
+状态：第 1 步已完成；第 2 步进行中，Core 已统一原实例身份并分离激活选择与 fresh 创建事实，ECS frame-local payload 与唯一 owner 迁移待做；步骤 3–5 尚未实施。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理只读交叉审查。沿当前 main 推进，不新建分支。
 
 **目标：** 先交付当前已发布输入，再将 leaf 保留替换为按实例和 exact 父依赖的协调，闭合混合激活/fresh、失败及依赖淘汰。
 
 **架构：** Core 选择目标来源并准备输入/库存决策；ECS 按实例自身持有原 owner/payload，沿现有 preparation、publication 和 cleanup 消费。View 中立、BSN 只执行 fresh Scene；不增加第二套缓存 runtime。
 
-**技术：** 现有 Rust/Bevy workspace、同步 Scene/BSN、标准容器。约束和验收归[设计](design.md)，检查入口归[验证指南](../../development/verification.md)，整体投入归[路线图](../../roadmap.md#工作量风险与-roi)。下列内部模块是拟新增边界，接口名字为设计名，未冒充现有源码。
+**技术：** 现有 Rust/Bevy workspace、同步 Scene/BSN、标准容器。约束和验收归[设计](design.md)，检查入口归[验证指南](../../development/verification.md)，整体投入归[路线图](../../roadmap.md#工作量风险与-roi)。下列内部模块列出目标接缝，未完成接口的名字为设计名，未冒充现有源码。
 
 ## 交付顺序与模块接缝
 
@@ -47,7 +47,7 @@
 - [x] 保留 leaf 命中、fragment 精确匹配、LRU、Back、拒绝返还、host loss/readmission 的现有回归，补齐原实例激活后再次离场的身份/LRU 回归。覆盖 Core `retained_hit_matches`、`retained_plan_partition_matches`、`owner_projections_match` 和 ECS `retained_payload_is_current`，不直接注入分类结果。
 - [x] 将 Core 实例事实归并为原 `RouteFrameVersion` + `HostVersion` 与 exact 父依赖，删除 retained 身份发号。owner 集合按原身份对比，库存仍按成功离场的 LRU 顺序；冻结 source/seal 和旧计划失效语义不变。
 - [ ] 引入 frame-local payload，迁移唯一 owner 的持有位置。库存依赖只存身份，外部父 slot 仅作 mount alias；保持 existing source projection、seal 和原 owner 的线性转移。
-- [ ] 将 current target steps 与 fresh creation obligations 分开；leaf 激活不再进入 fresh `applied_frames`/failure roots。现阶段同一协议选择单个 leaf，保证拒绝原 owner 返回与 cleanup 写集不变。
+- [x] 将 current target steps 与 fresh creation obligations 分开；leaf 激活不再进入 fresh `applied_frames`/failure roots。现阶段同一协议选择单个 leaf，保证拒绝原 owner 返回与 cleanup 写集不变。
 - [ ] 迁移后删除被替代的 leaf 身份权威、重复 payload 容器及 facade 内部假设；保留必要投影/证据，不因重命名丢失错误来源。通过门禁后以 `refactor: unify retained instance ownership` 独立提交。
 
 审查重点是等价性和 owner 迁移，不在这一步顺带放宽 params/search、增加父保留或更改失败 continuation。

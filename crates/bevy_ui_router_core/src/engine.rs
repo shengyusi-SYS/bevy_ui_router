@@ -1009,6 +1009,7 @@ struct FailureCleanupZeroTerminalPendingMountProjection {
 struct FailureCleanupZeroTerminalBoundErrorProjection {
     binding: FrozenErrorViewBinding,
     matched: MatchedRoute,
+    normal_prefix: Vec<MatchedRoute>,
     active_child_slots: Vec<LogicalChildSlotBinding>,
 }
 
@@ -1028,6 +1029,7 @@ pub(crate) struct FailureCleanupZeroTerminalCurrentProjection {
     location: RouteLocation,
     reservation: Vec<ReservedFrameAttempt>,
     target_frames: Vec<RouteFrameVersion>,
+    selected_retained_frames: Vec<RouteFrameVersion>,
     applied_frames: Vec<RouteFrameVersion>,
     current_target: FrameMountTarget,
     pending_mount: Option<FailureCleanupZeroTerminalPendingMountProjection>,
@@ -2160,6 +2162,7 @@ struct CoreBackTargetMountCurrentProjection {
     branch_routes: Option<Vec<MatchedRoute>>,
     reservation: Vec<CoreBackTargetReservedFrameProjection>,
     target_frames: Vec<RouteFrameVersion>,
+    selected_retained_frames: Vec<RouteFrameVersion>,
     applied_frames: Vec<RouteFrameVersion>,
     current_target: FrameMountTarget,
     pending_mount: Option<CoreBackTargetPendingMountProjection>,
@@ -2570,7 +2573,10 @@ struct PreparedPublicationObservation {
     history_execution: Option<HistoryExecutionBindingProjection>,
     current_location: Option<RouteLocation>,
     current_branch: Option<MatchedBranch>,
+    current_attempt: Option<FailureCleanupZeroTerminalAttemptProjection>,
     current_target_frames: Vec<RouteFrameVersion>,
+    current_selected_retained_frames: Vec<RouteFrameVersion>,
+    current_applied_frames: Vec<RouteFrameVersion>,
     current_reconciliation: Option<RouteReconciliationProjection>,
     state: RouterNavigationState,
     host: Option<HostVersion>,
@@ -2599,7 +2605,10 @@ impl PreparedPublicationObservation {
             && self.current_location == expected.current_location
             && Self::branch_fingerprint(self.current_branch.as_ref())
                 == Self::branch_fingerprint(expected.current_branch.as_ref())
+            && self.current_attempt == expected.current_attempt
             && self.current_target_frames == expected.current_target_frames
+            && self.current_selected_retained_frames == expected.current_selected_retained_frames
+            && self.current_applied_frames == expected.current_applied_frames
             && self.current_reconciliation == expected.current_reconciliation
             && self.state == expected.state
             && self.host == expected.host
@@ -3092,6 +3101,10 @@ struct CurrentWork {
     location: RouteLocation,
     reservation: Vec<ReservedFrameAttempt>,
     target_frames: Vec<RouteFrameVersion>,
+    // Selected original instances, not newly created frames or failure roots.
+    selected_retained_frames: Vec<RouteFrameVersion>,
+    // Only frames whose fresh view application was accepted (including a
+    // prepared prefix carried into a bound-error continuation).
     applied_frames: Vec<RouteFrameVersion>,
     current_target: FrameMountTarget,
     pending_mount: Option<PendingMount>,
@@ -3114,6 +3127,7 @@ impl CurrentWork {
             location: self.location.clone(),
             reservation: self.reservation.clone(),
             target_frames: self.target_frames.clone(),
+            selected_retained_frames: self.selected_retained_frames.clone(),
             applied_frames: self.applied_frames.clone(),
             current_target: self.current_target.clone(),
             pending_mount: self.pending_mount.clone(),
@@ -3174,6 +3188,7 @@ impl From<&BoundErrorAttempt> for FailureCleanupZeroTerminalBoundErrorProjection
         Self {
             binding: bound_error.binding.clone(),
             matched: bound_error.matched.clone(),
+            normal_prefix: bound_error.normal_prefix.clone(),
             active_child_slots: bound_error.active_child_slots.clone(),
         }
     }
@@ -3205,6 +3220,7 @@ impl From<&CurrentWork> for FailureCleanupZeroTerminalCurrentProjection {
             location: current.location.clone(),
             reservation: current.reservation.clone(),
             target_frames: current.target_frames.clone(),
+            selected_retained_frames: current.selected_retained_frames.clone(),
             applied_frames: current.applied_frames.clone(),
             current_target: current.current_target.clone(),
             pending_mount: current.pending_mount.as_ref().map(Into::into),
@@ -3232,6 +3248,7 @@ impl From<&CurrentWork> for CorePostCommitCurrentSourceProjection {
             location: current.location.clone(),
             reservation: current.reservation.clone(),
             target_frames: current.target_frames.clone(),
+            selected_retained_frames: current.selected_retained_frames.clone(),
             applied_frames: current.applied_frames.clone(),
             current_target: current.current_target.clone(),
             pending_mount: current.pending_mount.as_ref().map(Into::into),
@@ -10309,6 +10326,7 @@ impl RouterEngine {
                 location,
                 reservation: reserved_frames,
                 target_frames,
+                selected_retained_frames: Vec::new(),
                 applied_frames: Vec::new(),
                 current_target: target,
                 pending_mount: None,
@@ -10468,6 +10486,7 @@ impl RouterEngine {
                 location,
                 reservation: reserved_frames,
                 target_frames,
+                selected_retained_frames: Vec::new(),
                 applied_frames: Vec::new(),
                 current_target: target,
                 pending_mount: Some(PendingMount {
@@ -10686,6 +10705,7 @@ impl RouterEngine {
             location: location.clone(),
             reservation: reserved_frames,
             target_frames,
+            selected_retained_frames: Vec::new(),
             applied_frames: Vec::new(),
             current_target: target.clone(),
             pending_mount: None,
@@ -12051,6 +12071,7 @@ impl RouterEngine {
                         })
                         .collect(),
                     target_frames: current.target_frames.clone(),
+                    selected_retained_frames: current.selected_retained_frames.clone(),
                     applied_frames: current.applied_frames.clone(),
                     current_target: current.current_target.clone(),
                     pending_mount: current.pending_mount.as_ref().map(|pending| {
@@ -13222,8 +13243,15 @@ impl RouterEngine {
             }),
             current_location: current.map(|current| current.location.clone()),
             current_branch: current.and_then(|current| current.branch.clone()),
+            current_attempt: current.map(|current| (&current.attempt).into()),
             current_target_frames: current
                 .map(|current| current.target_frames.clone())
+                .unwrap_or_default(),
+            current_selected_retained_frames: current
+                .map(|current| current.selected_retained_frames.clone())
+                .unwrap_or_default(),
+            current_applied_frames: current
+                .map(|current| current.applied_frames.clone())
                 .unwrap_or_default(),
             current_reconciliation: current.and_then(|current| current.reconciliation.clone()),
             state: state.clone(),
@@ -14508,6 +14536,7 @@ impl RouterEngine {
                 location: location.clone(),
                 reservation: reserved_frames,
                 target_frames,
+                selected_retained_frames: Vec::new(),
                 applied_frames: Vec::new(),
                 current_target: target,
                 pending_mount: None,
@@ -14563,6 +14592,7 @@ impl RouterEngine {
                 location: location.clone(),
                 reservation: reserved_frames,
                 target_frames,
+                selected_retained_frames: Vec::new(),
                 applied_frames: Vec::new(),
                 current_target: target,
                 pending_mount: Some(PendingMount {
@@ -14677,6 +14707,7 @@ impl RouterEngine {
             location: location.clone(),
             reservation: reserved_frames,
             target_frames,
+            selected_retained_frames: Vec::new(),
             applied_frames: Vec::new(),
             current_target: target.clone(),
             pending_mount: None,
@@ -15547,6 +15578,7 @@ impl RouterEngine {
                     location: location.clone(),
                     reservation: vec![reserved_frame],
                     target_frames,
+                    selected_retained_frames: Vec::new(),
                     applied_frames: prepared_prefix,
                     current_target: parent_target,
                     pending_mount: Some(PendingMount {
@@ -15681,6 +15713,7 @@ impl RouterEngine {
                 reserved.candidate_frame(),
             )],
             target_frames,
+            selected_retained_frames: Vec::new(),
             applied_frames: prepared_prefix,
             current_target: target.clone(),
             pending_mount: None,
@@ -15816,6 +15849,7 @@ impl RouterEngine {
                 reserved.candidate_frame(),
             )],
             target_frames: vec![target_frame.clone()],
+            selected_retained_frames: Vec::new(),
             applied_frames: Vec::new(),
             current_target: target.clone(),
             pending_mount: None,
@@ -16374,7 +16408,11 @@ impl RouterEngine {
             .expect("running record is retained");
         let mut published_record =
             next_record.unwrap_or_else(|| self.records[record_index].clone());
-        for frame in &current.applied_frames {
+        for frame in current
+            .selected_retained_frames
+            .iter()
+            .chain(current.applied_frames.iter())
+        {
             published_record
                 .append_trace(NavigationTraceEvent::frame_activated(frame.clone()))
                 .expect("running trace is open");

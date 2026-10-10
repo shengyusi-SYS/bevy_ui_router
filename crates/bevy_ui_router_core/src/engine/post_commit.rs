@@ -1192,6 +1192,7 @@ pub(super) struct CorePostCommitCurrentSourceProjection {
     pub(super) location: RouteLocation,
     pub(super) reservation: Vec<ReservedFrameAttempt>,
     pub(super) target_frames: Vec<RouteFrameVersion>,
+    pub(super) selected_retained_frames: Vec<RouteFrameVersion>,
     pub(super) applied_frames: Vec<RouteFrameVersion>,
     pub(super) current_target: FrameMountTarget,
     pub(super) pending_mount: Option<FailureCleanupZeroTerminalPendingMountProjection>,

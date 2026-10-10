@@ -862,6 +862,7 @@ impl RouterEngine {
             && self.action.is_none()
             && current.stage == WorkStage::Applying
             && current.pending_mount.is_none()
+            && current.selected_retained_frames.is_empty()
             && current.applied_frames.is_empty()
             && index > 0
             && index + 1 == branch.routes().len()
@@ -938,7 +939,7 @@ impl RouterEngine {
         next.identity.frame = hit.frame().frame();
         next.identity.generation = hit.frame().generation();
         next.identity.origin = hit.frame().origin().clone();
-        next.applied_frames.push(hit.frame().clone());
+        next.selected_retained_frames.push(hit.frame().clone());
         next.stage = WorkStage::ReadyToCommit;
         Ok(next)
     }

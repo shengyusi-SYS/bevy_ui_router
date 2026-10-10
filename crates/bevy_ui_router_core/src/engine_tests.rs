@@ -10519,6 +10519,140 @@ fn publish_retained_post_commit_test_navigation(
     normal
 }
 
+fn prepared_retained_activation() -> (
+    RouterEngine,
+    PreparedPublication,
+    CleanupBatchToken,
+    RouteFrameVersion,
+    NavigationRequestId,
+) {
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("leaf").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let (engine, _, _) = ready_engine_with_tree_and_authority(routes.build().unwrap());
+    let mut engine = engine.with_keep_alive_capacity(1);
+    let mut owners = Vec::new();
+    for path in ["/items/1", "/items/2"] {
+        let normal = publish_retained_post_commit_test_navigation(&mut engine, path, &mut owners);
+        let current = engine.current.as_ref().unwrap();
+        let preserved = current.reconciliation.as_ref().unwrap().preserved().len();
+        assert_eq!(current.applied_frames, current.target_frames[preserved..]);
+        engine.complete_cleanup(valid_completion(&normal)).unwrap();
+    }
+    let original = owners[0].projection().frame().clone();
+    let request = engine.push(RouteLocation::new("/items/1")).unwrap();
+    let EngineAction::FrameTask(task) = engine.action().unwrap() else {
+        panic!("the retained leaf is selected before its fresh factory runs")
+    };
+    let plan = engine
+        .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    let (prepared, normal) = engine
+        .prepare_retained_hit_publication(
+            task,
+            &plan,
+            CleanupManifestSeal::new(Vec::new(), manifest_digest(0x7171), 0),
+            std::mem::take(&mut owners),
+        )
+        .unwrap_or_else(|_| panic!("the original cache owner must prepare"));
+    (engine, prepared, normal, original, request)
+}
+
+#[test]
+fn retained_activation_is_not_a_fresh_creation_but_keeps_activation_trace() {
+    let (mut engine, prepared, normal, original, request) = prepared_retained_activation();
+    let mut owners = Vec::new();
+    let Some(super::PreparedPublicationAuthority::Ready(sealed)) =
+        engine.prepared_publication_authority.as_ref()
+    else {
+        panic!("the exact retained handoff must prepare its independent next")
+    };
+    assert_eq!(
+        sealed.publication.current.target_frames.last(),
+        Some(&original)
+    );
+    assert!(
+        sealed.publication.current.applied_frames.is_empty(),
+        "retained activation cannot claim a fresh creation or fresh failure root"
+    );
+    assert_eq!(
+        sealed.publication.current.selected_retained_frames,
+        vec![original.clone()]
+    );
+    assert!(sealed.publication.current.cleanup_roots.is_empty());
+    engine
+        .validate_retained_publication(prepared)
+        .unwrap_or_else(|_| panic!("the exact retained publication must validate"))
+        .publish(|retained| owners.extend(retained));
+    assert!(engine.current.as_ref().unwrap().applied_frames.is_empty());
+    assert_eq!(engine.active().frames().last(), Some(&original));
+    let trace = engine.request(request).unwrap().trace();
+    let activated = trace
+        .iter()
+        .filter(|event| event.kind() == NavigationTraceEventKind::FrameActivated)
+        .map(|event| event.frame().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(activated, vec![&original]);
+    assert!(
+        !trace
+            .iter()
+            .any(|event| event.kind() == NavigationTraceEventKind::ViewApplied)
+    );
+    engine.complete_cleanup(valid_completion(&normal)).unwrap();
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn retained_publication_rejects_creation_source_drift_and_retains_original_owner() {
+    for drift in ["retained-selection", "fresh-creation"] {
+        let (mut engine, prepared, _, original, _) = prepared_retained_activation();
+        let active = engine.active().clone();
+        let history = engine.history_snapshot();
+        let evidence = prepared.evidence.clone();
+        let original_owners = engine.testing_retained_transfer_owners();
+        let current = engine.current.as_mut().unwrap();
+        assert_eq!(current.selected_retained_frames, vec![original.clone()]);
+        match drift {
+            "retained-selection" => current.selected_retained_frames.clear(),
+            "fresh-creation" => current.applied_frames.push(original.clone()),
+            _ => unreachable!(),
+        }
+        let (returned, error) = match engine.validate_retained_publication(prepared) {
+            Err(error) => error,
+            Ok(_) => panic!("creation-source drift must invalidate the frozen publication"),
+        };
+        assert_eq!(error, CommitError::Stale);
+        assert_eq!(engine.active(), &active);
+        assert_eq!(engine.history_snapshot(), history);
+        assert_eq!(returned.evidence, evidence);
+        assert!(matches!(
+            engine.prepared_publication_authority,
+            Some(PreparedPublicationAuthority::Rejected(_))
+        ));
+        // A rejected sealed publication retains its original transfer for
+        // authority settlement; it must not recreate or silently drop owners.
+        assert_eq!(engine.testing_retained_transfer_owners(), original_owners);
+        assert_eq!(original_owners.len(), 1);
+        assert_eq!(original_owners[0].frame(), &original);
+    }
+}
+
 #[test]
 fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_source_owners() {
     let mut routes = RouteTree::builder()
