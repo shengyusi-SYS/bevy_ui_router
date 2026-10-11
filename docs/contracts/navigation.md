@@ -40,9 +40,13 @@ normal 页面和布局可分别保留，exact parent frame/generation、outlet�
 
 例如 `R/P/C → R/Q → R/P/D`：P 开启保留、C 未开启时，离场保存原 P 及其 outlet、清理 C；返回复用原 P，由 matcher 选择 D。P、C 都开启时，C 可在非活动 P 内独立保留；返回 P/D 不会自动恢复旧 C。父实例未保留或被淘汰时，其依赖库存一并进入 child-first 清理，不能把子实例移到另一个父作用域。
 
-命中使用该父作用域内的 route/view 复用身份、params、raw search 和 raw fragment。命中保留原 Entity、局部组件状态和内容 handles，跳过 factory、Scene resolve/apply；本次请求仍沿合法的新执行与 publication 合同运行，不重放旧 task。未命中创建 fresh Scene。
+实例优先选择符合复用政策的当前内容，再选择 exact 父作用域内的库存，最后 fresh；多个合法库存候选选择最近成功离场者。父复用身份不以旧子目标或旧完整 location 决定。
+
+命中使用该父作用域内的 route/view 复用身份、params 和 raw search；最深目标还要求 raw fragment 精确匹配。命中保留原 Entity、局部组件状态和内容 handles，跳过 factory、Scene resolve/apply；本次请求仍沿合法的新执行与 publication 合同运行，不重放旧 task。未命中创建 fresh Scene。
 
 库存按成功离场维护简单 LRU，失败不刷新顺序。命中实例移出非活动库存，各层独立计算保留条件；超出容量时选最旧候选，并受控清理其依赖闭包，所以实际剩余数可以小于容量。parent/outlet/slot 或 host scope 失效时不能跨 scope 命中，旧责任须经[生命周期结算](lifecycle.md#非活动实例与长期-owner)。
+
+同次离场按子到父加入 LRU，所以父子都允许保留而容量为 1 时可留下父、清理子；本次选中的实例及其父依赖不作为容量淘汰目标。
 
 keep-alive 不改变输入更新规则：raw search 变化仍重建整条分支并失效旧父 scope；仅 fragment 变化仍重建 deepest normal frame，不把此次重建解释为缓存命中。
 

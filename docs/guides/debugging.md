@@ -20,7 +20,7 @@ python3 examples/windowed/ui_debug.py capture /tmp/router-ui.png
 
 需要桌面显示与图形驱动，Python client 仅使用标准库。上述 `ui-debug` 模式不请求启动焦点；`ui-debug` 仅在 debug 构建显式启用时监听 `127.0.0.1:15703`，窗口持续更新以处理请求。标准 release 构建不会启用此调试入口。
 
-`snapshot` 返回窗口 Entity、scale factor、实际 UI 布局、文本、焦点、`router_active`、输入资格及请求/实际滚动位置。`find` 按名称或显示文本检索节点；缓存节点仍存在，定位当前页面时选 `router_active=true`。点击使用窗口内**逻辑坐标**；从 snapshot 取得的 `center_physical` 应除以对应窗口的 `scale_factor`：
+`snapshot` 返回窗口 Entity、scale factor、实际 UI 布局、文本、焦点、`router_active`、输入资格、当前路由输入及请求/实际滚动位置。`pending_restore` 是当前 scope 的 `list` 恢复目标，容器尚未创建时也可查询。`find` 按名称或显示文本检索节点；缓存节点仍存在，定位当前页面时选 `router_active=true`。点击使用窗口内**逻辑坐标**；从 snapshot 取得的 `center_physical` 应除以对应窗口的 `scale_factor`：
 
 ```sh
 python3 examples/windowed/ui_debug.py click 100 120
@@ -37,14 +37,20 @@ python3 examples/windowed/ui_debug.py key Space
 | Overview / Settings，或 `1` / `2` | Push 到对应页面，状态栏同步当前位置和 history |
 | Replace（`R`）后 Back（`B`） | replace 不追加项，Back 返回前一成功项 |
 | 增加 Layout counter 和 page count，再在 Overview / Settings 往返 | 两个 leaf 显式缓存，原 layout/page Entity 和各自计数保留；cached page 不参与布局和输入 |
+| 增加 Layout counter，Outside（`4`）后进入另一个子页 | 原布局 A 及计数保留，目标子页由新路由选择；工具栏显示新的当前路径 |
 | 在列表区域滚动，切页后 Back | 恢复那次 history entry 的位置；再次 Push 同页可共享 Entity，后续 Back 仍恢复各次访问的位置 |
+| Delayed（`3`）→ Load（`L`）→ 滚动 → Outside → Back | Delayed 未保留，返回为新页面；列表尚无，恢复意图已存在 |
+| 上一步返回后，Ready（`G`）再 Load | 正常首布局恢复原位置；也可先 Load，内容准备好后 Ready |
+| 返回后 Cancel（`C`）再 Load，或等待 ready 时主动滚动 | 取消保持新列表初值；应用滚动取消等待目标，随后 Ready 不覆盖它 |
 | 点击 page counter 获焦，再按 Space | 当前 page 计数增加；切换后旧焦点释放，新页点击前不响应 Space |
 | 按住页面按钮，按 `1`/`2` 切页，再释放 | 旧页面不接收 release/click；新页面与其它有效目标仍可交互 |
 | Fail（`E`），再 Overview | 原 Build error 显示 fallback，失败不增加 history，后续显式导航恢复 |
 
 fallback 会替换路由布局并清理旧缓存；恢复后布局和页面为新实例。终端输出和状态栏可核对请求、目标 Entity、history cursor 与 focus；页面键盘 handler 在 `RouterInputSet::Ready` 后检查 gate。
 
-列表滚动使用实际 `MouseWheel` 消息：先把 cursor 移到 snapshot 中的 `overview-scroll` 或 `settings-scroll` 区域，再向 `router/input` 发送 `MouseWheel`，字段为 `window`、`unit: "Pixel"`、`x: 0.0`、`y` 和 `phase: "Moved"`；负 `y` 向下滚动。Router marker 负责访问记录，示例自己的 scroll observer 负责修改 Bevy `ScrollPosition`。
+示例容量为 3，布局 A、Overview、Settings 分别开启保留，Delayed 和 Outside 未开启。Load 仅模拟应用在稍后创建内容，Ready/Cancel 通过公开滚动命令消费意图；它没有引入异步 Scene 或加载框架。
+
+列表滚动使用实际 `MouseWheel` 消息：先把 cursor 移到 snapshot 中的 `overview-scroll`、`settings-scroll` 或已加载的 `delayed-scroll` 区域，再向 `router/input` 发送 `MouseWheel`，字段为 `window`、`unit: "Pixel"`、`x: 0.0`、`y` 和 `phase: "Moved"`；负 `y` 向下滚动。Router marker 负责访问记录，示例自己的 scroll observer 负责修改 Bevy `ScrollPosition`。
 
 跨页按住手势通过 `rpc router/input` 分别发送 `MouseButtonInput`：参数中的 `window` 使用 snapshot 返回的真实窗口 Entity，`button` 为 `Left`，`state` 依次为 `Pressed`、`Released`。保持按下期间切换页面，等待帧推进后再释放；拆开发送只用于持续手势检查，普通交互优先使用 `click`/`key`。参数编码与消息结构见 [client](../../examples/windowed/ui_debug.py) 的 `Bridge.event` 和 `Bridge.click`。
 

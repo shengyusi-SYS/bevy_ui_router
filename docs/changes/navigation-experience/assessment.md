@@ -1,6 +1,6 @@
 # 路由长期演进：职责与机制评估
 
-状态：长期方向与职责评估；实例专题已进入实施，当前输入与实例等价迁移已完成，其余方向的交付状态见[路线图](../../roadmap.md)。以已暴露的通用问题选择长期方向，消费者当前可接受和短期实现成本不能作为架构收口依据。本文维护选型理由，不重复专题 spec/plan；现行行为以[导航](../../contracts/navigation.md)、[输入与焦点](../../contracts/input-focus.md)和[生命周期](../../contracts/lifecycle.md)合同为准。
+状态：长期方向与职责评估；实例协调与访问级滚动已交付，原生输入正式接线尚未完成，剩余安排见[路线图](../../roadmap.md)。以已暴露的通用问题选择长期方向，消费者当前可接受和短期实现成本不能作为架构收口依据。本文维护选型理由，不重复专题 spec/plan；现行行为以[导航](../../contracts/navigation.md)、[输入与焦点](../../contracts/input-focus.md)和[生命周期](../../contracts/lifecycle.md)合同为准。
 
 ## 决策依据与职责
 
@@ -33,7 +33,7 @@ React Activity 清理隐藏内容的 Effects 是其 runtime 能力，不等于 B
 
 ### 实例协调与当前路由输入
 
-本专题的[设计](../instance-coordination/design.md)与[实施计划](../instance-coordination/plan.md)统一维护实例身份、exact 父依赖、当前输入、容量、混合准备和验收；本评估只保留选型理由。
+实例身份、exact 父依赖、当前输入与容量归[导航合同](../../contracts/navigation.md#实例保留)，混合准备归[运行机制](../../architecture/runtime.md)；已完成设计与计划由 Git 追溯，本评估只保留选型理由。
 
 目标匹配链、存活实例、当前已发布输入和 history entry 分别建模。构建输入是一次执行的快照，同一实例需要新的只读输入接缝；只放宽复用比较会留下过期数据。保留现行 params/search/fragment 默认行为，先解决模型和输入的职责分离。
 
@@ -53,6 +53,8 @@ Router 提供允许、禁止、范围外的自身资格，通用 UI 结合控件
 
 本次核查的官方 [0.20.0](https://github.com/bevyengine/bevy/releases/tag/v0.20.0) 已让 [Tab 跳过隐藏 UI](https://github.com/bevyengine/bevy/blob/v0.20.0/crates/bevy_input_focus/src/tab_navigation.rs)，但仍未提供 Router 资格 hook；[dispatch 和焦点队列](https://github.com/bevyengine/bevy/blob/v0.20.0/crates/bevy_input_focus/src/lib.rs)也未补齐所需公开接缝。它超出当前 0.19 支持范围，单纯升级不足以交付本项。
 
+官方 main 在固定版本 `0e93c7ab7d5ec016990dcb226ec544aee1636d70` 新增公开 [Focusable](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/lib.rs#L65)，[Tab 候选采集](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/tab_navigation.rs#L334)与 AcquireFocus 消费它，缺少组件不剪掉后代。这是未来候选接缝的部分进展；[dispatch](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/lib.rs#L414)仍只验证 Entity 存活，[焦点队列](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/gained_and_lost.rs#L64)仍无过滤。动态增删 Focusable 尚不能闭合直接设焦后的分发与排队焦点事件，当前不为此迁移整个 workspace。
+
 若正式接缝尚不可用且交付需要迁移桥，将兼容实现隔离在一个模块，接口服从同一资格合同，并用真实插件旅程验证等价行为。是否投入这段过渡工作须单独决定；不因较短工期默认先做，也不同时建设两条路线却只计算一条预算。
 
 ### 统一的访问级滚动恢复意图
@@ -67,7 +69,7 @@ Router 提供允许、禁止、范围外的自身资格，通用 UI 结合控件
 
 ## 规划与投入依据
 
-实例协调沿已完成的输入与实例迁移继续交付父子独立保留，并退出被替代的 leaf 专用路径。通用输入公开接缝先核实上游可行性，访问级滚动意图独立设计；不把整条路线图捆成一次发布前置。迁移桥与长期完成分别验收。
+实例协调和访问级滚动统一意图已交付，被替代的 leaf 专用路径已退出。通用输入公开接缝需先闭合上游可行性；不把整条路线图捆成一次发布前置。迁移桥与长期完成分别验收。
 
 整体主线、依赖关系、分项风险与预算统一归[路线图](../../roadmap.md#工作量风险与-roi)。实例模型设计不等于实现预算；消费者接入核查计入所属专题，应用迁移与业务政策由应用单独估算。预算不能以重复计算共享设计/验收放大，也不能以省去必要门禁缩小。
 

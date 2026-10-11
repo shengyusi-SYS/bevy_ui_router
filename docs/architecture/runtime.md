@@ -99,6 +99,8 @@ Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决�
 
 统一 mixed preparation 组合 `Current* → Retained* → Fresh*`，只有 fresh suffix 运行 Scene 并形成新建义务；命中先借库存做全部准备，最后单次移交原 owner，拒绝保留原责任。容量按非活动实例计算，淘汰的父依赖闭包按 child-first 消费原 payload。私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算自身失效实例及依赖，再返还原 Task/Mount/Commit 或失败 continuation；共享 authority loss 保持独立分流。语义范围归[导航](../contracts/navigation.md#实例保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
 
+实例沿用原 `RouteFrameVersion` 与 host incarnation，目标链的位置不充当实例身份。fresh 子借用本请求精确选中的 retained 父挂载；原 slot 继续归父，新建 slot 在 publication 前属于 preparation，失败清理，成功后移交父。选中库存与 fresh 创建义务分别冻结，库存父即使尚无 fresh 子输出也不能遗漏于失败来源。
+
 共享 slot 的 cleanup 从当前 exact children 冻结选定删除边；activation 保留发布前校验快照，独立准备清理后的 mount prior，避免命中或 LRU 淘汰将旧 sibling 带入下一轮。
 
 访问级滚动由 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 仅交接 canonical entry 与已准备 publication 的来源、目标和存活 frame/reuse 事实。准备期冻结记录并分配独立意图 ID，tail 只安装状态；位置写入移到正常布局前，不再借 publication 的组件写入管线。记录、冻结意图、一次绑定与实际显示见证各有职责；等待时只阻止 entry 记录被初值覆盖，显示见证继续更新，离场再次复验原绑定和应用值。

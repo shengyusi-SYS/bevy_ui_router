@@ -75,7 +75,7 @@ cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-fea
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
-窗口示例显式为 Overview / Settings 开启容量 2 的 leaf 保留，并标记列表滚动容器；quick start 演示默认关闭，nested 为父布局开启容量 1，子页保持不保留。历史窗口交互验证同 Entity/计数往返、不同 history entry 的滚动位置、retained 输入/focus 撤权与命中后新的点击/Space、fallback 清库存后重建；尚未在窗口重跑父子独立保留。
+窗口示例容量为 3，布局 A、Overview、Settings 独立开启保留，Delayed 和 Outside 不保留。它演示原父/新子与当前输入、自动 entry 滚动，以及 Back 到 fresh Delayed 后晚创建列表、ready、取消和应用滚动优先。quick start 演示默认关闭，nested 为父布局开启容量 1，子页保持不保留。
 
 Linux 示例选择 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev`。窗口交互验证 push/replace/back、布局计数保留、页面点击与 Space、旧焦点释放、跨页按住/释放、Build failure/fallback 和恢复。应用内 BRP 自动化见 [调试指南](../guides/debugging.md)。
 
@@ -107,13 +107,11 @@ python3 scripts/check-packaged-consumer.py
 
 历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；组合回归覆盖混用 Back/Push、淘汰后的后续普通导航、非目标缓存自身失效、暂缺布局后正常离场，以及部分清理中途 host loss 后的同 host 重新接纳与后续 fresh 导航。authority 隔离还须核对 native 内容根的 authored Visibility、Pickable 与应用局部状态保持。不能把跳过失败用例的检查称为全量通过。
 
-修复源码 `c570e125c943643c8ebf128b100e61b371a92148` 已通过 workspace 格式、all-targets/all-features 静态检查及未跳过用例的全特性测试，包含公开导航、保留、滚动、原生输入/focus 和独立 consumer；ECS 无 BSN 及独立窗口全特性检查也通过。该修复树在 Linux/WSLg、960×640、软件渲染的 `ui-debug` 窗口重跑了缓存身份/计数、Back 滚动、focus/跨页手势撤权和 fallback 后 fresh 恢复，并核对 renderer 截图。
+窗口源码 `042ee400892e83f8957307752586eb7e98a83c00` 已通过独立 workspace 格式、默认和全特性全目标静态检查，并在 Linux/WSLg、960×640、软件渲染、debug `ui-debug` 中完成组合验收。通过应用内 BRP 的真实 WindowEvent 与 typed messages，验证原父 Entity/计数返回新子且读取新输入、leaf 原 Entity/计数及不同 entry 位置、焦点与已开始手势撤权、replace/失败 history/fallback 后 fresh 恢复。fresh Delayed 返回时容器尚无而意图存在，先 ready 再 load 恢复；取消后 load 保持初值，应用主动滚动取消等待目标。renderer 截图另核对父/新子与晚容器恢复的最终呈现。
 
-2026-10-08 的缓存/滚动组合已在窗口源码 `1a30dc58d41c91dd3bcadc3d9795edbdd129a6ad` 验证：Linux/WSLg、960×640、软件渲染、debug `ui-debug`，通过应用内 BRP 发送真实 WindowEvent 与 typed messages。已验证原 Entity/页面和布局计数保留、多 entry 各自恢复位置、旧手势与 focus 撤权、命中后的新点击/Space，以及 fallback 清理旧库存后重新构建；renderer 截图检查最终呈现。库侧完成 workspace 全特性、独立 consumer、无 BSN 和新旧性能夹具行为检查；正式耗时结果归[性能基线](../performance.md)。
+父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。
 
-父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。尚未在窗口重跑父子独立库存。
-
-滚动统一意图源码 `69615784830b3b4f425f6e7991fd4a503b31c26c` 已通过格式、workspace 全目标/全特性静态检查、未跳过用例的全特性测试、ECS 无默认特性及独立 consumer。nested 原样消费与实际运行在正常 UI 布局中验证 fresh 子页 Back 后 ready。该提交树执行 `cargo package --workspace --locked`，六个包均验证成功；产物 consumer 复编译解压 Router 源码，核对实际来源后运行公开 BSN 旅程成功。未跳过打包验证或上传；最终窗口尚未覆盖新增父子/滚动行为，选定发布树变化后按风险复核。
+滚动统一意图源码 `69615784830b3b4f425f6e7991fd4a503b31c26c` 已通过格式、workspace 全目标/全特性静态检查、未跳过用例的全特性测试、ECS 无默认特性及独立 consumer。nested 原样消费与实际运行在正常 UI 布局中验证 fresh 子页 Back 后 ready。该提交树执行 `cargo package --workspace --locked`，六个包均验证成功；产物 consumer 复编译解压 Router 源码，核对实际来源后运行公开 BSN 旅程成功。后续窗口收口仅修改独立示例和文档，库源码保持该验证树；未上传，选定发布树变化后按风险复核。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 
