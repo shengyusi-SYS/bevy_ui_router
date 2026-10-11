@@ -13,6 +13,8 @@ use bevy_ui_router::{
 enum Action {
     Overview,
     Settings,
+    Delayed,
+    Outside,
     Replace,
     Back,
     Fail,
@@ -24,6 +26,19 @@ struct Layout;
 struct Counter(u32);
 #[derive(Component, Clone, Default)]
 struct PageButton(u32);
+#[derive(Component, Clone, Default)]
+struct DelayedPage {
+    loaded: bool,
+}
+#[derive(Clone, Copy, Default)]
+enum RestoreAction {
+    #[default]
+    Load,
+    Ready,
+    Cancel,
+}
+#[derive(Component, Clone, Default)]
+struct RestoreControl(RestoreAction);
 #[derive(Component)]
 struct Status;
 
@@ -53,18 +68,23 @@ fn main() {
     app.add_plugins(ui_debug::UiDebugPlugin);
 
     let mut views = RouteViewRegistry::new();
+    let root_view = register(&mut app, &mut views, "root", |_| {
+        Ok(bsn! {
+            Node { width: Val::Percent(100.0), height: Val::Percent(100.0) } DefaultOutlet
+        })
+    });
     let layout = register(&mut app, &mut views, "layout", |_| {
         Ok(bsn! {
             Node {
                 width: Val::Percent(100.0), height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column, row_gap: Val::Px(20.0),
-                padding: UiRect::all(Val::Px(24.0)),
+                flex_direction: FlexDirection::Column, row_gap: Val::Px(10.0),
+                padding: UiRect::all(Val::Px(16.0)),
             }
-            BackgroundColor(Color::srgb(0.08, 0.12, 0.19)) Layout
+            BackgroundColor(Color::srgb(0.08, 0.12, 0.19)) Layout Name::new("layout-a")
             Children [
                 (Text({"Shared layout / nested outlet".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }),
-                (Button Node { width: Val::Px(440.0), height: Val::Px(48.0), padding: UiRect::all(Val::Px(12.0)) }
-                    BackgroundColor(Color::srgb(0.18, 0.27, 0.37)) Counter
+                (Button Node { width: Val::Percent(100.0), height: Val::Px(40.0), padding: UiRect::all(Val::Px(8.0)) }
+                    BackgroundColor(Color::srgb(0.18, 0.27, 0.37)) Counter Name::new("layout-counter")
                     Children [(Text({"Layout counter: 0 (click +1)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false })]),
                 (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet)
             ]
@@ -72,11 +92,20 @@ fn main() {
     });
     let mut routes = RouteTree::builder()
         .root_with_options(
-            RoutePattern::path("/").unwrap(),
-            RouteNodeOptions::new().with_view(layout),
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(root_view),
         )
         .unwrap();
     let root = routes.root_id().unwrap();
+    let workspace = routes
+        .route_with_options(
+            root,
+            RoutePattern::path("workspace").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(layout)
+                .with_keep_alive(true),
+        )
+        .unwrap();
     for (name, color) in [
         ("overview", Color::srgb(0.12, 0.35, 0.32)),
         ("settings", Color::srgb(0.22, 0.22, 0.45)),
@@ -93,7 +122,7 @@ fn main() {
                     (Text({name.to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable { should_block_lower: false, is_hoverable: false }),
                     (Text({"Click / Space adds one. Scroll, switch pages, then Back.".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }),
                     (Button Node { width: Val::Px(440.0), height: Val::Px(44.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(8.0)) }
-                        BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton
+                        BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton Name::new(format!("{name}-count"))
                         Children [(Text({"Page count: 0 (click / Space)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false })]),
                     (Node {
                         width: Val::Percent(100.0), height: Val::Px(120.0), flex_shrink: 0.0,
@@ -115,7 +144,7 @@ fn main() {
         });
         routes
             .route_with_options(
-                root,
+                workspace,
                 RoutePattern::path(name).unwrap(),
                 RouteNodeOptions::new()
                     .with_view(view)
@@ -123,12 +152,57 @@ fn main() {
             )
             .unwrap();
     }
+    let delayed = register(&mut app, &mut views, "delayed", |_| {
+        Ok(bsn! {
+            Node {
+                width: Val::Percent(100.0), height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column, row_gap: Val::Px(8.0),
+                padding: UiRect::all(Val::Px(12.0)),
+            }
+            BackgroundColor(Color::srgb(0.25, 0.27, 0.14)) Name::new("delayed") DelayedPage
+            Children [
+                (Text({"Delayed list / explicit restore".to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable::IGNORE),
+                (Button Node { width: Val::Px(440.0), height: Val::Px(36.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(6.0)) }
+                    BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton Name::new("delayed-count")
+                    Children [(Text({"Page count: 0 (click / Space)".to_owned()}) Pickable::IGNORE)]),
+                (Node { column_gap: Val::Px(8.0) } Children [
+                    (Button RestoreControl({RestoreAction::Load}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
+                        Children [(Text({"Load [L]".to_owned()}) Pickable::IGNORE)]),
+                    (Button RestoreControl({RestoreAction::Ready}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
+                        Children [(Text({"Ready [G]".to_owned()}) Pickable::IGNORE)]),
+                    (Button RestoreControl({RestoreAction::Cancel}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
+                        Children [(Text({"Cancel [C]".to_owned()}) Pickable::IGNORE)])
+                ])
+            ]
+        })
+    });
+    routes
+        .route_with_options(
+            workspace,
+            RoutePattern::path("delayed").unwrap(),
+            RouteNodeOptions::new().with_view(delayed),
+        )
+        .unwrap();
+    let outside = register(&mut app, &mut views, "outside", |_| {
+        Ok(bsn! {
+            Node { width: Val::Percent(100.0), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(24.0)) }
+            Name::new("outside") BackgroundColor(Color::srgb(0.18, 0.15, 0.27))
+            Children [(Text({"Outside layout A. Return to a new child: A keeps its own state.".to_owned()}) Pickable::IGNORE)]
+        })
+    });
+    routes
+        .route_with_options(
+            root,
+            RoutePattern::path("outside").unwrap(),
+            RouteNodeOptions::new().with_view(outside),
+        )
+        .unwrap();
     let broken = register(&mut app, &mut views, "broken", |_| {
         Err::<Box<dyn Scene>, _>(BsnBuildError::new("Intentional example build failure"))
     });
     routes
         .route_with_options(
-            root,
+            workspace,
             RoutePattern::path("broken").unwrap(),
             RouteNodeOptions::new().with_view(broken),
         )
@@ -140,13 +214,13 @@ fn main() {
         );
         Ok(bsn! {
             Node { width: Val::Percent(100.0), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(24.0)) }
-            BackgroundColor(Color::srgb(0.36, 0.12, 0.15))
+            Name::new("fallback") BackgroundColor(Color::srgb(0.36, 0.12, 0.15))
             Children [(Text(message) Pickable { should_block_lower: false, is_hoverable: false })]
         })
     });
     let router = app
         .add_ui_router(
-            RouterConfig::new(routes.build().unwrap(), views, fallback).with_keep_alive_capacity(2),
+            RouterConfig::new(routes.build().unwrap(), views, fallback).with_keep_alive_capacity(3),
         )
         .unwrap();
     app.insert_resource(Demo {
@@ -156,7 +230,10 @@ fn main() {
         result: "Waiting for host".into(),
     })
     .add_systems(Startup, setup)
-    .add_systems(PreUpdate, keyboard.after(RouterInputSet::Ready))
+    .add_systems(
+        PreUpdate,
+        (keyboard, restore_keyboard).after(RouterInputSet::Ready),
+    )
     .add_systems(
         Update,
         (start_initial_navigation, update_status)
@@ -164,6 +241,7 @@ fn main() {
             .after(RouterScheduleSet::PublishSnapshots),
     )
     .add_observer(click)
+    .add_observer(restore_click)
     .add_observer(press)
     .add_observer(release)
     .add_observer(scroll)
@@ -194,15 +272,15 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(20.0)),
-                row_gap: Val::Px(16.0),
+                padding: UiRect::all(Val::Px(16.0)),
+                row_gap: Val::Px(10.0),
                 ..default()
             },
             BackgroundColor(Color::srgb(0.04, 0.06, 0.1)),
         ))
         .with_children(|shell| {
             shell.spawn((
-                Text::new("Bevy UI Router / interactive MVP"),
+                Text::new("Bevy UI Router / independent retention and scroll"),
                 TextFont {
                     font_size: FontSize::Px(28.0),
                     ..default()
@@ -210,13 +288,17 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
             ));
             shell
                 .spawn(Node {
-                    column_gap: Val::Px(12.0),
+                    column_gap: Val::Px(8.0),
+                    row_gap: Val::Px(8.0),
+                    flex_wrap: FlexWrap::Wrap,
                     ..default()
                 })
                 .with_children(|bar| {
                     for (label, action) in [
                         ("Overview [1]", Action::Overview),
                         ("Settings [2]", Action::Settings),
+                        ("Delayed [3]", Action::Delayed),
+                        ("Outside [4]", Action::Outside),
                         ("Replace [R]", Action::Replace),
                         ("Back [B]", Action::Back),
                         ("Fail [E]", Action::Fail),
@@ -225,12 +307,19 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
                             Button,
                             action,
                             Node {
-                                padding: UiRect::all(Val::Px(12.0)),
+                                padding: UiRect::all(Val::Px(8.0)),
                                 ..default()
                             },
                             BackgroundColor(Color::srgb(0.17, 0.23, 0.32)),
                         ))
-                        .with_child((Text::new(label), Pickable::IGNORE));
+                        .with_child((
+                            Text::new(label),
+                            TextFont {
+                                font_size: FontSize::Px(16.0),
+                                ..default()
+                            },
+                            Pickable::IGNORE,
+                        ));
                     }
                 });
             shell.spawn((
@@ -240,6 +329,7 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
                     ..default()
                 },
                 Status,
+                Name::new("status"),
             ));
             shell.spawn((
                 Node {
@@ -254,11 +344,15 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
 
 fn navigate(action: Action, demo: &mut Demo, navigation: &mut RouterNavigation) {
     let result = match action {
-        Action::Overview => navigation.push(demo.router, RouteLocation::new("/overview")),
-        Action::Settings => navigation.push(demo.router, RouteLocation::new("/settings")),
-        Action::Replace => navigation.replace(demo.router, RouteLocation::new("/overview")),
+        Action::Overview => navigation.push(demo.router, RouteLocation::new("/workspace/overview")),
+        Action::Settings => navigation.push(demo.router, RouteLocation::new("/workspace/settings")),
+        Action::Delayed => navigation.push(demo.router, RouteLocation::new("/workspace/delayed")),
+        Action::Outside => navigation.push(demo.router, RouteLocation::new("/outside")),
+        Action::Replace => {
+            navigation.replace(demo.router, RouteLocation::new("/workspace/overview"))
+        }
         Action::Back => navigation.back(demo.router),
-        Action::Fail => navigation.push(demo.router, RouteLocation::new("/broken")),
+        Action::Fail => navigation.push(demo.router, RouteLocation::new("/workspace/broken")),
     };
     match result {
         Ok(request) => {
@@ -307,6 +401,8 @@ fn keyboard(
     for (key, action) in [
         (KeyCode::Digit1, Action::Overview),
         (KeyCode::Digit2, Action::Settings),
+        (KeyCode::Digit3, Action::Delayed),
+        (KeyCode::Digit4, Action::Outside),
         (KeyCode::KeyR, Action::Replace),
         (KeyCode::KeyB, Action::Back),
         (KeyCode::KeyE, Action::Fail),
@@ -322,6 +418,121 @@ fn keyboard(
     {
         page.0 += 1;
         println!("Page keyboard {target:?}: {}", page.0);
+    }
+}
+
+fn restore_click(
+    event: On<Pointer<Click>>,
+    actions: Query<&RestoreControl>,
+    gate: Res<RouterInputGate>,
+    activity: RouteActivity,
+    restorations: RouteScrollRestorations,
+    mut pages: Query<(Entity, &mut DelayedPage)>,
+    mut commands: Commands,
+) {
+    let target = event.event_target();
+    if !gate.allows_pointer(target) {
+        return;
+    }
+    if let Ok(action) = actions.get(target)
+        && let Some((scope, mut page)) = pages
+            .iter_mut()
+            .find(|(scope, _)| activity.is_active(*scope))
+    {
+        restore(action.0, scope, &mut page, &restorations, &mut commands);
+    }
+}
+
+fn restore_keyboard(
+    keys: Res<ButtonInput<KeyCode>>,
+    gate: Res<RouterInputGate>,
+    activity: RouteActivity,
+    restorations: RouteScrollRestorations,
+    mut pages: Query<(Entity, &mut DelayedPage)>,
+    mut commands: Commands,
+) {
+    let Some((scope, mut page)) = pages
+        .iter_mut()
+        .find(|(scope, _)| activity.is_active(*scope))
+    else {
+        return;
+    };
+    if !gate.allows_keyboard(scope) {
+        return;
+    }
+    for (key, action) in [
+        (KeyCode::KeyL, RestoreAction::Load),
+        (KeyCode::KeyG, RestoreAction::Ready),
+        (KeyCode::KeyC, RestoreAction::Cancel),
+    ] {
+        if keys.just_pressed(key) {
+            restore(action, scope, &mut page, &restorations, &mut commands);
+        }
+    }
+}
+
+fn restore(
+    action: RestoreAction,
+    scope: Entity,
+    page: &mut DelayedPage,
+    restorations: &RouteScrollRestorations,
+    commands: &mut Commands,
+) {
+    match action {
+        RestoreAction::Load if !page.loaded => {
+            page.loaded = true;
+            // Application-owned readiness: create ordinary UI before UiSystems::Prepare.
+            // Router can expose the visit's restore intent before this container exists.
+            commands.entity(scope).with_children(|parent| {
+                parent
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(120.0),
+                            flex_shrink: 0.0,
+                            overflow: Overflow::scroll_y(),
+                            ..default()
+                        },
+                        Name::new("delayed-scroll"),
+                        RouteScroll::new("list")
+                            .with_restore_policy(RouteScrollRestorePolicy::Explicit),
+                        BackgroundColor(Color::srgb(0.06, 0.10, 0.16)),
+                    ))
+                    .with_children(|viewport| {
+                        viewport
+                            .spawn((
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(720.0),
+                                    flex_shrink: 0.0,
+                                    padding: UiRect::all(Val::Px(12.0)),
+                                    flex_direction: FlexDirection::Column,
+                                    justify_content: JustifyContent::SpaceBetween,
+                                    ..default()
+                                },
+                                Pickable::IGNORE,
+                            ))
+                            .with_children(|content| {
+                                for label in ["top", "middle", "bottom"] {
+                                    content.spawn((
+                                        Text::new(format!("delayed list / {label}")),
+                                        Pickable::IGNORE,
+                                    ));
+                                }
+                            });
+                    });
+            });
+        }
+        RestoreAction::Load => {}
+        RestoreAction::Ready | RestoreAction::Cancel => {
+            if let Some(pending) = restorations.pending(scope, "list") {
+                match action {
+                    RestoreAction::Ready => commands.ready_route_scroll(pending.id()),
+                    RestoreAction::Cancel => commands.cancel_route_scroll(pending.id()),
+                    RestoreAction::Load => unreachable!(),
+                };
+            }
+        }
     }
 }
 
@@ -375,9 +586,10 @@ fn update_status(
     snapshots: Res<RouterSnapshots>,
     focus: Res<InputFocus>,
     layouts: Query<Entity, With<Layout>>,
-    counters: Query<(&Counter, &Children)>,
+    counters: Query<(Entity, &Counter, &Children)>,
     pages: Query<(Entity, &PageButton, &Children)>,
     activity: RouteActivity,
+    inputs: RouteInputs,
     mut texts: Query<&mut Text>,
     status: Query<Entity, With<Status>>,
     mut last_state: Local<String>,
@@ -395,10 +607,18 @@ fn update_status(
         demo.result = format!("{:?}", result.status());
         demo.last_request = None;
     }
-    for (counter, children) in &counters {
+    for (entity, counter, children) in &counters {
+        if !activity.is_active(entity) {
+            continue;
+        }
         for child in children {
             if let Ok(mut text) = texts.get_mut(*child) {
-                text.0 = format!("Layout counter: {} (click +1)", counter.0);
+                let path = inputs.current(*child).map(|input| input.location().path());
+                text.0 = format!(
+                    "Layout counter: {} (click +1) / {}",
+                    counter.0,
+                    path.unwrap_or("inactive")
+                );
             }
         }
     }
