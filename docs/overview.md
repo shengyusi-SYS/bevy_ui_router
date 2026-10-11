@@ -4,9 +4,17 @@
 
 ## 核心需求与当前范围
 
-提供独立、通用的 Bevy UI Router。应用声明路由树和 view，绑定自己拥有的 UI host，通过 push、replace、back 展示嵌套页面，保留公共布局及局部状态。
+提供独立、通用的 Bevy UI Router，让应用声明页面及其嵌套关系，由库统一管理页面跳转、返回和当前路由信息，减少业务页面重复维护导航逻辑。
 
-成功导航统一发布 presentation 与 history；失败提供明确结果和有限恢复；非活动 Router 内容不保留集成输入权限或焦点。
+从应用使用者的角度，核心需求是：
+
+- **组织页面。** 用路由树描述页面、参数和共享布局，在应用自己的 UI host 中展示对应内容。
+- **切换与返回。** 通过 push、replace、back 导航，统一管理当前展示与访问记录；普通子页切换保留可复用的公共布局。
+- **获得正确上下文。** 页面能够读取当前路由和参数，复用布局也能看到本次导航的信息；错误呈现有明确结果。
+
+keep-alive 和滚动恢复是按需启用的体验增强：前者保留离场页面的局部状态，后者让返回时恢复该次访问的位置。父子独立保留是当前已确认的增强目标，不要求所有应用启用。异步页面、过渡动画等另按实际需求选题。
+
+正确性底线是当前展示与路由输入相符，访问记录按导航结果更新，非活动内容不继续响应集成输入或保留焦点，失败不会误动应用拥有的 host。内部身份、owner 和 publication 协议用于落实这些行为，具体合同见[生命周期](contracts/lifecycle.md)。
 
 当前实现范围：
 
@@ -14,6 +22,7 @@
 - 单条嵌套路由链，每个 layout 一个 default outlet，common-prefix 保留、suffix 替换和 memory history。
 - 显式滚动容器按 history entry 保存二维位置，Back 恢复并由正常 UI 布局裁剪。
 - 同一保留父布局下的 normal leaf 可 opt-in 保留原 Entity 和局部状态；非活动容量默认 0，启用后按简单 LRU 淘汰。
+- 当前已发布路由输入可只读查询，公共布局复用后仍可取得新 location 和自身 route-local params。
 - 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。
 - route-bound error view、router fallback、host loss/re-registration、stale 拒绝、局部 cleanup、输入与 focus 隔离。
 - facade、可运行示例、独立 consumer 和相称的跨层验证。
