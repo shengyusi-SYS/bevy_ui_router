@@ -45,9 +45,15 @@ React Activity 清理隐藏内容的 Effects 是其 runtime 能力，不等于 B
 
 ### 公开的通用输入资格接缝
 
-长期目标是在 Bevy/UI 的候选采集/选择及 dispatch 目标生成前消费 route-neutral 资格，继续使用原生排序、TabGroup、modal 和 bubbling。候选不合格不自动剪掉其全部后代；事件起始目标的过滤也不能误拦合法 host 上的冒泡。
+长期目标是在 Bevy/UI 的候选加入、AcquireFocus 接受及 dispatch 起始目标生成前消费 route-neutral 资格，继续使用原生排序、TabGroup、modal 和 bubbling。候选拒绝不剪掉其后代；合法起始目标继续原生冒泡，不逐祖先套用 Router gate。失效焦点按原无焦点语义释放并回退窗口。
 
-Router 提供允许、禁止、范围外的自身资格，通用 UI 结合控件与应用政策。导航与分发共用资格事实，同时明确当前焦点失效、窗口 fallback 和调度；不以事后清 focus 代替分发前判断。
+Router 桥内部区分允许、禁止、范围外；通用 UI 再结合控件与应用政策，不要求公开新的路由身份或资格资源。`RouterInputGate=false` 也包含范围外应用控件，不能直接用作全局拒绝。最近已登记的非活动或失效边界拒绝，不能借活动父布局资格；不同 Router 按目标自身 scope 判定。动态拓扑沿用 Refresh/Ready 合同，原生 dispatch 排在 Ready 后，publication/隔离保持同次撤权。
+
+焦点还需正式的操作准入/观察与官方事件处理接缝。[InputFocus 的 set/clear](https://github.com/bevyengine/bevy/blob/v0.19.1/crates/bevy_input_focus/src/lib.rs) 立即修改 `get()` 读取的 current，而[后续事件处理](https://github.com/bevyengine/bevy/blob/v0.19.1/crates/bevy_input_focus/src/gained_and_lost.rs)不修改它；只公开队列或在 drain 前过滤，仍不能闭合操作与读取之间的资格。入口须覆盖普通系统、World 和 AutoFocus 发起的操作，现有无 World 上下文的 setter 自身不能查询即时资格。合法操作保持同步兑现及原顺序/cause，同值 set 与空 clear 仍是覆盖旧候选的操作；pending 请求只由 Router 保存意图，不成为有效 focus 或先派发 FocusGained/Lost。
+
+Router 在 Scene apply 期间需要真实 task 的来源事实及暂存内容归属，不能等 apply 完成后反推。原 owner 成功发布且最后意图仍有效时兑现，所需裁决与准备必须先于 publication tail；操作记录不授予或重建 owner。官方事件接缝保留有效操作的完整顺序及曾合法获焦目标的离场释放通知，不能以删除所有非活动目标事件代替这一区分。
+
+上述是可采用接口的最低行为条件，不预定新的上游 API 形状。现有固定版本 [native focus 桥](../../../crates/bevy_ui_router_ecs/src/native_focus.rs)依赖私有字段反射与官方处理器替换；正式接线完成时应整体退休这段兼容责任，不能只在它旁边再加一层 adapter。
 
 优先围绕公开 hook 设计和实现，不要求消费者采用特定 Bevy fork。官方 0.19.1 缺少过滤入口，循环调用 navigate 的薄 adapter 只能是可替换迁移桥：它反复采集/排序候选，还依赖 doc(hidden) helper 和私有插件 glue 的替代接线，不能作为长期完成状态。
 
