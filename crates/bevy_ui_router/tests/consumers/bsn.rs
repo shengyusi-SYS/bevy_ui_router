@@ -8,6 +8,7 @@ use std::sync::{
 use bevy_app::{App, TaskPoolPlugin, Update};
 use bevy_asset::AssetPlugin;
 use bevy_ecs::prelude::*;
+use bevy_ecs::system::RunSystemOnce;
 use bevy_scene::{ResolvedScene, SceneFunction, ScenePlugin, bsn};
 use bevy_ui::{Node, Val};
 use bevy_ui_router::ecs::RouterScheduleSet;
@@ -265,7 +266,10 @@ fn assert_leaf(app: &mut App, item: &str, instance: usize) -> Entity {
     let leaf = app.world().get::<NativeLeaf>(entity).unwrap();
     assert_eq!(leaf.item, item);
     assert_eq!(leaf.instance, instance);
-    assert_eq!(app.world().get::<RouteScroll>(entity), Some(&RouteScroll::new("body")));
+    assert_eq!(
+        app.world().get::<RouteScroll>(entity),
+        Some(&RouteScroll::new("body").with_restore_policy(RouteScrollRestorePolicy::Explicit))
+    );
     assert!(
         app.world()
             .resource::<RouterInputGate>()
@@ -311,7 +315,9 @@ fn main() {
                     ..Node::default()
                 });
                 root.push_template(NativeLeaf { item, instance });
-                root.push_template(RouteScroll::new("body"));
+                root.push_template(
+                    RouteScroll::new("body").with_restore_policy(RouteScrollRestorePolicy::Explicit),
+                );
             }))
         })
         .unwrap();
@@ -507,6 +513,16 @@ fn main() {
         Some(&RouteLocation::new("/items/a"))
     );
     let returned_leaf = assert_leaf(&mut app, "a", 4);
+    // This consumer has no UI layout plugin and therefore no displayed scroll
+    // record. The same public lookup works without manufacturing an intent.
+    assert!(
+        app.world_mut()
+            .run_system_once(move |restorations: RouteScrollRestorations| {
+                restorations.pending(returned_leaf, "body")
+            })
+            .unwrap()
+            .is_none()
+    );
     assert_ne!(returned_leaf, third_leaf);
     assert_ne!(
         returned_leaf, first_leaf,

@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use bevy_app::{App, PostUpdate};
 use bevy_ecs::prelude::*;
+use bevy_ecs::system::RunSystemOnce;
 use bevy_input_focus::InputFocusPlugin;
 use bevy_internal::{
     DefaultPlugins,
     camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo},
     math::{UVec2, Vec2},
 };
-use bevy_scene::{ScenePlugin, bsn};
+use bevy_scene::{PatchFromTemplate, ScenePlugin, bsn};
 use bevy_ui::{
     ComputedNode, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, FlexDirection, Node,
     Overflow, ScrollPosition, UiSystems, UiTransform, Val,
@@ -33,6 +34,7 @@ struct FixtureOptions {
     camera: bool,
     keep_alive_capacity: usize,
     retained_layout: bool,
+    explicit_body: bool,
 }
 
 impl Default for FixtureOptions {
@@ -44,6 +46,7 @@ impl Default for FixtureOptions {
             camera: true,
             keep_alive_capacity: 0,
             retained_layout: false,
+            explicit_body: false,
         }
     }
 }
@@ -173,7 +176,16 @@ fn fixture(options: FixtureOptions) -> Fixture {
                         width: Val::Px(160.0), height: Val::Px(120.0),
                         flex_shrink: 0.0, overflow: Overflow::scroll(),
                     }
-                    RouteScroll::new("body") ScrollPosition({ options.initial }) Page(name)
+                    { RouteScroll::patch(move |marker, _| {
+                        *marker = RouteScroll::new("body").with_restore_policy(
+                            if options.explicit_body {
+                                RouteScrollRestorePolicy::Explicit
+                            } else {
+                                RouteScrollRestorePolicy::Automatic
+                            },
+                        );
+                    }) }
+                    ScrollPosition({ options.initial }) Page(name)
                     ScrollContainer("body")
                     Children [
                         (Node {
@@ -402,6 +414,73 @@ fn scroll(app: &mut App, entity: Entity, position: Vec2) {
     app.world_mut().get_mut::<ScrollPosition>(entity).unwrap().0 = position;
     app.update();
     assert_position(app, entity, position);
+}
+
+fn pending_scroll(app: &mut App, scope: Entity, key: &str) -> Option<RouteScrollRestoration> {
+    let key = key.to_owned();
+    app.world_mut()
+        .run_system_once(move |restorations: RouteScrollRestorations| {
+            restorations.pending(scope, &key)
+        })
+        .unwrap()
+}
+
+fn ready_scroll(app: &mut App, id: RouteScrollRestoreId) {
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands| {
+            commands.ready_route_scroll(id.clone());
+        })
+        .unwrap();
+}
+
+fn cancel_scroll(app: &mut App, id: RouteScrollRestoreId) {
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands| {
+            commands.cancel_route_scroll(id.clone());
+        })
+        .unwrap();
+}
+
+fn set_content_size(app: &mut App, page_name: &str, size: Vec2) {
+    let child = content(app, page_name);
+    let mut node = app.world_mut().get_mut::<Node>(child).unwrap();
+    node.width = Val::Px(size.x);
+    node.height = Val::Px(size.y);
+}
+
+fn spawn_late_container(
+    app: &mut App,
+    page_name: &str,
+    policy: RouteScrollRestorePolicy,
+    initial: Vec2,
+) -> Entity {
+    let parent = content(app, page_name);
+    let container = app
+        .world_mut()
+        .spawn((
+            Node {
+                width: Val::Px(100.0),
+                height: Val::Px(80.0),
+                flex_shrink: 0.0,
+                overflow: Overflow::scroll(),
+                ..Default::default()
+            },
+            RouteScroll::new("late").with_restore_policy(policy),
+            ScrollPosition(initial),
+            ScrollContainer("late"),
+            ChildOf(parent),
+        ))
+        .id();
+    app.world_mut().spawn((
+        Node {
+            width: Val::Px(500.0),
+            height: Val::Px(600.0),
+            flex_shrink: 0.0,
+            ..Default::default()
+        },
+        ChildOf(container),
+    ));
+    container
 }
 
 fn drive_availability(app: &mut App, router: RouterHandle, expected: RouterAvailability) {
@@ -853,6 +932,335 @@ fn a_shorter_restored_page_settles_the_clamp_before_content_grows_again() {
 }
 
 #[test]
+fn explicit_ready_preserves_the_visit_target_until_layout_and_settles_only_once() {
+    let initial = Vec2::new(11.0, 27.0);
+    let target = Vec2::new(70.0, 240.0);
+    let Fixture {
+        mut app,
+        router,
+        content_size,
+        ..
+    } = fixture(FixtureOptions {
+        explicit_body: true,
+        initial,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let original = page(&mut app, "a");
+    scroll(&mut app, original, target);
+    push(&mut app, router, "/b");
+    *content_size.lock().unwrap() = Vec2::new(180.0, 160.0);
+    back(&mut app, router);
+    let returned = page(&mut app, "a");
+    assert_ne!(returned, original);
+    assert_position(&app, returned, initial);
+    let restoration = pending_scroll(&mut app, returned, "body").unwrap();
+    assert_vec(restoration.position().0, target);
+    for _ in 0..2 {
+        app.update();
+        assert_position(&app, returned, initial);
+        assert_vec(
+            pending_scroll(&mut app, returned, "body")
+                .unwrap()
+                .position()
+                .0,
+            target,
+        );
+    }
+
+    // Readiness allows one real layout, whose range may still be smaller than
+    // the original visit. Later growth must not chase the old frozen target.
+    set_content_size(&mut app, "a", Vec2::new(280.0, 300.0));
+    ready_scroll(&mut app, restoration.id());
+    app.update();
+    assert_position(&app, returned, Vec2::new(70.0, 180.0));
+    assert!(pending_scroll(&mut app, returned, "body").is_none());
+    set_content_size(&mut app, "a", Vec2::new(600.0, 800.0));
+    app.update();
+    assert_position(&app, returned, Vec2::new(70.0, 180.0));
+}
+
+#[test]
+fn late_containers_share_the_visit_intent_and_explicit_ready_can_precede_binding() {
+    for policy in [
+        RouteScrollRestorePolicy::Automatic,
+        RouteScrollRestorePolicy::Explicit,
+    ] {
+        let (mut app, router) = app();
+        let target = Vec2::new(70.0, 240.0);
+        push(&mut app, router, "/a");
+        let original = spawn_late_container(&mut app, "a", policy, Vec2::ZERO);
+        app.update();
+        scroll(&mut app, original, target);
+        push(&mut app, router, "/b");
+        assert!(app.world().get_entity(original).is_err());
+        back(&mut app, router);
+        let scope = page(&mut app, "a");
+        let restoration = pending_scroll(&mut app, scope, "late").unwrap();
+        assert_vec(restoration.position().0, target);
+        // Navigation has already succeeded; waiting does not require another
+        // route request or a second restore table maintained by the app.
+        assert_eq!(history(&app, router).cursor(), Some(0));
+        app.update();
+        assert!(pending_scroll(&mut app, scope, "late").is_some());
+        if policy == RouteScrollRestorePolicy::Explicit {
+            ready_scroll(&mut app, restoration.id());
+            app.update();
+            assert!(pending_scroll(&mut app, scope, "late").is_some());
+        }
+        let late = spawn_late_container(&mut app, "a", policy, Vec2::new(9.0, 19.0));
+        app.update();
+        assert_position(&app, late, target);
+        assert!(pending_scroll(&mut app, scope, "late").is_none());
+    }
+}
+
+#[test]
+fn leaving_an_unready_visit_does_not_replace_its_record_with_the_scene_initial_value() {
+    let initial = Vec2::new(11.0, 27.0);
+    let target = Vec2::new(70.0, 240.0);
+    let Fixture {
+        mut app,
+        router,
+        content_size,
+        ..
+    } = fixture(FixtureOptions {
+        explicit_body: true,
+        initial,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let original = page(&mut app, "a");
+    scroll(&mut app, original, target);
+    push(&mut app, router, "/b");
+    *content_size.lock().unwrap() = Vec2::new(180.0, 160.0);
+    back(&mut app, router);
+    let waiting = page(&mut app, "a");
+    let old = pending_scroll(&mut app, waiting, "body").unwrap().id();
+    app.update();
+    assert_position(&app, waiting, initial);
+    push(&mut app, router, "/c");
+    back(&mut app, router);
+    let returned = page(&mut app, "a");
+    let restoration = pending_scroll(&mut app, returned, "body").unwrap();
+    assert_vec(restoration.position().0, target);
+    assert_ne!(old, restoration.id());
+    set_content_size(&mut app, "a", Vec2::new(600.0, 800.0));
+    ready_scroll(&mut app, restoration.id());
+    app.update();
+    assert_position(&app, returned, target);
+}
+
+#[test]
+fn another_back_to_the_same_entry_and_entity_invalidates_old_ready_and_cancel_ids() {
+    let target = Vec2::new(70.0, 240.0);
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        explicit_body: true,
+        keep_alive_capacity: 2,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let original = page(&mut app, "a");
+    scroll(&mut app, original, target);
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    assert_eq!(page(&mut app, "a"), original);
+    let old = pending_scroll(&mut app, original, "body").unwrap().id();
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    assert_eq!(page(&mut app, "a"), original);
+    let current = pending_scroll(&mut app, original, "body").unwrap();
+    assert_ne!(old, current.id());
+    ready_scroll(&mut app, old.clone());
+    cancel_scroll(&mut app, old);
+    app.update();
+    let still_waiting = pending_scroll(&mut app, original, "body").unwrap();
+    assert_eq!(still_waiting.id(), current.id());
+    assert_vec(still_waiting.position().0, target);
+    ready_scroll(&mut app, current.id());
+    app.update();
+    assert!(pending_scroll(&mut app, original, "body").is_none());
+    assert_position(&app, original, target);
+}
+
+#[test]
+fn application_scrolling_cancels_a_bound_restore_before_ready_without_rolling_back() {
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        explicit_body: true,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let original = page(&mut app, "a");
+    scroll(&mut app, original, Vec2::new(70.0, 240.0));
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let returned = page(&mut app, "a");
+    let id = pending_scroll(&mut app, returned, "body").unwrap().id();
+    let application = Vec2::new(35.0, 90.0);
+    scroll(&mut app, returned, application);
+    assert!(pending_scroll(&mut app, returned, "body").is_none());
+    ready_scroll(&mut app, id);
+    app.update();
+    assert_position(&app, returned, application);
+}
+
+#[test]
+fn application_write_after_scroll_prepare_wins_over_the_restore_and_settlement() {
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        explicit_body: true,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let first = page(&mut app, "a");
+    scroll(&mut app, first, Vec2::new(70.0, 240.0));
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let returned = page(&mut app, "a");
+    let restoration = pending_scroll(&mut app, returned, "body").unwrap();
+    let application = Vec2::new(35.0, 90.0);
+    app.add_systems(
+        PostUpdate,
+        (move |mut positions: Query<&mut ScrollPosition>| {
+            positions.get_mut(returned).unwrap().0 = application;
+        })
+        .after(RouterScrollSet::Prepare)
+        .before(UiSystems::Layout),
+    );
+    ready_scroll(&mut app, restoration.id());
+    app.update();
+    assert_position(&app, returned, application);
+    assert!(pending_scroll(&mut app, returned, "body").is_none());
+}
+
+#[test]
+fn application_override_before_same_update_publication_saves_the_last_display() {
+    let initial = Vec2::new(9.0, 19.0);
+    let target = Vec2::new(70.0, 240.0);
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        explicit_body: true,
+        initial,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let original = page(&mut app, "a");
+    scroll(&mut app, original, target);
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let returned = page(&mut app, "a");
+    assert_position(&app, returned, initial);
+    assert_vec(
+        pending_scroll(&mut app, returned, "body")
+            .unwrap()
+            .position()
+            .0,
+        target,
+    );
+
+    // Equivalent navigation publishes in Update, before scroll Prepare has a
+    // chance to observe this changed value. Only the previous actual display
+    // can be saved, never the abandoned intent or the not-yet-laid-out write.
+    app.world_mut()
+        .get_mut::<ScrollPosition>(returned)
+        .unwrap()
+        .0 = Vec2::new(35.0, 90.0);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/a"))
+        .unwrap();
+    app.update();
+    assert!(
+        matches!(app.world().resource::<RouterSnapshots>().request(router, request),
+        RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded)
+    );
+    assert!(pending_scroll(&mut app, returned, "body").is_none());
+    back(&mut app, router);
+    assert_eq!(page(&mut app, "a"), returned);
+    let restoration = pending_scroll(&mut app, returned, "body").unwrap();
+    assert_vec(restoration.position().0, initial);
+    ready_scroll(&mut app, restoration.id());
+    app.update();
+    assert_position(&app, returned, initial);
+}
+
+#[test]
+fn explicit_cancel_before_late_binding_leaves_the_new_container_at_its_application_position() {
+    let (mut app, router) = app();
+    push(&mut app, router, "/a");
+    let original = spawn_late_container(
+        &mut app,
+        "a",
+        RouteScrollRestorePolicy::Explicit,
+        Vec2::ZERO,
+    );
+    app.update();
+    scroll(&mut app, original, Vec2::new(70.0, 240.0));
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let scope = page(&mut app, "a");
+    let id = pending_scroll(&mut app, scope, "late").unwrap().id();
+    cancel_scroll(&mut app, id.clone());
+    assert!(pending_scroll(&mut app, scope, "late").is_none());
+    let application = Vec2::new(9.0, 19.0);
+    let late = spawn_late_container(
+        &mut app,
+        "a",
+        RouteScrollRestorePolicy::Explicit,
+        application,
+    );
+    ready_scroll(&mut app, id);
+    app.update();
+    assert_position(&app, late, application);
+    assert!(pending_scroll(&mut app, scope, "late").is_none());
+}
+
+#[test]
+fn a_bound_restore_does_not_transfer_to_a_replacement_container_with_the_same_key() {
+    let (mut app, router) = app();
+    push(&mut app, router, "/a");
+    let original = spawn_late_container(
+        &mut app,
+        "a",
+        RouteScrollRestorePolicy::Explicit,
+        Vec2::ZERO,
+    );
+    app.update();
+    scroll(&mut app, original, Vec2::new(70.0, 240.0));
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let scope = page(&mut app, "a");
+    let bound = spawn_late_container(
+        &mut app,
+        "a",
+        RouteScrollRestorePolicy::Explicit,
+        Vec2::ZERO,
+    );
+    app.update();
+    let restoration = pending_scroll(&mut app, scope, "late").unwrap();
+    app.world_mut().despawn(bound);
+    let application = Vec2::new(9.0, 19.0);
+    let replacement = spawn_late_container(
+        &mut app,
+        "a",
+        RouteScrollRestorePolicy::Explicit,
+        application,
+    );
+    assert_ne!(replacement, bound);
+    ready_scroll(&mut app, restoration.id());
+    app.update();
+    assert_position(&app, replacement, application);
+    assert!(pending_scroll(&mut app, scope, "late").is_none());
+}
+
+#[test]
 fn back_without_a_record_keeps_the_live_container_position() {
     let (mut app, router) = app();
     push(&mut app, router, "/a");
@@ -986,6 +1394,41 @@ fn failed_navigation_that_preserves_normal_content_keeps_its_scroll_untouched() 
     back(&mut app, router);
     let restored = page(&mut app, "a");
     assert_position(&app, restored, Vec2::new(70.0, 240.0));
+}
+
+#[test]
+fn an_unpublished_failure_preserves_the_original_explicit_restore_id() {
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        fallback_fails: true,
+        explicit_body: true,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let first = page(&mut app, "a");
+    let target = Vec2::new(70.0, 240.0);
+    scroll(&mut app, first, target);
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let returned = page(&mut app, "a");
+    let restoration = pending_scroll(&mut app, returned, "body").unwrap();
+    let before = history(&app, router);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/broken"))
+        .unwrap();
+    assert!(matches!(settle_status(&mut app, router, request),
+        RequestStatus::Failed(failure) if failure.kind() == NavigationFailureKind::RecoveryFailed));
+    assert_eq!(history(&app, router), before);
+    assert_eq!(page(&mut app, "a"), returned);
+    let still_waiting = pending_scroll(&mut app, returned, "body").unwrap();
+    assert_eq!(still_waiting.id(), restoration.id());
+    assert_vec(still_waiting.position().0, target);
+    ready_scroll(&mut app, restoration.id());
+    app.update();
+    assert_position(&app, returned, target);
 }
 
 #[test]
@@ -1155,6 +1598,7 @@ fn restoration_settlement_rejects_a_content_root_reparented_after_publication() 
             world.entity_mut(entity).insert(ChildOf(application_root));
             *observed.lock().unwrap() = Some((entity, requested));
         })
+        .after(RouterScrollSet::Prepare)
         .before(UiSystems::Layout),
     );
     back(&mut app, router);
@@ -1223,7 +1667,7 @@ fn a_missing_geometry_component_abandons_restoration_for_the_container_or_ancest
                 world.entity_mut(target).remove::<UiTransform>();
                 removed = true;
             })
-            .before(UiSystems::Layout),
+            .before(RouterScrollSet::Prepare),
         );
         back(&mut app, router);
         let restored = page(&mut app, "a");

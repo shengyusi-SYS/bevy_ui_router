@@ -115,4 +115,4 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 
 每次交付由独立代理只读复核 Core 选择/continuation 与 ECS 原 owner/写集/publication，另一视角核对公开行为。实现 shared publication 的修改错开；审查一致不能替代成功命令输出。根代理检查 exact staged 文件和 diff 后提交 main，不纳入职责外变更。
 
-原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。第 1–4 步已实现；本专题收口按第 5 步继续，输入/滚动扩展不因既有组合回归通过而完成。
+原生输入公开 hook 与访问级滚动恢复不塞入本计划；滚动统一意图已归[导航合同](../../contracts/navigation.md#按访问恢复滚动)，输入实施依赖正式接缝。第 1–4 步已实现；本专题收口按第 5 步继续，输入/滚动扩展不因既有组合回归通过而完成。

@@ -46,7 +46,7 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 | BSN：factory、resolve/apply、outlet、containment | [BSN facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs) | [BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) 及两个原样示例 |
 | 输入与焦点 | [原生 pointer 测试](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus 测试](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 窗口中的点击/Space、跨页手势与独立目标保护 |
 | 保留页与普通页交接 | [公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立 opt-in、原父/新子、内部库存与 LRU 依赖淘汰；OwnInvalid、fresh 失败、部分清理 host loss 后原请求终结与残留责任 |
-| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的二维位置、缩放/裁剪、布局暂缺与身份撤销、失败来源、host 重接纳及 stale settlement；原父/fresh 子 Back 的不同 entry 位置和当前输入 |
+| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的早晚绑定、显式 ready、二维裁剪、取消与应用优先、未完成记录及旧 ID 失效；保留既有失败、host 重接纳、原父/fresh 子 Back 与当前输入组合 |
 | 页面活动资格 | [公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 非交互内容、可变应用 Query、缓存失活/恢复、动态后代和 exact 父链/host registration |
 | facade 与 feature/依赖边界 | [独立 consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 最小依赖的独立应用运行与逐 case 编译拒绝 |
 
@@ -63,7 +63,7 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-quick start 验证最小 Scene runtime 和请求结果；nested 示例执行真实 UI 布局，离开布局后返回新子页，核对原父 Entity、工具栏状态、活动资格和新的当前输入。两者均不打开操作系统窗口或启用 GPU renderer；独立 consumer 原样编译运行两者。
+quick start 验证最小 Scene runtime 和请求结果；nested 示例执行真实 UI 布局，Back 到 fresh 子页后查询并 ready 该访问的滚动意图；离开布局后返回新子页，核对原父 Entity、工具栏状态、活动资格和新的当前输入。两者均不打开操作系统窗口或启用 GPU renderer；独立 consumer 原样编译运行两者。
 
 窗口应用是独立 workspace，图形依赖与 headless 库验证分开：
 
@@ -113,7 +113,9 @@ python3 scripts/check-packaged-consumer.py
 
 父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。尚未在窗口重跑父子独立库存。
 
-完整提交树 `efe1989a415c30e83ee9e9b07e2dfcdb48d054cb` 已执行 `cargo package --workspace --locked`，六个包均验证成功；`scripts/check-packaged-consumer.py` 核对来源后，从六个解压 Router 产物运行公开 BSN consumer 成功。标准打包在可用 registry 网络下完成，未跳过验证或上传。该证据覆盖现行树，不覆盖尚未实现的滚动/输入扩展；最终发布树仍需复核。
+访问级滚动统一意图已通过格式、workspace 全目标/全特性检查与未跳过用例的全特性测试，包含早晚容器、显式 ready、取消、同 Update 离场、应用写入优先及失败保留原 ID；ECS 无默认特性与独立 consumer 通过。nested 原样消费在真实正常 UI 布局中验证 fresh 子页 Back 后 ready；最终窗口尚未覆盖新增滚动行为。
+
+完整提交树 `efe1989a415c30e83ee9e9b07e2dfcdb48d054cb` 已执行 `cargo package --workspace --locked`，六个包均验证成功；`scripts/check-packaged-consumer.py` 核对来源后，从六个解压 Router 产物运行公开 BSN consumer 成功。标准打包在可用 registry 网络下完成，未跳过验证或上传。该证据覆盖当时的父子库存树，不覆盖随后滚动/输入扩展；最终发布树仍需复核。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 

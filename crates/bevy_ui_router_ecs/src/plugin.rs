@@ -44,6 +44,15 @@ pub enum RouterInputSet {
     Ready,
 }
 
+/// Ordering seam for history scroll restoration in the normal UI pipeline.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
+pub enum RouterScrollSet {
+    /// Bind and apply requested positions after UI content, before layout.
+    /// Create new UI structure before `bevy_ui::UiSystems::Prepare`; issue
+    /// ready/cancel or existing-component value changes before this set.
+    Prepare,
+}
+
 #[derive(Resource)]
 struct RouterInstallMarker;
 
@@ -104,9 +113,18 @@ pub(crate) fn install_foundations(app: &mut App) {
             publish_snapshots_system.in_set(RouterScheduleSet::PublishSnapshots),
         ),
     )
+    .configure_sets(
+        PostUpdate,
+        RouterScrollSet::Prepare
+            .after(bevy_ui::UiSystems::Content)
+            .before(bevy_ui::UiSystems::Layout),
+    )
     .add_systems(
         PostUpdate,
-        crate::scroll::settle_scroll_system.after(bevy_ui::UiSystems::Layout),
+        (
+            crate::scroll::prepare_scroll_system.in_set(RouterScrollSet::Prepare),
+            crate::scroll::settle_scroll_system.after(bevy_ui::UiSystems::Layout),
+        ),
     )
     .add_systems(
         PreUpdate,

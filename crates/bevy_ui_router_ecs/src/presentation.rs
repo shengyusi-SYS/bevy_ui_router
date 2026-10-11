@@ -15,9 +15,7 @@ use bevy_picking::{
     events::PointerState,
     hover::{HoverMap, PickingInteraction, PreviousHoverMap},
 };
-use bevy_ui::{
-    BackgroundColor, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, ScrollPosition, Val,
-};
+use bevy_ui::{BackgroundColor, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     integration::{
@@ -1522,13 +1520,11 @@ struct PreparedVisualMutation<'w> {
 pub(crate) struct PreparedPresentationMutation<'w> {
     entities: Vec<(usize, PreparedEntityMutation<'w>)>,
     pointer: PreparedPointerMutation<'w>,
-    scroll: Vec<(Entity, Mut<'w, ScrollPosition>, Option<ScrollPosition>)>,
 }
 
 pub(crate) struct PreparedCommitPresentationMutation<'w> {
     entities: Vec<(usize, PreparedEntityMutation<'w>)>,
     pointer: PreparedPointerMutation<'w>,
-    scroll: Vec<(Entity, Mut<'w, ScrollPosition>, Option<ScrollPosition>)>,
     split_at: usize,
 }
 
@@ -1725,23 +1721,12 @@ impl<'w> PreparedPresentationMutation<'w> {
         valid.then_some(PreparedCommitPresentationMutation {
             entities: self.entities,
             pointer: self.pointer,
-            scroll: self.scroll,
             split_at,
         })
     }
 }
 
 impl<'w> PreparedCommitPresentationMutation<'w> {
-    pub(crate) fn with_scroll(mut self, writes: &[crate::scroll::ScrollWrite]) -> Self {
-        for (entity, _, position) in &mut self.scroll {
-            *position = writes
-                .iter()
-                .find(|write| write.entity == *entity)
-                .map(|write| write.position.clone());
-        }
-        self
-    }
-
     fn state(&self) -> CommitPresentationState<'_, 'w> {
         let (leaving, entering) = self.entities.split_at(self.split_at);
         CommitPresentationState { leaving, entering }
@@ -1753,13 +1738,6 @@ impl<'w> PreparedCommitPresentationMutation<'w> {
         registry: impl FnOnce(CommitPresentationState<'_, 'w>),
         gate: impl FnOnce(CommitPresentationState<'_, 'w>),
     ) {
-        for (_, position, value) in &mut self.scroll {
-            if let Some(value) = value
-                && position.0 != value.0
-            {
-                position.0 = value.0;
-            }
-        }
         for (_, entity) in &mut self.entities[..self.split_at] {
             #[cfg(test)]
             record_test_commit_mutation(entity.entity, entity.next);
@@ -3601,7 +3579,7 @@ pub(crate) fn prepare_presentation_with_pointer_revocation<'w>(
     targets: &[FrameMutationTarget],
     pointer_targets: &[Entity],
 ) -> Option<PreparedPresentationMutation<'w>> {
-    prepare_presentation_access(world, targets, pointer_targets, &[], false).map(|access| access.0)
+    prepare_presentation_access(world, targets, pointer_targets, false).map(|access| access.0)
 }
 
 /// All publication receivers remain components on their exact resource
@@ -3614,25 +3592,13 @@ pub(crate) struct PublicationResources<'w> {
     pub(crate) route_focus: Mut<'w, RouteFocusState>,
 }
 
-#[cfg(test)]
 pub(crate) fn prepare_publication_access<'w>(
     world: &'w mut World,
     targets: &[FrameMutationTarget],
     pointer_targets: &[Entity],
 ) -> Option<(PreparedPresentationMutation<'w>, PublicationResources<'w>)> {
     let (presentation, resources) =
-        prepare_presentation_access(world, targets, pointer_targets, &[], true)?;
-    Some((presentation, resources?))
-}
-
-pub(crate) fn prepare_publication_access_with_scroll<'w>(
-    world: &'w mut World,
-    targets: &[FrameMutationTarget],
-    pointer_targets: &[Entity],
-    scroll_targets: &[Entity],
-) -> Option<(PreparedPresentationMutation<'w>, PublicationResources<'w>)> {
-    let (presentation, resources) =
-        prepare_presentation_access(world, targets, pointer_targets, scroll_targets, true)?;
+        prepare_presentation_access(world, targets, pointer_targets, true)?;
     Some((presentation, resources?))
 }
 
@@ -3640,7 +3606,6 @@ fn prepare_presentation_access<'w>(
     world: &'w mut World,
     targets: &[FrameMutationTarget],
     pointer_targets: &[Entity],
-    scroll_targets: &[Entity],
     publication: bool,
 ) -> Option<(
     PreparedPresentationMutation<'w>,
@@ -3687,7 +3652,6 @@ fn prepare_presentation_access<'w>(
         Option<&mut HoverMap>,
         Option<&mut PreviousHoverMap>,
         Option<&mut PointerState>,
-        Option<&mut ScrollPosition>,
         (
             Option<&mut crate::navigation::RouterNavigation>,
             Option<&mut RouteEntityRegistry>,
@@ -3698,7 +3662,6 @@ fn prepare_presentation_access<'w>(
     )>(world);
     let mut found = vec![false; targets.len()];
     let mut entities = Vec::with_capacity(targets.len());
-    let mut scroll = Vec::with_capacity(scroll_targets.len());
     let mut pointer_interactions = Vec::with_capacity(pointer_targets.len());
     let mut pointer_resources = PointerStateResources::default();
     let (mut navigation, mut registry, mut gate, mut input_focus, mut route_focus) =
@@ -3711,15 +3674,9 @@ fn prepare_presentation_access<'w>(
         hover,
         previous_hover,
         state,
-        scroll_position,
         resources,
     ) in query.iter_mut(world)
     {
-        if scroll_targets.contains(&entity)
-            && let Some(position) = scroll_position
-        {
-            scroll.push((entity, position, None));
-        }
         let (nav, reg, input_gate, focus, route) = resources;
         if publication {
             if Some(entity) == navigation_entity {
@@ -3870,7 +3827,6 @@ fn prepare_presentation_access<'w>(
     found.into_iter().all(|present| present).then_some((
         PreparedPresentationMutation {
             entities,
-            scroll,
             pointer: pointer_resources.prepare(pointer_targets, pointer_interactions),
         },
         resources,

@@ -57,7 +57,7 @@ Router 提供允许、禁止、范围外的自身资格，通用 UI 结合控件
 
 ### 统一的访问级滚动恢复意图
 
-本专题的[设计](../scroll-intent/design.md)和[计划](../scroll-intent/plan.md)维护待实施的意图、绑定、ready、取消与执行规则，当前行为仍归[导航合同](../../contracts/navigation.md#按访问恢复滚动)。本评估保留选型理由。
+统一意图已实现，绑定、ready、取消与执行规则归[导航合同](../../contracts/navigation.md#按访问恢复滚动)，接入见[集成指南](../../guides/integration.md#滚动恢复)。本评估保留选型理由。
 
 访问意图由成功 Back 和原 entry 记录决定，容器绑定与内容就绪独立。marker 只声明容器/key，不能决定意图是否存在。早、晚容器使用同一机制，冻结值与 live sampling 分开，避免为晚创建再补第二套恢复状态机。
 

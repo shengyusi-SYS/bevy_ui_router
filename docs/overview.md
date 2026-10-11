@@ -20,7 +20,7 @@ keep-alive 和滚动恢复是按需启用的体验增强：前者让布局与子
 
 - builder-first 路由树，静态/参数/末尾 wildcard 匹配，index route、pathless layout，以及 raw location/search/fragment。
 - 单条嵌套路由链，每个 layout 一个 default outlet，common-prefix 保留、suffix 替换和 memory history。
-- 显式滚动容器按 history entry 保存二维位置，Back 恢复并由正常 UI 布局裁剪。
+- 显式滚动容器按 history entry 保存二维位置，Back 统一恢复已有和晚出现容器；支持内容 ready、取消与应用滚动优先，由正常 UI 布局单次裁剪。
 - 有 normal 父作用域的布局与页面可分别 opt-in 保留原 Entity 和局部状态；返回时仍由新路由选择子页。非活动容量默认 0，启用后按简单 LRU 与父依赖闭包淘汰。
 - 当前已发布路由输入可只读查询，公共布局复用后仍可取得新 location 和自身 route-local params。
 - 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。

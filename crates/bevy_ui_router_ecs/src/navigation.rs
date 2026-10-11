@@ -15151,7 +15151,6 @@ fn publish_ready_back_target(
             .chain(splice.entering().frames()),
         &scroll_eligible,
     );
-    let scroll_targets = scroll_observation.target_entities();
     let gate_before = splice.current_live_interactive_entities(world);
     let (targets, isolate_count) = splice.presentation_mutation_targets();
     let gate_after = splice.resulting_live_interactive_entities(world, &targets);
@@ -15237,12 +15236,7 @@ fn publish_ready_back_target(
         .revoked_targets()
         .to_vec();
         let (presentation, resources) =
-            crate::presentation::prepare_publication_access_with_scroll(
-                world,
-                &targets,
-                &pointer_targets,
-                &scroll_targets,
-            )?;
+            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -15403,7 +15397,6 @@ fn publish_ready_back_target(
                 let scroll = entry
                     .scroll
                     .prepare(engine.history_publication(), scroll_observation);
-                let presentation_plan = presentation_plan.with_scroll(&scroll.writes);
                 let cleanup = ledger.bind_batch(engine.cleanup().clone());
                 drop(
                     ticket

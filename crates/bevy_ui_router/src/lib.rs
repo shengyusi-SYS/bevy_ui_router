@@ -56,8 +56,10 @@ pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
         NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
-        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouterConfig, RouterHandle,
+        RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
+        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterScrollSet,
         RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
         ViewDriverRegistrationErrorKind,
     };
@@ -106,8 +108,10 @@ pub mod prelude {
     pub use crate::ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
         NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterSnapshot, RouterSnapshots,
+        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouterConfig, RouterHandle,
+        RouterHostRegistration, RouterInputGate, RouterInstallError, RouterInstallErrorKind,
+        RouterNavigation, RouterScrollSet, RouterSnapshot, RouterSnapshots,
         ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
 }

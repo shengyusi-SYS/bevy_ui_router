@@ -14,6 +14,8 @@
 
 history entry 标识一次访问，页面实例保存 Entity 与局部状态，owner 承担物理责任；关系见[架构图](../architecture/README.md#访问实例与责任)。同一页面可服务多次访问，滚动位置必须按 entry 保存。采样缺失与身份失效分开：缺布局保留仍有效的 exact 容器见证，离场再净化记录，避免同 key 新实体继承旧值。长期 retained owner 可以超出原请求寿命，原请求仍应结清自己的前台 capability。
 
+等待恢复时只保护冻结目标与 entry 原记录，实际显示见证继续更新；否则取消或同 Update 离场会丢失来源。publication 可能早于布局前执行，离场也必须复验原绑定、策略和应用值。使用正常布局与一次结算，不用帧数或范围增长猜测 ready。
+
 嵌套路由保留 common prefix，服务的是布局与局部状态连续性；整 host 重建会改变这一用户行为。path、route-local params、search 和 fragment 的复用语义不同，不能仅按 route id 或 location 变化统一重建。
 
 active branch 因而不再等于完整生命周期库存。父 scope 退出、fallback 和 host loss 都要检查原 retained owner，而不是只递归删除当前 active；数量和树位置也不能代替 exact binding。

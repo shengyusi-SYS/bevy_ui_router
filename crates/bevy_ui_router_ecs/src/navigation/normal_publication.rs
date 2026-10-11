@@ -355,7 +355,6 @@ pub(super) fn publish_normal_work(
             .chain(view.entering_frames()),
         &scroll_eligible,
     );
-    let scroll_targets = scroll_observation.target_entities();
     let gate_before = view.current_live_interactive_entities(world);
     let (mut targets, mut isolate_count) = view.presentation_mutation_targets();
     let mut transitions = view.lifecycle_transitions();
@@ -504,12 +503,7 @@ pub(super) fn publish_normal_work(
         .revoked_targets()
         .to_vec();
         let (presentation, resources) =
-            crate::presentation::prepare_publication_access_with_scroll(
-                world,
-                &targets,
-                &pointer_targets,
-                &scroll_targets,
-            )?;
+            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -710,7 +704,6 @@ pub(super) fn publish_normal_work(
         let scroll = entry
             .scroll
             .prepare(engine.history_publication(), scroll_observation);
-        let presentation_plan = presentation_plan.with_scroll(&scroll.writes);
         let cleanup = engine.cleanup().clone();
         let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
         pending.ticket.take();

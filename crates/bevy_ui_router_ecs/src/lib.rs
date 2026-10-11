@@ -42,9 +42,12 @@ pub use app_ext::{
 pub use bsn::AppBsnExt;
 pub use input::RouterInputGate;
 pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterNavigation};
-pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet};
+pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet, RouterScrollSet};
 pub use route_inputs::RouteInputs;
-pub use scroll::RouteScroll;
+pub use scroll::{
+    RouteScroll, RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+    RouteScrollRestoreId, RouteScrollRestorePolicy,
+};
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
 
 pub mod prelude {
@@ -53,8 +56,10 @@ pub mod prelude {
     pub use crate::{
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
         NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
-        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouterConfig, RouterHandle,
+        RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
+        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterScrollSet,
         RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
         ViewDriverRegistrationErrorKind,
     };

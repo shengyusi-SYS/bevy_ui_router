@@ -101,7 +101,9 @@ Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决�
 
 共享 slot 的 cleanup 从当前 exact children 冻结选定删除边；activation 保留发布前校验快照，独立准备清理后的 mount prior，避免命中或 LRU 淘汰将旧 sibling 带入下一轮。
 
-显式滚动容器由 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 仅交接 opaque canonical entry key 及已准备 publication 的来源、目标和存活 entry 事实；位置记录不能签发路由权限。Back 的位置写入在原有 tail 前准备，正常 `PostUpdate` UI layout 后核对当前完整 branch 归属，再单次结算裁剪结果并采样实际逻辑像素位置。
+访问级滚动由 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 仅交接 canonical entry 与已准备 publication 的来源、目标和存活 frame/reuse 事实。准备期冻结记录并分配独立意图 ID，tail 只安装状态；位置写入移到正常布局前，不再借 publication 的组件写入管线。记录、冻结意图、一次绑定与实际显示见证各有职责；等待时只阻止 entry 记录被初值覆盖，显示见证继续更新，离场再次复验原绑定和应用值。
+
+早晚容器共用 `RouterScrollSet::Prepare`：复验当前 active branch，绑定唯一容器，按自动或 ready 策略写请求位置；正常 UI layout 后再次复验并单次结算裁剪结果。lookup 复用只读 `ActiveRouteScope`，Commands 消费原 opaque ID，不建立 loader、第二张路由表或额外协调层。公开行为归[导航合同](../contracts/navigation.md#按访问恢复滚动)。
 
 失败路径复用相同 Core 决策和 ECS ownership 边界：先处理该次失败的物理义务，
 再推进明确的 error boundary、fallback 或 authority settlement。
@@ -131,10 +133,12 @@ flowchart TB
     end
     subgraph PostUpdate
         direction LR
-        Layout["UiSystems::Layout"] --> Scroll["滚动恢复单次结算<br/>采样实际显示位置"]
+        Content["UiSystems::Content"] --> Prepare["RouterScrollSet::Prepare<br/>绑定 / ready / 请求位置"]
+        Prepare --> Layout["UiSystems::Layout"]
+        Layout --> Scroll["归属复验与单次结算<br/>采样实际显示位置"]
     end
     Ready --> Observe
-    Publish --> Layout
+    Publish --> Content
 ```
 
 `Update` 的前五个生命周期 set 是 crate-private；公开的本轮观察排序锚点只有

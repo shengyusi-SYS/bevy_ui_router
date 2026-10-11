@@ -1,12 +1,18 @@
 //! A finite headless demonstration of real UI layout, with no GPU or OS window.
 //! Sidebar and toolbar survive child navigation and a visit outside the layout.
+//! A fresh child restores its history-entry scroll after the application is ready.
 use bevy_app::App;
 use bevy_asset::AssetPlugin;
 use bevy_ecs::prelude::*;
+use bevy_ecs::system::RunSystemOnce;
 use bevy_input_focus::InputFocusPlugin;
-use bevy_internal::{DefaultPlugins, camera::Camera2d, math::Vec2};
-use bevy_scene::{ScenePlugin, bsn};
-use bevy_ui::{ComputedNode, FlexDirection, Node, Val};
+use bevy_internal::{
+    DefaultPlugins,
+    camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo},
+    math::{UVec2, Vec2},
+};
+use bevy_scene::{PatchFromTemplate, ScenePlugin, bsn};
+use bevy_ui::{ComputedNode, FlexDirection, Node, Overflow, ScrollPosition, Val};
 use bevy_ui_router::prelude::*;
 
 #[derive(Component, Clone, Default)]
@@ -33,7 +39,21 @@ fn main() {
         app.add_plugins(ScenePlugin);
     }
     app.add_plugins(InputFocusPlugin);
-    app.world_mut().spawn(Camera2d);
+    // The headless app supplies the target information normally provided by the
+    // renderer; propagation and layout still run through Bevy's normal systems.
+    app.world_mut().spawn((
+        Camera2d,
+        Camera {
+            computed: ComputedCameraValues {
+                target_info: Some(RenderTargetInfo {
+                    physical_size: UVec2::new(480, 240),
+                    scale_factor: 1.0,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ));
 
     let layout_driver = app
         .register_bsn_view(ViewDriverKey::new("layout").unwrap(), |_| {
@@ -90,8 +110,18 @@ fn main() {
         let driver = app
             .register_bsn_view(ViewDriverKey::new(name).unwrap(), move |_| {
                 Ok(bsn! {
-                    Node { width: Val::Px(360.0), height: Val::Px(160.0) }
+                    Node {
+                        width: Val::Px(360.0), height: Val::Px(160.0),
+                        flex_shrink: 0.0, overflow: Overflow::scroll(),
+                    }
+                    { RouteScroll::patch(|marker, _| {
+                        *marker = RouteScroll::new("body")
+                            .with_restore_policy(RouteScrollRestorePolicy::Explicit);
+                    }) }
                     Page(name)
+                    Children [(Node {
+                        width: Val::Px(720.0), height: Val::Px(600.0), flex_shrink: 0.0,
+                    })]
                 })
             })
             .unwrap();
@@ -153,6 +183,13 @@ fn main() {
     app.world_mut().get_mut::<ToolbarState>(toolbar).unwrap().0 = 7;
     assert_preserved(&mut app, &preserved, &parents);
     let first_page = show_page(&mut app, "overview", slot, &preserved);
+    let saved_scroll = Vec2::new(24.0, 96.0);
+    app.world_mut()
+        .get_mut::<ScrollPosition>(first_page)
+        .unwrap()
+        .0 = saved_scroll;
+    app.update();
+    assert_scroll(&app, first_page, saved_scroll);
 
     let request = app
         .world_mut()
@@ -180,8 +217,37 @@ fn main() {
         .unwrap();
     settle(&mut app, router, request, "/workspace/overview", 2, 0);
     assert_preserved(&mut app, &preserved, &parents);
-    show_page(&mut app, "overview", slot, &preserved);
+    let returned_overview = show_page(&mut app, "overview", slot, &preserved);
+    assert_ne!(returned_overview, first_page);
     assert!(app.world().get_entity(help_page).is_err());
+    let restoration = app
+        .world_mut()
+        .run_system_once(move |restorations: RouteScrollRestorations| {
+            restorations.pending(returned_overview, "body")
+        })
+        .unwrap()
+        .expect("Back freezes the original entry's scroll for the fresh child");
+    assert_eq!(restoration.position().0, saved_scroll);
+    // Navigation is already terminal while Explicit restoration waits for the
+    // application's content readiness. Signal this exact publication's intent.
+    assert_scroll(&app, returned_overview, Vec2::ZERO);
+    let ready = restoration.id();
+    app.world_mut()
+        .run_system_once(move |mut commands: Commands| {
+            commands.ready_route_scroll(ready.clone());
+        })
+        .unwrap();
+    app.update();
+    assert_scroll(&app, returned_overview, saved_scroll);
+    assert!(
+        app.world_mut()
+            .run_system_once(move |restorations: RouteScrollRestorations| {
+                restorations.pending(returned_overview, "body")
+            })
+            .unwrap()
+            .is_none()
+    );
+    println!("Restored the fresh overview's body to {saved_scroll:?} after content readiness.");
 
     // Leave the whole layout. Only it opts into retention; its child is disposed.
     let overview = only::<Page>(&mut app);
@@ -281,6 +347,21 @@ fn only<T: Component>(app: &mut App) -> Entity {
         .query_filtered::<Entity, With<T>>()
         .single(app.world())
         .unwrap()
+}
+
+fn assert_scroll(app: &App, entity: Entity, expected: Vec2) {
+    let world = app.world();
+    let requested = world.get::<ScrollPosition>(entity).unwrap().0;
+    let computed = world.get::<ComputedNode>(entity).unwrap();
+    let displayed = computed.scroll_position * computed.inverse_scale_factor;
+    assert!(
+        requested.abs_diff_eq(expected, 0.001),
+        "requested: {requested:?}"
+    );
+    assert!(
+        displayed.abs_diff_eq(expected, 0.001),
+        "displayed: {displayed:?}"
+    );
 }
 
 fn show_page(app: &mut App, name: &str, slot: Entity, layout: &[Entity]) -> Entity {

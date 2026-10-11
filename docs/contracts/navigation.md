@@ -72,11 +72,17 @@ publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不�
 
 离开 normal 页面时保存最后一次有效布局显示的二维逻辑像素位置，关联 Core canonical history entry 和 route 复用身份。同一 exact frame、Entity 和 key 仍有效而暂缺布局时保留最近见证；去标记、失去归属或替换 Entity 会清除该容器的 live 见证。重复 URL 的不同访问独立，Replace 使用新 entry。normal 被 error/fallback 替换时仍保存原位置，失败呈现不覆盖成功访问记录；失败保留原页面时不恢复或重置。
 
-成功 Back 恢复目标 entry，包括 cache hit 与仍存活的 preserved prefix 容器；Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。只对 publication 前已存在的标记容器准备位置，首个正常目标布局裁剪后，在 `UiSystems::Layout` 之后复验完整归属并单次回写实际位置；内容随后增长不会跳回旧请求值。
+成功 Back 为目标 entry 的已保存 frame/key 冻结恢复意图，包括 cache hit 与仍存活的 preserved prefix；容器可以已经存在或随后创建。Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。导航终态不等待内容就绪。
 
-容器或 frame 失效时丢弃恢复请求。缺少实际 UI 布局或有效相机时不保存伪造位置，放弃本次恢复并保留原值、给出有界诊断；不额外运行布局或延迟轮询。首版不自动追赶异步增长或延迟创建的容器。
+意图的 opaque ID 在每次 publication 独立创建；同 entry、frame 或 Entity 再次 Back 也不复用。`RouteScrollRestorations::pending(scope_entity, key)` 从该 exact active frame 的任意内容查询冻结位置及 ID，容器尚不存在也可查询。意图只绑定一次唯一容器，记录其原 Entity、frame、key、策略与位置；已绑定容器失效、key/策略改变或被替换时消费意图，不跟随替代 Entity。
 
-记录随 canonical entry 回收：Replace、forward 截断及 Router 移除释放对应记录；host loss 保留仍在 history 中的访问。接入方式见[集成指南](../guides/integration.md#滚动恢复)。
+`RouteScroll::new(key)` 默认 `Automatic`：绑定后的首个正常布局尝试一次。`with_restore_policy(RouteScrollRestorePolicy::Explicit)` 等待应用经 `Commands` 的 `ready_route_scroll(id)` 允许尝试，ready 可先于晚容器出现。新 publication 撤销旧意图；仅入队、未发布准备或保留当前内容的失败不取消它。旧或已消费 ID 无效果。
+
+等待时冻结目标与 entry 原记录保持，实际显示见证继续更新；采样和离场保存不能用初值覆盖仍有效意图的原记录。应用改变已绑定 `ScrollPosition` 则取消恢复，后续按实际显示采样；同 Update 立即离场也先复验该意图。应用在执行后改写位置，布局后不再用恢复结果覆盖。等值赋值与绑定前的应用意图不能由数值推断，可用 `cancel_route_scroll(id)` 明确取消；取消不回滚已经写入或应用自己的值。
+
+请求值统一在 `PostUpdate` 的 `RouterScrollSet::Prepare` 写入，该 set 在 `UiSystems::Content` 后、`UiSystems::Layout` 前；publication 后、Prepare 前读取组件可能仍为原值。正常布局后复验当前完整 branch 归属，单次回写实际裁剪位置并消费意图，内容随后增长不追赶旧目标。缺少实际布局或有效相机时不保存伪造位置，本次尝试放弃并保留绑定时原值，给出有界诊断；不额外运行布局或按固定帧重试。
+
+记录随 canonical entry 回收：Replace、forward 截断及 Router 移除释放对应记录；host loss 撤销意图，保留仍在 history 中的访问记录。接入方式见[集成指南](../guides/integration.md#滚动恢复)。
 
 ## Snapshots 与诊断
 

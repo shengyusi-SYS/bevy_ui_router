@@ -133,9 +133,36 @@ let router = app.add_ui_router(config)?;
 
 在 Scene 的滚动容器上同时声明 `RouteScroll::new("body")`、Bevy 的 `ScrollPosition` 和配置了 scroll overflow 的 `Node`；`RouteScroll` 从 facade/prelude 导入。多个容器使用不同稳定 key，例如 `"body"` 和 `"sidebar"`，子页面可重复父布局的 key。
 
-容器及标记需要在目标 publication 前存在，通常直接在 Scene 中声明；publication 后才新增容器或附加标记，即使赶在首次 layout 前，也不会加入本次恢复。内容在首个正常布局后增长不会再次跳回旧位置。
+默认自动策略在容器唯一绑定后的首个正常布局恢复一次。若内容需要加载或动态确定范围，声明显式策略：
 
-应用需安装正常 UI layout 并配置有效 camera/render target。Router 在 Back 时恢复该次访问的位置，包含缓存命中的 leaf 和被保留的父布局容器；未标记容器保持现有行为。完整语义和缺省行为见[导航合同](../contracts/navigation.md#按访问恢复滚动)，真实布局接入可参考[公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs)。
+```rust
+let marker = RouteScroll::new("body")
+    .with_restore_policy(RouteScrollRestorePolicy::Explicit);
+```
+
+BSN 中通过官方 `PatchFromTemplate` 声明修改，可参考 [nested 示例](../../crates/bevy_ui_router/examples/bsn_nested.rs)。应用决定内容何时足够恢复，再对当前意图 ready；只读 lookup 可以和应用自己的可变 Query 一起使用：
+
+```rust
+fn allow_restore(
+    restores: RouteScrollRestorations,
+    mut commands: Commands,
+    pages: Query<(Entity, &PageState)>,
+) {
+    for (scope, page) in &pages {
+        if page.content_ready {
+            if let Some(restore) = restores.pending(scope, "body") {
+                commands.ready_route_scroll(restore.id());
+            }
+        }
+    }
+}
+```
+
+`scope` 是该 active frame 内的内容 Entity，容器尚未创建也能查询；`restore.position()` 是被冻结的二维逻辑像素目标。取消或应用决定其它滚动政策时使用 `commands.cancel_route_scroll(restore.id())`。旧 ID 不影响下一次 Back；ready 不会等待范围继续增长，完成后内容增长也不再次跳动。
+
+新 UI 结构在 `Update` 或 `UiSystems::Prepare` 前创建并完成 deferred 写入，使相机等正常 propagation 生效。ready/cancel 与已有组件数值在 `RouterScrollSet::Prepare` 前生效；要覆盖本次恢复请求值，系统明确排在 Prepare 后、Layout 前。Commands 使用 Bevy 正常 deferred 同步。publication 与导航成功不代表本轮布局或恢复已经完成，最终位置在正常 Layout 后读取。
+
+应用需安装正常 UI layout 并配置有效 camera/render target。包括早晚容器、缓存命中和保留父布局的规则统一归[导航合同](../contracts/navigation.md#按访问恢复滚动)；真实布局边界见[公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs)。
 
 ## 输入与焦点接入
 
