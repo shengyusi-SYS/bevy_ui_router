@@ -40,6 +40,13 @@ def main():
             with tarfile.open(archive) as source:
                 source.extractall(consumer, filter="data")
             extracted[name] = consumer / f"{name}-{version}"
+            # Cargo archives normalize mtimes. In a shared target, a changed
+            # archive at the same package/version can otherwise look older than
+            # a cached build. Recompile these path sources, keeping bytes and
+            # registry dependency caches intact.
+            for source_file in extracted[name].rglob("*"):
+                if source_file.is_file():
+                    os.utime(source_file, None)
         facade = next(p for p in packages if p["name"] == "bevy_ui_router")
         manifest = (
             '[package]\nname = "packaged-router-consumer"\nversion = "0.0.0"\nedition = "2024"\n'

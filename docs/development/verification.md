@@ -101,7 +101,7 @@ cargo package --workspace
 python3 scripts/check-packaged-consumer.py
 ```
 
-第一步解压并验证六个库包；[产物 consumer](../../scripts/check-packaged-consumer.py) 只把 Router 依赖指向这些解压产物，核对实际来源后运行包内 BSN consumer。Bevy 来自官方 crates.io，consumer 固定 0.19.1。标准打包需要可用的 registry；已有离线多包验证曾遇到 Cargo checksum 错误，不能用 `--no-verify` 将它转成通过。确需验证未提交改动时，先审阅实际 diff，再显式使用 `--allow-dirty` 并准确记录源码状态。
+第一步解压并验证六个库包；[产物 consumer](../../scripts/check-packaged-consumer.py) 只把 Router 依赖指向这些解压产物，核对实际来源后运行包内 BSN consumer。Bevy 来自官方 crates.io，consumer 固定 0.19.1。归档文件的规范化时间戳可能让共享 target 复用同版本旧编译产物；脚本刷新解压源码时间戳，确保实际编译本次包内容，并保留 registry 依赖缓存。标准打包需要可用的 registry；已有离线多包验证曾遇到 Cargo checksum 错误，不能用 `--no-verify` 将它转成通过。确需验证未提交改动时，先审阅实际 diff，再显式使用 `--allow-dirty` 并准确记录源码状态。
 
 ## 已有证据与未验证范围
 
@@ -113,9 +113,7 @@ python3 scripts/check-packaged-consumer.py
 
 父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。尚未在窗口重跑父子独立库存。
 
-访问级滚动统一意图已通过格式、workspace 全目标/全特性检查与未跳过用例的全特性测试，包含早晚容器、显式 ready、取消、同 Update 离场、应用写入优先及失败保留原 ID；ECS 无默认特性与独立 consumer 通过。nested 原样消费在真实正常 UI 布局中验证 fresh 子页 Back 后 ready；最终窗口尚未覆盖新增滚动行为。
-
-完整提交树 `efe1989a415c30e83ee9e9b07e2dfcdb48d054cb` 已执行 `cargo package --workspace --locked`，六个包均验证成功；`scripts/check-packaged-consumer.py` 核对来源后，从六个解压 Router 产物运行公开 BSN consumer 成功。标准打包在可用 registry 网络下完成，未跳过验证或上传。该证据覆盖当时的父子库存树，不覆盖随后滚动/输入扩展；最终发布树仍需复核。
+滚动统一意图源码 `69615784830b3b4f425f6e7991fd4a503b31c26c` 已通过格式、workspace 全目标/全特性静态检查、未跳过用例的全特性测试、ECS 无默认特性及独立 consumer。nested 原样消费与实际运行在正常 UI 布局中验证 fresh 子页 Back 后 ready。该提交树执行 `cargo package --workspace --locked`，六个包均验证成功；产物 consumer 复编译解压 Router 源码，核对实际来源后运行公开 BSN 旅程成功。未跳过打包验证或上传；最终窗口尚未覆盖新增父子/滚动行为，选定发布树变化后按风险复核。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 
