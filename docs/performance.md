@@ -49,6 +49,26 @@ ROUTER_BENCH_MODE=keep_alive ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_ro
 
 这些列观察 authored 页面、内容和活实体；不测 heap，也不暴露或推定 Core 内部 owner 数量。导航与 idle 的差异包含相应驻留内容和公开 Router 机制，不能单凭时间差归因到某个内部步骤。该模式同样没有 UI layout、GPU、窗口或 I/O。
 
+## 父子库存对照
+
+父子库存采用独立 `instances` 模式：
+
+```sh
+ROUTER_BENCH_MODE=instances cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > instances-flat.csv
+ROUTER_BENCH_MODE=instances ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > instances-nested.csv
+```
+
+每组 24 行、正式每场景 128 样本；至少两轮 flat/nested。预热 64 次导航，让公开终态请求保留达到稳定数量，计时外继续核对；避免把请求增长期混入稳态。行为 smoke 将 `cargo bench` 换为 `cargo test` 并加 `-- --test`。父和子**各自**含 1/32/128 个 authored 内容节点，活动内容总数为两倍，不能与旧 leaf 模式按相同数字直接计算性能变化。
+
+| 场景前缀 | 连续 Replace 的真实工作 |
+| --- | --- |
+| `disabled` | 容量 0，父子均 fresh，旧父子清理 |
+| `parent_fresh_child` | 容量 2，仅父保留；原父 Entity/局部状态复用，子每次 fresh |
+| `parent_child_hit` | 容量 2，父子均保留；预热后原父子命中，factory 均不调用 |
+| `dependency_eviction` | 容量 2，三对父子循环；满容量后每次 fresh，淘汰一组有 exact 父依赖的旧父子 |
+
+同样报告导航与 idle；计时沿用 enqueue 至终态及前台 cleanup 清空的边界。计时外核对公共 activity、输入资格、history、factory 次数、原 Entity/父局部状态、库存数量和稳定活实体数，场景结束用真实 fallback 路径释放全部父子及内容。输出父/子独立内容预算、非活动实例和 factory 计数；不测 heap 或内部 owner 数。普通基础插件和内容 builder 与其它模式相同，不含 UI layout、GPU、窗口或异步 I/O。
+
 ## 计时边界
 
 Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `App::update` 和 snapshots 驱动。路由树固定为父布局及两个子路由，页面含 1/32/128 个 authored `Node + Content` 子节点，另有布局、工具栏和内部 outlet。它不测路由表规模。

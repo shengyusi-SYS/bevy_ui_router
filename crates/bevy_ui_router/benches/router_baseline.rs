@@ -2,6 +2,9 @@
 //! No renderer, UI layout, OS events, async I/O, or frame pacing is installed.
 //! ROUTER_BENCH_SHAPE=flat (default) or nested selects equal-sized content trees.
 //! ROUTER_BENCH_MODE=keep_alive selects the separate retention comparison CSV.
+//! ROUTER_BENCH_MODE=instances measures parent/child inventory coordination.
+#[path = "router_baseline/retained_instances.rs"]
+mod retained_instances;
 use std::{
     sync::{
         Arc,
@@ -749,6 +752,10 @@ fn main() {
         }
     );
     match std::env::var("ROUTER_BENCH_MODE") {
+        Ok(mode) if mode == "instances" => {
+            retained_instances::run(shape, samples);
+            return;
+        }
         Ok(mode) if mode == "keep_alive" => {
             println!(
                 "scenario,content_children,capacity,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,active_pages,inactive_pages,factory_builds"
@@ -759,7 +766,7 @@ fn main() {
             return;
         }
         Err(std::env::VarError::NotPresent) => {}
-        mode => panic!("ROUTER_BENCH_MODE must be unset or keep_alive, got {mode:?}"),
+        mode => panic!("ROUTER_BENCH_MODE must be unset, keep_alive or instances, got {mode:?}"),
     }
     println!(
         "scenario,content_children,batch,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,retained_requests"
