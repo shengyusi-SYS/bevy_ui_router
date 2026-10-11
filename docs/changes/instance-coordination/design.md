@@ -1,6 +1,6 @@
 # 实例协调与当前路由输入
 
-状态：当前只读输入与实例/owner 等价迁移已实现并通过完整门禁；父实例保留、独立子库存与依赖淘汰仍为待实施设计。本文定义本专题的行为与跨层接缝；现行行为见[导航合同](../../contracts/navigation.md)、[Scene 合同](../../contracts/scene.md)和[生命周期合同](../../contracts/lifecycle.md)。执行拆分见[实施计划](plan.md)，选型原因与其它专题见[长期评估](../navigation-experience/assessment.md)。
+状态：当前只读输入与实例/owner 等价迁移已实现并通过完整门禁；父实例保留、独立子库存与依赖淘汰已实现并通过公开及完整 crate 回归，代表性能与发布收口仍待完成。本文定义本专题的行为与跨层接缝；现行行为见[导航合同](../../contracts/navigation.md)、[Scene 合同](../../contracts/scene.md)和[生命周期合同](../../contracts/lifecycle.md)。执行拆分见[实施计划](plan.md)，选型原因与其它专题见[长期评估](../navigation-experience/assessment.md)。
 
 ## 目标与范围
 

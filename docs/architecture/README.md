@@ -24,7 +24,7 @@ flowchart TD
 
 | Crate | 拥有的职责 | 边界 |
 | --- | --- | --- |
-| Core | location、匹配、branch diff、请求顺序、frame/generation、history、leaf 保留/命中/LRU、失败与恢复决策 | 无 Bevy 或其他外部依赖，不操作 Entity |
+| Core | location、匹配、branch diff、请求顺序、frame/generation、history、实例选择/保留/LRU 与父依赖、失败与恢复决策 | 无 Bevy 或其他外部依赖，不操作 Entity |
 | View | view key、driver key、registry、descriptor、只读 effect/input | 仅依赖 Core，不拥有 World 或 lifecycle 权限 |
 | ECS | host/slot/frame binding、执行编排、staging、publication、cleanup、retained 物理内容、滚动、输入与活动资格 | 消费 Core 的受控合同，不维护第二套路由/history |
 | BSN | fresh Scene factory、build error、default outlet 声明 | 不依赖 ECS，不签发 mount、frame 或 commit 权限 |
@@ -71,7 +71,7 @@ Core 拥有 history 与保留决策，ECS 按 opaque entry key 保存滚动位�
 | route tree、稳定候选匹配、prefix/suffix | [route_tree.rs](../../crates/bevy_ui_router_core/src/route_tree.rs)、[matcher.rs](../../crates/bevy_ui_router_core/src/matcher.rs)、[branch_diff.rs](../../crates/bevy_ui_router_core/src/branch_diff.rs) |
 | Core 决策与跨 crate 协议 | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs)、[integration.rs](../../crates/bevy_ui_router_core/src/integration.rs) |
 | history authority、post-commit 与 idle settlement | [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)、[post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs)、[idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) |
-| leaf 保留、命中/LRU 与自身失效 continuation | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs)、[retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) |
+| 实例保留、父依赖/LRU 与自身失效 continuation | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs)、[retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) |
 | 单实例物理 payload 与预分配转移接收器 | ECS [instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs)；只读 payload 投影不持有 owner |
 | entry 滚动与页面活动资格 | ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs)、[activity.rs](../../crates/bevy_ui_router_ecs/src/activity.rs) |
 | View registry 与 effect | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs)、[effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |

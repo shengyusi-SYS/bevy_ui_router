@@ -178,22 +178,28 @@ impl PreparedInstanceExtraction {
     }
 }
 
-/// A single-instance receiver for the existing active/fresh transaction shape.
-/// The receiver is allocated before acceptance; finish only moves original owners.
+/// Receives original selected instances in target order. Both vectors are
+/// allocated before acceptance; finish only moves already owned payloads.
 #[derive(Debug)]
 pub(crate) struct PreparedInstanceBranch {
     frames: Vec<RealizedFrame>,
+    slots: Vec<MountedChildSlot>,
 }
 impl PreparedInstanceBranch {
-    pub(crate) fn reserve() -> Self {
+    pub(crate) fn reserve_for(frame_count: usize, slot_count: usize) -> Self {
         let mut frames = Vec::new();
-        frames.reserve_exact(1);
-        Self { frames }
+        frames.reserve_exact(frame_count);
+        let mut slots = Vec::new();
+        slots.reserve_exact(slot_count);
+        Self { frames, slots }
     }
-    pub(crate) fn finish(mut self, instance: InstancePayload) -> RealizedBranch {
-        let (frame, slots) = instance.into_owned_parts();
-        self.frames.push(frame);
-        RealizedBranch::from_owned_parts(self.frames, slots)
+    pub(crate) fn finish_instances(mut self, instances: Vec<InstancePayload>) -> RealizedBranch {
+        for instance in instances {
+            let (frame, mut slots) = instance.into_owned_parts();
+            self.frames.push(frame);
+            self.slots.append(&mut slots);
+        }
+        RealizedBranch::from_owned_parts(self.frames, self.slots)
     }
 }
 
@@ -387,19 +393,41 @@ pub(crate) fn validate_retained_entering_payload(
                 .map_or(bevy_ecs::entity::Entity::PLACEHOLDER, |frame| frame.shell()),
         ));
     };
-    if let Some(slot) = entering.child_slots().iter().find(|slot| {
-        world
-            .get::<bevy_ecs::hierarchy::Children>(slot.slot())
-            .is_some_and(|children| !children.is_empty())
-    }) {
-        return Err(crate::frame_local::FrameLocalError::ForeignChildSlot(
-            slot.slot(),
-        ));
-    }
     if world
         .get_resource::<crate::registry::RouteEntityRegistry>()
         .is_some_and(|registry| {
             registry.retained_payload_is_current(world, projection, frame, entering.child_slots())
+        })
+    {
+        Ok(())
+    } else {
+        Err(crate::frame_local::FrameLocalError::OwnershipDrift(
+            frame.shell(),
+        ))
+    }
+}
+
+pub(crate) fn validate_retained_entering_payload_with_fresh(
+    world: &bevy_ecs::world::World,
+    entering: PayloadRef<'_>,
+    projection: &RetainedLeafProjection,
+    fresh: PayloadRef<'_>,
+) -> Result<(), crate::frame_local::FrameLocalError> {
+    let [frame] = entering.frames() else {
+        return Err(crate::frame_local::FrameLocalError::OwnershipDrift(
+            bevy_ecs::entity::Entity::PLACEHOLDER,
+        ));
+    };
+    if world
+        .get_resource::<crate::registry::RouteEntityRegistry>()
+        .is_some_and(|registry| {
+            registry.retained_payload_is_current_with_fresh(
+                world,
+                projection,
+                frame,
+                entering.child_slots(),
+                fresh,
+            )
         })
     {
         Ok(())

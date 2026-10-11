@@ -2967,6 +2967,7 @@ fn returned_receipt_bundle_fixture() -> (App, NavigationRequestId, Entity, Vec<E
                 artifact: MountMutationArtifact::Receipt(error.into_owner()),
                 payload: PendingMountMutationPayload::Receipt { staged, proof },
                 allowance: None,
+                invalidation: None,
             });
             (request, slot, frame_entities)
         },
@@ -5440,7 +5441,7 @@ fn retained_hit_host_loss_settles_all_cache_owners_and_readmits_without_replay()
         let entry = &app.world().resource::<RouterNavigation>().entries[0];
         let pending = entry.pending_commit.as_ref().unwrap();
         assert!(
-            pending.retained_hit.is_some(),
+            !entry.engine.selected_retained_instances().is_empty(),
             "exercise a selected real cache hit"
         );
         assert!(pending.branch.frames().is_empty());
@@ -8873,6 +8874,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         scroll: crate::scroll::ScrollState::default(),
         retained: crate::retained::RetainedLeaves::default(),
         retained_miss_cleanup: None,
+        pending_retained_invalidation: None,
         cleanup_ledger: None,
         post_commit_compound: None,
         settled_retired_host_evidence: None,
@@ -33679,6 +33681,7 @@ fn exact_root_stale_application_retains_task_outside_final_task() {
                 top_slot_claim,
                 Some(&pending.branch),
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &task,
                 artifact,
             );
@@ -33765,6 +33768,7 @@ fn exact_child_stale_application_retains_nonleaf_branch_for_cleanup() {
                 top_slot_claim,
                 None,
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &task,
                 artifact,
             );
@@ -33838,6 +33842,7 @@ fn prepare_exact_child_stale_failure(app: &mut App) -> (NavigationRequestId, Rou
                 top_slot_claim,
                 None,
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &task,
                 artifact,
             );
@@ -33892,6 +33897,7 @@ fn prepare_exact_child_physical_residual_failure(
                 top_slot_claim,
                 Some(&pending.branch),
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &task,
                 artifact,
             ) {
@@ -34060,6 +34066,7 @@ fn prepare_reconciliation_stale_failure_with_active(
                 top_slot_claim,
                 None,
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &task,
                 artifact,
             );
@@ -36556,6 +36563,7 @@ pub(crate) fn production_report_application_rejects_opaque_or_foreign_identity_b
                 host.top_slot_claim.clone(),
                 None,
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &current_task,
                 artifact,
             )
@@ -36595,6 +36603,7 @@ pub(crate) fn production_report_application_rejects_opaque_or_foreign_identity_b
                 host.top_slot_claim.clone(),
                 None,
                 None,
+                &crate::retained::RetainedLeaves::default(),
                 &foreign_task,
                 artifact,
             )

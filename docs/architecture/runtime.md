@@ -18,14 +18,16 @@ flowchart TD
     Outlet --> Slot["Router child slot"]
     Slot --> ChildShell["active 子 FrameShell"]
     ChildShell --> ChildRoot["子 Scene 内容根"]
-    Slot --> Retained["retained leaf shell<br/>隐藏、独立长期 owner"]
+    Slot --> Retained["retained 实例 shell<br/>隐藏、独立长期 owner"]
     Retained --> CachedRoot["原 Scene 内容根与局部状态"]
+    CachedRoot --> CachedOutlet["实例自有 outlet / child slot"]
+    CachedOutlet --> CachedChild["独立 retained 子实例<br/>依赖原父作用域"]
 ```
 
 host 由应用创建、布置并添加 `RouterHostRegistration`。Router 管理自己的
 top slot、frame shell、child slot 及授权内容边界，不删除或重建 host。
 `DefaultOutlet` 是 Scene 内的普通声明，可以放在内部容器上；它本身不是
-mount binding 或 lifecycle owner。符合条件的 retained leaf 与 active sibling 留在同一 child slot 下；其独立 role/claim 使它成为受保护的非活动内容，不扩大 active frame 的内容边界。
+mount binding 或 lifecycle owner。符合条件的 retained 实例与 active sibling 留在同一 child slot 下，非活动父内部也可存在独立的子库存；各自 role/claim 使其成为受保护的非活动内容，不扩大父 frame 的内容权限。
 
 结构身份关联 Router、host、slot、frame 与 generation；执行结果还需匹配 task。
 host registration 的 incarnation 区分同一 Entity 上移除再插入的实例。
@@ -60,13 +62,15 @@ sequenceDiagram
     Note over Nav,Core: 后续 Update 按顺序推进，可跨多轮
     Nav->>Core: collect / 获取 action
     Core-->>Nav: 当前 frame task 与 mount 合同
-    Nav->>Core: 核对同父 retained 候选与原 owner
-    alt 有效缓存命中
-        Nav->>World: 借原实体准备目标，不运行 factory/apply
-    else 未命中
-        Nav->>Scene: 只读 input，构建并 resolve fresh Scene
-        Nav->>World: 登记、inert staging、apply、写后复验
-        Nav->>Core: 消费执行与挂载结果
+    Nav->>Core: 冻结逐实例 Current / Retained / Fresh 选择
+    loop 目标链从父到子
+        alt Current / Retained
+            Nav->>World: 借原实体与自有 slots 准备，不运行 factory/apply
+        else Fresh
+            Nav->>Scene: 只读 input，构建并 resolve fresh Scene
+            Nav->>World: 登记、inert staging、apply、写后复验
+            Nav->>Core: 消费执行与挂载结果
+        end
     end
     Nav->>World: 准备 current/next、输入/focus 与 cleanup/retained owner
     Note over Nav,World: 所有可失败准备与最终校验在 publication 前完成
@@ -91,7 +95,9 @@ ECS 先将物理切换、输入/focus 和后续 cleanup owner 组合成准备好
 这时已发布页面和 history 已生效；清理失败不能回滚或改写原成功结果。
 snapshot 发布是每轮观察出口，与真正的 presentation publication 是不同步骤。
 
-Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定命中、容量分区和退休责任；ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 持有原物理 payload 与长期 owner。[instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) 的 payload 只含一个原 frame 及以它为 parent 的自有 slots，外部父 mount 是 alias，不进入子实例清理写集。active/fresh 分支仍是交易集合；激活与清理通过预分配接收器消费原 payload。命中先借库存做全部准备，最后单次移交原 owner；拒绝保留原责任。容量按非活动库存计算，简单 LRU 复用同一离场/cleanup 管线。安全的缓存自身失效通过私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算该实例，再返还原 fresh task；当前 authority 失效仍走原 authority settlement。语义范围归[导航](../contracts/navigation.md#同父-leaf-保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
+Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs) 决定逐实例选择、容量分区和退休责任，[instances.rs](../../crates/bevy_ui_router_core/src/engine/instances.rs) 提供原身份及父依赖排序。ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 持有原物理 payload 与长期 owner。[instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) 的 payload 只含一个原 frame 及以它为 parent 的自有 slots，外部父 mount 是 alias，不进入子实例清理写集。
+
+统一 mixed preparation 组合 `Current* → Retained* → Fresh*`，只有 fresh suffix 运行 Scene 并形成新建义务；命中先借库存做全部准备，最后单次移交原 owner，拒绝保留原责任。容量按非活动实例计算，淘汰的父依赖闭包按 child-first 消费原 payload。私有 [retained_miss.rs](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) 先结算自身失效实例及依赖，再返还原 Task/Mount/Commit 或失败 continuation；共享 authority loss 保持独立分流。语义范围归[导航](../contracts/navigation.md#实例保留)与[生命周期合同](../contracts/lifecycle.md#非活动实例与长期-owner)。
 
 共享 slot 的 cleanup 从当前 exact children 冻结选定删除边；activation 保留发布前校验快照，独立准备清理后的 mount prior，避免命中或 LRU 淘汰将旧 sibling 带入下一轮。
 

@@ -1,5 +1,5 @@
 //! A finite headless demonstration of real UI layout, with no GPU or OS window.
-//! Sidebar and toolbar survive page navigation through an internal default outlet.
+//! Sidebar and toolbar survive child navigation and a visit outside the layout.
 use bevy_app::App;
 use bevy_asset::AssetPlugin;
 use bevy_ecs::prelude::*;
@@ -15,6 +15,8 @@ struct Layout;
 struct Sidebar;
 #[derive(Component, Clone, Default)]
 struct MainColumn;
+#[derive(Component, Clone, Default)]
+struct WorkspaceOutlet;
 #[derive(Component, Clone, Default)]
 struct ToolbarState(u32);
 #[derive(Component, Clone, Default)]
@@ -45,7 +47,7 @@ fn main() {
                         flex_direction: FlexDirection::Column,
                     } MainColumn Children [
                         (Node { width: Val::Percent(100.0), height: Val::Px(32.0) } ToolbarState),
-                        (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet)
+                        (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet WorkspaceOutlet)
                     ])
                 ]
             })
@@ -56,14 +58,35 @@ fn main() {
     views
         .insert(layout_view.clone(), RouteViewDescriptor::new(layout_driver))
         .unwrap();
+    let app_driver = app
+        .register_bsn_view(ViewDriverKey::new("app").unwrap(), |_| {
+            Ok(bsn! {
+                Node { width: Val::Percent(100.0), height: Val::Percent(100.0) }
+                DefaultOutlet
+            })
+        })
+        .unwrap();
+    let app_view = RouteViewKey::new("app").unwrap();
+    views
+        .insert(app_view.clone(), RouteViewDescriptor::new(app_driver))
+        .unwrap();
     let mut routes = RouteTree::builder()
         .root_with_options(
-            RoutePattern::path("/").unwrap(),
-            RouteNodeOptions::new().with_view(layout_view),
+            RoutePattern::pathless(),
+            RouteNodeOptions::new().with_view(app_view),
         )
         .unwrap();
     let root = routes.root_id().unwrap();
-    for name in ["overview", "settings", "help"] {
+    let workspace = routes
+        .route_with_options(
+            root,
+            RoutePattern::path("workspace").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(layout_view)
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    for name in ["overview", "settings", "help", "outside"] {
         let driver = app
             .register_bsn_view(ViewDriverKey::new(name).unwrap(), move |_| {
                 Ok(bsn! {
@@ -78,7 +101,7 @@ fn main() {
             .unwrap();
         routes
             .route_with_options(
-                root,
+                if name == "outside" { root } else { workspace },
                 RoutePattern::path(name).unwrap(),
                 RouteNodeOptions::new().with_view(view),
             )
@@ -95,7 +118,9 @@ fn main() {
         .insert(fallback.clone(), RouteViewDescriptor::new(driver))
         .unwrap();
     let router = app
-        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        .add_ui_router(
+            RouterConfig::new(routes.build().unwrap(), views, fallback).with_keep_alive_capacity(1),
+        )
         .unwrap();
     app.world_mut().spawn((
         Node {
@@ -110,14 +135,14 @@ fn main() {
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/overview"))
+        .push(router, RouteLocation::new("/workspace/overview"))
         .unwrap();
-    settle(&mut app, router, request, "/overview", 1, 0);
+    settle(&mut app, router, request, "/workspace/overview", 1, 0);
     let layout = only::<Layout>(&mut app);
     let sidebar = only::<Sidebar>(&mut app);
     let column = only::<MainColumn>(&mut app);
     let toolbar = only::<ToolbarState>(&mut app);
-    let outlet = only::<DefaultOutlet>(&mut app);
+    let outlet = only::<WorkspaceOutlet>(&mut app);
     // Observe the single child slot through Bevy's public hierarchy, without
     // importing Router's private slot/identity components or modifying the slot.
     let children = app.world().get::<Children>(outlet).unwrap();
@@ -132,9 +157,9 @@ fn main() {
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/settings"))
+        .push(router, RouteLocation::new("/workspace/settings"))
         .unwrap();
-    settle(&mut app, router, request, "/settings", 2, 1);
+    settle(&mut app, router, request, "/workspace/settings", 2, 1);
     assert_preserved(&mut app, &preserved, &parents);
     let settings_page = show_page(&mut app, "settings", slot, &preserved);
     assert!(app.world().get_entity(first_page).is_err());
@@ -142,9 +167,9 @@ fn main() {
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .replace(router, RouteLocation::new("/help"))
+        .replace(router, RouteLocation::new("/workspace/help"))
         .unwrap();
-    settle(&mut app, router, request, "/help", 2, 1);
+    settle(&mut app, router, request, "/workspace/help", 2, 1);
     assert_preserved(&mut app, &preserved, &parents);
     let help_page = show_page(&mut app, "help", slot, &preserved);
     assert!(app.world().get_entity(settings_page).is_err());
@@ -153,12 +178,57 @@ fn main() {
         .resource_mut::<RouterNavigation>()
         .back(router)
         .unwrap();
-    settle(&mut app, router, request, "/overview", 2, 0);
+    settle(&mut app, router, request, "/workspace/overview", 2, 0);
     assert_preserved(&mut app, &preserved, &parents);
     show_page(&mut app, "overview", slot, &preserved);
     assert!(app.world().get_entity(help_page).is_err());
 
-    println!("Preserved layout, sidebar, toolbar state=7, internal outlet and child slot.");
+    // Leave the whole layout. Only it opts into retention; its child is disposed.
+    let overview = only::<Page>(&mut app);
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/outside"))
+        .unwrap();
+    settle(&mut app, router, request, "/outside", 2, 1);
+    let outside = only::<Page>(&mut app);
+    assert_eq!(app.world().get::<Page>(outside).unwrap().0, "outside");
+    assert!(app.world().get_entity(overview).is_err());
+    assert_preserved(&mut app, &preserved, &parents);
+    assert!(
+        !app.world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(layout)
+    );
+
+    // Reuse the original layout, but let the new route select a fresh child.
+    let request = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/workspace/settings"))
+        .unwrap();
+    settle(&mut app, router, request, "/workspace/settings", 3, 2);
+    assert_preserved(&mut app, &preserved, &parents);
+    let returned_settings = show_page(&mut app, "settings", slot, &preserved);
+    assert_ne!(returned_settings, settings_page);
+    assert!(app.world().get_entity(outside).is_err());
+    assert!(
+        app.world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(layout)
+    );
+    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
+    assert_eq!(
+        inputs
+            .get(app.world())
+            .unwrap()
+            .current(toolbar)
+            .unwrap()
+            .location(),
+        &RouteLocation::new("/workspace/settings")
+    );
+
+    println!("Reused the original layout and toolbar state=7 with the newly selected child.");
 }
 
 fn assert_preserved(app: &mut App, entities: &[Entity; 6], parents: &[Entity; 6]) {
@@ -167,7 +237,7 @@ fn assert_preserved(app: &mut App, entities: &[Entity; 6], parents: &[Entity; 6]
     assert_eq!(only::<Sidebar>(app), sidebar);
     assert_eq!(only::<MainColumn>(app), column);
     assert_eq!(only::<ToolbarState>(app), toolbar);
-    assert_eq!(only::<DefaultOutlet>(app), outlet);
+    assert_eq!(only::<WorkspaceOutlet>(app), outlet);
     for (&entity, &parent) in entities.iter().zip(parents) {
         assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), parent);
     }

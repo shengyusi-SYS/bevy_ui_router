@@ -797,7 +797,7 @@ fn back_target_permanent_begin_rejects_owned_noncanonical_relations_losslessly()
         let expected_child_index = pending_mount.child_index;
         let expected_parent = pending_mount.parent.clone();
         let expected_outlet = pending_mount.outlet.clone();
-        let expected_from_preserved_parent = pending_mount.from_preserved_parent;
+        let expected_parent_source = pending_mount.parent_source;
         engine
             .current
             .as_mut()
@@ -860,10 +860,7 @@ fn back_target_permanent_begin_rejects_owned_noncanonical_relations_losslessly()
         assert_eq!(observed.child_index, expected_child_index);
         assert_eq!(observed.parent, expected_parent);
         assert_eq!(observed.outlet, expected_outlet);
-        assert_eq!(
-            observed.from_preserved_parent,
-            expected_from_preserved_parent
-        );
+        assert_eq!(observed.parent_source, expected_parent_source);
         assert_eq!(callback_calls.get(), 0);
         assert_eq!(engine.snapshot(), before);
         let current = engine
@@ -874,10 +871,7 @@ fn back_target_permanent_begin_rejects_owned_noncanonical_relations_losslessly()
         assert_eq!(current.child_index, expected_child_index);
         assert_eq!(current.parent, expected_parent);
         assert_eq!(current.outlet, expected_outlet);
-        assert_eq!(
-            current.from_preserved_parent,
-            expected_from_preserved_parent
-        );
+        assert_eq!(current.parent_source, expected_parent_source);
     }
 
     fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
@@ -10556,13 +10550,21 @@ fn prepared_retained_activation() -> (
     let EngineAction::FrameTask(task) = engine.action().unwrap() else {
         panic!("the retained leaf is selected before its fresh factory runs")
     };
+    let selection = engine
+        .prepare_instance_selection(&task, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    let EngineAction::Commit(ticket) = engine
+        .accept_instance_selection(task, &selection)
+        .unwrap_or_else(|_| panic!("original selected instance accepts"))
+    else {
+        panic!("all selected instances commit")
+    };
     let plan = engine
-        .prepare_retained_hit_plan(&task, &owners.iter().collect::<Vec<_>>())
-        .unwrap()
+        .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
         .unwrap();
     let (prepared, normal) = engine
-        .prepare_retained_hit_publication(
-            task,
+        .prepare_retained_publication(
+            &ticket,
             &plan,
             CleanupManifestSeal::new(Vec::new(), manifest_digest(0x7171), 0),
             std::mem::take(&mut owners),
@@ -10687,12 +10689,21 @@ fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_sourc
         engine.complete_cleanup(valid_completion(&normal)).unwrap();
     }
     assert_eq!(owners.len(), 1);
+    let original_child = owners[0].projection().clone();
+    assert_eq!(
+        original_child.parent(),
+        engine.active().frames().last().unwrap()
+    );
+    // Independent parent retention no longer retires this child by itself.
+    // A real capacity reduction exercises the normal-token retirement half.
+    engine = engine.with_keep_alive_capacity(1);
     let normal = publish_retained_post_commit_test_navigation(&mut engine, "/items/2", &mut owners);
     assert_eq!(
         owners.len(),
         1,
-        "only the still-live parent leaf has an ECS owner"
+        "capacity retires the older child while the departing parent keeps its owner"
     );
+    assert_eq!(owners[0].projection().frame(), original_child.parent());
     assert_eq!(
         engine.retained_leaves.len(),
         2,
@@ -10707,6 +10718,7 @@ fn post_commit_retained_transfer_preserves_both_batch_bindings_and_returns_sourc
         .projection()
         .frame()
         .clone();
+    assert_eq!(&original_retiring, original_child.frame());
     assert_eq!(
         engine
             .retained_leaves

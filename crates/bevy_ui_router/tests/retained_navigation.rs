@@ -10,7 +10,10 @@ use bevy_ui::Node;
 use bevy_ui_router::prelude::*;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Component, Clone, Default)]
@@ -22,9 +25,110 @@ struct Fixture {
     app: App,
     router: RouterHandle,
     factories: Arc<Mutex<HashMap<&'static str, usize>>>,
+    reject_child: Arc<AtomicBool>,
 }
 
 impl Fixture {
+    fn nested(capacity: usize, keep_child: bool) -> Self {
+        let mut app = App::new();
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+            BevyUiRouterPlugin::default(),
+        ));
+        let factories = Arc::new(Mutex::new(HashMap::new()));
+        let reject_child = Arc::new(AtomicBool::new(false));
+        let mut views = RouteViewRegistry::new();
+        for name in ["layout", "p", "c", "d", "q"] {
+            let calls = factories.clone();
+            let reject_child = reject_child.clone();
+            let driver = app
+                .register_bsn_view(ViewDriverKey::new(name).unwrap(), move |_| {
+                    *calls.lock().unwrap().entry(name).or_default() += 1;
+                    if name == "d" && reject_child.swap(false, Ordering::SeqCst) {
+                        return Err(BsnBuildError::new("detail build rejected"));
+                    }
+                    Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
+                        root.push_template(Node::default());
+                        root.push_template(Page(name));
+                        root.push_template(LocalValue::default());
+                        if name == "layout" {
+                            root.push_template(
+                                <DefaultOutlet as FromTemplate>::Template::default(),
+                            );
+                        } else if name == "p" {
+                            let mut container = ResolvedScene::default();
+                            container.push_template(Node::default());
+                            container.push_template(<DefaultOutlet as FromTemplate>::Template::default());
+                            root.get_or_insert_related_resolved_scenes::<ChildOf>().scenes.push(container);
+                        }
+                    }))
+                })
+                .unwrap();
+            views
+                .insert(
+                    RouteViewKey::new(name).unwrap(),
+                    RouteViewDescriptor::new(driver),
+                )
+                .unwrap();
+        }
+        let mut tree = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::pathless(),
+                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+            )
+            .unwrap();
+        let root = tree.root_id().unwrap();
+        let parent = tree
+            .route_with_options(
+                root,
+                RoutePattern::path("p").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("p").unwrap())
+                    .with_keep_alive(true),
+            )
+            .unwrap();
+        for (name, keep) in [("c", keep_child), ("d", false)] {
+            let mut options = RouteNodeOptions::new()
+                .with_view(RouteViewKey::new(name).unwrap())
+                .with_keep_alive(keep);
+            if name == "d" {
+                options = options.with_error_view(
+                    ErrorBoundaryKey::named("detail").unwrap(),
+                    RouteViewKey::new("q").unwrap(),
+                );
+            }
+            tree.route_with_options(parent, RoutePattern::path(name).unwrap(), options)
+                .unwrap();
+        }
+        tree.route_with_options(
+            root,
+            RoutePattern::path("q").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("q").unwrap()),
+        )
+        .unwrap();
+        let router = app
+            .add_ui_router(
+                RouterConfig::new(
+                    tree.build().unwrap(),
+                    views,
+                    RouteViewKey::new("q").unwrap(),
+                )
+                .with_keep_alive_capacity(capacity),
+            )
+            .unwrap();
+        app.world_mut()
+            .spawn((Node::default(), RouterHostRegistration::new(router)));
+        app.update();
+        Self {
+            app,
+            router,
+            factories,
+            reject_child,
+        }
+    }
+
     fn new(capacity: usize, keep: [bool; 5]) -> Self {
         let mut app = App::new();
         app.add_plugins((
@@ -93,6 +197,7 @@ impl Fixture {
             app,
             router,
             factories,
+            reject_child: Arc::new(AtomicBool::new(false)),
         }
     }
     fn settle(&mut self, request: NavigationRequestId) {
@@ -106,7 +211,10 @@ impl Fixture {
             {
                 match request.status() {
                     RequestStatus::Succeeded => return,
-                    RequestStatus::Failed(failure) => panic!("navigation failed: {failure:?}"),
+                    RequestStatus::Failed(failure) => panic!(
+                        "navigation failed: {failure:?}, trace: {:?}",
+                        request.trace()
+                    ),
                     _ => (),
                 }
             }
@@ -156,6 +264,458 @@ impl Fixture {
             .copied()
             .unwrap_or(0)
     }
+
+    fn fail(&mut self, request: NavigationRequestId, kind: NavigationFailureKind) {
+        for _ in 0..32 {
+            self.app.update();
+            if let RequestLookup::Found(record) = self
+                .app
+                .world()
+                .resource::<RouterSnapshots>()
+                .request(self.router, request)
+            {
+                if let RequestStatus::Failed(failure) = record.status() {
+                    assert_eq!(failure.kind(), kind, "{:?}", record.trace());
+                    return;
+                }
+                assert_ne!(record.status(), &RequestStatus::Succeeded);
+            }
+        }
+        panic!("the original request must terminate");
+    }
+}
+
+fn assert_parent_and_child_retention_are_independent(keep_child: bool) {
+    let mut fixture = Fixture::nested(3, keep_child);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalValue>(parent)
+        .unwrap()
+        .0 = 47;
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalValue>(child)
+        .unwrap()
+        .0 = 63;
+
+    fixture.push("/q");
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(47))
+    );
+    assert_eq!(fixture.app.world().get_entity(child).is_ok(), keep_child);
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(parent)
+    );
+    let mut input_state =
+        bevy_ecs::system::SystemState::<RouteInputs>::new(fixture.app.world_mut());
+    assert!(
+        input_state
+            .get(fixture.app.world())
+            .unwrap()
+            .current(parent)
+            .is_none()
+    );
+
+    fixture.push("/p/d");
+    assert_eq!(fixture.active("p"), parent);
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(47))
+    );
+    fixture.active("d");
+    assert_eq!(fixture.calls("p"), 1);
+    assert_eq!(fixture.calls("d"), 1);
+    let inputs = input_state.get(fixture.app.world()).unwrap();
+    assert_eq!(
+        inputs.current(parent).unwrap().location(),
+        &RouteLocation::new("/p/d")
+    );
+    assert!(inputs.current(child).is_none());
+
+    fixture.push("/p/c");
+    let returned_child = fixture.active("c");
+    assert_eq!(fixture.active("p"), parent);
+    assert_eq!(fixture.calls("p"), 1);
+    if keep_child {
+        assert_eq!(returned_child, child);
+        assert_eq!(
+            fixture.app.world().get::<LocalValue>(child),
+            Some(&LocalValue(63))
+        );
+        assert_eq!(fixture.calls("c"), 1);
+    } else {
+        assert_ne!(returned_child, child);
+        assert_eq!(fixture.calls("c"), 2);
+    }
+}
+
+#[test]
+fn retained_parent_selects_new_child_after_disposable_child_leaves() {
+    assert_parent_and_child_retention_are_independent(false);
+}
+
+#[test]
+fn retained_parent_keeps_independent_child_inventory_across_another_layout() {
+    assert_parent_and_child_retention_are_independent(true);
+}
+
+#[test]
+fn retained_parent_creates_its_first_child_slot_on_return() {
+    let mut fixture = Fixture::nested(3, true);
+    fixture.push("/p");
+    let parent = fixture.active("p");
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalValue>(parent)
+        .unwrap()
+        .0 = 47;
+    fixture.push("/q");
+    fixture.push("/p/d");
+    assert_eq!(fixture.active("p"), parent);
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(47))
+    );
+    assert_eq!(fixture.calls("p"), 1);
+    assert_eq!(fixture.calls("d"), 1);
+}
+
+#[test]
+fn retained_parent_back_recreates_only_its_disposable_child() {
+    let mut fixture = Fixture::nested(3, false);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalValue>(parent)
+        .unwrap()
+        .0 = 47;
+    fixture.push("/q");
+    fixture.back();
+    assert_eq!(fixture.active("p"), parent);
+    assert_ne!(fixture.active("c"), child);
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(47))
+    );
+    assert_eq!(fixture.calls("p"), 1);
+    assert_eq!(fixture.calls("c"), 2);
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(fixture.router)
+            .unwrap()
+            .history()
+            .current(),
+        Some(&RouteLocation::new("/p/c"))
+    );
+}
+
+#[test]
+fn retained_parent_survives_fresh_child_build_failure_and_bound_error() {
+    let mut fixture = Fixture::nested(3, true);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalValue>(parent)
+        .unwrap()
+        .0 = 47;
+    fixture.push("/q");
+    let history = fixture
+        .app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(fixture.router)
+        .unwrap()
+        .history()
+        .clone();
+    fixture.reject_child.store(true, Ordering::SeqCst);
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, RouteLocation::new("/p/d"))
+        .unwrap();
+    for _ in 0..32 {
+        fixture.app.update();
+        let RequestLookup::Found(record) = fixture
+            .app
+            .world()
+            .resource::<RouterSnapshots>()
+            .request(fixture.router, request)
+        else {
+            continue;
+        };
+        if matches!(record.status(), RequestStatus::Failed(_)) {
+            break;
+        }
+    }
+    let snapshots = fixture.app.world().resource::<RouterSnapshots>();
+    let RequestLookup::Found(record) = snapshots.request(fixture.router, request) else {
+        panic!("the original request remains queryable");
+    };
+    assert!(matches!(record.status(), RequestStatus::Failed(failure)
+        if failure.kind() == NavigationFailureKind::Build));
+    assert_eq!(snapshots.get(fixture.router).unwrap().history(), &history);
+    assert_eq!(fixture.active("p"), parent);
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(47))
+    );
+    assert_eq!(fixture.calls("p"), 1);
+    assert!(fixture.app.world().get_entity(child).is_ok());
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(child)
+    );
+    let mut input_state =
+        bevy_ecs::system::SystemState::<RouteInputs>::new(fixture.app.world_mut());
+    let inputs = input_state.get(fixture.app.world()).unwrap();
+    assert!(inputs.current(parent).unwrap().failure().is_none());
+    assert_eq!(
+        inputs.current(parent).unwrap().location(),
+        &RouteLocation::new("/p/d")
+    );
+    fixture.push("/p/c");
+    // Error presentations keep the existing full-rematch policy on the next navigation.
+    assert_ne!(fixture.active("p"), parent);
+    assert_ne!(fixture.active("c"), child);
+    assert_eq!(fixture.calls("p"), 2);
+    assert_eq!(fixture.calls("c"), 2);
+}
+
+#[test]
+fn retained_parent_invalid_content_retires_its_child_inventory_before_fresh_return() {
+    let mut fixture = Fixture::nested(3, true);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    fixture.push("/q");
+    assert!(fixture.app.world_mut().despawn(parent));
+    fixture.push("/p/d");
+    assert_ne!(fixture.active("p"), parent);
+    fixture.active("d");
+    assert_eq!(fixture.calls("p"), 2);
+    assert_eq!(fixture.calls("d"), 1);
+    assert!(fixture.app.world().get_entity(child).is_err());
+    fixture.push("/p/c");
+    assert_ne!(fixture.active("c"), child);
+    assert_eq!(fixture.calls("c"), 2);
+}
+
+#[test]
+fn retained_parent_invalidated_during_child_apply_completes_both_original_cleanups() {
+    let mut fixture = Fixture::nested(3, true);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    fixture.push("/q");
+    let mut outlets = fixture
+        .app
+        .world_mut()
+        .query::<(Entity, &DefaultOutlet, &ChildOf)>();
+    let anchor = outlets
+        .iter(fixture.app.world())
+        .find(|(_, _, binding)| binding.parent() == parent)
+        .unwrap()
+        .0;
+    let invalidate = Arc::new(AtomicBool::new(true));
+    fixture.app.world_mut().add_observer(
+        move |event: On<Insert, Page>, pages: Query<&Page>, mut commands: Commands| {
+            if pages.get(event.entity).is_ok_and(|page| page.0 == "d")
+                && invalidate.swap(false, Ordering::SeqCst)
+            {
+                commands.entity(anchor).remove::<Node>();
+            }
+        },
+    );
+    fixture.push("/p/d");
+    assert_ne!(fixture.active("p"), parent);
+    fixture.active("d");
+    assert_eq!(fixture.calls("p"), 2);
+    assert_eq!(fixture.calls("d"), 2);
+    assert!(fixture.app.world().get_entity(child).is_err());
+    fixture.push("/p/c");
+    assert_ne!(fixture.active("c"), child);
+}
+
+#[test]
+fn retained_parent_disposed_forest_completes_before_host_loss_and_readmission() {
+    let mut fixture = Fixture::nested(3, true);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    let shell = fixture.app.world().get::<ChildOf>(parent).unwrap().parent();
+    let mut hosts = fixture
+        .app
+        .world_mut()
+        .query_filtered::<Entity, With<RouterHostRegistration>>();
+    let host = hosts.single(fixture.app.world()).unwrap();
+    fixture.push("/q");
+    let history = fixture
+        .app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(fixture.router)
+        .unwrap()
+        .history()
+        .clone();
+    fixture.app.world_mut().add_observer(
+        move |event: On<Despawn, Node>, mut commands: Commands| {
+            if event.entity == shell {
+                commands.entity(host).remove::<RouterHostRegistration>();
+            }
+        },
+    );
+    assert!(fixture.app.world_mut().despawn(parent));
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, RouteLocation::new("/p/d"))
+        .unwrap();
+    fixture.fail(request, NavigationFailureKind::HostLost);
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(fixture.router)
+            .unwrap()
+            .history(),
+        &history
+    );
+    assert!(fixture.app.world().get_entity(host).is_ok());
+    assert!(fixture.app.world().get_entity(shell).is_err());
+    assert!(fixture.app.world().get_entity(child).is_err());
+    fixture
+        .app
+        .world_mut()
+        .entity_mut(host)
+        .insert(RouterHostRegistration::new(fixture.router));
+    for _ in 0..32 {
+        fixture.app.update();
+        if fixture
+            .app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(fixture.router)
+            .unwrap()
+            .availability()
+            == &RouterAvailability::Ready
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .resource::<RouterSnapshots>()
+            .get(fixture.router)
+            .unwrap()
+            .availability(),
+        &RouterAvailability::Ready
+    );
+    fixture.push("/p/d");
+    assert_ne!(fixture.active("p"), parent);
+    fixture.active("d");
+}
+
+#[test]
+fn retained_parent_live_forest_host_loss_transfers_original_cleanup_before_terminal() {
+    let mut fixture = Fixture::nested(3, true);
+    fixture.push("/p/c");
+    let parent = fixture.active("p");
+    let child = fixture.active("c");
+    let shell = fixture.app.world().get::<ChildOf>(parent).unwrap().parent();
+    let mut outlets = fixture
+        .app
+        .world_mut()
+        .query::<(Entity, &DefaultOutlet, &ChildOf)>();
+    let anchor = outlets
+        .iter(fixture.app.world())
+        .find(|(_, _, edge)| edge.parent() == parent)
+        .unwrap()
+        .0;
+    let mut hosts = fixture
+        .app
+        .world_mut()
+        .query_filtered::<Entity, With<RouterHostRegistration>>();
+    let host = hosts.single(fixture.app.world()).unwrap();
+    fixture.push("/q");
+    let history = fixture
+        .app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(fixture.router)
+        .unwrap()
+        .history()
+        .clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&fired);
+    fixture.app.world_mut().add_observer(
+        move |event: On<Despawn, Page>, mut commands: Commands| {
+            if event.entity == child {
+                observed.store(true, Ordering::SeqCst);
+                commands.entity(host).remove::<RouterHostRegistration>();
+            }
+        },
+    );
+    fixture.app.world_mut().entity_mut(anchor).remove::<Node>();
+    let request = fixture
+        .app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(fixture.router, RouteLocation::new("/p/d"))
+        .unwrap();
+    fixture.fail(request, NavigationFailureKind::AuthorityLost);
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the real child cleanup hook must run"
+    );
+    let snapshot = fixture
+        .app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(fixture.router)
+        .unwrap();
+    assert_eq!(snapshot.history(), &history);
+    assert!(snapshot.running_request().is_none());
+    assert!(fixture.app.world().get_entity(host).is_ok());
+    assert!(
+        fixture.app.world().get_entity(shell).is_ok(),
+        "the original live residual remains owned"
+    );
+    assert!(
+        !fixture
+            .app
+            .world()
+            .resource::<RouterInputGate>()
+            .allows_pointer(parent)
+    );
+    assert_eq!(fixture.calls("d"), 0);
 }
 
 fn assert_mixed_return(back: bool, keep_b: bool) {

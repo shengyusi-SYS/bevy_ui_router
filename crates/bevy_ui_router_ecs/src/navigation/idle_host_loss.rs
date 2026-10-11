@@ -401,7 +401,7 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
         return true;
     };
     let retained_boundaries = if retained_plan.is_some() {
-        let Ok(prepared) = registry.prepare_retained_boundaries(None, &retiring) else {
+        let Ok(prepared) = registry.prepare_retained_boundaries(&[], &retiring) else {
             return true;
         };
         Some(prepared)

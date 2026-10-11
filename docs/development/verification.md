@@ -45,8 +45,8 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 | ECS：host、identity、staging、publication、cleanup | [ECS public API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、`src/navigation_tests.rs`、`src/cleanup_tests.rs` | 公开导航旅程的旧内容清理、布局保留、失效缓存部分清理后的 host loss/readmission 与后续请求 |
 | BSN：factory、resolve/apply、outlet、containment | [BSN facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs) | [BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) 及两个原样示例 |
 | 输入与焦点 | [原生 pointer 测试](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus 测试](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 窗口中的点击/Space、跨页手势与独立目标保护 |
-| 保留页与普通页交接 | [公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | route opt-in 与容量独立；混用 Back/Push、命中后继续导航、LRU 后 fresh→fresh，保留身份与父布局 |
-| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的二维位置、缩放/裁剪、布局暂缺与身份撤销、preserved prefix、失败来源、host 重接纳及 stale settlement 拒绝 |
+| 保留页与普通页交接 | [公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立 opt-in、原父/新子、内部库存与 LRU 依赖淘汰；OwnInvalid、fresh 失败、部分清理 host loss 后原请求终结与残留责任 |
+| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的二维位置、缩放/裁剪、布局暂缺与身份撤销、失败来源、host 重接纳及 stale settlement；原父/fresh 子 Back 的不同 entry 位置和当前输入 |
 | 页面活动资格 | [公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 非交互内容、可变应用 Query、缓存失活/恢复、动态后代和 exact 父链/host registration |
 | facade 与 feature/依赖边界 | [独立 consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 最小依赖的独立应用运行与逐 case 编译拒绝 |
 
@@ -63,7 +63,7 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-quick start 验证最小 Scene runtime 和请求结果；nested 示例还执行真实 UI 布局并检查父布局/工具栏状态保留。两者均不打开操作系统窗口或启用 GPU renderer。
+quick start 验证最小 Scene runtime 和请求结果；nested 示例执行真实 UI 布局，离开布局后返回新子页，核对原父 Entity、工具栏状态、活动资格和新的当前输入。两者均不打开操作系统窗口或启用 GPU renderer；独立 consumer 原样编译运行两者。
 
 窗口应用是独立 workspace，图形依赖与 headless 库验证分开：
 
@@ -75,7 +75,7 @@ cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-fea
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
-窗口示例显式为 Overview / Settings 开启容量 2 的 leaf 保留，并标记列表滚动容器；quick start/nested 保留默认关闭的示范。窗口交互还验证同 Entity/计数往返、不同 history entry 的滚动位置、retained 输入/focus 撤权与命中后新的点击/Space、fallback 清库存后重建。
+窗口示例显式为 Overview / Settings 开启容量 2 的 leaf 保留，并标记列表滚动容器；quick start 演示默认关闭，nested 为父布局开启容量 1，子页保持不保留。历史窗口交互验证同 Entity/计数往返、不同 history entry 的滚动位置、retained 输入/focus 撤权与命中后新的点击/Space、fallback 清库存后重建；尚未在窗口重跑父子独立保留。
 
 Linux 示例选择 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev`。窗口交互验证 push/replace/back、布局计数保留、页面点击与 Space、旧焦点释放、跨页按住/释放、Build failure/fallback 和恢复。应用内 BRP 自动化见 [调试指南](../guides/debugging.md)。
 

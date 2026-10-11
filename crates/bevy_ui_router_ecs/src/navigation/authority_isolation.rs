@@ -168,6 +168,25 @@ pub(super) fn begin_authority_settlement(
         pending,
         logical_roots_override,
         AuthoritySettlementSource::Reconciliation,
+        None,
+    )
+}
+
+pub(super) fn begin_retained_invalidation_authority_settlement(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    active: RealizedBranch,
+    pending: PendingCommit,
+    continuation: &mut Option<bevy_ui_router_core::integration::RetainedInvalidationContinuation>,
+) -> AuthoritySettlementBeginOutcome {
+    begin_authority_settlement_from_source(
+        world,
+        entry,
+        active,
+        pending,
+        None,
+        AuthoritySettlementSource::Reconciliation,
+        Some(continuation),
     )
 }
 
@@ -183,6 +202,7 @@ pub(super) fn begin_initial_fallback_authority_settlement(
         pending,
         None,
         AuthoritySettlementSource::InitialFallbackTask,
+        None,
     )
 }
 
@@ -200,6 +220,7 @@ pub(super) fn begin_unstarted_fallback_host_loss(
         pending,
         None,
         AuthoritySettlementSource::UnstartedFallbackTask(task),
+        None,
     )
 }
 
@@ -216,6 +237,9 @@ fn begin_authority_settlement_from_source(
     mut pending: PendingCommit,
     logical_roots_override: Option<Vec<RouteFrameVersion>>,
     source: AuthoritySettlementSource<'_>,
+    invalidation: Option<
+        &mut Option<bevy_ui_router_core::integration::RetainedInvalidationContinuation>,
+    >,
 ) -> AuthoritySettlementBeginOutcome {
     let Some(host) = entry.host.as_ref() else {
         return AuthoritySettlementBeginOutcome::ProtocolContradiction {
@@ -322,7 +346,7 @@ fn begin_authority_settlement_from_source(
             }
         };
         let boundaries = if retained_plan.is_some() {
-            match registry.prepare_retained_boundaries(None, &retiring) {
+            match registry.prepare_retained_boundaries(&[], &retiring) {
                 Ok(boundaries) => Some(boundaries),
                 Err(()) => {
                     return AuthoritySettlementBeginOutcome::ProtocolContradiction {
@@ -516,14 +540,30 @@ fn begin_authority_settlement_from_source(
                 back_target.take();
             };
             if let Some(plan) = retained_plan {
-                engine
-                    .begin_authority_settlement_with_retention(
-                        lease, cause, plan, manifest, owners, publish,
-                    )
-                    .map_err(|error| {
-                        let (lease, _plan, _manifest, owners, kind) = error.into_parts();
-                        (lease, owners, kind)
-                    })
+                if let Some(continuation) = invalidation {
+                    let original = continuation
+                        .take()
+                        .expect("authority preparation owns the original local continuation");
+                    engine
+                        .begin_retained_invalidation_authority_settlement(
+                            original, lease, cause, plan, manifest, owners, publish,
+                        )
+                        .map_err(|error| {
+                            let (original, error) = error.into_parts();
+                            *continuation = Some(original);
+                            let (lease, _, _, owners, kind) = error.into_parts();
+                            (lease, owners, kind)
+                        })
+                } else {
+                    engine
+                        .begin_authority_settlement_with_retention(
+                            lease, cause, plan, manifest, owners, publish,
+                        )
+                        .map_err(|error| {
+                            let (lease, _, _, owners, kind) = error.into_parts();
+                            (lease, owners, kind)
+                        })
+                }
             } else {
                 let result = match trigger {
                     Some(trigger) => engine.begin_failed_authority_settlement_for_cause_retaining(
@@ -1459,6 +1499,8 @@ pub(super) fn fail_closed_cleanup_ledger_protocol(
         failure_cleanup_ledger: None,
         cleanup_settlement_ledger: Some(ledger),
         failure_cleanup_permanent_authority: None,
+        retained: None,
+        retained_cleanup: None,
         host: retired_host,
     });
     let mut isolation = Some(isolation);
@@ -1514,6 +1556,53 @@ pub(super) fn fail_closed_normal_authority_protocol(
         active,
         pending,
         AuthorityProtocolResidualKind::Authority(kind),
+    )
+}
+
+pub(super) fn prepare_retained_cleanup_protocol_isolation(
+    world: &World,
+    entry: &RouterEntry,
+    pending: &PendingCommit,
+    ledger: Option<&CleanupLedger>,
+) -> AuthorityIsolationPreparation {
+    prepare_authority_isolation_targets(
+        world,
+        entry
+            .active
+            .iter()
+            .flat_map(RealizedBranch::claims)
+            .chain(pending.branch.as_realized().claims())
+            .chain(
+                entry
+                    .retained
+                    .payloads()
+                    .flat_map(|payload| payload.claims()),
+            )
+            .chain(entry.host.iter().map(|host| &host.top_slot_claim))
+            .chain(ledger.into_iter().flat_map(CleanupLedger::exact_claims)),
+        entry
+            .active
+            .iter()
+            .flat_map(|branch| branch.live_interactive_entities(world))
+            .chain(
+                pending
+                    .branch
+                    .as_realized()
+                    .live_interactive_entities(world),
+            )
+            .chain(
+                entry
+                    .retained
+                    .payloads()
+                    .flat_map(|payload| payload.live_interactive_entities(world)),
+            )
+            .chain(entry.host.iter().map(|host| host.top_slot))
+            .chain(
+                ledger
+                    .into_iter()
+                    .flat_map(|ledger| ledger.retained_invalidation_input_targets(world)),
+            ),
+        0,
     )
 }
 
@@ -1601,6 +1690,8 @@ pub(super) fn fail_closed_pending_owner_protocol_prepared(
         failure_cleanup_ledger: None,
         cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: None,
+        retained: None,
+        retained_cleanup: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -1744,6 +1835,8 @@ pub(super) fn fail_closed_failed_owner_protocol_prepared(
         failure_cleanup_ledger: None,
         cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: None,
+        retained: None,
+        retained_cleanup: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -1820,6 +1913,8 @@ pub(super) fn fail_closed_failure_cleanup_completion_protocol(
         failure_cleanup_ledger: Some(ledger),
         cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: None,
+        retained: None,
+        retained_cleanup: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;

@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 pub(crate) mod idle_host_loss;
-mod instances;
+pub(crate) mod instances;
 pub(crate) mod retained;
 
 use crate::admission::{
@@ -209,6 +209,8 @@ pub(crate) enum FrameMountTarget {
 }
 
 pub(crate) struct FrameTask {
+    parent_source: Option<instances::TargetInstanceSourceKind>,
+    instance_selection_pending: bool,
     identity: FrameTaskIdentity,
     frame: RouteFrameVersion,
     target: FrameMountTarget,
@@ -219,6 +221,14 @@ pub(crate) struct FrameTask {
 }
 
 impl FrameTask {
+    pub(crate) const fn instance_selection_pending(&self) -> bool {
+        self.instance_selection_pending
+    }
+
+    pub(crate) const fn parent_source(&self) -> Option<instances::TargetInstanceSourceKind> {
+        self.parent_source
+    }
+
     pub(crate) const fn identity(&self) -> &FrameTaskIdentity {
         &self.identity
     }
@@ -272,6 +282,8 @@ impl FrameTask {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn testing_duplicate(&self) -> Self {
         Self {
+            parent_source: self.parent_source,
+            instance_selection_pending: self.instance_selection_pending,
             identity: self.identity.clone(),
             frame: self.frame.clone(),
             target: self.target.clone(),
@@ -483,6 +495,9 @@ enum FailureCleanupRecoveryTargetProjection {
     },
     BoundErrorIdentityExhausted(Box<BoundErrorIdentityExhaustedProjection>),
     AuthoritySettlement,
+    ResumeInstanceInvalidation {
+        invalid: RouteFrameVersion,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -492,6 +507,7 @@ enum FailureCleanupContinuationOwner {
     BeginFallback,
     BeginBoundError(Box<FrozenBoundErrorRecovery>),
     AuthoritySettlement,
+    ResumeInstanceInvalidation { invalid: RouteFrameVersion },
 }
 
 impl FailureCleanupContinuationOwner {
@@ -524,6 +540,11 @@ impl FailureCleanupContinuationOwner {
             },
             Self::AuthoritySettlement => {
                 FailureCleanupRecoveryTargetProjection::AuthoritySettlement
+            }
+            Self::ResumeInstanceInvalidation { invalid } => {
+                FailureCleanupRecoveryTargetProjection::ResumeInstanceInvalidation {
+                    invalid: invalid.clone(),
+                }
             }
         }
     }
@@ -809,7 +830,8 @@ impl FailureCleanupRequest {
             FailureCleanupContinuationOwner::Terminal
             | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_)
             | FailureCleanupContinuationOwner::BeginFallback
-            | FailureCleanupContinuationOwner::AuthoritySettlement => &[],
+            | FailureCleanupContinuationOwner::AuthoritySettlement
+            | FailureCleanupContinuationOwner::ResumeInstanceInvalidation { .. } => &[],
         }
     }
 
@@ -999,7 +1021,7 @@ struct FailureCleanupZeroTerminalPendingMountProjection {
     child_index: usize,
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
-    from_preserved_parent: bool,
+    parent_source: instances::TargetInstanceSourceKind,
     transaction: TransactionId,
     reserved: ReservedFrameAttempt,
     kind: PendingMountKind,
@@ -2153,7 +2175,7 @@ struct CoreBackTargetPendingMountProjection {
     child_index: usize,
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
-    from_preserved_parent: bool,
+    parent_source: instances::TargetInstanceSourceKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2900,8 +2922,9 @@ pub(crate) struct FailureCleanupCompletionOwner {
     continuation: FailureCleanupContinuationOwner,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FailureCleanupCompletionDisposition {
+    ResumeInstanceInvalidation(retained::RetainedInvalidationContinuation),
     Settled,
     RetainedPreparedPrefixBound,
     RetainedPreparedPrefixCleanup,
@@ -3146,7 +3169,7 @@ struct PendingMount {
     child_index: usize,
     parent: RouteFrameVersion,
     outlet: RouteSlotKey,
-    from_preserved_parent: bool,
+    parent_source: instances::TargetInstanceSourceKind,
     transaction: TransactionId,
     reserved: ReservedFrameAttempt,
     kind: PendingMountKind,
@@ -3175,7 +3198,7 @@ impl From<&PendingMount> for FailureCleanupZeroTerminalPendingMountProjection {
             child_index: pending.child_index,
             parent: pending.parent.clone(),
             outlet: pending.outlet.clone(),
-            from_preserved_parent: pending.from_preserved_parent,
+            parent_source: pending.parent_source,
             transaction: pending.transaction,
             reserved: pending.reserved,
             kind: pending.kind,
@@ -7491,8 +7514,26 @@ impl RouterEngine {
     where
         F: FnOnce(),
     {
+        self.fail_closed_authority_protocol_retaining_with_miss(
+            issuer,
+            lease,
+            None,
+            authority_mutation,
+        )
+    }
+
+    fn fail_closed_authority_protocol_retaining_with_miss<F>(
+        &mut self,
+        issuer: &mut HostAdmissionIssuer,
+        lease: Option<HostLease>,
+        expected_miss: Option<&CleanupBatchToken>,
+        authority_mutation: F,
+    ) -> Result<(), Option<HostLease>>
+    where
+        F: FnOnce(),
+    {
         let mut owner = lease;
-        if self.fail_closed_authority_protocol(|| match owner.take() {
+        if self.fail_closed_authority_protocol_with_miss(expected_miss, || match owner.take() {
             Some(lease) => match issuer.retire_current(lease) {
                 Ok(retired) => {
                     authority_mutation();
@@ -7515,11 +7556,23 @@ impl RouterEngine {
         }
     }
 
+    #[cfg(test)]
     fn fail_closed_authority_protocol<F>(&mut self, authority_mutation: F) -> bool
     where
         F: FnOnce() -> bool,
     {
-        if self.pending_retained_miss_cleanup.is_some() {
+        self.fail_closed_authority_protocol_with_miss(None, authority_mutation)
+    }
+
+    fn fail_closed_authority_protocol_with_miss<F>(
+        &mut self,
+        expected_miss: Option<&CleanupBatchToken>,
+        authority_mutation: F,
+    ) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        if self.pending_retained_miss_cleanup.as_ref() != expected_miss {
             return false;
         }
         let Some(current) = self.current.as_ref() else {
@@ -7578,6 +7631,9 @@ impl RouterEngine {
         self.current = None;
         self.pending_post_commit_terminal = None;
         self.pending_post_commit_settlement_trace = None;
+        // An installed cache owner may be consumed only through its exact
+        // owner-specific terminal. This does not complete its physical token.
+        self.pending_retained_miss_cleanup = None;
         self.live_failed_authority_trigger_revision = None;
         self.action = None;
         self.active_branch = None;
@@ -10493,7 +10549,7 @@ impl RouterEngine {
                     child_index: branch_index,
                     parent: parent.clone(),
                     outlet: outlet.clone(),
-                    from_preserved_parent: true,
+                    parent_source: instances::TargetInstanceSourceKind::Current,
                     transaction: reservation.transaction(),
                     reserved: pending_reserved,
                     kind: PendingMountKind::Normal,
@@ -10727,6 +10783,12 @@ impl RouterEngine {
             },
             history_capability,
             action: BackTargetResumeAction::FrameTask(FrameTask {
+                parent_source: if branch_index == 0 {
+                    None
+                } else {
+                    Some(instances::TargetInstanceSourceKind::Current)
+                },
+                instance_selection_pending: true,
                 identity,
                 frame: target_frame,
                 target,
@@ -10942,6 +11004,17 @@ impl RouterEngine {
                 ))
                 .expect("running trace is open");
         }
+        if let Some(current) = self.current.as_mut() {
+            if let (Some(projection), Some(branch)) = (&current.reconciliation, &current.branch) {
+                if !projection.instances_selected() {
+                    current.reconciliation = Some(
+                        projection
+                            .with_instance_selection(&[], branch)
+                            .expect("first fresh report selects its existing target"),
+                    );
+                }
+            }
+        }
         self.current
             .as_mut()
             .expect("report was preflighted")
@@ -10983,7 +11056,7 @@ impl RouterEngine {
                 child_index,
                 parent: frame.clone(),
                 outlet: outlet.clone(),
-                from_preserved_parent: false,
+                parent_source: instances::TargetInstanceSourceKind::Fresh,
                 transaction,
                 reserved: pending_reserved,
                 kind: PendingMountKind::Normal,
@@ -11248,6 +11321,29 @@ impl RouterEngine {
         request: FrameMountRequest,
         rejection: MountRejectionKind,
     ) -> Result<FailureCleanupRequest, MountCapabilityError<FrameMountRequest>> {
+        self.reject_mount_impl(request, rejection, None)
+    }
+
+    pub(crate) fn reject_retained_mount(
+        &mut self,
+        request: FrameMountRequest,
+        invalid: RouteFrameVersion,
+    ) -> Result<FailureCleanupRequest, MountCapabilityError<FrameMountRequest>> {
+        self.reject_mount_impl(request, MountRejectionKind::InvalidOutlet, Some(invalid))
+    }
+
+    fn reject_mount_impl(
+        &mut self,
+        request: FrameMountRequest,
+        rejection: MountRejectionKind,
+        invalid: Option<RouteFrameVersion>,
+    ) -> Result<FailureCleanupRequest, MountCapabilityError<FrameMountRequest>> {
+        if invalid
+            .as_ref()
+            .is_some_and(|invalid| !self.retained_mount_invalidation_is_current(invalid))
+        {
+            return Err(MountCapabilityError::new(MountError::WrongPhase, request));
+        }
         if let Err(kind) = self.mount.validate_request_token(&request.token) {
             return Err(MountCapabilityError::new(kind, request));
         }
@@ -11283,13 +11379,40 @@ impl RouterEngine {
             ))
             .expect("running trace is open");
         let (pending, failure) = mount_failure(rejection);
-        Ok(self.begin_failure_cleanup_for_branch(pending, failure, failure_branch_index))
+        Ok(match invalid {
+            Some(invalid) => {
+                self.begin_instance_invalidation_failure_cleanup(pending, failure, invalid)
+            }
+            None => self.begin_failure_cleanup_for_branch(pending, failure, failure_branch_index),
+        })
     }
 
     pub(crate) fn reject_mount_after_mutation(
         &mut self,
         artifact: MountMutationArtifact,
     ) -> Result<FailureCleanupRequest, MountCapabilityError<MountMutationArtifact>> {
+        self.reject_mount_after_mutation_impl(artifact, None)
+    }
+
+    pub(crate) fn reject_retained_mount_after_mutation(
+        &mut self,
+        artifact: MountMutationArtifact,
+        invalid: RouteFrameVersion,
+    ) -> Result<FailureCleanupRequest, MountCapabilityError<MountMutationArtifact>> {
+        self.reject_mount_after_mutation_impl(artifact, Some(invalid))
+    }
+
+    fn reject_mount_after_mutation_impl(
+        &mut self,
+        artifact: MountMutationArtifact,
+        invalid: Option<RouteFrameVersion>,
+    ) -> Result<FailureCleanupRequest, MountCapabilityError<MountMutationArtifact>> {
+        if invalid
+            .as_ref()
+            .is_some_and(|invalid| !self.retained_mount_invalidation_is_current(invalid))
+        {
+            return Err(MountCapabilityError::new(MountError::WrongPhase, artifact));
+        }
         let expected_stage = match &artifact {
             MountMutationArtifact::Grant(_) | MountMutationArtifact::Receipt(_) => {
                 WorkStage::AwaitingReceipt
@@ -11346,14 +11469,55 @@ impl RouterEngine {
                 parent, outlet, slot,
             ))
             .expect("running trace is open");
-        Ok(self.begin_failure_cleanup_for_branch(
-            PendingFailureKind::Mount(MountRejectionKind::RejectedAfterMutation),
-            NavigationFailure::new(
-                NavigationFailureKind::Mount,
-                "child mount rejected after mutation",
-            ),
-            failure_branch_index,
-        ))
+        let expected = PendingFailureKind::Mount(MountRejectionKind::RejectedAfterMutation);
+        let failure = NavigationFailure::new(
+            NavigationFailureKind::Mount,
+            "child mount rejected after mutation",
+        );
+        Ok(match invalid {
+            Some(invalid) => {
+                self.begin_instance_invalidation_failure_cleanup(expected, failure, invalid)
+            }
+            None => self.begin_failure_cleanup_for_branch(expected, failure, failure_branch_index),
+        })
+    }
+
+    fn retained_mount_invalidation_is_current(&self, invalid: &RouteFrameVersion) -> bool {
+        self.pending_retained_miss_cleanup.is_none()
+            && self.pending_retained_transfer.is_none()
+            && self.current.as_ref().is_some_and(|current| {
+                current.pending_mount.is_some()
+                    && current.reconciliation.as_ref().is_some_and(|projection| {
+                        projection.instances_selected()
+                            && projection
+                                .retained()
+                                .iter()
+                                .any(|instance| instance.frame() == invalid)
+                    })
+            })
+    }
+
+    fn begin_instance_invalidation_failure_cleanup(
+        &mut self,
+        expected: PendingFailureKind,
+        failure: NavigationFailure,
+        invalid: RouteFrameVersion,
+    ) -> FailureCleanupRequest {
+        // The mount artifact and fresh branch settle under their existing failure owner;
+        // selected instances stay in inventory until this continuation is returned.
+        let mut roots = self
+            .current
+            .as_ref()
+            .expect("the validated mount retains current work")
+            .applied_frames
+            .clone();
+        self.sort_instance_cleanup_roots(&mut roots);
+        self.begin_failure_cleanup_with_roots(
+            expected,
+            failure,
+            FailureCleanupContinuationOwner::ResumeInstanceInvalidation { invalid },
+            roots,
+        )
     }
 
     fn has_live_mount_context(
@@ -11394,7 +11558,11 @@ impl RouterEngine {
                     ..
                 } if bound.binding.branch_index() == pending.child_index
                     && bound.binding.outlet() == &pending.outlet
-            ) && pending.from_preserved_parent
+            ) && current
+                .reconciliation
+                .as_ref()
+                .and_then(|projection| projection.source_at(current.identity.branch_index))
+                == Some(pending.parent_source)
                 && pending.transaction == current.identity.transaction
                 && pending.reserved.frame_task() == current.identity.frame_task
                 && current.reservation.len() == 1
@@ -11420,24 +11588,25 @@ impl RouterEngine {
                 &pending.outlet,
             );
         }
-        let reservation_matches = if pending.from_preserved_parent {
-            current
-                .reservation
-                .get(pending.child_index)
-                .is_some_and(|reserved| {
-                    reserved == &pending.reserved
-                        && reserved.frame_task() == current.identity.frame_task
-                })
-        } else {
-            current.reservation.get(pending.child_index) == Some(&pending.reserved)
-                && current
+        let reservation_matches =
+            if pending.parent_source != instances::TargetInstanceSourceKind::Fresh {
+                current
                     .reservation
-                    .get(current.identity.branch_index)
+                    .get(pending.child_index)
                     .is_some_and(|reserved| {
-                        reserved.frame_task() == current.identity.frame_task
-                            && reserved.frame() == current.identity.frame
+                        reserved == &pending.reserved
+                            && reserved.frame_task() == current.identity.frame_task
                     })
-        };
+            } else {
+                current.reservation.get(pending.child_index) == Some(&pending.reserved)
+                    && current
+                        .reservation
+                        .get(current.identity.branch_index)
+                        .is_some_and(|reserved| {
+                            reserved.frame_task() == current.identity.frame_task
+                                && reserved.frame() == current.identity.frame
+                        })
+            };
         if !reservation_matches {
             return false;
         }
@@ -11449,10 +11618,9 @@ impl RouterEngine {
             current.identity.frame,
             current.identity.generation,
         );
-        let entering_start = current
-            .reconciliation
-            .as_ref()
-            .map_or(0, |projection| projection.preserved().len());
+        let entering_start = current.reconciliation.as_ref().map_or(0, |projection| {
+            projection.preserved().len() + projection.retained().len()
+        });
         if current_parent != pending.parent
             || current.target_frames.len() != child_index
             || current.target_frames.last() != Some(&pending.parent)
@@ -11476,15 +11644,17 @@ impl RouterEngine {
         {
             return false;
         }
-        let current_target_is_exact = if pending.from_preserved_parent {
+        let current_target_is_exact = if pending.parent_source
+            != instances::TargetInstanceSourceKind::Fresh
+        {
             current.reconciliation.as_ref().is_some_and(|projection| {
-                projection.preserved().iter().any(|preserved| {
-                    preserved.branch_index() == current.identity.branch_index
-                        && preserved.version() == &pending.parent
-                }) && projection.entering().first().is_some_and(|entering| {
-                    entering.branch_index() == pending.child_index
-                        && entering.slot() == ProjectedEnteringSlot::MountNew
-                })
+                projection.source_at(current.identity.branch_index) == Some(pending.parent_source)
+                    && current.target_frames.get(current.identity.branch_index)
+                        == Some(&pending.parent)
+                    && projection.entering().iter().any(|entering| {
+                        entering.branch_index() == pending.child_index
+                            && entering.slot() == ProjectedEnteringSlot::MountNew
+                    })
             })
         } else {
             match &current.current_target {
@@ -12079,7 +12249,7 @@ impl RouterEngine {
                             child_index: pending.child_index,
                             parent: pending.parent.clone(),
                             outlet: pending.outlet.clone(),
-                            from_preserved_parent: pending.from_preserved_parent,
+                            parent_source: pending.parent_source,
                         }
                     }),
                     stage: Self::back_target_stage_projection(Some(current)),
@@ -12134,20 +12304,21 @@ impl RouterEngine {
                 issuer_context,
             );
         };
-        let reservation_matches = if pending.from_preserved_parent {
-            current
-                .reservation
-                .get(pending.child_index)
-                .is_some_and(|reserved| reserved.frame_task == current.identity.frame_task)
-        } else {
-            current
-                .reservation
-                .get(current.identity.branch_index)
-                .is_some_and(|reserved| {
-                    reserved.frame_task == current.identity.frame_task
-                        && reserved.frame == current.identity.frame
-                })
-        };
+        let reservation_matches =
+            if pending.parent_source != instances::TargetInstanceSourceKind::Fresh {
+                current
+                    .reservation
+                    .get(pending.child_index)
+                    .is_some_and(|reserved| reserved.frame_task == current.identity.frame_task)
+            } else {
+                current
+                    .reservation
+                    .get(current.identity.branch_index)
+                    .is_some_and(|reserved| {
+                        reserved.frame_task == current.identity.frame_task
+                            && reserved.frame == current.identity.frame
+                    })
+            };
         let current_parent = RouteFrameVersion::new(
             current.identity.router,
             current.identity.host,
@@ -12156,10 +12327,9 @@ impl RouterEngine {
             current.identity.frame,
             current.identity.generation,
         );
-        let entering_start = current
-            .reconciliation
-            .as_ref()
-            .map_or(0, |projection| projection.preserved().len());
+        let entering_start = current.reconciliation.as_ref().map_or(0, |projection| {
+            projection.preserved().len() + projection.retained().len()
+        });
         let topology_is_current = pending.child_index == child_index
             && reservation_matches
             && current_parent == pending.parent
@@ -12189,15 +12359,17 @@ impl RouterEngine {
             == FrameOrigin::MatchedRoute(current_route.route())
             && child_route.slot() == &pending.outlet
             && current.reservation.get(child_index).is_some();
-        let current_target_is_exact = if pending.from_preserved_parent {
+        let current_target_is_exact = if pending.parent_source
+            != instances::TargetInstanceSourceKind::Fresh
+        {
             current.reconciliation.as_ref().is_some_and(|projection| {
-                projection.preserved().iter().any(|preserved| {
-                    preserved.branch_index() == current.identity.branch_index
-                        && preserved.version() == &pending.parent
-                }) && projection.entering().first().is_some_and(|entering| {
-                    entering.branch_index() == pending.child_index
-                        && entering.slot() == ProjectedEnteringSlot::MountNew
-                })
+                projection.source_at(current.identity.branch_index) == Some(pending.parent_source)
+                    && current.target_frames.get(current.identity.branch_index)
+                        == Some(&pending.parent)
+                    && projection.entering().iter().any(|entering| {
+                        entering.branch_index() == pending.child_index
+                            && entering.slot() == ProjectedEnteringSlot::MountNew
+                    })
             })
         } else {
             match &current.current_target {
@@ -12725,9 +12897,7 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
         if let Some(current) = self.current.as_ref()
-            && self
-                .retention_candidate(current, &retained::publication_slots(current))
-                .is_some()
+            && !self.retention_candidates(current).is_empty()
         {
             return Err(CommitError::InvalidManifest);
         }
@@ -12759,7 +12929,7 @@ impl RouterEngine {
             .expect("commit identity was validated")
             .clone_pre_retirement()
             .ok_or(CommitError::Stale)?;
-        self.seal_prepared_commit_partition(ticket, seal, retention, current, None)
+        self.seal_prepared_commit_partition(ticket, seal, retention, current)
     }
 
     fn seal_prepared_commit_partition(
@@ -12771,7 +12941,6 @@ impl RouterEngine {
             Vec<retained::RetainedRegistryEntry>,
         )>,
         mut current: CurrentWork,
-        next_record: Option<NavigationRequestRecord>,
     ) -> Result<SealedCommit, CommitError> {
         if current.stage != WorkStage::ReadyToCommit
             || current.identity != ticket.identity
@@ -12788,11 +12957,6 @@ impl RouterEngine {
             return Err(CommitError::InvalidManifest);
         }
 
-        let mut sealed_hit_current = if next_record.is_some() {
-            Some(current.clone_pre_retirement().ok_or(CommitError::Stale)?)
-        } else {
-            None
-        };
         if let Some((plan, _)) = &retention {
             // Only the independent next publication is changed. The observed
             // current remains intact on every preparation failure.
@@ -12815,27 +12979,23 @@ impl RouterEngine {
             debug_assert!(self.current_history_capability.is_none());
             None
         };
-        let mut publication = match self.precompute_publication(
-            current,
-            cleanup.clone(),
-            history_capability,
-            next_record.clone(),
-        ) {
-            Ok(publication) => publication,
-            Err(error) => {
-                debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
-                self.pending_history_preparation_error = Some(error);
-                let failure = self.begin_failure_cleanup(
-                    PendingFailureKind::AuthorityLost,
-                    NavigationFailure::new(
-                        NavigationFailureKind::AuthorityLost,
-                        "canonical history source or execution binding drifted",
-                    ),
-                );
-                self.action = Some(EngineAction::FailureCleanup(failure));
-                return Err(CommitError::Stale);
-            }
-        };
+        let mut publication =
+            match self.precompute_publication(current, cleanup.clone(), history_capability, None) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    debug_assert!(error.evidence_is_consistent_for(ticket.identity.request));
+                    self.pending_history_preparation_error = Some(error);
+                    let failure = self.begin_failure_cleanup(
+                        PendingFailureKind::AuthorityLost,
+                        NavigationFailure::new(
+                            NavigationFailureKind::AuthorityLost,
+                            "canonical history source or execution binding drifted",
+                        ),
+                    );
+                    self.action = Some(EngineAction::FailureCleanup(failure));
+                    return Err(CommitError::Stale);
+                }
+            };
         if let Some((plan, mut registry)) = retention {
             Self::bind_retained_retirements(&mut registry, plan.retiring(), &cleanup);
             publication.retained_update = Some(registry);
@@ -12852,29 +13012,13 @@ impl RouterEngine {
                 .as_ref()
                 .map(PreparedHistoryPublication::source_revision),
         };
-        let mut hit_state = None;
-        let source = if let Some(current) = &mut sealed_hit_current {
-            current.stage = WorkStage::CommitSealed {
-                token: cleanup.clone(),
-            };
-            let mut state = self.state.clone();
-            state.set_request(Some(RequestStatus::Running(NavigationPhase::ReadyToSwitch)));
-            let source = self.observe_prepared_publication_source_from(
-                Some(current),
-                next_record.as_ref(),
-                &state,
-            );
-            hit_state = Some(state);
-            source
-        } else {
-            self.current
-                .as_mut()
-                .expect("current work was validated")
-                .stage = WorkStage::CommitSealed {
-                token: cleanup.clone(),
-            };
-            self.observe_prepared_publication_source(publication.record_index)
+        self.current
+            .as_mut()
+            .expect("current work was validated")
+            .stage = WorkStage::CommitSealed {
+            token: cleanup.clone(),
         };
+        let source = self.observe_prepared_publication_source(publication.record_index);
         let sealed = SealedCommit {
             identity: ticket.identity.clone(),
             cleanup,
@@ -12882,24 +13026,6 @@ impl RouterEngine {
             evidence,
             source,
         };
-        if let Some(current) = sealed_hit_current {
-            // Validate the independently prepared receiver before installing it.
-            // No failure below this point may put the cached frame into the
-            // original fresh task's cleanup classification.
-            if !sealed.source.accepts(&sealed)
-                || sealed
-                    .publication
-                    .history
-                    .as_ref()
-                    .is_some_and(|history| !history.matches_canonical_source(&self.history))
-            {
-                return Err(self.retain_rejected_publication(sealed, CommitError::Stale));
-            }
-            self.current = Some(current);
-            self.records[sealed.publication.record_index] =
-                next_record.expect("a hit has its prepared record");
-            self.state = hit_state.expect("a hit has its prepared state");
-        }
         Ok(sealed)
     }
 
@@ -13772,8 +13898,42 @@ impl RouterEngine {
             token: outstanding,
         });
         let disposition = match continuation {
+            FailureCleanupContinuationOwner::ResumeInstanceInvalidation { invalid } => {
+                let current = self
+                    .current
+                    .as_mut()
+                    .expect("the completed original failure retains current work");
+                current.applied_frames.clear();
+                current.stage = WorkStage::Applying;
+                self.action = None;
+                let index = self
+                    .records
+                    .iter()
+                    .position(|record| record.id() == request)
+                    .expect("the original request remains retained");
+                let source = self.observe_prepared_publication_source(index);
+                FailureCleanupCompletionDisposition::ResumeInstanceInvalidation(
+                    retained::RetainedInvalidationContinuation::new(
+                        identity,
+                        invalid,
+                        self.completed_cleanup
+                            .last()
+                            .expect("completion was recorded")
+                            .token
+                            .clone(),
+                        source,
+                    ),
+                )
+            }
             FailureCleanupContinuationOwner::BeginBoundError(binding) => {
-                let retained_prepared_prefix = !binding.prepared_prefix.is_empty();
+                // Only freshly applied prefix frames have a physical owner to
+                // return from this cleanup. Selected instances remain owned by
+                // inventory and are carried by the recovery projection.
+                let retained_prepared_prefix = binding.prepared_prefix.iter().any(|frame| {
+                    self.current
+                        .as_ref()
+                        .is_some_and(|current| current.applied_frames.contains(frame))
+                });
                 match (
                     retained_prepared_prefix,
                     self.begin_bound_error(request, failure, *binding),
@@ -14599,7 +14759,7 @@ impl RouterEngine {
                     child_index: branch_index,
                     parent: parent.clone(),
                     outlet: outlet.clone(),
-                    from_preserved_parent: true,
+                    parent_source: instances::TargetInstanceSourceKind::Current,
                     transaction: reservation.transaction(),
                     reserved: pending_reserved,
                     kind: PendingMountKind::Normal,
@@ -14736,6 +14896,18 @@ impl RouterEngine {
         self.state.set_request(Some(RequestStatus::Running(phase)));
         self.issued_view_tasks.push(identity.clone());
         self.action = Some(EngineAction::FrameTask(FrameTask {
+            parent_source: self.current.as_ref().and_then(|current| {
+                current
+                    .identity
+                    .branch_index
+                    .checked_sub(1)
+                    .and_then(|index| current.reconciliation.as_ref()?.source_at(index))
+            }),
+            instance_selection_pending: self
+                .current
+                .as_ref()
+                .and_then(|current| current.reconciliation.as_ref())
+                .is_some_and(|projection| !projection.instances_selected()),
             identity,
             frame: target_frame,
             target,
@@ -14924,7 +15096,14 @@ impl RouterEngine {
                 || frame.frame() != projected.frame()
                 || frame.generation() != projected.generation()
                 || !slot_matches
-                || !current.applied_frames.contains(frame)
+                || !(current.applied_frames.contains(frame)
+                    || projection.retained().iter().any(|instance| {
+                        instance.frame() == frame
+                            && self
+                                .retained_leaves
+                                .iter()
+                                .any(|entry| entry.is_live() && entry.projection() == instance)
+                    }))
             {
                 return None;
             }
@@ -15023,7 +15202,9 @@ impl RouterEngine {
             return None;
         }
         let role = projection.child_slots().iter().find(|role| {
-            role.parent_branch_index() == parent_index && role.outlet() == binding.outlet()
+            role.parent_branch_index() == parent_index
+                && role.outlet() == binding.outlet()
+                && role.binding().is_none_or(|slot| slot.parent() == &parent)
         })?;
         match projected_slot {
             ProjectedEnteringSlot::Existing(slot) => {
@@ -15094,7 +15275,11 @@ impl RouterEngine {
 
         let grandparent_index = parent_index - 1;
         let role = projection.child_slots().iter().find(|role| {
-            role.parent_branch_index() == grandparent_index && role.outlet() == parent_route.slot()
+            role.parent_branch_index() == grandparent_index
+                && role.outlet() == parent_route.slot()
+                && role.binding().is_none_or(|slot| {
+                    current.target_frames.get(grandparent_index) == Some(slot.parent())
+                })
         })?;
         let grandparent = current.target_frames.get(grandparent_index)?;
         let grandparent_is_exact = projection.preserved().iter().any(|preserved| {
@@ -15159,7 +15344,8 @@ impl RouterEngine {
             FailureCleanupContinuationOwner::Terminal
             | FailureCleanupContinuationOwner::TerminalRecoveryFailed(_)
             | FailureCleanupContinuationOwner::BeginFallback
-            | FailureCleanupContinuationOwner::AuthoritySettlement => &[],
+            | FailureCleanupContinuationOwner::AuthoritySettlement
+            | FailureCleanupContinuationOwner::ResumeInstanceInvalidation { .. } => &[],
         };
         let logical_roots = self
             .current
@@ -15181,7 +15367,12 @@ impl RouterEngine {
         continuation: FailureCleanupContinuationOwner,
         logical_roots: Vec<RouteFrameVersion>,
     ) -> FailureCleanupRequest {
-        self.current_history_capability = None;
+        if !matches!(
+            &continuation,
+            FailureCleanupContinuationOwner::ResumeInstanceInvalidation { .. }
+        ) {
+            self.current_history_capability = None;
+        }
         let current = self
             .current
             .as_ref()
@@ -15245,6 +15436,13 @@ impl RouterEngine {
         self.prepared_publication_authority = None;
     }
 
+    pub(crate) fn selected_retained_instances(&self) -> &[retained::RetainedLeafProjection] {
+        self.current
+            .as_ref()
+            .and_then(|current| current.reconciliation.as_ref())
+            .map_or(&[], |projection| projection.retained())
+    }
+
     pub(crate) fn authority_settlement_logical_roots(&self) -> Vec<RouteFrameVersion> {
         let current = self
             .current
@@ -15255,8 +15453,7 @@ impl RouterEngine {
             .as_ref()
             .expect("authority settlement requires reconciliation");
         let mut roots = projection
-            .entering()
-            .iter()
+            .fresh_entering()
             .rev()
             .filter_map(|entering| current.target_frames.get(entering.branch_index()))
             .cloned()
@@ -15276,6 +15473,15 @@ impl RouterEngine {
         reserved: Option<crate::ids::ReservedAttemptIds>,
         failure: NavigationFailure,
     ) {
+        let prepared_prefix = prepared_prefix
+            .iter()
+            .filter(|frame| {
+                self.current
+                    .as_ref()
+                    .is_some_and(|current| current.applied_frames.contains(frame))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         self.retire_history_authority();
         if prepared_prefix.is_empty() {
             self.current = None;
@@ -15317,7 +15523,7 @@ impl RouterEngine {
             reserved.frame_task(),
             reserved.candidate_frame(),
         )];
-        current.applied_frames = prepared_prefix.to_vec();
+        current.applied_frames = prepared_prefix.clone();
         current.cleanup_batch = reserved.cleanup_batch();
         let roots = prepared_prefix.iter().rev().cloned().collect();
         let cleanup = self.begin_failure_cleanup_with_roots(
@@ -15397,7 +15603,10 @@ impl RouterEngine {
                 let child = target_frames.get(child_index)?;
                 let route = branch.routes().get(child_index)?;
                 let projected = reconciliation.child_slots().iter().find(|slot| {
-                    slot.parent_branch_index() == child_index - 1 && slot.outlet() == route.slot()
+                    slot.parent_branch_index() == child_index - 1
+                        && slot.outlet() == route.slot()
+                        && slot.kind() != ProjectedChildSlotRoleKind::Leaving
+                        && slot.binding().is_none_or(|slot| slot.parent() == parent)
                 })?;
                 let slot_is_exact = projected.binding().is_none_or(|slot| {
                     slot.parent() == parent
@@ -15532,6 +15741,16 @@ impl RouterEngine {
             );
             return BoundErrorBeginDisposition::Cleanup;
         };
+        let carried_retained = reconciliation
+            .retained()
+            .iter()
+            .map(|instance| instance.frame().clone())
+            .collect::<Vec<_>>();
+        let fresh_prepared_prefix = prepared_prefix
+            .iter()
+            .filter(|frame| !carried_retained.contains(frame))
+            .cloned()
+            .collect::<Vec<_>>();
         let direct_mount = match recovery.mount {
             FrozenErrorMountSource::MountRequired {
                 parent,
@@ -15578,14 +15797,16 @@ impl RouterEngine {
                     location: location.clone(),
                     reservation: vec![reserved_frame],
                     target_frames,
-                    selected_retained_frames: Vec::new(),
-                    applied_frames: prepared_prefix,
+                    selected_retained_frames: carried_retained.clone(),
+                    applied_frames: fresh_prepared_prefix,
                     current_target: parent_target,
                     pending_mount: Some(PendingMount {
                         child_index: binding.branch_index(),
                         parent: parent.clone(),
                         outlet: outlet.clone(),
-                        from_preserved_parent: true,
+                        parent_source: reconciliation
+                            .source_at(parent_index)
+                            .expect("frozen recovery parent source"),
                         transaction: reserved.transaction(),
                         reserved: reserved_frame,
                         kind: PendingMountKind::BoundError,
@@ -15713,8 +15934,8 @@ impl RouterEngine {
                 reserved.candidate_frame(),
             )],
             target_frames,
-            selected_retained_frames: Vec::new(),
-            applied_frames: prepared_prefix,
+            selected_retained_frames: carried_retained.clone(),
+            applied_frames: fresh_prepared_prefix,
             current_target: target.clone(),
             pending_mount: None,
             stage: WorkStage::Applying,
@@ -15742,6 +15963,18 @@ impl RouterEngine {
         self.transition_with_trace(request, NavigationPhase::Recovering);
         self.issued_view_tasks.push(identity.clone());
         self.action = Some(EngineAction::FrameTask(FrameTask {
+            parent_source: self.current.as_ref().and_then(|current| {
+                current
+                    .identity
+                    .branch_index
+                    .checked_sub(1)
+                    .and_then(|index| current.reconciliation.as_ref()?.source_at(index))
+            }),
+            instance_selection_pending: self
+                .current
+                .as_ref()
+                .and_then(|current| current.reconciliation.as_ref())
+                .is_some_and(|projection| !projection.instances_selected()),
             identity,
             frame: target_frame,
             target,
@@ -15874,6 +16107,18 @@ impl RouterEngine {
         self.issued_view_tasks.push(identity.clone());
         let fallback_identity = identity.clone();
         self.action = Some(EngineAction::FrameTask(FrameTask {
+            parent_source: self.current.as_ref().and_then(|current| {
+                current
+                    .identity
+                    .branch_index
+                    .checked_sub(1)
+                    .and_then(|index| current.reconciliation.as_ref()?.source_at(index))
+            }),
+            instance_selection_pending: self
+                .current
+                .as_ref()
+                .and_then(|current| current.reconciliation.as_ref())
+                .is_some_and(|projection| !projection.instances_selected()),
             identity,
             frame: target_frame,
             target,
@@ -16043,6 +16288,18 @@ impl RouterEngine {
         self.state.set_request(Some(RequestStatus::Running(phase)));
         self.issued_view_tasks.push(identity.clone());
         self.action = Some(EngineAction::FrameTask(FrameTask {
+            parent_source: self.current.as_ref().and_then(|current| {
+                current
+                    .identity
+                    .branch_index
+                    .checked_sub(1)
+                    .and_then(|index| current.reconciliation.as_ref()?.source_at(index))
+            }),
+            instance_selection_pending: self
+                .current
+                .as_ref()
+                .and_then(|current| current.reconciliation.as_ref())
+                .is_some_and(|projection| !projection.instances_selected()),
             identity,
             frame,
             target,
@@ -16110,6 +16367,18 @@ impl RouterEngine {
             failure,
         );
         self.action = Some(EngineAction::FrameTask(FrameTask {
+            parent_source: self.current.as_ref().and_then(|current| {
+                current
+                    .identity
+                    .branch_index
+                    .checked_sub(1)
+                    .and_then(|index| current.reconciliation.as_ref()?.source_at(index))
+            }),
+            instance_selection_pending: self
+                .current
+                .as_ref()
+                .and_then(|current| current.reconciliation.as_ref())
+                .is_some_and(|projection| !projection.instances_selected()),
             identity,
             frame,
             target,
@@ -16786,7 +17055,7 @@ impl RouterEngine {
                     child_index: pending.child_index,
                     parent: pending.parent.clone(),
                     outlet: pending.outlet.clone(),
-                    from_preserved_parent: pending.from_preserved_parent,
+                    parent_source: pending.parent_source,
                 })
         });
         let pending_no_target_authority =

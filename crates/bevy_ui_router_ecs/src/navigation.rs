@@ -657,6 +657,7 @@ struct PendingMountMutationRejection {
     artifact: MountMutationArtifact,
     payload: PendingMountMutationPayload,
     allowance: Option<SealedMountNewStagingAllowance>,
+    invalidation: Option<crate::presentation::RetainedInvalidationEvidence>,
 }
 
 pub(crate) struct PendingBackTargetDriving {
@@ -1717,6 +1718,23 @@ impl MountNewStagingSeed {
             })
     }
 
+    fn from_selected_retained_request(
+        world: &World,
+        request: NavigationRequestId,
+        projection: &r3_core::RetainedLeafProjection,
+        payload: &crate::instance::InstancePayload,
+        outlet: &bevy_ui_router_core::slot::RouteSlotKey,
+        slot: bevy_ui_router_core::ids::RouteSlotId,
+    ) -> Option<Self> {
+        crate::instance::validate_retained_entering_payload(
+            world,
+            payload.as_payload_ref(),
+            projection,
+        )
+        .ok()?;
+        Self::from_validated_request(world, request, payload.frame(), outlet, slot)
+    }
+
     fn seal_staged(
         self,
         world: &World,
@@ -2209,6 +2227,7 @@ pub(crate) struct RouterEntry {
     pub(crate) scroll: crate::scroll::ScrollState,
     pub(crate) retained: crate::retained::RetainedLeaves,
     retained_miss_cleanup: Option<Box<retained_miss::RetainedMissCleanup>>,
+    pending_retained_invalidation: Option<crate::presentation::RetainedInvalidationEvidence>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
@@ -5450,6 +5469,8 @@ pub(crate) struct AuthorityProtocolResidualOwner {
     failure_cleanup_ledger: Option<CleanupLedger>,
     cleanup_settlement_ledger: Option<CleanupLedger>,
     failure_cleanup_permanent_authority: Option<R1FailureCleanupPermanentAuthorityPair>,
+    retained: Option<crate::retained::RetainedLeaves>,
+    retained_cleanup: Option<retained_miss::ProtocolResidual>,
     pub(crate) host: Option<RetiredHostBinding>,
 }
 
@@ -5476,6 +5497,16 @@ enum AuthorityProtocolResidualKind {
     FailureCleanupCompletion(FailureCleanupCompletionMismatchView),
     CleanupStopped,
     FailureCleanupPermanentAuthority,
+    RetainedInvalidationAuthority {
+        cause: crate::presentation::RetainedInvalidationEvidence,
+        authority: crate::presentation::RetainedInvalidationEvidence,
+        reason: Box<AuthorityProtocolResidualKind>,
+    },
+    RetainedCleanupAuthority {
+        cause: crate::presentation::RetainedInvalidationEvidence,
+        authority: LifecyclePreflightEvidence,
+        reason: Box<retained_miss::Rejection>,
+    },
 }
 
 impl RouterEntry {
@@ -5807,6 +5838,7 @@ impl RouterNavigation {
             scroll: crate::scroll::ScrollState::default(),
             retained: crate::retained::RetainedLeaves::default(),
             retained_miss_cleanup: None,
+            pending_retained_invalidation: None,
             cleanup_ledger: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
@@ -7643,7 +7675,22 @@ fn reject_native_task(
     let message = failure.error.to_string();
     let has_residual = failure.residual().is_some();
     let isolation = failure.validate_settled(world);
+    let selected = if isolation.is_ok() {
+        reject_selected_task_if_invalid(world, entry, &pending, task)
+    } else {
+        std::ops::ControlFlow::Continue(task)
+    };
     let branch = failed_prepared_branch(pending, None).with_native_failure(failure);
+    let task = match selected {
+        std::ops::ControlFlow::Break(request) => {
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch,
+            });
+            return;
+        }
+        std::ops::ControlFlow::Continue(task) => task,
+    };
     if let Err(reason) = isolation {
         let failed = PendingFailedBranch {
             terminal: PendingFailedBranchTerminal::TaskWithPhysicalResidual {
@@ -7706,6 +7753,7 @@ fn realize_native_task(
     top_claim: ExactRegistryClaim,
     branch: Option<&PreparedBranch>,
     active: Option<&RealizedBranch>,
+    retained_instances: &crate::retained::RetainedLeaves,
     task: &RootFrameTask,
     prepared: crate::bsn::PreparedBsnScene,
 ) -> Result<RealizedFrame, crate::presentation::native_frame::NativeFrameFailure> {
@@ -7727,25 +7775,20 @@ fn realize_native_task(
                     prepared,
                 ));
             };
-            if active.is_none() {
-                let (Some(parent), Some(slot)) = (branch.last_frame(), branch.child_slots().last())
-                else {
-                    return Err(NativeFrameFailure::before_mount(
-                        RealizationError::InvalidMount,
-                        prepared,
-                    ));
-                };
-                return realize_native_child(world, parent, slot, task, prepared);
-            }
             let Ok(projection) = engine.reconciliation_projection_for_task(task) else {
                 return Err(NativeFrameFailure::before_mount(
                     RealizationError::InvalidMount,
                     prepared,
                 ));
             };
-            let Some(mount) =
-                seal_staging_mount_with_retained(world, &projection, active, branch, task)
-            else {
+            let Some(mount) = seal_staging_mount_with_retained(
+                world,
+                &projection,
+                active,
+                branch,
+                retained_instances,
+                task,
+            ) else {
                 return Err(NativeFrameFailure::before_mount(
                     RealizationError::InvalidMount,
                     prepared,
@@ -7761,6 +7804,7 @@ fn seal_staging_mount_with_retained<'a>(
     projection: &r3_core::ReconciliationProjectionView<'_>,
     active: Option<&'a RealizedBranch>,
     entering: &'a PreparedBranch,
+    retained_instances: &'a crate::retained::RetainedLeaves,
     task: &RootFrameTask,
 ) -> Option<crate::branch_transaction::SealedReconciliationStagingMount<'a>> {
     let retained = match task.mount_target() {
@@ -7770,8 +7814,16 @@ fn seal_staging_mount_with_retained<'a>(
             .ok()?,
         FrameMountTarget::TopSlot { .. } => Vec::new(),
     };
-    crate::branch_transaction::seal_reconciliation_staging_mount_with_retained(
-        projection, active, entering, task, &retained,
+    let selected = projection
+        .retained()
+        .map(|projection| {
+            retained_instances
+                .payload_for(projection)
+                .map(|payload| (projection, payload))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    crate::branch_transaction::seal_mixed_reconciliation_staging_mount(
+        projection, active, entering, &selected, task, &retained,
     )
 }
 
@@ -7783,6 +7835,7 @@ fn apply_applied_driver_report_to_branch(
     top_slot_claim: crate::registry::ExactRegistryClaim,
     branch: Option<&PreparedBranch>,
     active: Option<&RealizedBranch>,
+    retained_instances: &crate::retained::RetainedLeaves,
     task: &RootFrameTask,
     artifact: AppliedDriverReportArtifact,
 ) -> Result<RealizedFrame, DriverReportApplicationError> {
@@ -7808,28 +7861,17 @@ fn apply_applied_driver_report_to_branch(
             let Some(branch) = branch else {
                 return Err(DriverReportApplicationError::Stale);
             };
-            if active.is_none() {
-                let (Some(parent), Some(mounted)) =
-                    (branch.last_frame(), branch.child_slots().last())
-                else {
-                    return Err(DriverReportApplicationError::Stale);
-                };
-                return realize_child_frame_deferred(
-                    world,
-                    parent,
-                    mounted,
-                    task,
-                    task.view_request_sequence(),
-                    plan.accept(),
-                )
-                .map_err(DriverReportApplicationError::Realization);
-            }
             let projection = engine
                 .reconciliation_projection_for_task(task)
                 .map_err(|_| DriverReportApplicationError::Stale)?;
-            let Some(mount) =
-                seal_staging_mount_with_retained(world, &projection, active, branch, task)
-            else {
+            let Some(mount) = seal_staging_mount_with_retained(
+                world,
+                &projection,
+                active,
+                branch,
+                retained_instances,
+                task,
+            ) else {
                 return Err(DriverReportApplicationError::Stale);
             };
             realize_reconciliation_child_frame_deferred(
@@ -7908,6 +7950,8 @@ fn install_failure_cleanup_permanent_authority(
         failure_cleanup_ledger: None,
         cleanup_settlement_ledger: None,
         failure_cleanup_permanent_authority: Some(pair),
+        retained: None,
+        retained_cleanup: None,
         host: retired_host,
     });
     let protocol_residual = &mut entry.authority_protocol_residual;
@@ -8154,7 +8198,6 @@ fn complete_zero_physical_failure(
             entry.pending_commit = Some(PendingCommit {
                 ticket: None,
                 final_task: None,
-                retained_hit: None,
                 rejected_retained_publication: None,
                 branch,
             });
@@ -8170,7 +8213,22 @@ fn complete_zero_physical_failure(
                 branch: FailedPreparedBranch::new(branch),
             });
         }
+        FailureCleanupCompletionDisposition::ResumeInstanceInvalidation(continuation) => {
+            assert!(retained_prepared_prefix.is_none());
+            let evidence = entry
+                .pending_retained_invalidation
+                .take()
+                .expect("the original instance invalidation cause survives fresh cleanup");
+            retained_miss::begin(
+                entry,
+                r3_core::RetainedInvalidationReceiver::AfterFailure(continuation),
+                None,
+                PendingCommit::new(),
+                evidence,
+            );
+        }
         FailureCleanupCompletionDisposition::Settled => {
+            entry.pending_retained_invalidation = None;
             assert!(
                 retained_prepared_prefix.is_none(),
                 "a settled continuation cannot return a retained physical prefix",
@@ -8190,9 +8248,20 @@ fn retry_pending_mount_mutation_rejection(
         artifact,
         payload,
         allowance,
+        invalidation,
     } = pending_rejection;
-    match entry.engine.reject_mount_after_mutation(artifact) {
+    let result = if let Some(evidence) = invalidation.as_ref() {
+        entry
+            .engine
+            .reject_retained_mount_after_mutation(artifact, evidence.projection().frame().clone())
+    } else {
+        entry.engine.reject_mount_after_mutation(artifact)
+    };
+    match result {
         Ok(request) => {
+            if invalidation.is_some() {
+                entry.pending_retained_invalidation = invalidation;
+            }
             let residual = match payload {
                 PendingMountMutationPayload::Grant { residual } => residual,
                 PendingMountMutationPayload::Receipt { staged, proof } => {
@@ -8212,6 +8281,7 @@ fn retry_pending_mount_mutation_rejection(
             artifact: error.into_owner(),
             payload,
             allowance,
+            invalidation,
         }),
     }
 }
@@ -9170,14 +9240,11 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                         };
                         match action {
                             EngineAction::Commit(ticket) => {
-                                let mut pending = PendingCommit::new();
+                                let mut pending = entry.pending_commit.take().unwrap_or_else(PendingCommit::new);
                                 pending.ticket = Some(ticket);
                                 entry.pending_commit = Some(pending);
                             }
                             EngineAction::FrameTask(mut task) => {
-                                let task_mount_target = task.mount_target();
-                                let realizing_root =
-                                    matches!(task_mount_target, FrameMountTarget::TopSlot { .. });
                                 let (mut pending, retry_effect) = match retry_context {
                                     Some((pending, effect)) => (pending, Some(effect)),
                                     None => (
@@ -9188,40 +9255,51 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         None,
                                     ),
                                 };
-                                if retry_effect.is_none()
-                                    && pending.branch.frames().is_empty()
-                                    && pending.branch.child_slots().is_empty()
-                                    && !entry.retained.is_empty()
-                                {
-                                    let hit = entry.retained.inventory().ok_or(IntegrationError::Stale)
-                                        .and_then(|inventory| entry.engine.prepare_retained_hit_plan(&task, &inventory));
-                                    match hit {
-                                        Ok(Some(plan)) => {
-                                            if let Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) =
-                                                retained_miss::classify(world, entry, &plan)
-                                            {
-                                                retained_miss::begin(entry, task, plan, pending, evidence);
-                                                continue;
-                                            }
-                                            pending.retained_hit = Some(Box::new(plan));
-                                            pending.final_task = Some(task);
+                                if task.instance_selection_pending() {
+                                    let selection = entry.retained.inventory()
+                                        .ok_or(IntegrationError::Stale)
+                                        .and_then(|inventory| entry.engine.prepare_instance_selection(&task, &inventory));
+                                    let plan = match selection {
+                                        Ok(plan) => plan,
+                                        Err(_) => {
+                                            entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+                                            continue;
+                                        }
+                                    };
+                                    if let Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) =
+                                        retained_miss::classify(world, entry, plan.selected())
+                                    {
+                                        retained_miss::begin(
+                                            entry,
+                                            r3_core::RetainedInvalidationReceiver::FrameTask(task),
+                                            Some(plan),
+                                            pending,
+                                            evidence,
+                                        );
+                                        continue;
+                                    }
+                                    match entry.engine.accept_instance_selection(task, plan) {
+                                        Ok(EngineAction::FrameTask(selected)) => task = selected,
+                                        Ok(EngineAction::MountRequest(request)) => {
+                                            entry.pending_mount_request = Some(request);
                                             entry.pending_commit = Some(pending);
                                             continue;
                                         }
-                                        Ok(None) => {}
-                                        Err(_) => {
-                                            entry.pending_failed_branch = Some(PendingFailedBranch {
-                                                terminal: PendingFailedBranchTerminal::Task {
-                                                    task,
-                                                    failure: ViewFailureKind::Apply,
-                                                    message: "retained hit selection became stale".into(),
-                                                },
-                                                branch: failed_prepared_branch(pending, None),
-                                            });
+                                        Ok(EngineAction::Commit(ticket)) => {
+                                            pending.ticket = Some(ticket);
+                                            entry.pending_commit = Some(pending);
+                                            continue;
+                                        }
+                                        Ok(_) => unreachable!("instance selection continues with a task, mount request or commit"),
+                                        Err(error) => {
+                                            let (task, _, _) = error.into_parts();
+                                            entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
                                             continue;
                                         }
                                     }
                                 }
+                                let task_mount_target = task.mount_target();
+                                let realizing_root = matches!(task_mount_target, FrameMountTarget::TopSlot { .. });
                                 let expected_child_outlet =
                                     match entry.engine.expected_child_outlet(&task) {
                                         Ok(expected) => expected,
@@ -9552,7 +9630,8 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                             continue;
                                         }
                                     };
-                                    let realized = realize_native_task(world, &entry.engine, host_candidate.clone(), top_slot, top_slot_claim.clone(), (!realizing_root).then_some(&pending.branch), entry.active.as_ref(), &task, prepared);
+                                    let realized = realize_native_task(world, &entry.engine, host_candidate.clone(), top_slot, top_slot_claim.clone(), (!realizing_root).then_some(&pending.branch), entry.active.as_ref(),
+                                    &entry.retained, &task, prepared);
                                     match crate::presentation::native_frame::finish_focus(world, focus_owner, realized) {
                                         Ok(frame) => Some(Ok(frame)),
                                         Err(crate::presentation::native_frame::NativeFrameFailure::Mount(failure)) => Some(Err(DriverReportApplicationError::Realization(failure))),
@@ -9742,6 +9821,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     top_slot_claim,
                                     (!realizing_root).then_some(&pending.branch),
                                     entry.active.as_ref(),
+                                    &entry.retained,
                                     &task,
                                     artifact,
                                 )
@@ -9784,6 +9864,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         continue;
                                     }
                                     Err(DriverReportApplicationError::Realization(failure)) => {
+                                        let selected = reject_selected_task_if_invalid(world,entry,&pending,task);
                                         let (error, residual) = failure.into_parts();
                                         let message = format!("frame realization rejected: {error:?}");
                                         if let Some(residual) = residual {
@@ -9795,6 +9876,16 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                         residual,
                                                     )
                                                 }
+                                            };
+                                            let task = match selected {
+                                                std::ops::ControlFlow::Break(request) => {
+                                                    entry.pending_failed_branch = Some(PendingFailedBranch {
+                                                        terminal:PendingFailedBranchTerminal::Request(request),
+                                                        branch:failed_branch,
+                                                    });
+                                                    continue;
+                                                }
+                                                std::ops::ControlFlow::Continue(task) => task,
                                             };
                                             match route_back_target_frame_failure(
                                                 world,
@@ -9846,6 +9937,16 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                 ),
                                             }
                                         } else {
+                                            let task = match selected {
+                                                std::ops::ControlFlow::Break(request) => {
+                                                    entry.pending_failed_branch = Some(PendingFailedBranch {
+                                                        terminal:PendingFailedBranchTerminal::Request(request),
+                                                        branch:failed_prepared_branch(pending,None),
+                                                    });
+                                                    continue;
+                                                }
+                                                std::ops::ControlFlow::Continue(task) => task,
+                                            };
                                             let (pending, task) =
                                                 match route_back_target_frame_failure(
                                                     world,
@@ -10121,50 +10222,56 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                     entry.pending_commit = Some(pending);
                                     continue;
                                 }
+                                if let Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) =
+                                    classify_selected_with_entering(world, entry, &pending, None)
+                                {
+                                    let request = entry.pending_mount_request.take()
+                                        .expect("the original validated mount request remains owned");
+                                    match entry.engine.reject_retained_mount(request, evidence.projection().frame().clone()) {
+                                        Ok(request) => {
+                                            entry.pending_retained_invalidation = Some(evidence);
+                                            entry.pending_failed_branch = Some(PendingFailedBranch {
+                                                terminal: PendingFailedBranchTerminal::Request(request),
+                                                branch: failed_prepared_branch(pending, None),
+                                            });
+                                        }
+                                        Err(error) => {
+                                            entry.pending_mount_request = Some(error.into_owner());
+                                            entry.pending_commit = Some(pending);
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let request_identity = entry
                                     .pending_mount_request
                                     .as_ref()
                                     .expect("validated mount request remains held")
                                     .request();
-                                let (
-                                    parent_is_exact,
-                                    parent_is_active,
-                                    outlet_exists,
-                                    outlet,
-                                    mount_parent,
-                                ) = {
-                                    let request = entry
-                                        .pending_mount_request
-                                        .as_ref()
+                                let (parent_is_exact, parent_source, outlet_exists, outlet, mount_parent) = {
+                                    let request = entry.pending_mount_request.as_ref()
                                         .expect("validated mount request remains held");
-                                    let entering_parent = pending
-                                        .branch
-                                        .frames()
-                                        .iter()
+                                    let entering_parent = pending.branch.frames().iter()
                                         .find(|frame| frame.frame() == request.parent());
-                                    let active_parent = entry.active.as_ref().and_then(|branch| {
-                                        branch
-                                            .frames()
-                                            .iter()
-                                            .find(|frame| frame.frame() == request.parent())
-                                    });
-                                    let exact_entering = entering_parent.is_some_and(|parent| {
-                                        validate_entering_mount_parent(
-                                            world, parent, pending.branch.as_realized(), entry.active.as_ref(),
-                                        )
-                                    });
-                                    let exact_active = active_parent
-                                        .is_some_and(|parent| validate_active_frame(world, parent));
-                                    let parent = entering_parent.or(active_parent);
-                                    (
-                                        exact_entering ^ exact_active,
-                                        exact_active,
-                                        parent.is_some_and(|parent| {
-                                            parent.outlet(request.outlet()).is_some()
-                                        }),
-                                        request.outlet().clone(),
-                                        request.parent().clone(),
-                                    )
+                                    let active_parent = entry.active.as_ref().and_then(|branch| branch.frames().iter()
+                                        .find(|frame| frame.frame() == request.parent()));
+                                    let retained_parent = entry.engine.selected_retained_instances().iter()
+                                        .find(|projection| projection.frame() == request.parent())
+                                        .and_then(|projection| entry.retained.payload_for(projection)
+                                            .map(|payload| (projection, payload)));
+                                    let exact_entering = entering_parent.is_some_and(|parent|
+                                        validate_entering_mount_parent(world, parent, pending.branch.as_realized(), entry.active.as_ref()));
+                                    let exact_active = active_parent.is_some_and(|parent| validate_active_frame(world, parent));
+                                    let exact_retained = retained_parent.is_some_and(|(projection, payload)|
+                                        crate::instance::validate_retained_entering_payload(world, payload.as_payload_ref(), projection).is_ok());
+                                    let exact_count = usize::from(exact_entering) + usize::from(exact_active) + usize::from(exact_retained);
+                                    let source = if exact_count != 1 { None }
+                                        else if exact_active { Some(r3_core::TargetInstanceSourceKind::Current) }
+                                        else if exact_retained { Some(r3_core::TargetInstanceSourceKind::Retained) }
+                                        else { Some(r3_core::TargetInstanceSourceKind::Fresh) };
+                                    let parent = entering_parent.or(active_parent).or(retained_parent.map(|(_, payload)| payload.frame()));
+                                    (exact_count == 1, source,
+                                        parent.is_some_and(|parent| parent.outlet(request.outlet()).is_some()),
+                                        request.outlet().clone(), request.parent().clone())
                                 };
                                 if !parent_is_exact || !outlet_exists {
                                     let request = entry
@@ -10210,47 +10317,38 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         continue;
                                     }
                                 };
-                                let allowance_seed = if parent_is_active {
-                                    entry
-                                        .active
-                                        .as_ref()
-                                        .and_then(|branch| {
-                                            branch.frames().iter().find(|frame| {
-                                                frame.frame() == &mount_parent
-                                            })
-                                        })
-                                        .and_then(|parent| {
-                                            MountNewStagingSeed::from_validated_request(
-                                                world,
-                                                request_identity,
-                                                parent,
-                                                &outlet,
-                                                grant.slot(),
-                                            )
-                                        })
-                                } else {
-                                    None
+                                let allowance_seed = match parent_source {
+                                    Some(r3_core::TargetInstanceSourceKind::Current) => entry.active.as_ref()
+                                        .and_then(|branch| branch.frames().iter().find(|frame| frame.frame() == &mount_parent))
+                                        .and_then(|parent| MountNewStagingSeed::from_validated_request(
+                                            world, request_identity, parent, &outlet, grant.slot())),
+                                    Some(r3_core::TargetInstanceSourceKind::Retained) => entry.engine.selected_retained_instances().iter()
+                                        .find(|projection| projection.frame() == &mount_parent)
+                                        .and_then(|projection| entry.retained.payload_for(projection).map(|payload| (projection, payload)))
+                                        .and_then(|(projection,payload)| MountNewStagingSeed::from_selected_retained_request(
+                                            world, request_identity, projection, payload, &outlet, grant.slot())),
+                                    _ => None,
                                 };
-                                let staged_result = {
-                                    let parent = if parent_is_active {
-                                        entry
-                                            .active
-                                            .as_ref()
-                                            .and_then(|branch| {
-                                                branch.frames().iter().find(|frame| {
-                                                    frame.frame() == &mount_parent
-                                                })
-                                            })
-                                            .expect("validated active mount parent remains exact")
-                                    } else {
-                                        pending
-                                            .branch
-                                            .frames()
-                                            .iter()
-                                            .find(|frame| frame.frame() == &mount_parent)
-                                            .expect("validated entering mount parent remains exact")
-                                    };
-                                    stage_child_slot(world, parent, &outlet, &grant)
+                                let staged_result = match parent_source {
+                                    Some(r3_core::TargetInstanceSourceKind::Current) => {
+                                        let parent = entry.active.as_ref()
+                                            .and_then(|branch| branch.frames().iter().find(|frame| frame.frame() == &mount_parent))
+                                            .expect("validated current mount parent remains exact");
+                                        stage_child_slot(world, parent, &outlet, &grant)
+                                    }
+                                    Some(r3_core::TargetInstanceSourceKind::Retained) => {
+                                        let (projection,payload) = entry.engine.selected_retained_instances().iter()
+                                            .find(|projection| projection.frame() == &mount_parent)
+                                            .and_then(|projection| entry.retained.payload_for(projection).map(|payload| (projection,payload)))
+                                            .expect("validated retained mount parent remains exact");
+                                        crate::mount::stage_retained_child_slot(world, projection, payload, &outlet, &grant)
+                                    }
+                                    Some(r3_core::TargetInstanceSourceKind::Fresh) => {
+                                        let parent = pending.branch.frames().iter().find(|frame| frame.frame() == &mount_parent)
+                                            .expect("validated fresh mount parent remains exact");
+                                        stage_child_slot(world, parent, &outlet, &grant)
+                                    }
+                                    None => unreachable!("the exact parent role was checked before consuming its mount request"),
                                 };
                                 let (staged, allowance) = match staged_result {
                                     Ok(staged) => {
@@ -10265,33 +10363,16 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                 .as_ref()
                                                 .and_then(|residual| seed.seal_residual(world, residual))
                                         });
-                                        match entry.engine.reject_mount_after_mutation(
-                                            MountMutationArtifact::Grant(grant),
-                                        ) {
-                                            Ok(request) => {
-                                                entry.pending_failed_branch =
-                                                    Some(PendingFailedBranch {
-                                                        terminal:
-                                                            PendingFailedBranchTerminal::Request(
-                                                                request,
-                                                            ),
-                                                        branch: failed_prepared_branch(pending, residual)
-                                                            .with_mount_new_allowance(allowance),
-                                                    });
-                                            }
-                                            Err(error) => {
-                                                entry.pending_mount_mutation_rejection =
-                                                    Some(PendingMountMutationRejection {
-                                                        pending,
-                                                        artifact: error.into_owner(),
-                                                        payload:
-                                                            PendingMountMutationPayload::Grant {
-                                                                residual,
-                                                            },
-                                                        allowance,
-                                                    });
-                                            }
-                                        }
+                                        let invalidation = match classify_selected_with_entering(world,entry,&pending,allowance.as_ref()) {
+                                            Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) => Some(evidence),
+                                            _ => None,
+                                        };
+                                        let rejection = PendingMountMutationRejection {
+                                            pending, artifact: MountMutationArtifact::Grant(grant),
+                                            payload: PendingMountMutationPayload::Grant {residual},
+                                            allowance, invalidation,
+                                        };
+                                        entry.pending_mount_mutation_rejection = retry_pending_mount_mutation_rejection(world, entry, rejection);
                                         continue;
                                     }
                                 };
@@ -10301,6 +10382,10 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                 let permit = match entry.engine.accept_mount_receipt(attestation) {
                                     Ok(permit) => permit,
                                     Err(error) => {
+                                        let invalidation = match classify_selected_with_entering(world,entry,&pending,allowance.as_ref()) {
+                                            Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) => Some(evidence),
+                                            _ => None,
+                                        };
                                         let pending_rejection =
                                             PendingMountMutationRejection {
                                                 pending,
@@ -10313,6 +10398,7 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                                         proof,
                                                     },
                                                 allowance,
+                                                invalidation,
                                             };
                                         entry.pending_mount_mutation_rejection =
                                             retry_pending_mount_mutation_rejection(
@@ -10323,31 +10409,36 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                         continue;
                                     }
                                 };
-                                match confirm_child_slot(
-                                    world,
-                                    &mut entry.engine,
-                                    staged,
-                                    permit,
-                                    &proof,
-                                ) {
+                                let confirmed = if parent_source == Some(r3_core::TargetInstanceSourceKind::Retained) {
+                                    let projection = entry.engine.selected_retained_instances().iter()
+                                        .find(|projection| projection.frame() == &mount_parent).cloned()
+                                        .expect("the selected original parent remains in the accepted prefix");
+                                    let payload = entry.retained.payload_for(&projection)
+                                        .expect("the original selected payload remains in inventory until publication");
+                                    crate::mount::confirm_child_slot_with_retained_parent(
+                                        world, &mut entry.engine, staged, permit, &proof, &projection, payload)
+                                } else {
+                                    confirm_child_slot(world, &mut entry.engine, staged, permit, &proof)
+                                };
+                                match confirmed {
                                     Ok(mounted) => {
-                                        let pushed = if parent_is_active {
-                                            let parent = entry
-                                                .active
-                                                .as_ref()
-                                                .and_then(|branch| {
-                                                    branch.frames().iter().find(|frame| {
-                                                        frame.frame() == &mount_parent
-                                                    })
-                                                })
-                                                .expect(
-                                                    "confirmed active mount parent remains exact",
-                                                );
-                                            pending
-                                                .branch
-                                                .push_reconciliation_child_slot(mounted, parent)
-                                        } else {
-                                            pending.branch.push_child_slot(mounted)
+                                        let pushed = match parent_source {
+                                            Some(r3_core::TargetInstanceSourceKind::Current) => {
+                                                let parent = entry.active.as_ref()
+                                                    .and_then(|branch| branch.frames().iter().find(|frame| frame.frame() == &mount_parent))
+                                                    .expect("confirmed current mount parent remains exact");
+                                                pending.branch.push_reconciliation_child_slot(mounted,parent)
+                                            }
+                                            Some(r3_core::TargetInstanceSourceKind::Retained) => {
+                                                let parent = entry.engine.selected_retained_instances().iter()
+                                                    .find(|projection| projection.frame() == &mount_parent)
+                                                    .and_then(|projection| entry.retained.payload_for(projection))
+                                                    .map(crate::instance::InstancePayload::frame)
+                                                    .expect("confirmed retained mount parent remains exact");
+                                                pending.branch.push_reconciliation_child_slot(mounted,parent)
+                                            }
+                                            Some(r3_core::TargetInstanceSourceKind::Fresh) => pending.branch.push_child_slot(mounted),
+                                            None => unreachable!("confirmed mount keeps its exact parent role"),
                                         };
                                         match pushed {
                                             Ok(()) => {
@@ -10385,7 +10476,10 @@ fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> V
                                             }
                                         }
                                     }
-                                    Err(failure) => {
+                                    Err(mut failure) => {
+                                        if let Some(evidence) = failure.take_retained_invalidation() {
+                                            entry.pending_retained_invalidation = Some(evidence);
+                                        }
                                         let (cleanup, begin, residual) = failure.into_parts();
                                         let allowance = allowance
                                             .and_then(|allowance| allowance.rebind_residual(&residual));
@@ -14810,9 +14904,7 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
     let Some(mut pending) = entry.pending_commit.take() else {
         return true;
     };
-    if entry.engine.keep_alive_capacity() > 0
-        && (pending.retained_hit.is_some() || pending.ticket.is_some())
-    {
+    if entry.engine.keep_alive_capacity() > 0 && pending.ticket.is_some() {
         // A hit has no fresh branch to bind. A fresh Back may retain its
         // departing leaf too. Both use the ordinary retention publisher, which
         // accepts this original Back execution together with its owners.
@@ -15541,6 +15633,11 @@ fn prepare_commit_entry(
         entry.pending_commit = Some(pending);
         return None;
     }
+    let pending = match begin_selected_invalidation(world, entry, pending) {
+        Some(pending) => pending,
+        None => return None,
+    };
+    let mut pending = pending;
     let Some(authority_root) = entry
         .active
         .as_ref()
@@ -15559,16 +15656,12 @@ fn prepare_commit_entry(
         return None;
     };
     let (facts, has_leaving) = {
-        let projection = if let Some(plan) = pending.retained_hit.as_ref() {
-            Ok(plan.reconciliation())
-        } else {
-            match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
-                (Some(ticket), _) => entry.engine.reconciliation_projection_for_commit(ticket),
-                (None, Some(task)) => entry.engine.reconciliation_projection_for_task(task),
-                (None, None) => {
-                    entry.pending_commit = Some(pending);
-                    return None;
-                }
+        let projection = match (pending.ticket.as_ref(), pending.final_task.as_ref()) {
+            (Some(ticket), _) => entry.engine.reconciliation_projection_for_commit(ticket),
+            (None, Some(task)) => entry.engine.reconciliation_projection_for_task(task),
+            (None, None) => {
+                entry.pending_commit = Some(pending);
+                return None;
             }
         };
         let Ok(projection) = projection else {
@@ -15585,17 +15678,39 @@ fn prepare_commit_entry(
         };
         (facts, has_leaving)
     };
+    // A fully retained target can reach Commit without a fresh frame apply.
+    // Route common authority loss before mixed preparation requires live stock.
+    let missing = RequiredResourceSet::missing_from(world);
+    let authority_loss = if !missing.is_empty() {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::RequiredResources(missing),
+            LifecyclePreflightExpectation::ResourcePresent,
+            LifecyclePreflightObserved::Missing,
+        ))
+    } else if entry
+        .host
+        .as_ref()
+        .is_none_or(|host| !current_host_binding_is_exact(world, host))
+    {
+        Some(LifecyclePreflightEvidence::new(
+            LifecyclePreflightSource::HostBinding,
+            LifecyclePreflightExpectation::ExactAuthority,
+            LifecyclePreflightObserved::Drifted,
+        ))
+    } else {
+        None
+    };
+    if let Some(evidence) = authority_loss {
+        let had_active = entry.active.is_some();
+        let active = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+        settle_prepublication_authority_loss(
+            world, entry, active, pending, had_active, evidence, false,
+        );
+        return None;
+    }
     let had_active = entry.active.is_some();
     let active_owner = entry.active.take().unwrap_or_else(RealizedBranch::empty);
-    let sealed = match if let Some(plan) = pending.retained_hit.as_ref() {
-        SealedExistingReconciliation::prepare_retained_from_projection(
-            active_owner,
-            facts,
-            plan.hit(),
-        )
-    } else {
-        SealedExistingReconciliation::prepare_from_projection(active_owner, facts)
-    } {
+    let sealed = match SealedExistingReconciliation::prepare_from_projection(active_owner, facts) {
         Ok(sealed) => sealed,
         Err(failure) => {
             let (active, _) = failure.into_parts();
@@ -15604,115 +15719,54 @@ fn prepare_commit_entry(
             return None;
         }
     };
-    let splice = if let Some(plan) = pending.retained_hit.as_ref() {
-        let entering_boundaries = entry
-            .retained
-            .payload_for(plan.hit())
-            .into_iter()
-            .flat_map(crate::instance::InstancePayload::claims)
-            .map(ExactRegistryClaim::entity)
-            .collect::<Vec<_>>();
+    let entering_owner = std::mem::replace(&mut pending.branch, PreparedBranch::empty());
+    let selected = entry
+        .engine
+        .selected_retained_instances()
+        .iter()
+        .map(|projection| {
+            entry
+                .retained
+                .payload_for(projection)
+                .map(|payload| (projection, payload))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(selected) = selected else {
+        let (active, _, _) = sealed.reject().into_parts();
+        entry.active = had_active.then_some(active);
+        pending.branch = entering_owner;
+        entry.pending_commit = Some(pending);
+        return None;
+    };
+    let splice = match sealed.prepare_mixed_entering(world, entering_owner, &selected) {
+        Ok(splice) => splice,
+        Err(failure) => {
+            let (sealed, entering, _) = failure.into_parts();
+            let (active, _, _) = sealed.reject().into_parts();
+            entry.active = had_active.then_some(active);
+            pending.branch = entering;
+            entry.pending_commit = Some(pending);
+            return None;
+        }
+    };
+    let sealed = if commit_sealed_registration_removal_is_armed(entry)
+        && entry.engine.selected_retained_instances().is_empty()
+    {
         let host_is_current = entry
             .host
             .as_ref()
             .is_some_and(|host| current_host_binding_is_exact(world, host));
-        if let Err(evidence) = reconciliation_current_preflight(
-            world,
-            host_is_current,
-            has_leaving,
-            sealed.preserved(),
-            sealed.leaving(),
-            sealed.slot_roles(),
-            &entering_boundaries,
-        ) {
-            let (active, _, _) = sealed.reject().into_parts();
-            settle_prepublication_authority_loss(
-                world, entry, active, pending, had_active, evidence, false,
-            );
-            return None;
-        }
-        let Some(branch) = entry.retained.payload_for(plan.hit()) else {
-            let (active, _, _) = sealed.reject().into_parts();
-            entry.active = had_active.then_some(active);
-            entry.pending_commit = Some(pending);
-            return None;
-        };
-        match sealed.prepare_retained_entering(world, branch, plan.hit()) {
-            Ok(prepared) => NormalPublicationSplice::Retained {
-                prepared,
-                hit: plan.hit().clone(),
-            },
-            Err((sealed, _)) => {
-                let (active, _, _) = sealed.reject().into_parts();
-                entry.active = had_active.then_some(active);
-                let task = pending.final_task.take()?;
-                let (pending, task) = match route_back_target_frame_failure(
-                    world,
-                    entry,
-                    BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
-                    task,
-                    ViewFailureKind::Apply,
-                    "retained entering preparation rejected",
-                ) {
-                    RouteBackTargetFrameFailureOutcome::Handled => return None,
-                    RouteBackTargetFrameFailureOutcome::NonTarget {
-                        physical: BackTargetDriverUnverifiedPhysicalOwner::Pending(pending),
-                        task,
-                    } => (pending, task),
-                    RouteBackTargetFrameFailureOutcome::NonTarget { .. } => unreachable!(),
-                };
-                entry.pending_failed_branch = Some(PendingFailedBranch {
-                    terminal: PendingFailedBranchTerminal::Task {
-                        task,
-                        failure: ViewFailureKind::Apply,
-                        message: "retained entering preparation rejected".into(),
-                    },
-                    branch: failed_prepared_branch(pending, None),
-                });
-                return None;
-            }
-        }
-    } else {
-        let entering_owner = std::mem::replace(&mut pending.branch, PreparedBranch::empty());
-        match sealed.bind_entering(entering_owner) {
-            Ok(splice) => NormalPublicationSplice::Fresh(splice),
-            Err(failure) => {
-                let (sealed, entering, _) = failure.into_parts();
-                let (active, _, _roles) = sealed.reject().into_parts();
-                entry.active = had_active.then_some(active);
-                pending.branch = entering;
-                entry.pending_commit = Some(pending);
-                return None;
-            }
-        }
-    };
-
-    let mut splice = splice;
-    let sealed = if let NormalPublicationSplice::Fresh(fresh) = splice {
-        let (fresh, sealed) = if commit_sealed_registration_removal_is_armed(entry) {
-            let host_is_current = entry
-                .host
-                .as_ref()
-                .is_some_and(|host| current_host_binding_is_exact(world, host));
-            let (observed_splice, ready) =
-                match reconciliation_preflight(world, host_is_current, has_leaving, fresh) {
-                    ReconciliationPreflightOutcome::Ready { splice, .. } => (splice, true),
-                    ReconciliationPreflightOutcome::PendingRejected { splice, .. }
-                    | ReconciliationPreflightOutcome::AuthorityLost { splice, .. } => {
-                        (splice, false)
-                    }
-                };
-            let sealed = if ready {
-                prepare_normal_registration_probe(world, entry, &mut pending, &observed_splice)
-            } else {
-                None
-            };
-            (observed_splice, sealed)
+        let ready = splice.view(&entry.retained).is_some_and(|view| {
+            matches!(
+                reconciliation_preflight_view(world, host_is_current, has_leaving, view),
+                ReconciliationPreflightDecision::Ready(_)
+            )
+        });
+        if ready {
+            prepare_normal_registration_probe(world, entry, &mut pending, &splice)
         } else {
-            (fresh, None)
-        };
-        splice = NormalPublicationSplice::Fresh(fresh);
-        sealed
+            None
+        }
     } else {
         None
     };
@@ -15725,26 +15779,130 @@ fn prepare_commit_entry(
     })
 }
 
+fn classify_selected_with_entering(
+    world: &World,
+    entry: &RouterEntry,
+    pending: &PendingCommit,
+    allowance: Option<&SealedMountNewStagingAllowance>,
+) -> Option<crate::presentation::RetainedPayloadClassification> {
+    let registry = world.get_resource::<RouteEntityRegistry>()?;
+    for projection in entry.engine.selected_retained_instances() {
+        let payload = entry.retained.payload_for(projection)?;
+        let classification = registry.classify_retained_payload_with_entering(
+            world,
+            projection,
+            payload,
+            pending.branch.as_realized().as_payload_ref(),
+            allowance,
+        )?;
+        if !matches!(
+            classification,
+            crate::presentation::RetainedPayloadClassification::Current
+        ) {
+            return Some(classification);
+        }
+    }
+    Some(crate::presentation::RetainedPayloadClassification::Current)
+}
+
+fn reject_selected_task_if_invalid(
+    world: &World,
+    entry: &mut RouterEntry,
+    pending: &PendingCommit,
+    task: RootFrameTask,
+) -> std::ops::ControlFlow<FailureCleanupRequest, RootFrameTask> {
+    let Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) =
+        classify_selected_with_entering(world, entry, pending, None)
+    else {
+        return std::ops::ControlFlow::Continue(task);
+    };
+    match entry.engine.reject_retained_invalidation(
+        r3_core::RetainedInvalidationReceiver::FrameTask(task),
+        evidence.projection().frame().clone(),
+    ) {
+        Ok(request) => {
+            entry.pending_retained_invalidation = Some(evidence);
+            std::ops::ControlFlow::Break(request)
+        }
+        Err(error) => {
+            let (receiver, _) = error.into_parts();
+            let r3_core::RetainedInvalidationReceiver::FrameTask(task) = receiver else {
+                unreachable!("rejection returns the original selected task")
+            };
+            std::ops::ControlFlow::Continue(task)
+        }
+    }
+}
+
+fn begin_selected_invalidation(
+    world: &World,
+    entry: &mut RouterEntry,
+    mut pending: PendingCommit,
+) -> Option<PendingCommit> {
+    let Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(evidence)) =
+        classify_selected_with_entering(world, entry, &pending, None)
+    else {
+        return Some(pending);
+    };
+    let receiver = if let Some(ticket) = pending.ticket.take() {
+        r3_core::RetainedInvalidationReceiver::Commit(ticket)
+    } else if let Some(task) = pending.final_task.take() {
+        r3_core::RetainedInvalidationReceiver::FrameTask(task)
+    } else {
+        return Some(pending);
+    };
+    match entry
+        .engine
+        .reject_retained_invalidation(receiver, evidence.projection().frame().clone())
+    {
+        Ok(request) => {
+            entry.pending_retained_invalidation = Some(evidence);
+            entry.pending_failed_branch = Some(PendingFailedBranch {
+                terminal: PendingFailedBranchTerminal::Request(request),
+                branch: failed_prepared_branch(pending, None),
+            });
+            None
+        }
+        Err(error) => {
+            let (receiver, _) = error.into_parts();
+            match receiver {
+                r3_core::RetainedInvalidationReceiver::FrameTask(task) => {
+                    pending.final_task = Some(task)
+                }
+                r3_core::RetainedInvalidationReceiver::Commit(ticket) => {
+                    pending.ticket = Some(ticket)
+                }
+                r3_core::RetainedInvalidationReceiver::AfterFailure(_) => {
+                    unreachable!("normal publication owns a task or commit")
+                }
+            }
+            Some(pending)
+        }
+    }
+}
+
 fn prepare_normal_registration_probe(
     world: &mut World,
     entry: &mut RouterEntry,
     pending: &mut PendingCommit,
-    splice: &SealedReconciliationSplice,
+    splice: &NormalPublicationSplice,
 ) -> Option<SealedNormalPreparation> {
+    let view = splice.view(&entry.retained)?;
     let registry = world.get_resource::<RouteEntityRegistry>()?;
-    let transitions = splice.lifecycle_transitions();
+    let transitions = view.lifecycle_transitions();
     let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
-    let manifest = if splice.leaving().obligation_count() == 0 {
+    let manifest = if view.leaving().obligation_count() == 0 {
         FrozenCleanupManifest::empty()
     } else {
         FrozenCleanupManifest::from_leaving_branch(
             world,
             registry,
-            splice.leaving(),
+            view.leaving(),
             registry_plan.resulting_claims(),
-            (!splice.entering().frames().is_empty()).then_some(splice.entering().as_payload_ref()),
+            (!view.entering().frames().is_empty()).then_some(view.entering()),
         )?
     };
+    let logical_roots = logical_cleanup_roots(view.leaving());
     if pending.ticket.is_none() {
         pending.ticket = Some(
             entry
@@ -15757,11 +15915,7 @@ fn prepare_normal_registration_probe(
         .engine
         .prepare_commit(
             pending.ticket.as_ref()?,
-            CleanupManifest::new(
-                logical_cleanup_roots(splice.leaving()),
-                manifest.digest(),
-                manifest.len(),
-            ),
+            CleanupManifest::new(logical_roots, manifest.digest(), manifest.len()),
         )
         .ok()?;
     // The probe changes a real authority input only after the owned Core seal.
@@ -16954,7 +17108,7 @@ fn begin_failed_authority_settlement(
             }
         };
         let boundaries = if has_retained {
-            match registry.prepare_retained_boundaries(None, &retiring) {
+            match registry.prepare_retained_boundaries(&[], &retiring) {
                 Ok(boundaries) => Some(boundaries),
                 Err(()) => {
                     return FailedAuthoritySettlementBeginOutcome::ProtocolContradiction {
@@ -19742,7 +19896,7 @@ fn begin_post_commit_compound(
     } else {
         let Ok(boundaries) = world
             .resource::<RouteEntityRegistry>()
-            .prepare_retained_boundaries(None, &retiring)
+            .prepare_retained_boundaries(&[], &retiring)
         else {
             entry.post_commit_compound = Some(
                 PostCommitCompoundHolder::PreAcceptInert {
@@ -20947,11 +21101,288 @@ fn drive_post_commit_compound(world: &mut World, entry: &mut RouterEntry) -> boo
     true
 }
 
+fn drive_retained_invalidation_authority(world: &mut World, entry: &mut RouterEntry) -> bool {
+    let Some(work) = entry.retained_miss_cleanup.take() else {
+        return false;
+    };
+    let work = match *work {
+        retained_miss::RetainedMissCleanup::AuthorityProtocol {
+            owner,
+            authority,
+            reason,
+            isolation,
+            rejection,
+        } => {
+            drive_retained_invalidation_protocol(
+                world, entry, owner, authority, reason, isolation, rejection,
+            );
+            return true;
+        }
+        other => other,
+    };
+    let retained_miss::RetainedMissCleanup::PreparationRejected {
+        owner,
+        evidence: retained_miss::Rejection::AuthorityLost(authority),
+    } = work
+    else {
+        entry.retained_miss_cleanup = Some(Box::new(work));
+        return false;
+    };
+    let retained_miss::Preparation {
+        receiver,
+        selection,
+        plan,
+        pending,
+        evidence,
+        successor,
+    } = owner;
+    let r3_core::RetainedInvalidationReceiver::AfterFailure(continuation) = receiver else {
+        unreachable!(
+            "shared authority loss after fresh cleanup keeps its original local continuation"
+        )
+    };
+    let had_active = entry.active.is_some();
+    let active = entry.active.take().unwrap_or_else(RealizedBranch::empty);
+    let mut continuation = Some(continuation);
+    let outcome = authority_isolation::begin_retained_invalidation_authority_settlement(
+        world,
+        entry,
+        active,
+        pending,
+        &mut continuation,
+    );
+    let (active, pending, reason, isolation) = match outcome {
+        AuthoritySettlementBeginOutcome::Begun => {
+            assert!(
+                continuation.is_none(),
+                "accepted authority settlement consumes the original continuation"
+            );
+            return true;
+        }
+        AuthoritySettlementBeginOutcome::RetryablePreparation { active, pending } => {
+            (active, pending, None, None)
+        }
+        AuthoritySettlementBeginOutcome::ProtocolContradiction {
+            active,
+            pending,
+            kind,
+        } => (
+            active,
+            pending,
+            Some(AuthorityProtocolResidualKind::Authority(kind)),
+            None,
+        ),
+        AuthoritySettlementBeginOutcome::TriggerContradiction {
+            active,
+            pending,
+            kind,
+        } => (
+            active,
+            pending,
+            Some(AuthorityProtocolResidualKind::AuthorityTrigger(kind)),
+            None,
+        ),
+        AuthoritySettlementBeginOutcome::IsolationContradiction {
+            active,
+            pending,
+            contradiction,
+            isolation,
+        } => (
+            active,
+            pending,
+            Some(AuthorityProtocolResidualKind::AuthorityIsolation(
+                contradiction.clone(),
+            )),
+            Some((isolation, Some(contradiction))),
+        ),
+        AuthoritySettlementBeginOutcome::LedgerContradiction {
+            active,
+            pending,
+            kind,
+        } => (
+            active,
+            pending,
+            Some(AuthorityProtocolResidualKind::CleanupLedger(kind)),
+            None,
+        ),
+        #[cfg(feature = "bsn")]
+        AuthoritySettlementBeginOutcome::NativeCleanupContradiction {
+            active,
+            pending,
+            error,
+        } => (
+            active,
+            pending,
+            Some(AuthorityProtocolResidualKind::NativeCleanup(error)),
+            None,
+        ),
+    };
+    entry.active = had_active.then_some(active);
+    let owner = retained_miss::Preparation {
+        receiver: r3_core::RetainedInvalidationReceiver::AfterFailure(
+            continuation.expect("rejected authority preparation returns its original continuation"),
+        ),
+        selection,
+        plan,
+        pending,
+        evidence,
+        successor,
+    };
+    if let Some(reason) = reason {
+        drive_retained_invalidation_protocol(
+            world, entry, owner, authority, reason, isolation, None,
+        );
+    } else {
+        entry.retained_miss_cleanup = Some(Box::new(
+            retained_miss::RetainedMissCleanup::PreparationRejected {
+                owner,
+                evidence: retained_miss::Rejection::AuthorityLost(authority),
+            },
+        ));
+    }
+    true
+}
+
+fn drive_retained_invalidation_protocol(
+    world: &mut World,
+    entry: &mut RouterEntry,
+    owner: retained_miss::Preparation,
+    authority: crate::presentation::RetainedInvalidationEvidence,
+    reason: AuthorityProtocolResidualKind,
+    isolation: Option<(
+        PreparedAuthorityIsolation,
+        Option<AuthorityIsolationContradiction>,
+    )>,
+    rejection: Option<r3_core::RetainedInvalidationAuthorityFailCloseErrorKind>,
+) {
+    let (isolation, isolation_contradiction) = match isolation {
+        Some(prepared) => prepared,
+        None => match authority_isolation::prepare_retained_cleanup_protocol_isolation(
+            world,
+            entry,
+            &owner.pending,
+            None,
+        ) {
+            AuthorityIsolationPreparation::Ready(isolation) => (isolation, None),
+            AuthorityIsolationPreparation::PermanentContradiction {
+                contradiction,
+                fail_closed,
+            } => (fail_closed, Some(contradiction)),
+            AuthorityIsolationPreparation::RetryableCapacity => {
+                entry.retained_miss_cleanup = Some(Box::new(
+                    retained_miss::RetainedMissCleanup::AuthorityProtocol {
+                        owner,
+                        authority,
+                        reason,
+                        isolation: None,
+                        rejection,
+                    },
+                ));
+                return;
+            }
+        },
+    };
+    let retained_miss::Preparation {
+        receiver,
+        selection,
+        plan,
+        pending,
+        evidence,
+        successor,
+    } = owner;
+    let r3_core::RetainedInvalidationReceiver::AfterFailure(continuation) = receiver else {
+        unreachable!(
+            "this terminal sink consumes only the original completed fresh-cleanup continuation"
+        )
+    };
+    let (host, lease) = match entry.host.take() {
+        Some(host) => {
+            let (host, lease) = host.into_retired();
+            (Some(host), Some(lease))
+        }
+        None => (None, None),
+    };
+    let mut residual = Some(AuthorityProtocolResidualOwner {
+        back_target: entry.pending_back_target_execution.take().map(Box::new),
+        kind: AuthorityProtocolResidualKind::RetainedInvalidationAuthority {
+            cause: evidence,
+            authority,
+            reason: Box::new(reason),
+        },
+        isolation_contradiction,
+        active: entry.active.take(),
+        pending: Some(pending),
+        failed: None,
+        failure_cleanup_completion: None,
+        failure_cleanup_ledger: None,
+        cleanup_settlement_ledger: None,
+        failure_cleanup_permanent_authority: None,
+        retained: None,
+        retained_cleanup: None,
+        host,
+    });
+    let mut isolation = Some(isolation);
+    let retained = &mut entry.retained;
+    let destination = &mut entry.authority_protocol_residual;
+    if let Err(error) = entry
+        .engine
+        .fail_closed_retained_invalidation_authority_protocol_retaining(continuation, lease, || {
+            let mut owner = residual
+                .take()
+                .expect("accepted terminal transfer owns the original physical scope");
+            owner.retained = Some(std::mem::take(retained));
+            isolation
+                .take()
+                .expect("accepted terminal transfer applies its prepared isolation once")
+                .apply(world);
+            *destination = Some(owner);
+        })
+    {
+        let (continuation, lease, kind) = error.into_parts();
+        let mut owner = residual
+            .take()
+            .expect("rejected terminal transfer retains its original physical scope");
+        match (owner.host.take(), lease) {
+            (Some(host), Some(lease)) => entry.host = Some(host.restore(lease)),
+            (None, None) => (),
+            _ => unreachable!("the terminal sink returns its exact optional lease"),
+        }
+        entry.active = owner.active.take();
+        entry.pending_back_target_execution = owner.back_target.take().map(|owner| *owner);
+        let AuthorityProtocolResidualKind::RetainedInvalidationAuthority {
+            cause,
+            authority,
+            reason,
+        } = owner.kind
+        else {
+            unreachable!("the rejected residual preserves the original typed invalidation cause")
+        };
+        entry.retained_miss_cleanup = Some(Box::new(
+            retained_miss::RetainedMissCleanup::AuthorityProtocol {
+                owner: retained_miss::Preparation {
+                    receiver: r3_core::RetainedInvalidationReceiver::AfterFailure(continuation),
+                    selection,
+                    plan,
+                    pending: owner.pending.take().unwrap(),
+                    evidence: cause,
+                    successor,
+                },
+                authority,
+                reason: *reason,
+                isolation: Some((isolation.take().unwrap(), owner.isolation_contradiction)),
+                rejection: Some(kind),
+            },
+        ));
+    }
+}
+
 pub(crate) fn settle_cleanup_system(world: &mut World) {
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
-                if retained_miss::drive(world, entry) {
+                if drive_retained_invalidation_authority(world, entry)
+                    || retained_miss::drive(world, entry)
+                {
                     continue;
                 }
                 if drive_post_commit_compound(world, entry) {
@@ -21042,16 +21473,36 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 entry.pending_failed_branch = Some(failed);
                 return;
             };
-            FrozenCleanupManifest::from_failed_prepared_branch(world, registry, &failed.branch)
-                .and_then(|mut manifest| {
-                    #[cfg(feature = "bsn")]
-                    if let Some(slot) =
-                        exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref())
-                    {
-                        manifest.observe_current_task_outlet(world, registry, slot)?;
-                    }
-                    Ok(manifest)
+            let selected = entry
+                .engine
+                .selected_retained_instances()
+                .iter()
+                .map(|projection| {
+                    entry
+                        .retained
+                        .payload_for(projection)
+                        .map(|payload| (projection, payload))
                 })
+                .collect::<Option<Vec<_>>>();
+            let Some(selected) = selected else {
+                entry.pending_failed_branch = Some(failed);
+                return;
+            };
+            FrozenCleanupManifest::from_failed_prepared_branch_with_selected(
+                world,
+                registry,
+                &failed.branch,
+                &selected,
+            )
+            .and_then(|mut manifest| {
+                #[cfg(feature = "bsn")]
+                if let Some(slot) =
+                    exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref())
+                {
+                    manifest.observe_current_task_outlet(world, registry, slot)?;
+                }
+                Ok(manifest)
+            })
         };
         let manifest = match manifest {
             Ok(manifest) => manifest,
@@ -21211,7 +21662,22 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 }
                 return;
             };
-            manifest.freeze_failure_cleanup_partition_retaining(
+            let selected = entry
+                .engine
+                .selected_retained_instances()
+                .iter()
+                .map(|projection| {
+                    entry
+                        .retained
+                        .payload_for(projection)
+                        .map(|payload| (projection, payload))
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(selected) = selected else {
+                entry.pending_failed_branch = Some(failed);
+                return;
+            };
+            manifest.freeze_failure_cleanup_partition_with_selected(
                 world,
                 registry,
                 entry.active.as_ref(),
@@ -21220,6 +21686,7 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                     .retained_prepared_prefix()
                     .map(PreparedBranch::as_realized),
                 host,
+                &selected,
             )
         };
         let Some(partition) = partition else {
@@ -21408,13 +21875,29 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
             return;
         };
         let settled = if ledger.is_failed_prepared() {
-            let source = FailureCleanupSourceProjection::observe_with_prepared(
+            let selected = entry
+                .engine
+                .selected_retained_instances()
+                .iter()
+                .map(|projection| {
+                    entry
+                        .retained
+                        .payload_for(projection)
+                        .map(|payload| (projection, payload))
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(selected) = selected else {
+                entry.cleanup_ledger = Some(ledger);
+                return;
+            };
+            let source = FailureCleanupSourceProjection::observe_with_selected(
                 entry.host.as_ref(),
                 entry.active.as_ref(),
                 ledger
                     .failed_prepared_branch()
                     .and_then(FailedPreparedBranch::retained_prepared_prefix)
                     .map(PreparedBranch::as_realized),
+                &selected,
             );
             ledger.settle_failure_cleanup(world, attempt, &source)
         } else {
@@ -21517,7 +22000,6 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 entry.pending_commit = Some(PendingCommit {
                     ticket: None,
                     final_task: None,
-                    retained_hit: None,
                     rejected_retained_publication: None,
                     branch,
                 });
@@ -21537,7 +22019,22 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 });
                 bind_post_cleanup_back_resolution(entry);
             }
+            Ok(FailureCleanupCompletionDisposition::ResumeInstanceInvalidation(continuation)) => {
+                assert!(retained_prepared_prefix.is_none());
+                let evidence = entry
+                    .pending_retained_invalidation
+                    .take()
+                    .expect("the original instance invalidation cause survives fresh cleanup");
+                retained_miss::begin(
+                    entry,
+                    r3_core::RetainedInvalidationReceiver::AfterFailure(continuation),
+                    None,
+                    PendingCommit::new(),
+                    evidence,
+                );
+            }
             Ok(FailureCleanupCompletionDisposition::Settled) => {
+                entry.pending_retained_invalidation = None;
                 assert!(
                     retained_prepared_prefix.is_none(),
                     "a settled continuation cannot return a retained physical prefix",

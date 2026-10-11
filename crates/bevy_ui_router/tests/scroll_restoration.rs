@@ -32,6 +32,7 @@ struct FixtureOptions {
     fallback_fails: bool,
     camera: bool,
     keep_alive_capacity: usize,
+    retained_layout: bool,
 }
 
 impl Default for FixtureOptions {
@@ -42,6 +43,7 @@ impl Default for FixtureOptions {
             fallback_fails: false,
             camera: true,
             keep_alive_capacity: 0,
+            retained_layout: false,
         }
     }
 }
@@ -118,14 +120,47 @@ fn fixture(options: FixtureOptions) -> Fixture {
     views
         .insert(layout_view.clone(), RouteViewDescriptor::new(layout_driver))
         .unwrap();
+    let root_view = if options.retained_layout {
+        let driver = app
+            .register_bsn_view(ViewDriverKey::new("app").unwrap(), |_| {
+                Ok(bsn! {
+                    Node { width: Val::Percent(100.0), height: Val::Percent(100.0) }
+                    DefaultOutlet
+                })
+            })
+            .unwrap();
+        let view = RouteViewKey::new("app").unwrap();
+        views
+            .insert(view.clone(), RouteViewDescriptor::new(driver))
+            .unwrap();
+        view
+    } else {
+        layout_view.clone()
+    };
     let mut routes = RouteTree::builder()
         .root_with_options(
             RoutePattern::path("/").unwrap(),
-            RouteNodeOptions::new().with_view(layout_view),
+            RouteNodeOptions::new().with_view(root_view),
         )
         .unwrap();
     let root = routes.root_id().unwrap();
-    for name in ["a", "b", "c", "broken", "fallback"] {
+    let layout = if options.retained_layout {
+        routes
+            .route_with_options(
+                root,
+                RoutePattern::path("layout").unwrap(),
+                RouteNodeOptions::new()
+                    .with_view(layout_view)
+                    .with_keep_alive(true),
+            )
+            .unwrap()
+    } else {
+        root
+    };
+    for name in ["a", "b", "c", "broken", "fallback", "outside"] {
+        if name == "outside" && !options.retained_layout {
+            continue;
+        }
         let size = Arc::clone(&content_size);
         let driver = app
             .register_bsn_view(ViewDriverKey::new(name).unwrap(), move |_| {
@@ -167,11 +202,11 @@ fn fixture(options: FixtureOptions) -> Fixture {
         if name != "fallback" {
             routes
                 .route_with_options(
-                    root,
+                    if name == "outside" { root } else { layout },
                     RoutePattern::path(name).unwrap(),
-                    RouteNodeOptions::new()
-                        .with_view(view)
-                        .with_keep_alive(options.keep_alive_capacity > 0),
+                    RouteNodeOptions::new().with_view(view).with_keep_alive(
+                        options.keep_alive_capacity > 0 && !options.retained_layout,
+                    ),
                 )
                 .unwrap();
         }
@@ -469,6 +504,69 @@ fn repeated_entries_restore_distinct_positions_on_cache_hits_misses_and_eviction
         } else {
             assert_ne!(first_entry_a, returned_a);
         }
+    }
+}
+
+#[test]
+fn retained_parent_and_fresh_child_restore_the_original_visit_and_current_inputs() {
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        keep_alive_capacity: 1,
+        retained_layout: true,
+        ..Default::default()
+    });
+    push(&mut app, router, "/layout/a");
+    let original_child = page(&mut app, "a");
+    let parent_container = container(&mut app, "prefix");
+    let first_parent = Vec2::new(24.0, 32.0);
+    let first_child = Vec2::new(45.0, 70.0);
+    scroll(&mut app, parent_container, first_parent);
+    scroll(&mut app, original_child, first_child);
+
+    push(&mut app, router, "/outside");
+    assert!(app.world().get_entity(original_child).is_err());
+    assert!(
+        !app.world()
+            .resource::<RouterInputGate>()
+            .allows_keyboard(parent_container)
+    );
+    let mut input_state = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
+    assert!(
+        input_state
+            .get(app.world())
+            .unwrap()
+            .current(parent_container)
+            .is_none()
+    );
+
+    push(&mut app, router, "/layout/b");
+    assert_eq!(container(&mut app, "prefix"), parent_container);
+    assert_position(&app, parent_container, first_parent);
+    let later_parent = Vec2::new(88.0, 150.0);
+    scroll(&mut app, parent_container, later_parent);
+    push(&mut app, router, "/outside");
+
+    back(&mut app, router);
+    let later_child = page(&mut app, "b");
+    assert_eq!(container(&mut app, "prefix"), parent_container);
+    assert_position(&app, parent_container, later_parent);
+    back(&mut app, router);
+    assert!(app.world().get_entity(later_child).is_err());
+    back(&mut app, router);
+
+    let returned_child = page(&mut app, "a");
+    assert_ne!(returned_child, original_child);
+    assert_eq!(container(&mut app, "prefix"), parent_container);
+    assert_position(&app, parent_container, first_parent);
+    assert_position(&app, returned_child, first_child);
+    assert_eq!(history(&app, router).cursor(), Some(0));
+    let inputs = input_state.get(app.world()).unwrap();
+    for entity in [parent_container, returned_child] {
+        assert_eq!(
+            inputs.current(entity).unwrap().location(),
+            &RouteLocation::new("/layout/a")
+        );
     }
 }
 

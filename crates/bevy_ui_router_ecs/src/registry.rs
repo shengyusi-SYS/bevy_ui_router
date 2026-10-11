@@ -648,7 +648,7 @@ impl RouteEntityRegistry {
 
     pub(crate) fn prepare_retained_boundaries(
         &self,
-        addition: Option<RetainedBoundaryProof>,
+        additions: &[RetainedBoundaryProof],
         retired: &[RetainedLeafProjection],
     ) -> Result<PreparedRetainedBoundaries, ()> {
         if retired.iter().enumerate().any(|(index, projection)| {
@@ -664,7 +664,7 @@ impl RouteEntityRegistry {
         }
         // Recovery may keep this packet across updates. Remove only its exact
         // targets so other routers can continue changing their own boundaries.
-        if addition.is_none() {
+        if additions.is_empty() {
             let mut removals = Vec::new();
             removals.try_reserve_exact(retired.len()).map_err(|_| ())?;
             removals.extend(retired.iter().cloned());
@@ -672,7 +672,7 @@ impl RouteEntityRegistry {
         }
         let mut boundaries = Vec::new();
         boundaries
-            .try_reserve_exact(self.retained_boundaries.len() + usize::from(addition.is_some()))
+            .try_reserve_exact(self.retained_boundaries.len() + additions.len())
             .map_err(|_| ())?;
         boundaries.extend(
             self.retained_boundaries
@@ -680,14 +680,14 @@ impl RouteEntityRegistry {
                 .filter(|boundary| !retired.contains(boundary.projection()))
                 .cloned(),
         );
-        if let Some(addition) = addition {
+        for addition in additions {
             if boundaries.iter().any(|boundary| {
                 boundary.projection().frame() == addition.projection().frame()
                     || boundary.shell() == addition.shell()
             }) {
                 return Err(());
             }
-            boundaries.push(addition);
+            boundaries.push(addition.clone());
         }
         Ok(PreparedRetainedBoundaries::Replace(boundaries))
     }
@@ -711,6 +711,135 @@ impl RouteEntityRegistry {
             && boundary.is_current(world)
     }
 
+    pub(crate) fn retained_payload_is_current_with_fresh(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+        frame: &crate::presentation::RealizedFrame,
+        slots: &[crate::mount::MountedChildSlot],
+        fresh: crate::instance::PayloadRef<'_>,
+    ) -> bool {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let Some(boundary) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none()
+            && boundary.matches_payload(frame, slots)
+            && boundary.is_current_with_fresh(world, fresh)
+    }
+
+    pub(crate) fn retained_payload_is_current_with_staged_slot(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+        payload: &crate::instance::InstancePayload,
+        staged: &crate::mount::ProvisionalChildSlot,
+    ) -> bool {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let Some(boundary) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none()
+            && boundary.matches_payload(payload.frame(), payload.child_slots())
+            && boundary.is_current_with_staged_slot(world, staged)
+    }
+
+    pub(crate) fn classify_retained_payload_with_staged_slot(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+        payload: &crate::instance::InstancePayload,
+        staged: &crate::mount::ProvisionalChildSlot,
+    ) -> Option<crate::presentation::RetainedPayloadClassification> {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let boundary = matches.next()?;
+        if matches.next().is_some()
+            || !boundary.matches_payload(payload.frame(), payload.child_slots())
+        {
+            return None;
+        }
+        Some(boundary.classify_payload_with_staged_slot(world, staged))
+    }
+
+    pub(crate) fn retained_parent_is_current(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+    ) -> bool {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let Some(boundary) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none() && boundary.preservation_is_current(world)
+    }
+
+    pub(crate) fn retained_parent_owns_slot(
+        &self,
+        world: &World,
+        parent: &RouteFrameVersion,
+        slot: &ExactRegistryClaim,
+    ) -> bool {
+        let mut current_parent = parent;
+        let mut current_slot = slot;
+        // A dependency must reach a live external parent in at most inventory
+        // depth steps. This proof never grants mutation or activates a child.
+        for _ in 0..=self.retained_boundaries.len() {
+            let mut matches = self
+                .retained_boundaries
+                .iter()
+                .filter(|boundary| boundary.projection().frame() == current_parent);
+            let Some(boundary) = matches.next() else {
+                return false;
+            };
+            if matches.next().is_some()
+                || !boundary.owns_slot(current_slot)
+                || !boundary.own_parent_identity_is_current(world)
+            {
+                return false;
+            }
+            let Some(record) = self.record(boundary.slot_entity()) else {
+                return false;
+            };
+            match record.lifecycle() {
+                EntityLifecycle::Active | EntityLifecycle::PreparedInert => {
+                    return boundary.is_shared_authority_current(world);
+                }
+                EntityLifecycle::Retained => {
+                    current_parent = boundary.projection().parent();
+                    // Borrow the registry's stable original record projection below.
+                    let Some(parent_boundary) = self
+                        .retained_boundaries
+                        .iter()
+                        .find(|candidate| candidate.projection().frame() == current_parent)
+                    else {
+                        return false;
+                    };
+                    let Some(parent_slot) = parent_boundary.own_slot_claim(record.entity()) else {
+                        return false;
+                    };
+                    if record.claim() != *parent_slot {
+                        return false;
+                    }
+                    current_slot = parent_slot;
+                }
+                EntityLifecycle::Leaving | EntityLifecycle::Quarantined => return false,
+            }
+        }
+        false
+    }
+
     pub(crate) fn classify_retained_payload(
         &self,
         world: &World,
@@ -727,6 +856,27 @@ impl RouteEntityRegistry {
             return None;
         }
         Some(boundary.classify_payload(world))
+    }
+
+    pub(crate) fn classify_retained_payload_with_entering(
+        &self,
+        world: &World,
+        projection: &RetainedLeafProjection,
+        payload: &crate::instance::InstancePayload,
+        fresh: crate::instance::PayloadRef<'_>,
+        allowance: Option<&crate::branch_transaction::SealedMountNewStagingAllowance>,
+    ) -> Option<crate::presentation::RetainedPayloadClassification> {
+        let mut matches = self
+            .retained_boundaries
+            .iter()
+            .filter(|boundary| boundary.projection() == projection);
+        let boundary = matches.next()?;
+        if matches.next().is_some()
+            || !boundary.matches_payload(payload.frame(), payload.child_slots())
+        {
+            return None;
+        }
+        Some(boundary.classify_payload_with_entering(world, fresh, allowance))
     }
 
     pub(crate) fn retained_shell_is_current(

@@ -20,13 +20,17 @@ active branch 因而不再等于完整生命周期库存。父 scope 退出、fa
 
 缓存复用的是已实现页面，fresh Scene 仍是一次执行的构建输入。已有页面不应通过克隆 Scene 或重放旧 task 恢复；依赖保活、前台 capability 和残留隔离责任各有自己的结束边界。
 
+目标链与本次 fresh 创建义务独立：复用父实例不决定子目标，库存前缀不能进入 fresh apply/失败根集合。父子各持原 payload，以 exact 父依赖协调；整组 opt-in 或全局 Fresh/Retained 分类会让正常提交与失败续接反复分叉。
+
 ## 共用完成路径，保留不同的失败语义
 
 Back 的成功目标既可能 fresh，也可能 retained。共享接收器若仍假设所有成功结果都 fresh，就会遗漏合法目标；应让它们进入既有 publication 管线，携带原 history authority、执行身份与 continuation，而不是补一套缓存 Back 状态机。
 
 重新激活、非目标保护与安全处置回答不同问题。缺少原 outlet 声明可能阻止激活，不自动撤销受保护身份或阻止按原 owner 安全处置；各路径分别证明当前 authority、角色、目标写集与原义务，不能把任意 drift 都降成 miss。
 
-cleanup 决定物理义务如何处置，continuation 决定原请求如何结束或恢复。后者来自原失败与 attempt，不能由保留了旧 active、剩余实体数或删除结果反推。停止删除不等于责任已结清：部分完成路径须保存原 receipt 与失效来源，重新证明剩余原义务，只将已证明 inert 的残留转交私有责任，再接回原 continuation。仅真实容量或可完成前置不足可以重试；永久矛盾必须有界结算。
+cleanup 决定物理义务如何处置，continuation 决定原请求如何结束或恢复。后者来自原失败与 attempt，不能由保留了旧 active、剩余实体数或删除结果反推。停止删除不等于责任已结清：部分完成路径须保存原 receipt 与失效来源，重新证明剩余原义务。可以完成原 token 的 inert shell 结算与仅终结前台、保有未完成物理责任的 authority residual 是不同结果，不能伪造 completion。仅真实容量或可完成前置不足可以重试；永久矛盾必须有界结算。
+
+物理准备的拒绝必须进入有明确 owner 的 classification/continuation；不能在独立 current/next preflight 之前以空准备结果无限等待。共用同一生产 predicate 时可以删除重复前置校验，保留发布前完整检查及必要写后复验。
 
 ## 线性 owner 与 preparation 边界不能靠快照补救
 

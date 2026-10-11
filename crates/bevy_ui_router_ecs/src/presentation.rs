@@ -193,6 +193,7 @@ enum FrameMountBindingKind {
         expected_anchor_children: Vec<Entity>,
         staging_lifecycle: EntityLifecycle,
         allowed_existing_shells: Vec<ExactRegistryClaim>,
+        retained_parent: Option<RetainedLeafProjection>,
     },
 }
 
@@ -230,6 +231,7 @@ impl FrameMountBinding {
                 expected_anchor_children: mounted.expected_anchor_children().to_vec(),
                 staging_lifecycle: EntityLifecycle::PreparedInert,
                 allowed_existing_shells: Vec::new(),
+                retained_parent: None,
             },
         }
     }
@@ -249,6 +251,7 @@ impl FrameMountBinding {
                 expected_anchor_children: mounted.expected_anchor_children().to_vec(),
                 staging_lifecycle: mount.expected_slot_lifecycle(),
                 allowed_existing_shells: mount.allowed_existing_shells().to_vec(),
+                retained_parent: mount.retained_parent().cloned(),
             },
         }
     }
@@ -306,6 +309,21 @@ impl FrameMountBinding {
                     && anchor_binding == mounted.anchor_binding()
                     && (anchor_binding.is_native() || expected_anchor_children == mounted.expected_anchor_children())
             )
+    }
+
+    /// Stock parent roles may change independently while this original child
+    /// remains inactive. Activation separately proves the current exact roles.
+    pub(crate) fn matches_mounted_child_slot_identity(&self, mounted: &MountedChildSlot) -> bool {
+        self.slot == mounted.slot()
+            && self.slot_claim.owner() == mounted.slot_claim().owner()
+            && self.slot_claim.seal() == mounted.slot_claim().seal()
+            && matches!(&self.kind, FrameMountBindingKind::ChildOutlet { parent, outlet, anchor, anchor_binding, expected_anchor_children, .. }
+                if parent == mounted.parent() && outlet == mounted.outlet() && *anchor == mounted.anchor()
+                    && anchor_binding.anchor() == mounted.anchor_binding().anchor()
+                    && anchor_binding.source_claim().entity() == mounted.anchor_claim().entity()
+                    && anchor_binding.source_claim().owner() == mounted.anchor_claim().owner()
+                    && anchor_binding.source_claim().seal() == mounted.anchor_claim().seal()
+                    && (anchor_binding.is_native() || expected_anchor_children == mounted.expected_anchor_children()))
     }
 
     pub(crate) fn same_physical_mount(&self, other: &Self) -> bool {
@@ -676,8 +694,11 @@ impl RetainedInvalidationEvidence {
     }
 
     pub(crate) fn is_current(&self, world: &World) -> bool {
-        self.expected.shared_authority_is_current(world)
-            && self.host == observe_validated_host_candidate(world, &self.expected.host_candidate)
+        self.expected.shared_authority_is_current(world) && self.observed_source_is_current(world)
+    }
+
+    pub(crate) fn observed_source_is_current(&self, world: &World) -> bool {
+        self.host == observe_validated_host_candidate(world, &self.expected.host_candidate)
             && self.observed.iter().all(|observed| {
                 *observed == RetainedEntityObservation::observe(world, observed.entity)
             })
@@ -880,10 +901,33 @@ impl RetainedBoundaryProof {
             EntityLifecycle::PreparedInert => {
                 (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
             }
+            EntityLifecycle::Retained
+                if registry.retained_parent_owns_slot(world, parent, &slot_claim) =>
+            {
+                (ChildSlotLifecycle::Retained, Visibility::Hidden)
+            }
             EntityLifecycle::Retained | EntityLifecycle::Leaving | EntityLifecycle::Quarantined => {
                 return false;
             }
         };
+        let mut current_anchor = anchor_binding.clone();
+        let source = current_anchor.source_claim();
+        let Some(current) = registry
+            .record(source.entity())
+            .map(|record| record.claim())
+        else {
+            return false;
+        };
+        if current.owner() != source.owner()
+            || current.seal() != source.seal()
+            || !matches!(
+                current.lifecycle(),
+                EntityLifecycle::Active | EntityLifecycle::Retained
+            )
+        {
+            return false;
+        }
+        *current_anchor.source_claim_mut() = current;
         if validate_child_mount_slot(
             world,
             &self.host_candidate,
@@ -892,7 +936,7 @@ impl RetainedBoundaryProof {
             parent,
             outlet,
             *anchor,
-            anchor_binding,
+            &current_anchor,
             expected_anchor_children,
             frame,
             &[],
@@ -908,11 +952,48 @@ impl RetainedBoundaryProof {
         true
     }
 
+    pub(crate) fn classify_payload_with_entering(
+        &self,
+        world: &World,
+        fresh: crate::instance::PayloadRef<'_>,
+        allowance: Option<&crate::branch_transaction::SealedMountNewStagingAllowance>,
+    ) -> RetainedPayloadClassification {
+        if self.shared_authority_is_current(world)
+            && self.own_payload_is_current_with_context(world, Some(fresh), allowance, None)
+        {
+            RetainedPayloadClassification::Current
+        } else {
+            self.classify_payload(world)
+        }
+    }
+
+    pub(crate) fn classify_payload_with_staged_slot(
+        &self,
+        world: &World,
+        staged: &crate::mount::ProvisionalChildSlot,
+    ) -> RetainedPayloadClassification {
+        let shared = self.shared_authority_is_current(world);
+        if shared && self.own_payload_is_current_with_context(world, None, None, Some(staged)) {
+            RetainedPayloadClassification::Current
+        } else {
+            self.classify_invalid_payload(world, shared, Some(staged.slot()))
+        }
+    }
+
     pub(crate) fn classify_payload(&self, world: &World) -> RetainedPayloadClassification {
         let shared = self.shared_authority_is_current(world);
         if shared && self.own_payload_is_current(world) {
             return RetainedPayloadClassification::Current;
         }
+        self.classify_invalid_payload(world, shared, None)
+    }
+
+    fn classify_invalid_payload(
+        &self,
+        world: &World,
+        shared: bool,
+        staged_slot: Option<Entity>,
+    ) -> RetainedPayloadClassification {
         let mut observed_entities = self
             .entities
             .iter()
@@ -928,6 +1009,7 @@ impl RetainedBoundaryProof {
                     .outlet_binding()
                     .map(|binding| binding.source_claim().entity()),
             )
+            .chain(staged_slot)
             .collect::<Vec<_>>();
         observed_entities.sort_by_key(|entity| entity.to_bits());
         observed_entities.dedup();
@@ -1030,7 +1112,88 @@ impl RetainedBoundaryProof {
         true
     }
 
+    pub(crate) fn is_shared_authority_current(&self, world: &World) -> bool {
+        self.shared_authority_is_current(world)
+    }
+    pub(crate) fn own_slot_claim(&self, entity: Entity) -> Option<&ExactRegistryClaim> {
+        self.empty_slots
+            .iter()
+            .find(|slot| slot.claim.entity() == entity)
+            .map(|slot| &slot.claim)
+    }
+
+    pub(crate) fn own_parent_identity_is_current(&self, world: &World) -> bool {
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        self.entities.iter().all(|entity| {
+            registry
+                .record(entity.entity)
+                .is_some_and(|record| record.claim() == entity.claim)
+                && world.get::<RouteOwnershipSeal>(entity.entity)
+                    == Some(&RouteOwnershipSeal::new(entity.claim.seal()))
+                && world.get::<FrameLifecycle>(entity.entity)
+                    == Some(&FrameLifecycle(EntityLifecycle::Retained))
+                && world.get::<ChildOf>(entity.entity).map(ChildOf::parent) == Some(entity.parent)
+        }) && self.empty_slots.iter().all(|slot| {
+            registry
+                .record(slot.claim.entity())
+                .is_some_and(|record| record.claim() == slot.claim)
+                && world.get::<RouteOwnershipSeal>(slot.claim.entity())
+                    == Some(&RouteOwnershipSeal::new(slot.claim.seal()))
+                && world
+                    .get::<ChildOf>(slot.claim.entity())
+                    .map(ChildOf::parent)
+                    == Some(slot.anchor_binding.anchor())
+        })
+    }
+
+    pub(crate) fn owns_slot(&self, claim: &ExactRegistryClaim) -> bool {
+        self.empty_slots.iter().any(|slot| {
+            slot.claim.entity() == claim.entity()
+                && slot.claim.owner() == claim.owner()
+                && slot.claim.seal() == claim.seal()
+                && claim.lifecycle() == EntityLifecycle::Retained
+        })
+    }
+
+    pub(crate) fn is_current_with_staged_slot(
+        &self,
+        world: &World,
+        staged: &crate::mount::ProvisionalChildSlot,
+    ) -> bool {
+        self.shared_authority_is_current(world)
+            && self.own_payload_is_current_with_context(world, None, None, Some(staged))
+    }
+
+    pub(crate) fn is_current_with_fresh(
+        &self,
+        world: &World,
+        fresh: crate::instance::PayloadRef<'_>,
+    ) -> bool {
+        self.shared_authority_is_current(world)
+            && self.own_payload_is_current_with_fresh(world, Some(fresh))
+    }
+
     fn own_payload_is_current(&self, world: &World) -> bool {
+        self.own_payload_is_current_with_fresh(world, None)
+    }
+
+    fn own_payload_is_current_with_fresh(
+        &self,
+        world: &World,
+        fresh: Option<crate::instance::PayloadRef<'_>>,
+    ) -> bool {
+        self.own_payload_is_current_with_context(world, fresh, None, None)
+    }
+
+    fn own_payload_is_current_with_context(
+        &self,
+        world: &World,
+        fresh: Option<crate::instance::PayloadRef<'_>>,
+        allowance: Option<&crate::branch_transaction::SealedMountNewStagingAllowance>,
+        staged: Option<&crate::mount::ProvisionalChildSlot>,
+    ) -> bool {
         let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
             return false;
         };
@@ -1140,6 +1303,68 @@ impl RetainedBoundaryProof {
                 return false;
             }
             if let Some(record) = registry.record(entity) {
+                let owned =
+                    self.entities
+                        .iter()
+                        .any(|binding| binding.entity == entity && record.claim() == binding.claim)
+                        || self.empty_slots.iter().any(|slot| {
+                            slot.claim.entity() == entity && record.claim() == slot.claim
+                        });
+                let exact_staging = allowance.is_some_and(|allowance| {
+                    allowance.parent() == frame
+                        && allowance.entity() == entity
+                        && allowance.claim() == &record.claim()
+                        && allowance.matches_binding(
+                            frame,
+                            allowance.outlet(),
+                            allowance.slot(),
+                            entity,
+                            allowance.claim(),
+                            allowance.anchor(),
+                            allowance.anchor_binding(),
+                        )
+                });
+                let exact_staged_slot = staged.is_some_and(|staged| {
+                    staged.parent() == frame
+                        && staged.slot() == entity
+                        && staged.slot_claim() == &record.claim()
+                        && staged
+                            .anchor_binding()
+                            .is_current_with_manifest_policy(world, frame, true, true)
+                });
+                if !owned
+                    && (fresh
+                        .is_some_and(|fresh| fresh.claims().any(|claim| *claim == record.claim()))
+                        || exact_staging
+                        || exact_staged_slot)
+                {
+                    if !matches!(record.lifecycle(), EntityLifecycle::PreparedInert) {
+                        return false;
+                    }
+                    // The mixed fresh validator proves this complete original payload separately.
+                    continue;
+                }
+                if !owned
+                    && matches!(
+                        record.owner(),
+                        RegistryOwner::Committed(EntityOwner::FrameShell(_))
+                    )
+                    && world.get::<ChildOf>(entity).is_some_and(|parent| {
+                        self.empty_slots
+                            .iter()
+                            .any(|slot| slot.claim.entity() == parent.parent())
+                    })
+                    && registry.retained_shell_is_current(
+                        world,
+                        entity,
+                        world
+                            .get::<ChildOf>(entity)
+                            .expect("parent observed")
+                            .parent(),
+                    )
+                {
+                    continue;
+                }
                 if !self
                     .entities
                     .iter()
@@ -2596,6 +2821,7 @@ fn validate_mount_binding_allowing_additions(
             anchor_binding,
             expected_anchor_children,
             staging_lifecycle,
+            retained_parent,
             ..
         } => {
             let (component_lifecycle, visibility) = match staging_lifecycle {
@@ -2603,6 +2829,16 @@ fn validate_mount_binding_allowing_additions(
                     (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
                 }
                 EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
+                EntityLifecycle::Retained
+                    if retained_parent.as_ref().is_some_and(|projection| {
+                        projection.frame() == parent
+                            && world
+                                .resource::<RouteEntityRegistry>()
+                                .retained_parent_is_current(world, projection)
+                    }) =>
+                {
+                    (ChildSlotLifecycle::Retained, Visibility::Hidden)
+                }
                 EntityLifecycle::Retained
                 | EntityLifecycle::Leaving
                 | EntityLifecycle::Quarantined => {
@@ -5928,6 +6164,7 @@ pub(crate) mod tests {
                 expected_anchor_children: Vec::new(),
                 staging_lifecycle: EntityLifecycle::PreparedInert,
                 allowed_existing_shells: Vec::new(),
+                retained_parent: None,
             },
         };
         let owner = RegistryOwner::Committed(EntityOwner::ChildSlot {

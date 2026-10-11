@@ -16,13 +16,13 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 
 | 导航变化 | view/lifecycle 行为 |
 | --- | --- |
-| 同祖先切换 leaf | 保留不变 prefix；suffix 默认 fresh，符合下述 keep-alive 条件时复用原 leaf |
+| 同祖先切换子页 | 保留不变 prefix；suffix 默认 fresh，符合下述 keep-alive 条件时逐实例复用 |
 | 某段 params 或复用身份变化 | 从该段起替换，保留此前 prefix |
 | raw search 变化 | 按上述精确比较重建整链 |
 | 仅 fragment 变化 | 保留祖先，重建最深 normal frame；frame/slot 身份保持，generation 推进 |
 | canonical path/search/fragment 全部等价 | normal presentation 保持原结构，history 仍按命令语义提交；显式滚动恢复可写入位置 |
 
-新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留 layout 和命中的 cached leaf 不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用通过 `RouteInputs::current(Entity)` 读取所属 active frame 的本次已发布输入，而不是把旧 factory 快照当作当前值。
+新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留布局和命中的库存实例不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用通过 `RouteInputs::current(Entity)` 读取所属 active frame 的本次已发布输入，而不是把旧 factory 快照当作当前值。
 
 `RouteInputRef` 提供 `route()`、`params()`、`location()`、`origin()`、`failure()` 五个只读 getters；search/fragment 经 `location()` 读取。每层 params 仅属于该 route，完整 location 属于本次 presentation。normal frame 的 failure 为 None；route-error frame 使用错误边界 route/local params 和原 failure，正常前缀不继承 failure；router fallback 的 route 为 None、params 为空、failure 为原失败。error/fallback location 是失败请求位置，不能从未推进的成功 history 反推。
 
@@ -32,15 +32,17 @@ active error presentation 不走 normal 等价导航优化。复用判定包含�
 
 实现见 [matcher](../../crates/bevy_ui_router_core/src/matcher.rs)、[branch diff](../../crates/bevy_ui_router_core/src/branch_diff.rs) 与 [location](../../crates/bevy_ui_router_core/src/location.rs)。
 
-## 同父 leaf 保留
+## 实例保留
 
 `RouteNodeOptions::with_keep_alive(true)` 为 route 显式启用保留；`RouterConfig::with_keep_alive_capacity(n)` 限制每个 Router 的非活动实例数，默认 0。active 实例不占容量，未 opt-in 或容量为 0 时沿用 fresh/cleanup 路径。
 
-仅最深 normal leaf 可保留，而且 exact parent frame/generation、outlet、slot binding 与 host incarnation 必须处于仍有效的保留作用域。root 独立页面、带活动子分支的页面、error/fallback、失败或 quarantine 内容不进入缓存。leaf 自己声明的空 child slot 不等于活动子分支。
+normal 页面和布局可分别保留，exact parent frame/generation、outlet、slot binding 与 host incarnation 必须有效；父实例可以 active 或 retained。直接挂在 host 根部、没有 normal 父 frame 的页面，以及 error/fallback、失败或 quarantine 内容不进入库存。单条目标链、default outlet 和同 Router/host 的范围保持。
+
+例如 `R/P/C → R/Q → R/P/D`：P 开启保留、C 未开启时，离场保存原 P 及其 outlet、清理 C；返回复用原 P，由 matcher 选择 D。P、C 都开启时，C 可在非活动 P 内独立保留；返回 P/D 不会自动恢复旧 C。父实例未保留或被淘汰时，其依赖库存一并进入 child-first 清理，不能把子实例移到另一个父作用域。
 
 命中使用该父作用域内的 route/view 复用身份、params、raw search 和 raw fragment。命中保留原 Entity、局部组件状态和内容 handles，跳过 factory、Scene resolve/apply；本次请求仍沿合法的新执行与 publication 合同运行，不重放旧 task。未命中创建 fresh Scene。
 
-缓存按失活时刻维护简单 LRU。命中实例移出非活动库存，原 active leaf 若可保留则成为最新失活项；超出容量时受控清理最旧非活动实例。parent/outlet/slot 或 host scope 失效时不能跨 scope 命中，旧责任须经[生命周期结算](lifecycle.md#非活动实例与长期-owner)。
+库存按成功离场维护简单 LRU，失败不刷新顺序。命中实例移出非活动库存，各层独立计算保留条件；超出容量时选最旧候选，并受控清理其依赖闭包，所以实际剩余数可以小于容量。parent/outlet/slot 或 host scope 失效时不能跨 scope 命中，旧责任须经[生命周期结算](lifecycle.md#非活动实例与长期-owner)。
 
 keep-alive 不改变输入更新规则：raw search 变化仍重建整条分支并失效旧父 scope；仅 fragment 变化仍重建 deepest normal frame，不把此次重建解释为缓存命中。
 

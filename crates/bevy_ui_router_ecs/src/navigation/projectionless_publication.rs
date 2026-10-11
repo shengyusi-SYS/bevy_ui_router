@@ -334,7 +334,7 @@ fn freeze_projectionless_leaving(
             world,
             registry,
             leaving,
-            None,
+            &[],
             &change.selected(&entry.retained).collect::<Vec<_>>(),
             resulting_claims,
         ),
@@ -693,7 +693,7 @@ pub(super) fn prepare_projectionless_branch(
         };
         let leaving = entry.active.as_ref()?;
         let retired = change
-            .selected(&entry.retained)
+            .selected_in_storage_order(&entry.retained)
             .map(|(_, branch)| branch)
             .collect::<Vec<_>>();
         let frames = leaving
@@ -716,7 +716,7 @@ pub(super) fn prepare_projectionless_branch(
             .collect::<Option<Vec<_>>>()?;
         let boundaries = world
             .resource::<RouteEntityRegistry>()
-            .prepare_retained_boundaries(None, &retiring)
+            .prepare_retained_boundaries(&[], &retiring)
             .ok()?;
         Some((Some(assembly), rebinds, Some(boundaries)))
     })();
@@ -1132,19 +1132,24 @@ pub(super) fn publish_projectionless_work(
                 });
             match plan {
                 Ok(plan)
-                    if plan.retained().is_none()
+                    if plan.retained().is_empty()
                         && plan.preserved().is_empty()
                         && plan.retiring().len() == retiring.len()
                         && plan
                             .retiring()
                             .iter()
                             .all(|projection| retiring.contains(projection))
-                        && plan
-                            .disposable_roots()
+                        && plan.disposable_roots().iter().all(|root| {
+                            logical_roots.contains(root)
+                                || plan
+                                    .retiring()
+                                    .iter()
+                                    .any(|projection| projection.frame() == root)
+                        })
+                        && logical_roots
                             .iter()
-                            .eq(logical_roots.iter().chain(
-                                plan.retiring().iter().map(|projection| projection.frame()),
-                            )) =>
+                            .chain(plan.retiring().iter().map(|projection| projection.frame()))
+                            .all(|root| plan.disposable_roots().contains(root)) =>
                 {
                     Some(plan)
                 }

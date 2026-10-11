@@ -1651,10 +1651,23 @@ struct FailureCleanupActiveSourceProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct FailureCleanupRetainedSourceProjection {
+    projection: RetainedLeafProjection,
+    claims: Vec<ExactRegistryClaim>,
+    mount: crate::presentation::FrameMountBinding,
+    own_slots: Vec<(
+        ExactRegistryClaim,
+        crate::presentation::OutletBinding,
+        Vec<Entity>,
+    )>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FailureCleanupSourceProjection {
     host: Option<FailureCleanupHostSourceProjection>,
     active: Option<FailureCleanupActiveSourceProjection>,
     prepared: Option<FailureCleanupActiveSourceProjection>,
+    retained: Vec<FailureCleanupRetainedSourceProjection>,
 }
 
 impl FailureCleanupSourceProjection {
@@ -1666,6 +1679,15 @@ impl FailureCleanupSourceProjection {
         host: Option<&HostBinding>,
         active: Option<&RealizedBranch>,
         prepared: Option<&RealizedBranch>,
+    ) -> Self {
+        Self::observe_with_selected(host, active, prepared, &[])
+    }
+
+    pub(crate) fn observe_with_selected(
+        host: Option<&HostBinding>,
+        active: Option<&RealizedBranch>,
+        prepared: Option<&RealizedBranch>,
+        selected: &[(&RetainedLeafProjection, &InstancePayload)],
     ) -> Self {
         let observe_branch = |branch: &RealizedBranch| FailureCleanupActiveSourceProjection {
             frames: branch
@@ -1685,6 +1707,27 @@ impl FailureCleanupSourceProjection {
             }),
             active: active.map(observe_branch),
             prepared: prepared.map(observe_branch),
+            retained: selected
+                .iter()
+                .map(
+                    |(projection, payload)| FailureCleanupRetainedSourceProjection {
+                        projection: (*projection).clone(),
+                        claims: payload.claims().cloned().collect(),
+                        mount: payload.frame().mount_binding().clone(),
+                        own_slots: payload
+                            .child_slots()
+                            .iter()
+                            .map(|slot| {
+                                (
+                                    slot.slot_claim().clone(),
+                                    slot.anchor_binding().clone(),
+                                    slot.expected_anchor_children().to_vec(),
+                                )
+                            })
+                            .collect(),
+                    },
+                )
+                .collect(),
         }
     }
 
@@ -2723,6 +2766,70 @@ fn observe_failed_outlet_binding(
     parent: &bevy_ui_router_core::frame::RouteFrameVersion,
     binding: &crate::presentation::OutletBinding,
 ) -> Option<FailedBoundaryDrift> {
+    observe_failed_outlet_binding_with_proof(
+        world,
+        registry,
+        source,
+        parent,
+        binding,
+        FailedOutletProof::Activation,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FailedOutletProof {
+    Activation,
+    SelectedDisposal,
+}
+
+fn selected_failed_outlet_proof(
+    parent: &RouteFrameVersion,
+    binding: &crate::presentation::OutletBinding,
+    selected: &[(&RetainedLeafProjection, &InstancePayload)],
+    external_mount: Option<&crate::presentation::FrameMountBinding>,
+) -> FailedOutletProof {
+    let exact_selected_source = binding.is_native()
+        && selected.iter().any(|(projection, payload)| {
+            projection.frame() == parent
+                && payload.frame().frame() == parent
+                && payload
+                    .frame()
+                    .mount_binding()
+                    .matches_retained_scope(projection)
+                && payload
+                    .claims()
+                    .all(|claim| claim.lifecycle() == EntityLifecycle::Retained)
+                && payload
+                    .frame()
+                    .claims()
+                    .any(|claim| claim == binding.source_claim())
+                && payload
+                    .frame()
+                    .outlets()
+                    .iter()
+                    .any(|outlet| outlet.anchor_binding() == binding)
+                && external_mount.is_none_or(|mount| {
+                    payload
+                        .child_slots()
+                        .iter()
+                        .any(|slot| mount.matches_mounted_child_slot(slot))
+                })
+        });
+    if exact_selected_source {
+        FailedOutletProof::SelectedDisposal
+    } else {
+        FailedOutletProof::Activation
+    }
+}
+
+fn observe_failed_outlet_binding_with_proof(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    source: FailedBoundarySource,
+    parent: &RouteFrameVersion,
+    binding: &crate::presentation::OutletBinding,
+    proof: FailedOutletProof,
+) -> Option<FailedBoundaryDrift> {
     if !binding.is_native() {
         return observe_failed_boundary_claim(world, registry, source, binding.source_claim());
     }
@@ -2736,7 +2843,10 @@ fn observe_failed_outlet_binding(
         drift.expected = expected;
         return Some(drift);
     }
-    (!binding.is_current(world, parent, true)).then_some(FailedBoundaryDrift {
+    // Removing a fresh child only needs the exact original boundary and its
+    // containment. Outlet eligibility is required again before activation.
+    let require_outlet = matches!(proof, FailedOutletProof::Activation);
+    (!binding.is_current(world, parent, require_outlet)).then_some(FailedBoundaryDrift {
         source,
         expected,
         state: FailedManifestClaimState::PhysicalDrift,
@@ -2941,11 +3051,11 @@ impl FrozenCleanupManifest {
         world: &World,
         registry: &RouteEntityRegistry,
         leaving: &RealizedBranch,
-        retained: Option<&RetainedLeafProjection>,
+        retained: &[RetainedLeafProjection],
         retiring: &[(&RetainedLeafProjection, &crate::instance::InstancePayload)],
         projected_claims: &[ExactRegistryClaim],
     ) -> Result<Self, RetainedPartitionManifestError> {
-        if let Some(candidate) = retained {
+        for candidate in retained {
             let mut frames = leaving
                 .frames()
                 .iter()
@@ -2960,12 +3070,20 @@ impl FrozenCleanupManifest {
         let mut frames = leaving
             .frames()
             .iter()
-            .filter(|frame| retained.is_none_or(|candidate| frame.frame() != candidate.frame()))
+            .filter(|frame| {
+                !retained
+                    .iter()
+                    .any(|candidate| frame.frame() == candidate.frame())
+            })
             .collect::<Vec<_>>();
         let mut slots = leaving
             .child_slots()
             .iter()
-            .filter(|slot| retained.is_none_or(|candidate| slot.parent() != candidate.frame()))
+            .filter(|slot| {
+                !retained
+                    .iter()
+                    .any(|candidate| slot.parent() == candidate.frame())
+            })
             .collect::<Vec<_>>();
         let mut authorized_retired = Vec::with_capacity(retiring.len());
         for (projection, branch) in retiring {
@@ -3022,60 +3140,108 @@ impl FrozenCleanupManifest {
     pub(crate) fn from_retained_invalidation(
         world: &World,
         registry: &RouteEntityRegistry,
-        branch: &InstancePayload,
-        evidence: &RetainedInvalidationEvidence,
+        retiring: &[(&RetainedLeafProjection, &InstancePayload)],
+        evidence: &[RetainedInvalidationEvidence],
     ) -> Option<Self> {
-        let frame = branch.frame();
-        let root = frame.native_root()?;
-        if !evidence.matches_payload(frame, branch.child_slots())
-            || !evidence.is_current(world)
-            || !evidence.preservation_is_current(world)
-            || frame.frame() != evidence.projection().frame()
-            || frame.native_root() != Some(root)
-            || branch.claims().any(|claim| {
-                claim.lifecycle() != EntityLifecycle::Retained
-                    || registry
-                        .record(claim.entity())
-                        .is_none_or(|record| record.claim() != *claim)
+        if evidence.is_empty()
+            || evidence.iter().enumerate().any(|(index, observed)| {
+                evidence[..index]
+                    .iter()
+                    .any(|prior| prior.projection() == observed.projection())
+                    || retiring
+                        .iter()
+                        .filter(|(projection, payload)| {
+                            *projection == observed.projection()
+                                && observed.matches_payload(payload.frame(), payload.child_slots())
+                        })
+                        .count()
+                        != 1
+                    || !observed.observed_source_is_current(world)
             })
-            || !frame.claims().any(|claim| {
-                claim.entity() == root
-                    && claim.owner()
-                        == &RegistryOwner::Committed(EntityOwner::FrameContentTarget(
-                            frame.frame().clone(),
-                        ))
+            || !evidence.iter().any(|observed| {
+                observed.is_current(world) && observed.preservation_is_current(world)
             })
-            || branch
-                .child_slots()
-                .iter()
-                .any(|slot| slot.parent() != frame.frame())
         {
             return None;
         }
-        let claims = frame.claims().cloned().collect::<Vec<_>>();
-        let mut obligations = frame_obligations(registry, frame, &claims)?;
-        for slot in branch.child_slots() {
-            let record = registry.record(slot.slot())?;
-            obligations.push(CleanupObligation {
-                identity: CleanupTargetIdentity::Registered(slot.slot_claim().clone()),
-                manifest: record.manifest().clone(),
-                expected_parent: slot.anchor(),
-                unit_root: slot.slot(),
-                authorized_parent: slot.anchor(),
-                allow_missing_components: false,
-                terminal_mode: CleanupTerminalMode::Normal,
-            });
-        }
-        order_leaf_to_root(&mut obligations)?;
-        let mut candidates = vec![attached_frame_mount_parent_candidate(world, frame)?];
-        for slot in branch.child_slots() {
-            if !obligations
-                .iter()
-                .any(|obligation| obligation.entity() == slot.anchor())
+        let mut obligations = Vec::new();
+        let mut candidates = Vec::new();
+        for (index, (projection, payload)) in retiring.iter().enumerate() {
+            let frame = payload.frame();
+            if frame.frame() != projection.frame()
+                || !frame.mount_binding().matches_retained_scope(projection)
+                || retiring[..index]
+                    .iter()
+                    .any(|(prior, _)| prior.frame() == projection.frame())
+                || payload
+                    .child_slots()
+                    .iter()
+                    .any(|slot| slot.parent() != frame.frame())
+                || payload.claims().any(|claim| {
+                    claim.lifecycle() != EntityLifecycle::Retained
+                        || registry
+                            .record(claim.entity())
+                            .is_none_or(|record| record.claim() != *claim)
+                })
+                || (!evidence
+                    .iter()
+                    .any(|observed| observed.projection() == *projection)
+                    && !registry.retained_payload_is_current(
+                        world,
+                        projection,
+                        frame,
+                        payload.child_slots(),
+                    ))
             {
-                candidates.push(mounted_anchor_parent_candidate(world, slot)?);
+                return None;
+            }
+            let claims = frame.claims().cloned().collect::<Vec<_>>();
+            obligations.extend(frame_obligations(registry, frame, &claims)?);
+            for slot in payload.child_slots() {
+                let record = registry.record(slot.slot())?;
+                obligations.push(CleanupObligation {
+                    identity: CleanupTargetIdentity::Registered(slot.slot_claim().clone()),
+                    manifest: record.manifest().clone(),
+                    expected_parent: slot.anchor(),
+                    unit_root: slot.slot(),
+                    authorized_parent: slot.anchor(),
+                    allow_missing_components: false,
+                    terminal_mode: CleanupTerminalMode::Normal,
+                });
+            }
+            if !retiring
+                .iter()
+                .flat_map(|(_, payload)| payload.claims())
+                .any(|claim| claim.entity() == frame.mount_binding().slot())
+            {
+                candidates.push(retained_frame_mount_parent_candidate(
+                    world, registry, frame,
+                )?);
+            }
+            for slot in payload.child_slots() {
+                if !retiring
+                    .iter()
+                    .flat_map(|(_, payload)| payload.claims())
+                    .any(|claim| claim.entity() == slot.anchor())
+                    && !retained_native_slot_mount_exchange_is_already_absent(
+                        world,
+                        frame,
+                        slot,
+                        &obligations,
+                    )
+                {
+                    candidates.push(mounted_anchor_parent_candidate(world, slot)?);
+                }
             }
         }
+        order_leaf_to_root(&mut obligations)?;
+        // Parent instances and their own slots are targets only when Core selected
+        // their dependency closure. Every other inventory boundary stays protected.
+        candidates.retain(|candidate| {
+            !obligations
+                .iter()
+                .any(|obligation| obligation.entity() == candidate.physical)
+        });
         let mount_parents =
             freeze_external_mount_parents(world, registry, &obligations, candidates)?;
         let digest = frozen_manifest_digest(&obligations, &mount_parents);
@@ -3087,9 +3253,9 @@ impl FrozenCleanupManifest {
             digest,
         };
         let receipts = vec![None; manifest.obligations.len()];
-        let evidence = collect_evidence(world, &manifest.obligations, &receipts);
+        let observed = collect_evidence(world, &manifest.obligations, &receipts);
         (manifest.preflight(world)
-            && quarantine_disposition(&evidence, &manifest.obligations).is_none())
+            && quarantine_disposition(&observed, &manifest.obligations).is_none())
         .then_some(manifest)
     }
 
@@ -3176,7 +3342,9 @@ impl FrozenCleanupManifest {
                 let children = frames
                     .iter()
                     .enumerate()
-                    .filter(|(_, frame)| frame.mount_binding().matches_mounted_child_slot(slot))
+                    .filter(|(_, frame)| {
+                        leaving_frame_matches_slot(frame, slot, authorized_retired)
+                    })
                     .collect::<Vec<_>>();
                 // Multiple target children require an explicit retained-owner
                 // transfer. The ordinary branch proof remains single-child.
@@ -3240,7 +3408,11 @@ impl FrozenCleanupManifest {
             .iter()
             .map(|frame| match mount_proof {
                 LeavingMountProof::RetainedPartition => {
-                    attached_frame_mount_parent_candidate(world, frame)
+                    if authorized_retired.contains(&frame.frame()) {
+                        retained_frame_mount_parent_candidate(world, registry, frame)
+                    } else {
+                        attached_frame_mount_parent_candidate(world, frame)
+                    }
                 }
                 LeavingMountProof::FreshSuccessor(successor) => {
                     let successor = exact_successor_for_mount(frame, successor)?;
@@ -3272,6 +3444,15 @@ impl FrozenCleanupManifest {
         registry: &RouteEntityRegistry,
         branch: &FailedPreparedBranch,
     ) -> Result<Self, FailedManifestBuildError> {
+        Self::from_failed_prepared_branch_with_selected(world, registry, branch, &[])
+    }
+
+    pub(crate) fn from_failed_prepared_branch_with_selected(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        branch: &FailedPreparedBranch,
+        selected: &[(&RetainedLeafProjection, &InstancePayload)],
+    ) -> Result<Self, FailedManifestBuildError> {
         if branch.frames().is_empty()
             && branch.child_slots().is_empty()
             && branch.mount_residuals().is_empty()
@@ -3280,7 +3461,8 @@ impl FrozenCleanupManifest {
         {
             return Ok(Self::empty());
         }
-        let topology = FailedPreparedTopology::build(world, registry, branch)?;
+        let topology =
+            FailedPreparedTopology::build_with_selected(world, registry, branch, selected)?;
         let obligations = topology.freeze_obligations(world, registry)?;
         let (parent_candidates, mut candidate_drifts) = topology.freeze_parent_candidates(world)?;
         let (mount_parents, mut freeze_drifts) = freeze_external_mount_parents_detailed(
@@ -3826,6 +4008,25 @@ impl FrozenCleanupManifest {
         prepared: Option<&RealizedBranch>,
         host: &HostBinding,
     ) -> Option<FrozenFailureCleanupPartition> {
+        self.freeze_failure_cleanup_partition_with_selected(
+            world,
+            registry,
+            active,
+            prepared,
+            host,
+            &[],
+        )
+    }
+
+    pub(crate) fn freeze_failure_cleanup_partition_with_selected(
+        &self,
+        world: &World,
+        registry: &RouteEntityRegistry,
+        active: Option<&RealizedBranch>,
+        prepared: Option<&RealizedBranch>,
+        host: &HostBinding,
+        selected: &[(&RetainedLeafProjection, &InstancePayload)],
+    ) -> Option<FrozenFailureCleanupPartition> {
         let targets = self
             .obligations
             .iter()
@@ -3851,6 +4052,33 @@ impl FrozenCleanupManifest {
         let prepared_claims = prepared
             .map(|prepared| prepared.claims().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let retained_claims = selected
+            .iter()
+            .flat_map(|(_, payload)| payload.claims())
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected
+            .iter()
+            .enumerate()
+            .any(|(index, (projection, payload))| {
+                payload.frame().frame() != projection.frame()
+                    || !payload
+                        .frame()
+                        .mount_binding()
+                        .matches_retained_scope(projection)
+                    || selected[..index]
+                        .iter()
+                        .any(|(prior, _)| prior.frame() == projection.frame())
+            })
+            || retained_claims
+                .iter()
+                .any(|claim| claim.lifecycle() != EntityLifecycle::Retained)
+        {
+            return None;
+        }
+        // Selected stock is a non-target source. Its original identity stays
+        // frozen even when its physical payload needs local invalidation; the
+        // observed protected state below must remain exact through fresh cleanup.
         if prepared_claims.iter().any(|claim| {
             claim.lifecycle() != EntityLifecycle::PreparedInert
                 || registry
@@ -3863,11 +4091,23 @@ impl FrozenCleanupManifest {
         if active_claims
             .iter()
             .chain(&prepared_claims)
+            .chain(&retained_claims)
             .any(|claim| allowed_writes.contains(&claim.entity()))
             || active_claims.iter().any(|claim| {
                 prepared_claims
                     .iter()
-                    .any(|prepared| prepared.entity() == claim.entity())
+                    .chain(&retained_claims)
+                    .any(|other| other.entity() == claim.entity())
+            })
+            || prepared_claims.iter().any(|claim| {
+                retained_claims
+                    .iter()
+                    .any(|other| other.entity() == claim.entity())
+            })
+            || retained_claims.iter().enumerate().any(|(index, claim)| {
+                retained_claims[index + 1..]
+                    .iter()
+                    .any(|other| other.entity() == claim.entity())
             })
         {
             return None;
@@ -3876,6 +4116,11 @@ impl FrozenCleanupManifest {
         roots.extend(allowed_writes.iter().copied());
         roots.extend(active_claims.iter().map(ExactRegistryClaim::entity));
         roots.extend(prepared_claims.iter().map(ExactRegistryClaim::entity));
+        roots.extend(retained_claims.iter().map(ExactRegistryClaim::entity));
+        for (_, payload) in selected {
+            roots.push(payload.frame().mount_binding().slot());
+            roots.push(payload.frame().mount_binding().physical_parent().0);
+        }
         roots.extend(
             self.obligations
                 .iter()
@@ -3918,6 +4163,7 @@ impl FrozenCleanupManifest {
             || active_claims
                 .iter()
                 .chain(&prepared_claims)
+                .chain(&retained_claims)
                 .any(|claim| !protected_entities.contains(&claim.entity()))
         {
             return None;
@@ -3927,17 +4173,23 @@ impl FrozenCleanupManifest {
             .copied()
             .map(|entity| FrozenFailureCleanupObservedEntity::observe(world, registry, entity))
             .collect::<Vec<_>>();
-        if protected_observed.iter().any(|observed| !observed.present) {
+        if protected_observed.iter().any(|observed| {
+            !observed.present
+                && !retained_claims
+                    .iter()
+                    .any(|claim| claim.entity() == observed.entity)
+        }) {
             return None;
         }
         Some(FrozenFailureCleanupPartition {
             source: FrozenFailureCleanupSource {
                 manifest_digest: self.digest,
                 targets,
-                logical: FailureCleanupSourceProjection::observe_with_prepared(
+                logical: FailureCleanupSourceProjection::observe_with_selected(
                     Some(host),
                     active,
                     prepared,
+                    selected,
                 ),
             },
             roots,
@@ -4055,6 +4307,15 @@ impl<'a> FailedPreparedTopology<'a> {
         world: &World,
         registry: &RouteEntityRegistry,
         branch: &'a FailedPreparedBranch,
+    ) -> Result<Self, FailedManifestBuildError> {
+        Self::build_with_selected(world, registry, branch, &[])
+    }
+
+    fn build_with_selected(
+        world: &World,
+        registry: &RouteEntityRegistry,
+        branch: &'a FailedPreparedBranch,
+        selected: &[(&RetainedLeafProjection, &InstancePayload)],
     ) -> Result<Self, FailedManifestBuildError> {
         let frame_count = branch
             .frames()
@@ -4277,7 +4538,7 @@ impl<'a> FailedPreparedTopology<'a> {
                         FailedPreparedTopologyError::ConflictingOwner,
                     ));
                 }
-                if let Some(drift) = observe_failed_outlet_binding(
+                if let Some(drift) = observe_failed_outlet_binding_with_proof(
                     world,
                     registry,
                     FailedBoundarySource::MountedSlotAnchor {
@@ -4288,6 +4549,12 @@ impl<'a> FailedPreparedTopology<'a> {
                     },
                     slot.parent(),
                     slot.anchor_binding(),
+                    selected_failed_outlet_proof(
+                        slot.parent(),
+                        slot.anchor_binding(),
+                        selected,
+                        None,
+                    ),
                 ) {
                     boundary_drifts.push(drift);
                 }
@@ -4362,7 +4629,14 @@ impl<'a> FailedPreparedTopology<'a> {
                                 ));
                             }
                         };
-                        observe_failed_outlet_binding(world, registry, source, parent, binding)
+                        observe_failed_outlet_binding_with_proof(
+                            world,
+                            registry,
+                            source,
+                            parent,
+                            binding,
+                            selected_failed_outlet_proof(parent, binding, selected, Some(mount)),
+                        )
                     } else {
                         observe_failed_boundary_claim(world, registry, source, parent_claim)
                     };
@@ -4405,12 +4679,13 @@ impl<'a> FailedPreparedTopology<'a> {
                         }
                     }
                 };
-                if let Some(drift) = observe_failed_outlet_binding(
+                if let Some(drift) = observe_failed_outlet_binding_with_proof(
                     world,
                     registry,
                     source,
                     node.parent,
                     boundary.binding,
+                    selected_failed_outlet_proof(node.parent, boundary.binding, selected, None),
                 ) {
                     boundary_drifts.push(drift);
                 }
@@ -5327,6 +5602,20 @@ fn leaving_slot_has_exact_parent(frames: &[&RealizedFrame], slot: &MountedChildS
             })
 }
 
+fn leaving_frame_matches_slot(
+    frame: &RealizedFrame,
+    slot: &MountedChildSlot,
+    retired: &[&RouteFrameVersion],
+) -> bool {
+    if retired.contains(&frame.frame()) {
+        frame
+            .mount_binding()
+            .matches_mounted_child_slot_identity(slot)
+    } else {
+        frame.mount_binding().matches_mounted_child_slot(slot)
+    }
+}
+
 fn append_exact_leaving_unit(
     registry: &RouteEntityRegistry,
     frames: &[&RealizedFrame],
@@ -5351,7 +5640,7 @@ fn append_exact_leaving_unit(
         let children = frames
             .iter()
             .enumerate()
-            .filter(|(_, child)| child.mount_binding().matches_mounted_child_slot(slot))
+            .filter(|(_, child)| leaving_frame_matches_slot(child, slot, authorized_retired))
             .collect::<Vec<_>>();
         if children
             .iter()
@@ -5428,19 +5717,27 @@ fn append_retained_authority_branches(
     }
     for (index, (projection, branch)) in retiring.iter().enumerate() {
         let frame = branch.frame();
-        let active = active.ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
         let mut parents = active
-            .frames()
-            .iter()
+            .into_iter()
+            .flat_map(RealizedBranch::frames)
+            .chain(retiring.iter().map(|(_, payload)| payload.frame()))
             .filter(|frame| frame.frame() == projection.parent());
         let parent = parents
             .next()
             .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
-        let mut slots = active.child_slots().iter().filter(|slot| {
-            slot.parent() == projection.parent()
-                && slot.outlet() == projection.outlet()
-                && slot.slot_id() == projection.slot()
-        });
+        let mut slots = active
+            .into_iter()
+            .flat_map(RealizedBranch::child_slots)
+            .chain(
+                retiring
+                    .iter()
+                    .flat_map(|(_, payload)| payload.child_slots()),
+            )
+            .filter(|slot| {
+                slot.parent() == projection.parent()
+                    && slot.outlet() == projection.outlet()
+                    && slot.slot_id() == projection.slot()
+            });
         let slot = slots
             .next()
             .ok_or(AuthoritySettlementManifestError::InvalidTopology)?;
@@ -5456,14 +5753,23 @@ fn append_retained_authority_branches(
             || mount.slot_claim().seal() != slot.slot_claim().seal()
             || !matches!(
                 mount.slot_claim().lifecycle(),
-                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+                EntityLifecycle::Active
+                    | EntityLifecycle::PreparedInert
+                    | EntityLifecycle::Retained
             )
             || !matches!(
                 slot.slot_claim().lifecycle(),
-                EntityLifecycle::Active | EntityLifecycle::PreparedInert
+                EntityLifecycle::Active
+                    | EntityLifecycle::PreparedInert
+                    | EntityLifecycle::Retained
             )
             || mount.physical_parent().0 != slot.anchor()
-            || mount.outlet_binding() != Some(slot.anchor_binding())
+            || mount.outlet_binding().is_none_or(|binding| {
+                binding.anchor() != slot.anchor()
+                    || binding.source_claim().entity() != slot.anchor_claim().entity()
+                    || binding.source_claim().owner() != slot.anchor_claim().owner()
+                    || binding.source_claim().seal() != slot.anchor_claim().seal()
+            })
             || !parent.outlet(slot.outlet()).is_some_and(|outlet| {
                 outlet.anchor() == slot.anchor()
                     && outlet.anchor_claim() == slot.anchor_claim()
@@ -5486,9 +5792,37 @@ fn append_retained_authority_branches(
             return Err(AuthoritySettlementManifestError::InvalidTopology);
         }
     }
-    // Append each cached leaf before its active parent's slot obligation.
-    // The ordinary branch validator still rejects multiple owned siblings.
-    for (_, branch) in retiring {
+    // Each dependency must reach the active chain; reject cycles without
+    // recursion. Sort the instance forest child-first before any mutation.
+    let mut ordered = retiring
+        .iter()
+        .enumerate()
+        .map(|(index, (projection, _))| {
+            let mut parent = projection.parent();
+            let mut depth = 0;
+            while let Some((ancestor, _)) = retiring
+                .iter()
+                .find(|(candidate, _)| candidate.frame() == parent)
+            {
+                depth += 1;
+                if depth > retiring.len() {
+                    return Err(AuthoritySettlementManifestError::InvalidTopology);
+                }
+                parent = ancestor.parent();
+            }
+            if !active
+                .into_iter()
+                .flat_map(RealizedBranch::frames)
+                .any(|frame| frame.frame() == parent)
+            {
+                return Err(AuthoritySettlementManifestError::InvalidTopology);
+            }
+            Ok((index, depth))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ordered.sort_by_key(|(index, depth)| (std::cmp::Reverse(*depth), *index));
+    for (index, _) in ordered {
+        let branch = retiring[index].1;
         append_exact_authority_branch(
             world,
             registry,
@@ -5956,6 +6290,37 @@ fn frame_mount_parent_candidate(
     })
 }
 
+fn retained_frame_mount_parent_candidate(
+    world: &World,
+    registry: &RouteEntityRegistry,
+    frame: &RealizedFrame,
+) -> Option<CleanupMountParentCandidate> {
+    let mut candidate = attached_frame_mount_parent_candidate(world, frame)?;
+    let refresh = |claim: &ExactRegistryClaim| {
+        let current = registry.record(claim.entity())?.claim();
+        (current.owner() == claim.owner()
+            && current.seal() == claim.seal()
+            && matches!(
+                current.lifecycle(),
+                EntityLifecycle::Active
+                    | EntityLifecycle::PreparedInert
+                    | EntityLifecycle::Retained
+            ))
+        .then_some(current)
+    };
+    candidate.claim = refresh(&candidate.claim)?;
+    if let Some((_, Some(claim))) = &mut candidate.supplied_parent {
+        *claim = refresh(claim)?;
+    }
+    if let CleanupParentBinding::Structural {
+        upstream: Some(binding),
+    } = &mut candidate.binding
+    {
+        *binding.source_claim_mut() = refresh(binding.source_claim())?;
+    }
+    Some(candidate)
+}
+
 fn attached_frame_mount_parent_candidate(
     world: &World,
     frame: &RealizedFrame,
@@ -6030,6 +6395,47 @@ fn mounted_anchor_parent_candidate(
         children_before,
         children_after,
     })
+}
+
+fn retained_native_slot_mount_exchange_is_already_absent(
+    world: &World,
+    frame: &RealizedFrame,
+    slot: &MountedChildSlot,
+    obligations: &[CleanupObligation],
+) -> bool {
+    let Some(root) = frame.native_root() else {
+        return false;
+    };
+    let Some(root_claim) = frame.claims().find(|claim| claim.entity() == root) else {
+        return false;
+    };
+    if !slot.anchor_binding().is_native()
+        || slot.parent() != frame.frame()
+        || slot.anchor_claim() != root_claim
+        || root_claim.owner()
+            != &RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame.frame().clone()))
+        || world.get_entity(slot.anchor()).is_ok()
+        || world.get_entity(slot.slot()).is_ok()
+    {
+        return false;
+    }
+    let root_index = obligations
+        .iter()
+        .position(|obligation| obligation.identity.registered() == Some(root_claim));
+    let slot_index = obligations
+        .iter()
+        .position(|obligation| obligation.identity.registered() == Some(slot.slot_claim()));
+    let (Some(root_index), Some(slot_index)) = (root_index, slot_index) else {
+        return false;
+    };
+    let receipts = vec![None; obligations.len()];
+    matches!(
+        classify_obligation(world, obligations, &receipts, root_index),
+        CleanupEvidence::AlreadyAbsent
+    ) && matches!(
+        classify_obligation(world, obligations, &receipts, slot_index),
+        CleanupEvidence::AlreadyAbsent
+    )
 }
 
 fn residual_anchor_parent_candidate(
@@ -8012,6 +8418,7 @@ pub(crate) struct PreparedCleanupLedger {
 /// cleanup batch and no physical owner until the original transfer is accepted.
 pub(crate) struct PreparedRetainedInvalidationRemoval {
     payload_frames: Vec<RealizedFrame>,
+    payload_slots: Vec<MountedChildSlot>,
     ledger: CleanupLedger,
     step: PreparedRetainedInvalidationRemovalStep,
 }
@@ -8041,14 +8448,17 @@ impl PreparedRetainedInvalidationRemoval {
     pub(crate) fn activate(
         mut self,
         batch: CleanupBatch,
-        instance: InstancePayload,
+        instances: Vec<InstancePayload>,
     ) -> (CleanupLedger, PreparedRetainedInvalidationRemovalStep) {
         self.ledger.batch = Some(batch);
-        let (frame, child_slots) = instance.into_owned_parts();
-        self.payload_frames.push(frame);
+        for instance in instances {
+            let (frame, mut slots) = instance.into_owned_parts();
+            self.payload_frames.push(frame);
+            self.payload_slots.append(&mut slots);
+        }
         self.ledger.owner = Some(CleanupOwner::Leaving(LeavingPayload {
             frames: self.payload_frames,
-            child_slots,
+            child_slots: self.payload_slots,
         }));
         (self.ledger, self.step)
     }
@@ -8123,60 +8533,71 @@ impl PreparedCleanupLedger {
     pub(crate) fn prepare_retained_invalidation_removal(
         self,
         world: &World,
-        branch: &InstancePayload,
+        branches: &[(&RetainedLeafProjection, &InstancePayload)],
     ) -> Result<PreparedRetainedInvalidationRemoval, RetainedInvalidationRemovalPreparationError>
     {
         use RetainedInvalidationRemovalPreparationError::{InvalidSource, RetryableCapacity};
-        let frame = branch.frame();
-        let Some(root) = frame.native_root() else {
-            return Err(InvalidSource);
-        };
-        let root_claim = frame.claims().find(|claim| claim.entity() == root);
-        let shell_claim = frame.claims().find(|claim| claim.entity() == frame.shell());
-        if self.batch.is_some()
+        if branches.is_empty()
+            || self.batch.is_some()
             || self.failure_cleanup_partition.is_some()
             || self.related_protected.is_none()
             || self.obligations.is_empty()
             || self.receipts.len() != self.obligations.len()
             || self.receipts.iter().any(Option::is_some)
-            || root_claim.is_none_or(|claim| {
-                claim.owner()
-                    != &RegistryOwner::Committed(EntityOwner::FrameContentTarget(
-                        frame.frame().clone(),
-                    ))
-            })
-            || shell_claim.is_none_or(|claim| {
-                claim.owner()
-                    != &RegistryOwner::Committed(EntityOwner::FrameShell(frame.frame().clone()))
-            })
-            || branch.claims().any(|claim| {
-                claim.lifecycle() != EntityLifecycle::Retained
-                    || self
-                        .obligations
-                        .iter()
-                        .filter(|obligation| obligation.identity.registered() == Some(claim))
-                        .count()
-                        != 1
-            })
-            || branch
-                .child_slots()
+            || branches
                 .iter()
-                .any(|slot| slot.parent() != frame.frame())
+                .enumerate()
+                .any(|(index, (projection, branch))| {
+                    branch.frame().frame() != projection.frame()
+                        || branches[..index]
+                            .iter()
+                            .any(|(prior, _)| prior.frame() == projection.frame())
+                        || branch
+                            .child_slots()
+                            .iter()
+                            .any(|slot| slot.parent() != branch.frame().frame())
+                        || branch.claims().any(|claim| {
+                            claim.lifecycle() != EntityLifecycle::Retained
+                                || self
+                                    .obligations
+                                    .iter()
+                                    .filter(|obligation| {
+                                        obligation.identity.registered() == Some(claim)
+                                    })
+                                    .count()
+                                    != 1
+                        })
+                })
             || self.obligations.iter().any(|obligation| {
                 obligation.terminal_mode != CleanupTerminalMode::Normal
                     || match &obligation.identity {
                         CleanupTargetIdentity::Registered(claim) => {
-                            branch.claims().filter(|source| *source == claim).count() != 1
+                            branches
+                                .iter()
+                                .flat_map(|(_, branch)| branch.claims())
+                                .filter(|source| *source == claim)
+                                .count()
+                                != 1
                         }
                         CleanupTargetIdentity::ContainedContent { root, shell, .. } => {
-                            Some(root) != root_claim || Some(shell) != shell_claim
+                            branches
+                                .iter()
+                                .filter(|(_, branch)| {
+                                    let frame = branch.frame();
+                                    frame.claims().any(|claim| {
+                                        claim == root && Some(claim.entity()) == frame.native_root()
+                                    }) && frame.claims().any(|claim| {
+                                        claim == shell && claim.entity() == frame.shell()
+                                    })
+                                })
+                                .count()
+                                != 1
                         }
                     }
             })
         {
             return Err(InvalidSource);
         }
-
         // This is still reserved storage, not an owner. Reuse its real domain
         // and first attempt so every prepared receipt survives activation intact.
         let mut ledger = CleanupLedger::activate_owner(self, None);
@@ -8199,24 +8620,31 @@ impl PreparedCleanupLedger {
         {
             return Err(InvalidSource);
         }
-        let root_absent = attempt.evidence.iter().any(|(index, evidence)| {
-            ledger.obligations[*index].entity() == root
-                && matches!(evidence, CleanupEvidence::AlreadyAbsent)
-        });
-        if root_absent
-            && (!observed_children(world, frame.shell()).is_empty()
-                || attempt
-                    .evidence
-                    .iter()
-                    .filter(|(_, evidence)| matches!(evidence, CleanupEvidence::Exact { .. }))
-                    .count()
-                    != 1
-                || attempt.evidence.iter().any(|(index, evidence)| {
-                    matches!(evidence, CleanupEvidence::Exact { .. })
-                        && ledger.obligations[*index].entity() != frame.shell()
-                }))
-        {
-            return Err(InvalidSource);
+        let mut root_absent = false;
+        for (_, branch) in branches.iter().filter(|_| branches.len() == 1) {
+            let frame = branch.frame();
+            let absent = frame.native_root().is_some_and(|root| {
+                attempt.evidence.iter().any(|(index, evidence)| {
+                    ledger.obligations[*index].entity() == root
+                        && matches!(evidence, CleanupEvidence::AlreadyAbsent)
+                })
+            });
+            if absent {
+                // Keep the existing stopped empty-shell case local to this
+                // original instance, never infer a forest-wide continuation.
+                if !observed_children(world, frame.shell()).is_empty()
+                    || attempt.evidence.iter().any(|(index, evidence)| {
+                        matches!(evidence, CleanupEvidence::Exact { .. })
+                            && branch
+                                .claims()
+                                .any(|claim| claim.entity() == ledger.obligations[*index].entity())
+                            && ledger.obligations[*index].entity() != frame.shell()
+                    })
+                {
+                    return Err(InvalidSource);
+                }
+                root_absent = true;
+            }
         }
         let focus = ledger.focus_closure_for_attempt(
             world,
@@ -8248,9 +8676,7 @@ impl PreparedCleanupLedger {
             // A shell observer can then stop on protected drift only after all
             // original target receipts have been committed.
             let targets = &removal.targets;
-            removal.order.sort_unstable_by_key(|row| {
-                (!targets[*row].absent, targets[*row].entity.to_bits())
-            });
+            removal.order.sort_by_key(|row| !targets[*row].absent);
         }
         if !removal.targets_are_current(world, &ledger)
             || !ledger.mount_parents_physical_match(world)
@@ -8260,10 +8686,20 @@ impl PreparedCleanupLedger {
         }
         let mut payload_frames = Vec::new();
         payload_frames
-            .try_reserve_exact(1)
+            .try_reserve_exact(branches.len())
+            .map_err(|_| RetryableCapacity)?;
+        let mut payload_slots = Vec::new();
+        payload_slots
+            .try_reserve_exact(
+                branches
+                    .iter()
+                    .map(|(_, branch)| branch.child_slots().len())
+                    .sum(),
+            )
             .map_err(|_| RetryableCapacity)?;
         Ok(PreparedRetainedInvalidationRemoval {
             payload_frames,
+            payload_slots,
             ledger,
             step: PreparedRetainedInvalidationRemovalStep {
                 attempt,
@@ -8398,7 +8834,7 @@ impl CleanupLedger {
     pub(crate) fn reserve_retained_invalidation(
         world: &World,
         manifest: FrozenCleanupManifest,
-        frame: &RealizedFrame,
+        frames: &[&RealizedFrame],
     ) -> Result<PreparedCleanupLedger, CleanupLedgerReserveError> {
         let Some(mut protected) =
             freeze_retained_invalidation_protected(world, &manifest.obligations)
@@ -8408,7 +8844,9 @@ impl CleanupLedger {
                 manifest,
             ));
         };
-        append_cleanup_host_sources(world, &mut protected, std::slice::from_ref(frame));
+        for frame in frames {
+            append_cleanup_host_sources(world, &mut protected, std::slice::from_ref(*frame));
+        }
         let mut prepared = Self::reserve(manifest)?;
         prepared.related_protected = Some(protected);
         Ok(prepared)
@@ -11740,6 +12178,25 @@ impl CleanupLedger {
             .filter_map(|obligation| obligation.identity.registered())
     }
 
+    pub(crate) fn retained_invalidation_input_targets<'a>(
+        &'a self,
+        world: &'a World,
+    ) -> impl Iterator<Item = Entity> + 'a {
+        self.obligations
+            .iter()
+            .map(CleanupObligation::entity)
+            .chain(
+                self.owner
+                    .iter()
+                    .filter_map(|owner| match owner {
+                        CleanupOwner::Leaving(payload) => Some(payload.frames()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .flat_map(|frame| frame.live_interactive_entities(world)),
+            )
+    }
+
     pub(crate) fn cleanup_settlement_permanent_evidence(
         &self,
     ) -> Option<&CleanupSettlementPermanentEvidence> {
@@ -11771,6 +12228,22 @@ impl CleanupLedger {
         let Some(CleanupOwner::Leaving(payload)) = self.owner.as_ref() else {
             return false;
         };
+        if self.receipts.iter().all(Option::is_some) {
+            if !self.stopped_retained_disposed_forest_is_exact(
+                world,
+                invalidation,
+                evidence,
+                targets,
+                payload,
+            ) {
+                return false;
+            }
+            // Disposal has already consumed every authorized physical target.
+            // Keep the original stop/protected evidence; only complete this
+            // original ledger's token, without resuming its mutation plan.
+            self.finish_if_settled();
+            return true;
+        }
         let [frame] = payload.frames() else {
             return false;
         };
@@ -11950,6 +12423,151 @@ impl CleanupLedger {
         }
         self.finish_if_settled();
         true
+    }
+
+    fn stopped_retained_disposed_forest_is_exact(
+        &self,
+        world: &World,
+        invalidation: &RetainedInvalidationEvidence,
+        evidence: &CleanupSettlementPermanentEvidence,
+        targets: &[Entity],
+        payload: &LeavingPayload,
+    ) -> bool {
+        let Some(batch) = self.batch.as_ref() else {
+            return false;
+        };
+        let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+            return false;
+        };
+        let Some(seed) = payload
+            .frames
+            .iter()
+            .find(|frame| frame.frame() == invalidation.projection().frame())
+        else {
+            return false;
+        };
+        // Activation appends each original instance's own slots together.
+        // Borrow that source slice intact; neither a forest-wide slot set nor
+        // a reconstructed projection can prove the seed's original payload.
+        let start = payload
+            .child_slots
+            .iter()
+            .position(|slot| slot.parent() == seed.frame())
+            .unwrap_or(0);
+        let end = start
+            + payload.child_slots[start..]
+                .iter()
+                .take_while(|slot| slot.parent() == seed.frame())
+                .count();
+        if payload.child_slots[..start]
+            .iter()
+            .chain(payload.child_slots[end..].iter())
+            .any(|slot| slot.parent() == seed.frame())
+            || !invalidation.matches_payload(seed, &payload.child_slots[start..end])
+        {
+            return false;
+        }
+        let source_claims = || {
+            payload
+                .frames
+                .iter()
+                .flat_map(RealizedFrame::claims)
+                .chain(payload.child_slots.iter().map(MountedChildSlot::slot_claim))
+        };
+        if payload.frames.iter().enumerate().any(|(index, frame)| {
+            payload.frames[..index]
+                .iter()
+                .any(|prior| prior.frame() == frame.frame())
+        }) || payload.child_slots.iter().any(|slot| {
+            payload
+                .frames
+                .iter()
+                .filter(|frame| frame.frame() == slot.parent())
+                .count()
+                != 1
+        }) || source_claims().any(|claim| {
+            claim.lifecycle() != EntityLifecycle::Retained
+                || self
+                    .obligations
+                    .iter()
+                    .filter(|obligation| obligation.identity.registered() == Some(claim))
+                    .count()
+                    != 1
+        }) || self.related_protected.is_none()
+            || self.failure_cleanup_partition.is_some()
+            || self.back_no_target_batch.is_some()
+            || self.back_no_target_capacity.is_some()
+            || self.back_no_target_authority_partition.is_some()
+            || self.authority_host_children.is_some()
+            || self.quarantine_detachment.is_some()
+            || self.cleanup_settlement_permanent_pending.is_some()
+            || self.issued_attempt.is_some()
+            || self.obligations.is_empty()
+            || self.receipts.len() != self.obligations.len()
+            || evidence.ledger_domain != self.ledger_domain
+            || evidence.manifest_digest != self.manifest_digest
+            || evidence.obligation_count != self.obligations.len()
+            || batch.manifest_digest() != self.manifest_digest
+            || batch.obligation_count() != self.obligations.len()
+            || !targets
+                .iter()
+                .copied()
+                .eq(self.obligations.iter().map(CleanupObligation::entity))
+            || self
+                .completion_digest
+                .is_some_and(|digest| digest != completion_digest(&self.receipts))
+        {
+            return false;
+        }
+        self.obligations
+            .iter()
+            .enumerate()
+            .all(|(index, obligation)| {
+                let source_is_exact = match &obligation.identity {
+                    CleanupTargetIdentity::Registered(claim) => {
+                        source_claims().filter(|source| *source == claim).count() == 1
+                    }
+                    CleanupTargetIdentity::ContainedContent { root, shell, .. } => {
+                        payload
+                            .frames
+                            .iter()
+                            .filter(|frame| {
+                                frame.native_root() == Some(root.entity())
+                                    && frame.shell() == shell.entity()
+                                    && frame.claims().any(|claim| claim == root)
+                                    && frame.claims().any(|claim| claim == shell)
+                            })
+                            .count()
+                            == 1
+                    }
+                };
+                let Some(receipt) = self.receipts[index].as_ref() else {
+                    return false;
+                };
+                source_is_exact
+                    && obligation.terminal_mode == CleanupTerminalMode::Normal
+                    && receipt.ledger_domain == self.ledger_domain
+                    && receipt.obligation == index
+                    && receipt.attempt_revision != 0
+                    && receipt.attempt_revision < self.next_attempt
+                    && receipt.observed
+                    && matches!(
+                        receipt.disposition,
+                        CleanupDisposition::Removed
+                            | CleanupDisposition::RemovedDetached
+                            | CleanupDisposition::AlreadyAbsent
+                    )
+                    && receipt.binding
+                        == receipt_binding(
+                            receipt.ledger_domain,
+                            receipt.attempt_revision,
+                            index,
+                            receipt.disposition,
+                            obligation,
+                        )
+                    && world.get_entity(obligation.entity()).is_err()
+                    && registry.record(obligation.entity()).is_none()
+            })
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
@@ -18508,6 +19126,203 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod retained_assembly_tests {
     use super::*;
+
+    #[test]
+    fn fresh_cleanup_freezes_invalid_selected_stock_as_protected_observation() {
+        use crate::{navigation::RouterNavigation, plugin::BevyUiRouterPlugin};
+        use bevy_ui_router_core::{prelude::RouteLocation, request::RequestStatus};
+
+        #[derive(bevy_ecs::component::Component)]
+        struct LaterStockDrift;
+
+        for absent in [false, true] {
+            let mut app = bevy_app::App::new();
+            app.add_plugins(BevyUiRouterPlugin::default());
+            let router = crate::navigation::tests::install_retained_slice_router(&mut app, 2);
+            app.update();
+            for path in ["/items/1", "/items/2"] {
+                let request = app
+                    .world_mut()
+                    .resource_mut::<RouterNavigation>()
+                    .push(router, RouteLocation::new(path))
+                    .unwrap();
+                for _ in 0..12 {
+                    app.update();
+                    if app.world().resource::<RouterNavigation>().entries[0]
+                        .engine
+                        .request(request)
+                        .is_some_and(|record| record.status() == &RequestStatus::Succeeded)
+                    {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    app.world().resource::<RouterNavigation>().entries[0]
+                        .engine
+                        .request(request)
+                        .unwrap()
+                        .status(),
+                    &RequestStatus::Succeeded
+                );
+            }
+            let (projection, affected, shell) = {
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                let projection = entry.retained.inventory().unwrap()[0].projection().clone();
+                let payload = entry.retained.payload_for(&projection).unwrap();
+                let shell = payload.frame().shell();
+                let affected = if absent {
+                    payload
+                        .claims()
+                        .find(|claim| claim.entity() != shell)
+                        .unwrap()
+                        .entity()
+                } else {
+                    shell
+                };
+                (projection, affected, shell)
+            };
+            if absent {
+                app.world_mut().despawn(affected);
+            } else {
+                app.world_mut()
+                    .entity_mut(affected)
+                    .remove::<RouteOwnershipSeal>();
+            }
+            let (partition, source, manifest, top_slot) = {
+                let registry = app.world().resource::<RouteEntityRegistry>();
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                let payload = entry.retained.payload_for(&projection).unwrap();
+                assert!(matches!(
+                    registry.classify_retained_payload(
+                        app.world(),
+                        &projection,
+                        payload.frame(),
+                        payload.child_slots()
+                    ),
+                    Some(crate::presentation::RetainedPayloadClassification::OwnInvalid(_))
+                ));
+                let selected = [(&projection, payload)];
+                let host = entry.host.as_ref().unwrap();
+                let manifest = FrozenCleanupManifest::empty();
+                let partition = manifest
+                    .freeze_failure_cleanup_partition_with_selected(
+                        app.world(),
+                        registry,
+                        entry.active.as_ref(),
+                        None,
+                        host,
+                        &selected,
+                    )
+                    .expect("invalid stock is protected by observation, not an activation proof");
+                let observed = partition
+                    .protected_observed
+                    .iter()
+                    .find(|item| item.entity == affected)
+                    .unwrap();
+                assert_eq!(observed.present, !absent);
+                assert!(partition.allowed_writes.is_empty());
+                let source = FailureCleanupSourceProjection::observe_with_selected(
+                    Some(host),
+                    entry.active.as_ref(),
+                    None,
+                    &selected,
+                );
+                let active_target_manifest = FrozenCleanupManifest::from_current_frame(
+                    app.world(),
+                    registry,
+                    entry.active.as_ref().unwrap().frames().last().unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    active_target_manifest
+                        .freeze_failure_cleanup_partition_with_selected(
+                            app.world(),
+                            registry,
+                            entry.active.as_ref(),
+                            None,
+                            host,
+                            &selected,
+                        )
+                        .is_none(),
+                    "current cannot become a fresh cleanup target"
+                );
+                (partition, source, manifest, host.top_slot)
+            };
+            assert!(
+                partition
+                    .refreeze(
+                        app.world(),
+                        Some(&source),
+                        &manifest.obligations,
+                        &manifest.mount_parents,
+                        &[],
+                        manifest.digest(),
+                        None,
+                        FailureCleanupTransitionStage::MountParentsCommitted
+                    )
+                    .is_ok()
+            );
+            let no_stock = {
+                let entry = &app.world().resource::<RouterNavigation>().entries[0];
+                FailureCleanupSourceProjection::observe_with_prepared(
+                    entry.host.as_ref(),
+                    entry.active.as_ref(),
+                    None,
+                )
+            };
+            assert!(matches!(
+                partition.refreeze(
+                    app.world(),
+                    Some(&no_stock),
+                    &manifest.obligations,
+                    &manifest.mount_parents,
+                    &[],
+                    manifest.digest(),
+                    None,
+                    FailureCleanupTransitionStage::MountParentsCommitted
+                ),
+                Err(FailureCleanupSettlementRefreezeEvidence {
+                    failure: FailureCleanupPartitionRefreezeFailure::Source { .. },
+                    ..
+                })
+            ));
+            app.world_mut().entity_mut(shell).insert(LaterStockDrift);
+            assert!(matches!(
+                partition.refreeze(
+                    app.world(),
+                    Some(&source),
+                    &manifest.obligations,
+                    &manifest.mount_parents,
+                    &[],
+                    manifest.digest(),
+                    None,
+                    FailureCleanupTransitionStage::MountParentsCommitted
+                ),
+                Err(FailureCleanupSettlementRefreezeEvidence {
+                    failure: FailureCleanupPartitionRefreezeFailure::Protected { .. },
+                    ..
+                })
+            ));
+            app.world_mut()
+                .entity_mut(top_slot)
+                .remove::<RouteOwnershipSeal>();
+            let entry = &app.world().resource::<RouterNavigation>().entries[0];
+            let payload = entry.retained.payload_for(&projection).unwrap();
+            assert!(
+                manifest
+                    .freeze_failure_cleanup_partition_with_selected(
+                        app.world(),
+                        app.world().resource::<RouteEntityRegistry>(),
+                        entry.active.as_ref(),
+                        None,
+                        entry.host.as_ref().unwrap(),
+                        &[(&projection, payload)]
+                    )
+                    .is_none(),
+                "the host authority predicate stays required"
+            );
+        }
+    }
 
     #[test]
     fn leaving_assembly_empty_forest_keeps_zero_obligation_post_commit_transfer_ownerless() {

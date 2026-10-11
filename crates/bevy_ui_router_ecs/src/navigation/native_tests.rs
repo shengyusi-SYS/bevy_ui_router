@@ -995,7 +995,7 @@ fn native_delayed_retained_proof_removal_preserves_another_router_cache() {
         assert_eq!(inventory.len(), 1);
         app.world()
             .resource::<RouteEntityRegistry>()
-            .prepare_retained_boundaries(None, &[inventory[0].projection().clone()])
+            .prepare_retained_boundaries(&[], &[inventory[0].projection().clone()])
             .unwrap()
     };
     let driver = app
@@ -1215,6 +1215,7 @@ fn native_outlet_loss_after_scene_preparation_keeps_exact_current_task_source() 
                 host.top_slot_claim.clone(),
                 Some(&pending.branch),
                 entry.active.as_ref(),
+                &entry.retained,
                 &task,
                 prepared,
             );
@@ -1312,7 +1313,8 @@ fn native_allocated_child_retains_exact_external_outlet_evidence() {
         let mut factory: bevy_ui_router_bsn::BsnSceneFactory = Box::new(|_| Ok(Box::new(bevy_scene::bsn! { Node })));
         let prepared = crate::bsn::prepare_bsn_view(world, &mut factory, task.input()).unwrap();
         let frame = realize_native_task(world, &entry.engine, host.candidate.clone(), host.top_slot,
-            host.top_slot_claim.clone(), Some(&pending.branch), entry.active.as_ref(), &task, prepared)
+            host.top_slot_claim.clone(), Some(&pending.branch), entry.active.as_ref(),
+                &entry.retained, &task, prepared)
             .unwrap_or_else(|_| panic!("actual native child allocation succeeds"));
         let shell = frame.shell();
         let slot = frame.mount_binding().slot();

@@ -1,6 +1,6 @@
 # 实例协调实施计划
 
-状态：第 1、2 步已完成并通过完整门禁；Core 原实例身份、激活/创建事实与 ECS 单实例 payload/原 owner 的等价迁移已闭合。步骤 3–5 尚未实施。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理只读交叉审查。沿当前 main 推进，不新建分支。
+状态：第 1–4 步的实现和公开回归已完成；workspace 全特性、Core/ECS 完整 crate、无默认特性与独立 consumer 通过。第 5 步的父/fresh 子 Back、当前输入与既有 entry 滚动组合、示例和现行文档已闭合；代表性能调查与发布环境验收仍待收口。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理交叉审查。沿当前 main 推进，不新建分支。
 
 **目标：** 先交付当前已发布输入，再将 leaf 保留替换为按实例和 exact 父依赖的协调，闭合混合激活/fresh、失败及依赖淘汰。
 
@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | Core `view_input.rs` | 匹配/恢复事实 → published input value/ref | 构建快照与当前输入的共同字段语义，不持有 Entity |
 | ECS `active_scope.rs`、`route_inputs.rs` | 当前 registry/hierarchy → exact active frame/input | 只读归属解析与公共 SystemParam |
-| Core `engine/instances.rs` | frozen current/inventory + matched target → source selection/retention partition | 实例事实、父依赖、选择及 LRU；不持有物理 payload |
+| Core `engine/instances.rs`、`engine/retained.rs` | frozen current/inventory + matched target → source selection/retention partition | 前者持有实例事实与依赖排序，后者编排选择、LRU 与原 capability；不持有物理 payload |
 | ECS `instance.rs` | 原 frame + 其 own slots → 唯一实例 payload | 分拆/组合物理持有，不决定匹配或保留政策 |
 | ECS `branch_transaction.rs` 与 `navigation/normal_publication.rs` | 逐实例来源、mount、原 owners → prepared transaction | 混合准备、写集/owner 组合及统一 publication 接收 |
 
@@ -58,13 +58,13 @@
 
 输入：步骤 2 的完整库存与原 payload、matcher 目标、步骤 1 的输入 preparation。产出：来源为 `Current* → Retained* → Fresh*` 的逐位置 target selection、显式父来源、fresh obligations，以及可一次消费的 prepared splice/owner 接收器。
 
-- [ ] 先增加 `R/P/C → R/Q → R/P/D` 的 P(true)/C(false) 公开旅程；断言 P 原 Entity/局部状态/factory 次数、C 消失、D fresh、当前输入更新、P 在 D 准备期间仍 inactive。保留带 fragment 的祖先输入轨迹。
-- [ ] Core 选择独立目标来源，替换 `retarget_retained_leaf`、single-entering 门槛与 `from_preserved_parent: bool` 推断。fresh 父后只允许 fresh 子，slot 选择先检查选中父原 slot，缺失才发原 grant/stage/confirm。
-- [ ] ECS staging/mount predicate 接受本请求精确选中的 Retained/Hidden 父；使用原 slot 只借用，新 slot 暂归 preparation。触发写入后复验 target/protected，验证按 own payload 与 child boundary 分开，P 不加入 fresh branch 假冒创建内容。
-- [ ] 迁移 `classify_failed_boundary`、`exact_current_task_outlet` 和 `FailureCleanupSourceProjection`，冻结原 selection/owner 的库存边界来源；区分库存 OwnInvalid、fresh drift 和共享 authority loss。补 fresh 子尚未分配输出时的失败归属，不能从 active/prepared 子集推断选中 P 的事实。
-- [ ] 将 publication 的全局 Fresh/Retained 分支替换为逐 frame/slot 的 current/next；提前组合原 owners、claim rebind、输入/focus/scroll、cleanup 和接收器，atomic tail 沿原要求执行。
-- [ ] 增加 fresh D 构建拒绝、preflight 拒绝、带库存前缀 route-error/fallback、准备中 host loss 的生产事实回归。验证原 P owner 返还/移交一次，原 slot 和其它子库存 protected，新 slot/fresh D 仅由本次失败清理，history continuation 未被缓存路径改写。
-- [ ] 完成局部测试和只读交叉审查后进入步骤 4，尚不单独提交或宣布父保留交付；保留 inactive 父的合法子库存与依赖结算必须一同闭合。
+- [x] 先增加 `R/P/C → R/Q → R/P/D` 的 P(true)/C(false) 公开旅程；断言 P 原 Entity/局部状态/factory 次数、C 消失、D fresh、当前输入更新、P 在 D 准备期间仍 inactive。保留带 fragment 的祖先输入轨迹。
+- [x] Core 选择独立目标来源，替换 `retarget_retained_leaf`、single-entering 门槛与 `from_preserved_parent: bool` 推断。fresh 父后只允许 fresh 子，slot 选择先检查选中父原 slot，缺失才发原 grant/stage/confirm。
+- [x] ECS staging/mount predicate 接受本请求精确选中的 Retained/Hidden 父；使用原 slot 只借用，新 slot 暂归 preparation。触发写入后复验 target/protected，验证按 own payload 与 child boundary 分开，P 不加入 fresh branch 假冒创建内容。
+- [x] 迁移 `classify_failed_boundary`、`exact_current_task_outlet` 和 `FailureCleanupSourceProjection`，冻结原 selection/owner 的库存边界来源；区分库存 OwnInvalid、fresh drift 和共享 authority loss。补 fresh 子尚未分配输出时的失败归属，不能从 active/prepared 子集推断选中 P 的事实。
+- [x] 将 publication 的全局 Fresh/Retained 分支替换为逐 frame/slot 的 current/next；提前组合原 owners、claim rebind、输入/focus/scroll、cleanup 和接收器，atomic tail 沿原要求执行。
+- [x] 增加 fresh D 构建拒绝、preflight 拒绝、带库存前缀 route-error/fallback、准备中 host loss 的生产事实回归。验证原 P owner 返还/移交一次，原 slot 和其它子库存 protected，新 slot/fresh D 仅由本次失败清理，history continuation 未被缓存路径改写。
+- [x] 完成局部测试和只读交叉审查后进入步骤 4，尚不单独提交或宣布父保留交付；保留 inactive 父的合法子库存与依赖结算必须一同闭合。
 
 这一步的控制流和 failure receiver 必须能表达多实例来源，不能先叠加一个 P 专用临时状态机再在下一步推翻。
 
@@ -74,19 +74,19 @@
 
 输入：步骤 3 的逐实例选择和 publication/失败接收器。产出：active/inactive 父均可存活的 exact 库存、确定的实例 LRU、依赖 cleanup forest 和现有 authority settlement 的完整 owner 集合。
 
-- [ ] 增加 P/C 均保留及多个内部子切换回归，覆盖尚未被选中时的库存 preservation，再证明 matcher 可返回 P/D 而不恢复旧 C；最深 leaf fragment 条件仍成立。多个合法候选按最近成功离场和稳定身份选择，重复 frame/owner 登记有界拒绝。
-- [ ] 替换 `scope_survives` 和 authority assembly 中“父必须 next active”的条件，迁移 `presentation.rs` 的 shared-authority predicate 与 `registry.rs` 的持续 preservation proof，从同一冻结库存核对 exact 父依赖。activation/preservation 各按自身角色接受有效 Retained 父，不全局扩张 staging 许可；inactive 子不占 active slot，但保留完整 exact mount。
-- [ ] 按设计计费与 child-first 离场顺序实现容量 0/1、内部子独立淘汰、父淘汰依赖闭包；失败不刷新 LRU。使用标准容器，不引入整分支 blob 或第二个淘汰队列。
-- [ ] ECS 消费原 payload/owners 构建 child-first cleanup forest，校验无重复 claim。库存 OwnInvalid 使用原证据/owner/任务 continuation 局部结算依赖，清理成功且 authority 有效后从失效位置起 fresh，合法当前 Q 保持 protected；失败或 authority 变化沿既有分流有界终结。
-- [ ] 验证发布前 host loss 不提交 history，post-commit authority 保留已提交结果及原 normal token/ledger，仅接收仍 live 的实例；idle 不重开旧请求。stopped/quarantine settlement 仍一次收敛，不将父 slot 算入子销毁写集。
-- [ ] 删除不再被生产使用的 single-hit/single-leaf 选择、旧 retained parent-only-active 分支及重复校验；必要 identity、post-write drift、protected closure 回归先迁移。完整门禁与审查后统一提交 `feat: coordinate parent and child instance inventory`，同步已落地合同和架构。
+- [x] 增加 P/C 均保留及多个内部子切换回归，覆盖尚未被选中时的库存 preservation，再证明 matcher 可返回 P/D 而不恢复旧 C；最深 leaf fragment 条件仍成立。多个合法候选按最近成功离场和稳定身份选择，重复 frame/owner 登记有界拒绝。
+- [x] 替换 `scope_survives` 和 authority assembly 中“父必须 next active”的条件，迁移 `presentation.rs` 的 shared-authority predicate 与 `registry.rs` 的持续 preservation proof，从同一冻结库存核对 exact 父依赖。activation/preservation 各按自身角色接受有效 Retained 父，不全局扩张 staging 许可；inactive 子不占 active slot，但保留完整 exact mount。
+- [x] 按设计计费与 child-first 离场顺序实现容量 0/1、内部子独立淘汰、父淘汰依赖闭包；失败不刷新 LRU。使用标准容器，不引入整分支 blob 或第二个淘汰队列。
+- [x] ECS 消费原 payload/owners 构建 child-first cleanup forest，校验无重复 claim。库存 OwnInvalid 使用原证据/owner/任务 continuation 局部结算依赖，清理成功且 authority 有效后从失效位置起 fresh，合法当前 Q 保持 protected；失败或 authority 变化沿既有分流有界终结。
+- [x] 验证发布前 host loss 不提交 history，post-commit authority 保留已提交结果及原 normal token/ledger，仅接收仍 live 的实例；idle 不重开旧请求。stopped/quarantine settlement 仍一次收敛，不将父 slot 算入子销毁写集。
+- [x] 删除不再被生产使用的 single-hit/single-leaf 选择、旧 retained parent-only-active 分支及重复校验；必要 identity、post-write drift、protected closure 回归先迁移。完整门禁与审查后统一提交 `feat: coordinate parent and child instance inventory`，同步已落地合同和架构。
 
 ## 5. 高层组合与文档归位（4–7 人日中的本专题部分）
 
 文件：facade `tests/{retained_navigation.rs,public_navigation_journeys.rs,public_activity.rs,scroll_restoration.rs,facade_consumers.rs,consumers/bsn.rs}`；文档 `docs/{overview.md,roadmap.md,contracts/navigation.md,contracts/lifecycle.md,contracts/input-focus.md,architecture/README.md,architecture/runtime.md,architecture/lifecycle.md,guides/integration.md,development/README.md,development/verification.md}`；按实际接缝更新 `crates/bevy_ui_router/examples/bsn_nested.rs`。
 
-- [ ] 在同一个公开旅程组合 Back、原 P 激活/fresh D、当前输入与既有 entry 滚动；用真实 BSN 内容和动态后代观察活动资格，复用已闭合 pointer/focus gate，确认旧访问意图不因相同 Entity 复活而串用。
-- [ ] 用独立 facade consumer 接入 RouteInputs 和父/子保留；示例演示布局状态存续与新 location，保持业务中立。相同输入/no-op、params/search/fragment 和 fallback/readmission 回归全部保留。
+- [x] 在同一个公开旅程组合 Back、原 P 激活/fresh D、当前输入与既有 entry 滚动；用真实 BSN 内容和动态后代观察活动资格，复用已闭合 pointer/focus gate，确认旧访问意图不因相同 Entity 复活而串用。
+- [x] 用独立 facade consumer 接入 RouteInputs 和父/子保留；示例演示布局状态存续与新 location，保持业务中立。相同输入/no-op、params/search/fragment 和 fallback/readmission 回归全部保留。
 - [ ] 对选定代表规模复测切换/命中/依赖淘汰，沿既有基线区分 cleanup 与 layout/render，不把本专题扩成无预算性能优化。性能调查和真实优化预算归路线图。
 - [ ] 运行最终门禁；审查设计五组验收是否都有生产入口证据，报告平台/窗口未跑项，不通过临时探针冒充消费接入。
 - [ ] 按实际落地行为更新合同、当前架构图、指南、示例和验证入口；路线图只留未完成工作。本设计必要语义迁入所属合同，完成的 plan 退出默认树，由 Git 追溯；提交 `docs: document instance coordination and current inputs`。
@@ -115,4 +115,4 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 
 每次交付由独立代理只读复核 Core 选择/continuation 与 ECS 原 owner/写集/publication，另一视角核对公开行为。实现 shared publication 的修改错开；审查一致不能替代成功命令输出。根代理检查 exact staged 文件和 diff 后提交 main，不纳入职责外变更。
 
-原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。第 1、2 步已实现；父保留、混合来源与内部库存仍待实施，设计审查不代表 runtime 已交付。
+原生输入公开 hook 与滚动 ready/晚绑定不塞入本计划；进入各自实施时各建 design/plan。第 1–4 步已实现；本专题收口按第 5 步继续，输入/滚动扩展不因既有组合回归通过而完成。

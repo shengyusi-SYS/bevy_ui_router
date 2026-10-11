@@ -1,64 +1,6 @@
 use super::*;
 
-pub(super) enum NormalPublicationSplice {
-    Fresh(SealedReconciliationSplice),
-    Retained {
-        prepared: crate::branch_transaction::PreparedRetainedEntering,
-        hit: r3_core::RetainedLeafProjection,
-    },
-}
-
-impl NormalPublicationSplice {
-    fn view<'a>(
-        &'a self,
-        retained: &'a crate::retained::RetainedLeaves,
-    ) -> Option<crate::branch_transaction::ReconciliationSpliceView<'a>> {
-        match self {
-            Self::Fresh(splice) => Some(splice.view()),
-            Self::Retained { prepared, hit } => Some(prepared.view(retained.payload_for(hit)?)),
-        }
-    }
-
-    fn reject(self) -> crate::branch_transaction::RejectedReconciliationOwners {
-        match self {
-            Self::Fresh(splice) => splice.reject(),
-            Self::Retained { prepared, .. } => prepared.reject(),
-        }
-    }
-
-    fn retain_leaf(
-        &mut self,
-        retained: &crate::retained::RetainedLeaves,
-        projection: &r3_core::RetainedLeafProjection,
-    ) -> bool {
-        match self {
-            Self::Fresh(splice) => splice.retain_leaf(projection),
-            Self::Retained { prepared, hit } => retained
-                .payload_for(hit)
-                .is_some_and(|branch| prepared.retain_leaf(branch, projection)),
-        }
-    }
-
-    #[cfg(feature = "bsn")]
-    fn prepare_native_cleanup(
-        &mut self,
-        world: &mut World,
-    ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
-        match self {
-            Self::Fresh(splice) => splice.prepare_native_cleanup(world),
-            Self::Retained { prepared, .. } => prepared.prepare_native_cleanup(world),
-        }
-    }
-
-    fn finish(self, hit: Option<crate::instance::InstancePayload>) -> SealedReconciliationSplice {
-        match self {
-            Self::Fresh(splice) => splice,
-            Self::Retained { prepared, .. } => prepared.finish_retained_entering(
-                hit.expect("validated hit transfers its original physical payload"),
-            ),
-        }
-    }
-}
+pub(super) type NormalPublicationSplice = crate::branch_transaction::PreparedMixedEntering;
 
 fn publication_view<'a>(
     world: &'a World,
@@ -151,12 +93,16 @@ pub(super) fn publish_normal_work(
                                 entry.pending_back_target_execution,
                                 Some(PendingBackTargetExecution::Driving(_))
                             ) && pending.ticket.is_some()
+                                && entry.engine.selected_retained_instances().is_empty()
                             {
                                 // Preserve the actual rejected splice and the
                                 // original ticket/continuation. Reclassifying a
                                 // fresh branch later could change the decision.
-                                let NormalPublicationSplice::Fresh(splice) = splice else {
-                                    unreachable!("a retained hit still owns its task")
+                                let splice = match splice.into_sealed_when_unselected() {
+                                    Ok(splice) => splice,
+                                    Err(_) => {
+                                        unreachable!("the frozen selection has no retained source")
+                                    }
                                 };
                                 let Some(PendingBackTargetExecution::Driving(driving)) =
                                     entry.pending_back_target_execution.take()
@@ -204,7 +150,9 @@ pub(super) fn publish_normal_work(
                                     unreachable!()
                                 }
                             };
-                            let terminal = if pending.retained_hit.is_some() {
+                            let terminal = if pending.branch.frames().is_empty()
+                                && pending.branch.child_slots().is_empty()
+                            {
                                 PendingFailedBranchTerminal::Task {
                                     task,
                                     failure: ViewFailureKind::Apply,
@@ -252,35 +200,6 @@ pub(super) fn publish_normal_work(
                 .iter_mut()
                 .find(|entry| entry.handle == handle)
                 .unwrap();
-            if let Some(hit) = pending.retained_hit.as_ref() {
-                let plan = hit.commit_plan();
-                if let Some(projection) = plan.retained()
-                    && !splice.retain_leaf(&entry.retained, projection)
-                {
-                    return Err(Some(AuthorityProtocolResidualKind::Authority(
-                        BeginAuthoritySettlementErrorKind::InvalidManifest,
-                    )));
-                }
-                let change = entry
-                    .retained
-                    .prepare_change_with_hit(
-                        plan.retiring(),
-                        Some(hit.hit()),
-                        plan.retained().is_some(),
-                    )
-                    .ok_or(None)?;
-                #[cfg(feature = "bsn")]
-                for (_, branch) in change.selected_mut(&mut entry.retained) {
-                    if let Err(error) = branch.prepare_native_cleanup(world) {
-                        return Err(if error.is_retryable() {
-                            None
-                        } else {
-                            Some(AuthorityProtocolResidualKind::NativeCleanup(error))
-                        });
-                    }
-                }
-                return Ok(Some((None, change)));
-            }
             if entry.engine.keep_alive_capacity() == 0 && entry.retained.is_empty() {
                 return Ok(None);
             }
@@ -314,16 +233,18 @@ pub(super) fn publish_normal_work(
                         BeginAuthoritySettlementErrorKind::Stale,
                     ))
                 })?;
-            if let Some(projection) = plan.retained() {
-                if !splice.retain_leaf(&entry.retained, projection) {
-                    return Err(Some(AuthorityProtocolResidualKind::Authority(
-                        BeginAuthoritySettlementErrorKind::InvalidManifest,
-                    )));
-                }
+            if !splice.retain_instances(&entry.retained, plan.retained()) {
+                return Err(Some(AuthorityProtocolResidualKind::Authority(
+                    BeginAuthoritySettlementErrorKind::InvalidManifest,
+                )));
             }
             let change = entry
                 .retained
-                .prepare_change(plan.retiring(), plan.retained().is_some())
+                .prepare_change_with_selected(
+                    plan.retiring(),
+                    plan.activated(),
+                    plan.retained().len(),
+                )
                 .ok_or(None)?;
             #[cfg(feature = "bsn")]
             for (_, branch) in change.selected_mut(&mut entry.retained) {
@@ -335,11 +256,11 @@ pub(super) fn publish_normal_work(
                     });
                 }
             }
-            Ok(Some((Some(plan), change)))
+            Ok(Some((plan, change)))
         },
     );
     let (mut retention, mut retained_change) = match retention {
-        Ok(Some((plan, change))) => (plan, Some(change)),
+        Ok(Some((plan, change))) => (Some(plan), Some(change)),
         Ok(None) => (None, None),
         Err(contradiction) => {
             world.resource_scope(
@@ -368,17 +289,15 @@ pub(super) fn publish_normal_work(
         }
     };
     let uses_retention = retained_change.is_some();
-    let retention_plan = retention
-        .as_ref()
-        .or_else(|| pending.retained_hit.as_ref().map(|hit| hit.commit_plan()));
-    let retained_projection = retention_plan.and_then(|plan| plan.retained().cloned());
-    let retiring = retention_plan
-        .as_ref()
+    let retention_plan = retention.as_ref();
+    let retained_projections = retention_plan
+        .map(|plan| plan.retained().to_vec())
+        .unwrap_or_default();
+    let mut boundary_removals = retention_plan
         .map(|plan| plan.retiring().to_vec())
         .unwrap_or_default();
-    let mut boundary_removals = retiring.clone();
-    if let Some(hit) = pending.retained_hit.as_ref() {
-        boundary_removals.push(hit.hit().clone());
+    if let Some(plan) = retention_plan {
+        boundary_removals.extend_from_slice(plan.activated());
     }
     #[cfg(feature = "bsn")]
     if let Err(error) = splice.prepare_native_cleanup(world) {
@@ -433,7 +352,7 @@ pub(super) fn publish_normal_work(
         view.preserved()
             .frames()
             .iter()
-            .chain(view.entering().frames()),
+            .chain(view.entering_frames()),
         &scroll_eligible,
     );
     let scroll_targets = scroll_observation.target_entities();
@@ -497,7 +416,7 @@ pub(super) fn publish_normal_work(
                 world,
                 registry,
                 view.leaving(),
-                retained_projection.as_ref(),
+                &retained_projections,
                 &retired,
                 &resulting_claims,
             ) {
@@ -528,7 +447,7 @@ pub(super) fn publish_normal_work(
             }
         };
 
-        let root_rebase = if view.entering().frames().is_empty() {
+        let root_rebase = if !view.requires_root_cleanup_rebase() {
             None
         } else {
             match view.prepare_root_cleanup_rebase(world, &frozen_manifest) {
@@ -554,7 +473,11 @@ pub(super) fn publish_normal_work(
                 .iter()
                 .find(|entry| entry.handle == handle)?;
             let view = splice.view(&entry.retained)?;
-            crate::native_focus::prepare_publication(world, view.entering().frames(), &gate_after)
+            crate::native_focus::prepare_publication_frames(
+                world,
+                view.entering_frames(),
+                &gate_after,
+            )
         },
     );
     let mut splice_owner = Some(splice);
@@ -626,22 +549,20 @@ pub(super) fn publish_normal_work(
             None
         };
         let retained_boundaries = if uses_retention {
-            let addition = if retained_projection.is_some() {
-                Some(view.prepare_retained_boundary(&resulting_claims)?)
-            } else {
-                None
-            };
+            let additions = view.prepare_retained_boundaries(&resulting_claims)?;
             Some(
                 registry
-                    .prepare_retained_boundaries(addition, &boundary_removals)
+                    .prepare_retained_boundaries(&additions, &boundary_removals)
                     .ok()?,
             )
         } else {
             None
         };
-        let retiring_rebind = retired_branches
-            .iter()
-            .map(|branch| {
+        let retiring_rebind = retained_change
+            .as_ref()
+            .into_iter()
+            .flat_map(|change| change.selected_in_storage_order(&entry.retained))
+            .map(|(_, branch)| {
                 branch.prepare_retained_claim_rebind(&resulting_claims, EntityLifecycle::Leaving)
             })
             .collect::<Option<Vec<_>>>()?;
@@ -677,7 +598,7 @@ pub(super) fn publish_normal_work(
             .cloned()
             .collect::<Vec<_>>();
         let claim_rebind = view.prepare_claim_rebind(&splice_claims)?;
-        if pending.ticket.is_none() && pending.retained_hit.is_none() {
+        if pending.ticket.is_none() {
             let task = pending
                 .final_task
                 .take()
@@ -692,39 +613,6 @@ pub(super) fn publish_normal_work(
         let presentation_plan = presentation.seal_commit(isolate_count)?;
         let prepared = if let Some(sealed) = sealed.take() {
             crate::retained::PreparedPublication::Ordinary(sealed.prepared)
-        } else if let Some(plan) = pending.retained_hit.take() {
-            let task = pending
-                .final_task
-                .take()
-                .expect("hit keeps the original task until preparation");
-            let owners = retained_change.as_mut()?.take_owners(&mut entry.retained);
-            let manifest =
-                CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
-            match entry.engine.prepare_retained_hit_commit(
-                task,
-                *plan,
-                manifest,
-                owners,
-                match entry.pending_back_target_execution.as_ref() {
-                    Some(PendingBackTargetExecution::Driving(driving)) => {
-                        Some((&driving.history, &driving.continuation))
-                    }
-                    _ => None,
-                },
-            ) {
-                Ok(prepared) => crate::retained::PreparedPublication::Retained(prepared),
-                Err(error) => {
-                    let (task, plan, _manifest, owners, error) = error.into_parts();
-                    pending.final_task = Some(task);
-                    pending.retained_hit = Some(Box::new(plan));
-                    assert!(
-                        entry.retained.restore_owners(owners).is_ok(),
-                        "hit preparation returns the complete original capabilities"
-                    );
-                    retained_publication_contradiction = Some(error);
-                    return None;
-                }
-            }
         } else if let Some(plan) = retention.take() {
             let owners = retained_change.as_mut()?.take_owners(&mut entry.retained);
             let manifest =
@@ -833,17 +721,17 @@ pub(super) fn publish_normal_work(
             {
                 branch.apply_claim_rebind(rebind);
             }
-            change.into_hit_and_payloads(&mut entry.retained)
+            change.into_activated_and_payloads(&mut entry.retained)
         } else {
             crate::retained::RetainedPayloads {
-                hit: None,
+                activated: Vec::new(),
                 retiring: Vec::new(),
             }
         };
         let mut splice = splice_owner
             .take()
             .expect("fully prepared commit retains its sealed splice")
-            .finish(payloads.hit);
+            .finish(payloads.activated);
         splice.apply_claim_rebind(claim_rebind);
         if let Some(rebase) = root_rebase {
             splice.apply_root_rebase(rebase);
@@ -865,17 +753,12 @@ pub(super) fn publish_normal_work(
                     .then_some(leaving),
             )
         });
-        let next_retained = retained_branch.map(|branch| {
-            (
-                retained_projection.expect("retained splice has the same Core projection"),
-                branch,
-            )
-        });
+        let next_retained = retained_projections.into_iter().zip(retained_branch);
         let retained_owner = &mut entry.retained;
         let active_owner = &mut entry.active;
         let cleanup_owner = &mut entry.cleanup_ledger;
         let scroll_owner = &mut entry.scroll;
-        engine.publish(|owner| {
+        engine.publish(|owners| {
             presentation_plan.apply_staged(
                 |_| focus_plan.apply(),
                 |_| {
@@ -891,8 +774,8 @@ pub(super) fn publish_normal_work(
             *active_owner = next_active;
             *cleanup_owner = next_cleanup;
             *scroll_owner = scroll.state;
-            if let Some((projection, branch)) = next_retained {
-                retained_owner.install_published(projection, owner, branch);
+            for ((projection, branch), owner) in next_retained.zip(owners) {
+                retained_owner.install_published(projection, Some(owner), branch);
             }
         });
         Some(())

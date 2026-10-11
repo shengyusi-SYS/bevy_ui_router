@@ -154,6 +154,12 @@ impl RouterEngine {
                     host,
                     self.state.active().frames(),
                     &self.active_child_slots,
+                    &self
+                        .retained_leaves
+                        .iter()
+                        .filter(|entry| entry.is_live())
+                        .map(retained::RetainedRegistryEntry::projection)
+                        .collect::<Vec<_>>(),
                 ) {
                     return Err(IdleHostLossErrorKind::InvalidManifest);
                 }
@@ -171,6 +177,7 @@ impl RouterEngine {
             .cloned()
             .collect::<Vec<_>>();
         logical_roots.extend(retiring.iter().map(|projection| projection.frame().clone()));
+        self.sort_instance_cleanup_roots(&mut logical_roots);
         if logical_roots
             .iter()
             .enumerate()

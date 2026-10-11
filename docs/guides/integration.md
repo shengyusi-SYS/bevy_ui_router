@@ -90,7 +90,7 @@ Cargo feature 只控制编译，不能证明应用运行时资源已就绪。
 ## 嵌套内容与结果观察
 
 layout Scene 在希望显示子路由的内部 `Node` 上声明一个 `DefaultOutlet`。
-相邻 leaf 切换会保留可复用的父 layout、outlet 及局部组件状态；leaf 默认重建，也可按下一节启用同父保留。
+相邻子页切换会保留可复用的父 layout、outlet 及局部组件状态；离场实例默认清理，也可按下一节启用保留。
 当前支持每个 layout 的单个 default outlet。Scene 加载 profile 见[Scene 合同](../contracts/scene.md)，
 search/fragment 更新见[导航合同](../contracts/navigation.md)，错误恢复见[生命周期](../contracts/lifecycle.md)。
 
@@ -109,21 +109,23 @@ headless 程序应给等待设置边界并检查 `RequestStatus::Succeeded` / `F
 active 已切换而请求仍在 `PostCommitCleanup` 是合法状态；避免仅凭一次 phase
 或 factory 返回就把整个导航视为完成。
 
-## 同父页面保留
+## 布局与页面保留
 
-在已有父 route 下为 leaf opt-in，并为 Router 配置非活动容量：
+在已有 normal 父 route 下，为布局或页面 opt-in，并为 Router 配置非活动容量：
 
 ```rust
-let leaf = RouteNodeOptions::new()
+let page = RouteNodeOptions::new()
     .with_view(page_view)
     .with_keep_alive(true);
-routes.route_with_options(parent, RoutePattern::path(":id")?, leaf)?;
+routes.route_with_options(parent, RoutePattern::path(":id")?, page)?;
 let config = RouterConfig::new(routes.build()?, views, fallback)
     .with_keep_alive_capacity(2);
 let router = app.add_ui_router(config)?;
 ```
 
-默认容量为 0；只设 route 或只设容量不会使所有页面自动保留。适用范围、LRU、search/fragment 与 history entry 的区别见[导航合同](../contracts/navigation.md#同父-leaf-保留)，失效和原 owner 结算见[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。不需要额外缓存 runtime、factory wrapper 或应用自建 Entity 仓库。
+默认容量为 0；只设 route 或只设容量不会使所有页面自动保留。适用范围、LRU、search/fragment 与 history entry 的区别见[导航合同](../contracts/navigation.md#实例保留)，失效和原 owner 结算见[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。不需要额外缓存 runtime、factory wrapper 或应用自建 Entity 仓库。
+
+父、子分别配置：保留父布局不要求保留当前子页；返回时由目标路由选择子页。[嵌套示例](../../crates/bevy_ui_router/examples/bsn_nested.rs)演示离开整个布局再返回另一子页，保留原工具栏状态，并读取新的当前输入。
 
 命中继续使用原实体与组件状态，应用的后台系统通过下述 `RouteActivity` 查询决定是否工作；布局仍由正常 Bevy UI 管线执行，滚动接入不需要另换容器或记录接口。
 

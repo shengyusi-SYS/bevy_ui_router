@@ -2228,7 +2228,7 @@ pub struct MountRegistrationSession<'engine> {
     slot: RouteSlotId,
 }
 
-impl MountRegistrationSession<'_> {
+impl<'engine> MountRegistrationSession<'engine> {
     pub const fn slot(&self) -> RouteSlotId {
         self.slot
     }
@@ -2259,12 +2259,67 @@ impl MountRegistrationSession<'_> {
         })
     }
 
+    /// Rejects this original permit while preserving the selected-instance continuation.
+    #[doc(hidden)]
+    pub fn reject_retained_invalidation(
+        self,
+        invalid: RouteFrameVersion,
+    ) -> Result<FailureCleanupRequest, MountRegistrationSessionRejectionError<'engine>> {
+        let Self {
+            engine,
+            permit,
+            slot,
+        } = self;
+        match engine.reject_retained_mount_after_mutation(
+            CoreMountMutationArtifact::RegistrationPermit(permit),
+            invalid,
+        ) {
+            Ok(inner) => Ok(FailureCleanupRequest { inner }),
+            Err(error) => {
+                let kind = map_mount_error(error.kind());
+                let CoreMountMutationArtifact::RegistrationPermit(permit) = error.into_owner()
+                else {
+                    unreachable!("rejection returns the original registration permit")
+                };
+                Err(MountRegistrationSessionRejectionError {
+                    kind,
+                    session: Self {
+                        engine,
+                        permit,
+                        slot,
+                    },
+                })
+            }
+        }
+    }
+
     pub fn reject(self) -> FailureCleanupRequest {
         FailureCleanupRequest {
             inner: self
                 .engine
                 .reject_preflighted_mount_registration(self.permit),
         }
+    }
+}
+
+#[must_use = "a rejected selected-instance continuation returns the original registration session"]
+pub struct MountRegistrationSessionRejectionError<'engine> {
+    kind: IntegrationError,
+    session: MountRegistrationSession<'engine>,
+}
+impl<'engine> MountRegistrationSessionRejectionError<'engine> {
+    pub fn kind(&self) -> IntegrationError {
+        self.kind
+    }
+    pub fn into_session(self) -> MountRegistrationSession<'engine> {
+        self.session
+    }
+}
+impl std::fmt::Debug for MountRegistrationSessionRejectionError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountRegistrationSessionRejectionError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2392,6 +2447,13 @@ pub struct ViewReportIdentity {
 }
 
 impl FrameTask {
+    pub fn parent_source(&self) -> Option<TargetInstanceSourceKind> {
+        self.inner.parent_source()
+    }
+    pub fn instance_selection_pending(&self) -> bool {
+        self.inner.instance_selection_pending()
+    }
+
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn testing_duplicate(&self) -> Self {
@@ -2782,8 +2844,9 @@ pub struct FailureCleanupCompletionOwner {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum FailureCleanupCompletionDisposition {
+    ResumeInstanceInvalidation(RetainedInvalidationContinuation),
     Settled,
     RetainedPreparedPrefixBound,
     RetainedPreparedPrefixCleanup,
@@ -4045,8 +4108,9 @@ pub enum TrustedPostCommitCompoundCompletionOutcome<Physical, PhysicalTerminal> 
 }
 
 pub use crate::engine::retained::{
-    RetainedAuthoritySettlementPlan, RetainedCommitPlan, RetainedHitPlan, RetainedLeafOwner,
-    RetainedLeafProjection, RetainedPostCommitAuthorityPlan,
+    InstanceSelectionPlan, RetainedAuthoritySettlementPlan, RetainedCommitPlan,
+    RetainedInvalidationPlan, RetainedLeafOwner, RetainedLeafProjection,
+    RetainedPostCommitAuthorityPlan, TargetInstanceStepProjection,
 };
 
 /// Rejected authority transfer returns the unchanged host and every retained owner.
@@ -4085,7 +4149,9 @@ impl RetainedAuthoritySettlementError {
     }
 }
 
-impl RetainedHitPlan {
+pub use crate::engine::instances::{RetainedOwnSlotProjection, TargetInstanceSourceKind};
+
+impl InstanceSelectionPlan {
     pub fn reconciliation(&self) -> ReconciliationProjectionView<'_> {
         ReconciliationProjectionView {
             inner: self.reconciliation_projection(),
@@ -4093,20 +4159,47 @@ impl RetainedHitPlan {
     }
 }
 
-impl RetainedLeafProjection {
-    pub fn empty_child_slots(
-        &self,
-    ) -> impl ExactSizeIterator<Item = ReconciliationChildSlotBindingView<'_>> {
-        self.logical_empty_child_slots()
-            .iter()
-            .map(|inner| ReconciliationChildSlotBindingView { inner })
-    }
-}
-
 /// Unique cache-only cleanup continuation holding the original fresh task.
 pub struct RetainedMissCleanupOwner {
     inner: crate::engine::retained::RetainedMissCleanupOwner,
     cleanup: CleanupBatch,
+}
+
+pub use crate::engine::retained::RetainedMissCleanupAuthorityFailCloseErrorKind;
+
+/// Rejection preserves the installed cache token, every original owner, and
+/// the original host lease for the trusted physical receiver.
+#[must_use = "rejected authority termination retains the installed cache owner"]
+pub struct RetainedMissCleanupAuthorityFailCloseError {
+    owner: RetainedMissCleanupOwner,
+    lease: HostLease,
+    kind: RetainedMissCleanupAuthorityFailCloseErrorKind,
+}
+
+impl RetainedMissCleanupAuthorityFailCloseError {
+    pub fn kind(&self) -> RetainedMissCleanupAuthorityFailCloseErrorKind {
+        self.kind
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        RetainedMissCleanupOwner,
+        HostLease,
+        RetainedMissCleanupAuthorityFailCloseErrorKind,
+    ) {
+        (self.owner, self.lease, self.kind)
+    }
+}
+
+impl std::fmt::Debug for RetainedMissCleanupAuthorityFailCloseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedMissCleanupAuthorityFailCloseError")
+            .field("owner", &self.owner)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RetainedMissCleanupOwner {
@@ -4163,21 +4256,204 @@ pub enum RetainedPublicationError {
     BackTargetMismatch(PreparationReceiverMismatchView),
 }
 
-/// A rejected hit returns the original task and every original cache owner.
-pub struct RetainedHitPreparationError {
+/// The original mount failure's capability, returned only after its physical obligations settle.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RetainedInvalidationContinuation {
+    inner: crate::engine::retained::RetainedInvalidationContinuation,
+}
+impl RetainedInvalidationContinuation {
+    pub fn invalid(&self) -> &RouteFrameVersion {
+        self.inner.invalid()
+    }
+}
+pub use crate::engine::retained::RetainedInvalidationResumeFailure;
+#[must_use]
+pub struct RetainedInvalidationResumeError {
+    continuation: RetainedInvalidationContinuation,
+    failure: RetainedInvalidationResumeFailure,
+}
+impl RetainedInvalidationResumeError {
+    pub fn failure(&self) -> RetainedInvalidationResumeFailure {
+        self.failure
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        RetainedInvalidationContinuation,
+        RetainedInvalidationResumeFailure,
+    ) {
+        (self.continuation, self.failure)
+    }
+}
+impl std::fmt::Debug for RetainedInvalidationResumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedInvalidationResumeError")
+            .field("continuation", &self.continuation)
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
+#[must_use]
+pub struct RetainedInvalidationAuthoritySettlementError {
+    continuation: RetainedInvalidationContinuation,
+    settlement: RetainedAuthoritySettlementError,
+}
+impl RetainedInvalidationAuthoritySettlementError {
+    pub fn into_parts(
+        self,
+    ) -> (
+        RetainedInvalidationContinuation,
+        RetainedAuthoritySettlementError,
+    ) {
+        (self.continuation, self.settlement)
+    }
+}
+impl std::fmt::Debug for RetainedInvalidationAuthoritySettlementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedInvalidationAuthoritySettlementError")
+            .field("continuation", &self.continuation)
+            .field("settlement", &self.settlement)
+            .finish()
+    }
+}
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedInvalidationAuthorityFailCloseErrorKind {
+    SourceMismatch,
+    ProtocolRejected,
+}
+#[doc(hidden)]
+#[must_use]
+pub struct RetainedInvalidationAuthorityFailCloseError {
+    continuation: RetainedInvalidationContinuation,
+    lease: Option<HostLease>,
+    kind: RetainedInvalidationAuthorityFailCloseErrorKind,
+}
+impl RetainedInvalidationAuthorityFailCloseError {
+    pub fn kind(&self) -> RetainedInvalidationAuthorityFailCloseErrorKind {
+        self.kind
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        RetainedInvalidationContinuation,
+        Option<HostLease>,
+        RetainedInvalidationAuthorityFailCloseErrorKind,
+    ) {
+        (self.continuation, self.lease, self.kind)
+    }
+}
+impl std::fmt::Debug for RetainedInvalidationAuthorityFailCloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedInvalidationAuthorityFailCloseError")
+            .field("continuation", &self.continuation)
+            .field("has_lease", &self.lease.is_some())
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+pub enum RetainedInvalidationReceiver {
+    FrameTask(FrameTask),
+    Commit(CommitTicket),
+    AfterFailure(RetainedInvalidationContinuation),
+}
+impl RetainedInvalidationReceiver {
+    fn into_inner(self) -> crate::engine::retained::CoreRetainedInvalidationReceiver {
+        match self {
+            Self::FrameTask(task) => {
+                crate::engine::retained::CoreRetainedInvalidationReceiver::FrameTask(task.inner)
+            }
+            Self::Commit(ticket) => {
+                crate::engine::retained::CoreRetainedInvalidationReceiver::Commit(ticket.inner)
+            }
+            Self::AfterFailure(owner) => {
+                crate::engine::retained::CoreRetainedInvalidationReceiver::AfterFailure(owner.inner)
+            }
+        }
+    }
+    fn from_inner(inner: crate::engine::retained::CoreRetainedInvalidationReceiver) -> Self {
+        match inner {
+            crate::engine::retained::CoreRetainedInvalidationReceiver::FrameTask(inner) => {
+                Self::FrameTask(FrameTask { inner })
+            }
+            crate::engine::retained::CoreRetainedInvalidationReceiver::Commit(inner) => {
+                Self::Commit(CommitTicket { inner })
+            }
+            crate::engine::retained::CoreRetainedInvalidationReceiver::AfterFailure(inner) => {
+                Self::AfterFailure(RetainedInvalidationContinuation { inner })
+            }
+        }
+    }
+}
+impl std::fmt::Debug for RetainedInvalidationReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameTask(task) => f
+                .debug_tuple("FrameTask")
+                .field(task.inner.identity())
+                .finish(),
+            Self::Commit(ticket) => f
+                .debug_tuple("Commit")
+                .field(ticket.inner.identity())
+                .finish(),
+            Self::AfterFailure(owner) => f.debug_tuple("AfterFailure").field(owner).finish(),
+        }
+    }
+}
+
+#[must_use]
+pub struct RetainedInvalidationReceiverError {
+    receiver: RetainedInvalidationReceiver,
+    error: IntegrationError,
+}
+impl RetainedInvalidationReceiverError {
+    pub fn into_parts(self) -> (RetainedInvalidationReceiver, IntegrationError) {
+        (self.receiver, self.error)
+    }
+}
+impl std::fmt::Debug for RetainedInvalidationReceiverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedInvalidationReceiverError")
+            .field("receiver", &self.receiver)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+#[must_use]
+pub struct InstanceSelectionPreparationError {
     task: FrameTask,
-    plan: RetainedHitPlan,
+    plan: InstanceSelectionPlan,
+    error: IntegrationError,
+}
+impl std::fmt::Debug for InstanceSelectionPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceSelectionPreparationError")
+            .field("plan", &self.plan)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+impl InstanceSelectionPreparationError {
+    pub fn into_parts(self) -> (FrameTask, InstanceSelectionPlan, IntegrationError) {
+        (self.task, self.plan, self.error)
+    }
+}
+
+/// A rejected hit returns the original task and every original cache owner.
+pub struct RetainedInvalidationPreparationError {
+    receiver: RetainedInvalidationReceiver,
+    plan: RetainedInvalidationPlan,
     manifest: CleanupManifest,
     owners: Vec<RetainedLeafOwner>,
     error: RetainedPublicationError,
 }
 
-impl std::fmt::Debug for RetainedHitPreparationError {
+impl std::fmt::Debug for RetainedInvalidationPreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RetainedHitPreparationError")
-            .field("request", &self.task.request())
-            .field("frame", self.task.frame())
+            .debug_struct("RetainedInvalidationPreparationError")
+            .field("receiver", &self.receiver)
             .field("plan", &self.plan)
             .field("manifest", &self.manifest.projection())
             .field("owners", &self.owners)
@@ -4186,17 +4462,23 @@ impl std::fmt::Debug for RetainedHitPreparationError {
     }
 }
 
-impl RetainedHitPreparationError {
+impl RetainedInvalidationPreparationError {
     pub fn into_parts(
         self,
     ) -> (
-        FrameTask,
-        RetainedHitPlan,
+        RetainedInvalidationReceiver,
+        RetainedInvalidationPlan,
         CleanupManifest,
         Vec<RetainedLeafOwner>,
         RetainedPublicationError,
     ) {
-        (self.task, self.plan, self.manifest, self.owners, self.error)
+        (
+            self.receiver,
+            self.plan,
+            self.manifest,
+            self.owners,
+            self.error,
+        )
     }
 }
 
@@ -4237,7 +4519,7 @@ impl RetainedCommitPreparationError {
 pub struct PreparedRetainedCommit {
     publication: PreparedPublication,
     cleanup: CleanupBatch,
-    retained: Option<RetainedLeafProjection>,
+    retained: Vec<RetainedLeafProjection>,
     back_target: Option<(
         BackResolutionScopeProjection,
         HistoryExecutionBindingProjection,
@@ -4263,8 +4545,8 @@ impl PreparedRetainedCommit {
     pub fn cleanup(&self) -> &CleanupBatch {
         &self.cleanup
     }
-    pub fn retained_leaf(&self) -> Option<&RetainedLeafProjection> {
-        self.retained.as_ref()
+    pub fn retained(&self) -> &[RetainedLeafProjection] {
+        &self.retained
     }
 }
 
@@ -4283,7 +4565,7 @@ impl ValidatedRetainedCommit<'_> {
     }
     pub fn publish<F>(self, mutation: F)
     where
-        F: FnOnce(Option<RetainedLeafOwner>),
+        F: FnOnce(Vec<RetainedLeafOwner>),
     {
         let Self {
             publication,
@@ -5875,6 +6157,16 @@ pub struct ReconciliationProjectionView<'a> {
 }
 
 impl<'a> ReconciliationProjectionView<'a> {
+    pub fn retained(&self) -> impl ExactSizeIterator<Item = &'a RetainedLeafProjection> {
+        self.inner.retained().iter()
+    }
+    pub fn source_at(&self, index: usize) -> Option<TargetInstanceSourceKind> {
+        self.inner.source_at(index)
+    }
+    pub fn instances_selected(&self) -> bool {
+        self.inner.instances_selected()
+    }
+
     pub fn preserved(
         &self,
     ) -> impl ExactSizeIterator<Item = ReconciliationExistingFrameView<'a>> + 'a {
@@ -6129,7 +6421,7 @@ pub struct RouterEngine {
 }
 
 impl RouterEngine {
-    /// Maximum inactive normal leaf instances. Zero disables keep-alive.
+    /// Maximum inactive normal instances. Zero disables keep-alive.
     pub fn with_keep_alive_capacity(mut self, capacity: usize) -> Self {
         self.inner = self.inner.with_keep_alive_capacity(capacity);
         self
@@ -8528,10 +8820,46 @@ impl RouterEngine {
             })
     }
 
+    /// Settles the original mount request before retiring an invalid selected instance.
+    #[doc(hidden)]
+    pub fn reject_retained_mount(
+        &mut self,
+        request: MountRequest,
+        invalid: RouteFrameVersion,
+    ) -> Result<FailureCleanupRequest, RejectMountError> {
+        self.inner
+            .reject_retained_mount(request.inner, invalid)
+            .map(|inner| FailureCleanupRequest { inner })
+            .map_err(|error| RejectMountError {
+                kind: map_mount_error(error.kind()),
+                owner: MountRequest {
+                    inner: error.into_owner(),
+                },
+            })
+    }
+
     #[doc(hidden)]
     pub fn reject_mount_after_mutation(
         &mut self,
         artifact: MountMutationArtifact,
+    ) -> Result<FailureCleanupRequest, RejectMountMutationError> {
+        self.reject_mount_mutation_impl(artifact, None)
+    }
+
+    /// Settles the original staged mount before retiring an invalid selected instance.
+    #[doc(hidden)]
+    pub fn reject_retained_mount_after_mutation(
+        &mut self,
+        artifact: MountMutationArtifact,
+        invalid: RouteFrameVersion,
+    ) -> Result<FailureCleanupRequest, RejectMountMutationError> {
+        self.reject_mount_mutation_impl(artifact, Some(invalid))
+    }
+
+    fn reject_mount_mutation_impl(
+        &mut self,
+        artifact: MountMutationArtifact,
+        invalid: Option<RouteFrameVersion>,
     ) -> Result<FailureCleanupRequest, RejectMountMutationError> {
         let artifact = match artifact {
             MountMutationArtifact::Grant(grant) => CoreMountMutationArtifact::Grant(grant.inner),
@@ -8542,8 +8870,13 @@ impl RouterEngine {
                 CoreMountMutationArtifact::RegistrationPermit(permit.inner)
             }
         };
-        self.inner
-            .reject_mount_after_mutation(artifact)
+        let result = match invalid {
+            Some(invalid) => self
+                .inner
+                .reject_retained_mount_after_mutation(artifact, invalid),
+            None => self.inner.reject_mount_after_mutation(artifact),
+        };
+        result
             .map(|inner| FailureCleanupRequest { inner })
             .map_err(|error| RejectMountMutationError {
                 kind: map_mount_error(error.kind()),
@@ -8931,26 +9264,251 @@ impl RouterEngine {
             .map_err(map_commit_error)
     }
 
-    /// Selects a normal retained leaf before factory dispatch without moving its owner.
-    pub fn prepare_retained_hit_plan(
+    pub fn selected_retained_instances(&self) -> &[RetainedLeafProjection] {
+        self.inner.selected_retained_instances()
+    }
+
+    /// Freezes one complete Current/Retained/Fresh choice before the first factory dispatch.
+    pub fn prepare_instance_selection(
         &mut self,
         task: &FrameTask,
         inventory: &[&RetainedLeafOwner],
-    ) -> Result<Option<RetainedHitPlan>, IntegrationError> {
+    ) -> Result<InstanceSelectionPlan, IntegrationError> {
         self.inner
-            .prepare_retained_hit_plan(&task.inner, inventory)
+            .prepare_instance_selection(&task.inner, inventory)
             .map_err(map_commit_error)
     }
+    /// Accepts this request's exact selected prefix without moving its original owners.
+    pub fn accept_instance_selection(
+        &mut self,
+        task: FrameTask,
+        plan: InstanceSelectionPlan,
+    ) -> Result<EngineAction, InstanceSelectionPreparationError> {
+        match self.inner.accept_instance_selection(task.inner, &plan) {
+            Ok(action) => Ok(match action {
+                CoreEngineAction::FrameTask(inner) => EngineAction::FrameTask(FrameTask { inner }),
+                CoreEngineAction::MountRequest(inner) => {
+                    EngineAction::MountRequest(MountRequest { inner })
+                }
+                CoreEngineAction::Commit(inner) => EngineAction::Commit(CommitTicket { inner }),
+                CoreEngineAction::FailureCleanup(inner) => {
+                    EngineAction::FailureCleanup(FailureCleanupRequest { inner })
+                }
+                CoreEngineAction::BackResolution(inner) => EngineAction::BackResolution(inner),
+            }),
+            Err((task, error)) => Err(InstanceSelectionPreparationError {
+                task: FrameTask { inner: task },
+                plan,
+                error: map_commit_error(error),
+            }),
+        }
+    }
 
+    /// Reissues only the cleared fresh suffix after the original selected instances are valid again.
+    #[doc(hidden)]
+    pub fn resume_retained_invalidation(
+        &mut self,
+        continuation: RetainedInvalidationContinuation,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<EngineAction, RetainedInvalidationResumeError> {
+        match self
+            .inner
+            .resume_retained_invalidation(continuation.inner, inventory)
+        {
+            Ok(action) => Ok(match action {
+                CoreEngineAction::FrameTask(inner) => EngineAction::FrameTask(FrameTask { inner }),
+                CoreEngineAction::MountRequest(inner) => {
+                    EngineAction::MountRequest(MountRequest { inner })
+                }
+                CoreEngineAction::Commit(inner) => EngineAction::Commit(CommitTicket { inner }),
+                CoreEngineAction::FailureCleanup(inner) => {
+                    EngineAction::FailureCleanup(FailureCleanupRequest { inner })
+                }
+                CoreEngineAction::BackResolution(inner) => EngineAction::BackResolution(inner),
+            }),
+            Err((inner, failure)) => Err(RetainedInvalidationResumeError {
+                continuation: RetainedInvalidationContinuation { inner },
+                failure,
+            }),
+        }
+    }
+
+    /// Transfers the original local continuation only when the existing authority settlement accepts it.
+    #[doc(hidden)]
+    pub fn begin_retained_invalidation_authority_settlement<F>(
+        &mut self,
+        continuation: RetainedInvalidationContinuation,
+        lease: HostLease,
+        cause: PreCommitAuthorityCause,
+        plan: RetainedAuthoritySettlementPlan,
+        manifest: CleanupManifest,
+        owners: Vec<RetainedLeafOwner>,
+        authority_mutation: F,
+    ) -> Result<CleanupBatch, RetainedInvalidationAuthoritySettlementError>
+    where
+        F: FnOnce(CleanupBatch),
+    {
+        if !self
+            .inner
+            .inspect_retained_invalidation_continuation(&continuation.inner)
+        {
+            return Err(RetainedInvalidationAuthoritySettlementError {
+                continuation,
+                settlement: RetainedAuthoritySettlementError {
+                    lease,
+                    plan,
+                    manifest,
+                    owners,
+                    kind: BeginAuthoritySettlementErrorKind::Stale,
+                },
+            });
+        }
+        let mut original = Some(continuation);
+        let result =
+            self.begin_authority_settlement_with_retention(
+                lease,
+                cause,
+                plan,
+                manifest,
+                owners,
+                |batch| {
+                    drop(original.take().expect(
+                        "only the accepted authority tail consumes the original continuation",
+                    ));
+                    authority_mutation(batch);
+                },
+            );
+        match result {
+            Ok(batch) => Ok(batch),
+            Err(settlement) => Err(RetainedInvalidationAuthoritySettlementError {
+                continuation: original
+                    .take()
+                    .expect("rejection preserves the original continuation"),
+                settlement,
+            }),
+        }
+    }
+
+    /// Ends an unaccepted local continuation through the existing authority
+    /// fail-close protocol. Its original owner is consumed only by acceptance;
+    /// an installed miss retains its separate cleanup owner and cannot enter here.
+    #[doc(hidden)]
+    pub fn fail_closed_retained_invalidation_authority_protocol_retaining<F>(
+        &mut self,
+        continuation: RetainedInvalidationContinuation,
+        lease: Option<HostLease>,
+        authority_mutation: F,
+    ) -> Result<(), RetainedInvalidationAuthorityFailCloseError>
+    where
+        F: FnOnce(),
+    {
+        if lease.is_none() {
+            return Err(RetainedInvalidationAuthorityFailCloseError {
+                continuation,
+                lease,
+                kind: RetainedInvalidationAuthorityFailCloseErrorKind::ProtocolRejected,
+            });
+        }
+        if !self
+            .inner
+            .inspect_retained_invalidation_continuation(&continuation.inner)
+        {
+            return Err(RetainedInvalidationAuthorityFailCloseError {
+                continuation,
+                lease,
+                kind: RetainedInvalidationAuthorityFailCloseErrorKind::SourceMismatch,
+            });
+        }
+        let mut original = Some(continuation);
+        match self.fail_closed_authority_protocol_retaining(lease, || {
+            drop(
+                original.take().expect(
+                    "only accepted authority fail-close consumes the original continuation",
+                ),
+            );
+            authority_mutation();
+        }) {
+            Ok(()) => Ok(()),
+            Err(lease) => Err(RetainedInvalidationAuthorityFailCloseError {
+                continuation: original
+                    .take()
+                    .expect("rejected authority fail-close preserves its original continuation"),
+                lease,
+                kind: RetainedInvalidationAuthorityFailCloseErrorKind::ProtocolRejected,
+            }),
+        }
+    }
+
+    /// Settles fresh obligations under their original receiver before invalidating a selected instance.
+    #[doc(hidden)]
+    pub fn reject_retained_invalidation(
+        &mut self,
+        receiver: RetainedInvalidationReceiver,
+        invalid: RouteFrameVersion,
+    ) -> Result<FailureCleanupRequest, RetainedInvalidationReceiverError> {
+        match self
+            .inner
+            .reject_retained_invalidation(receiver.into_inner(), invalid)
+        {
+            Ok(inner) => Ok(FailureCleanupRequest { inner }),
+            Err((receiver, error)) => Err(RetainedInvalidationReceiverError {
+                receiver: RetainedInvalidationReceiver::from_inner(receiver),
+                error: map_commit_error(error),
+            }),
+        }
+    }
+
+    /// Freezes OwnInvalid responsibility from either the unaccepted first selection or the accepted prefix.
+    pub fn prepare_retained_invalidation_plan(
+        &self,
+        receiver: &RetainedInvalidationReceiver,
+        selection: Option<&InstanceSelectionPlan>,
+        invalid: &RouteFrameVersion,
+        inventory: &[&RetainedLeafOwner],
+    ) -> Result<RetainedInvalidationPlan, IntegrationError> {
+        match receiver {
+            RetainedInvalidationReceiver::FrameTask(task) => {
+                self.inner.prepare_retained_invalidation_plan(
+                    crate::engine::retained::CoreRetainedInvalidationReceiverRef::FrameTask(
+                        &task.inner,
+                    ),
+                    selection,
+                    invalid,
+                    inventory,
+                )
+            }
+            RetainedInvalidationReceiver::Commit(ticket) => {
+                self.inner.prepare_retained_invalidation_plan(
+                    crate::engine::retained::CoreRetainedInvalidationReceiverRef::Commit(
+                        &ticket.inner,
+                    ),
+                    selection,
+                    invalid,
+                    inventory,
+                )
+            }
+            RetainedInvalidationReceiver::AfterFailure(owner) => {
+                self.inner.prepare_retained_invalidation_plan(
+                    crate::engine::retained::CoreRetainedInvalidationReceiverRef::AfterFailure(
+                        &owner.inner,
+                    ),
+                    selection,
+                    invalid,
+                    inventory,
+                )
+            }
+        }
+        .map_err(map_commit_error)
+    }
     /// Retires only the selected cache instance before applying the original fresh task.
     pub fn begin_retained_miss_cleanup<F>(
         &mut self,
-        task: FrameTask,
-        plan: RetainedHitPlan,
+        receiver: RetainedInvalidationReceiver,
+        plan: RetainedInvalidationPlan,
         manifest: CleanupManifest,
         owners: Vec<RetainedLeafOwner>,
         install: F,
-    ) -> Result<(), RetainedHitPreparationError>
+    ) -> Result<(), RetainedInvalidationPreparationError>
     where
         F: FnOnce(RetainedMissCleanupOwner),
     {
@@ -8961,19 +9519,23 @@ impl RouterEngine {
         );
         let manifest_digest = manifest.manifest_digest;
         let obligation_count = manifest.obligation_count;
-        match self
-            .inner
-            .begin_retained_miss_cleanup(task.inner, &plan, seal, owners, |inner| {
+        match self.inner.begin_retained_miss_cleanup(
+            receiver.into_inner(),
+            &plan,
+            seal,
+            owners,
+            |inner| {
                 let cleanup = CleanupBatch {
                     inner: inner.cleanup().clone(),
                     manifest_digest,
                     obligation_count,
                 };
                 install(RetainedMissCleanupOwner { inner, cleanup });
-            }) {
+            },
+        ) {
             Ok(()) => Ok(()),
-            Err((task, owners, error)) => Err(RetainedHitPreparationError {
-                task: FrameTask { inner: task },
+            Err((receiver, owners, error)) => Err(RetainedInvalidationPreparationError {
+                receiver: RetainedInvalidationReceiver::from_inner(receiver),
                 plan,
                 manifest,
                 owners,
@@ -8992,13 +9554,44 @@ impl RouterEngine {
             .map_err(map_cleanup_error)
     }
 
+    /// The trusted ECS receiver establishes shared authority loss and keeps
+    /// the stopped physical ledger. Acceptance ends its original foreground
+    /// receiver and transfers the original cache owners into that residual;
+    /// it does not assert physical completion of the cache token.
+    #[doc(hidden)]
+    pub fn fail_closed_retained_miss_cleanup_authority_protocol_retaining<F>(
+        &mut self,
+        owner: RetainedMissCleanupOwner,
+        lease: HostLease,
+        install: F,
+    ) -> Result<(), RetainedMissCleanupAuthorityFailCloseError>
+    where
+        F: FnOnce(Vec<RetainedLeafOwner>),
+    {
+        let RetainedMissCleanupOwner { inner, cleanup } = owner;
+        self.inner
+            .fail_closed_retained_miss_cleanup_authority_protocol_retaining(
+                &mut self.admission,
+                inner,
+                lease.inner,
+                install,
+            )
+            .map_err(
+                |(inner, lease, kind)| RetainedMissCleanupAuthorityFailCloseError {
+                    owner: RetainedMissCleanupOwner { inner, cleanup },
+                    lease: HostLease { inner: lease },
+                    kind,
+                },
+            )
+    }
+
     pub fn complete_retained_miss_cleanup<Physical, F>(
         &mut self,
         owner: RetainedMissCleanupOwner,
         completion: CleanupCompletion,
         physical: Physical,
         reclaim: F,
-    ) -> Result<FrameTask, RetainedMissCleanupCompletionError<Physical>>
+    ) -> Result<EngineAction, RetainedMissCleanupCompletionError<Physical>>
     where
         F: FnOnce(Physical),
     {
@@ -9016,7 +9609,17 @@ impl RouterEngine {
             .inner
             .complete_retained_miss_cleanup(owner, completion, physical, reclaim)
         {
-            Ok(inner) => Ok(FrameTask { inner }),
+            Ok(action) => Ok(match action {
+                CoreEngineAction::FrameTask(inner) => EngineAction::FrameTask(FrameTask { inner }),
+                CoreEngineAction::MountRequest(inner) => {
+                    EngineAction::MountRequest(MountRequest { inner })
+                }
+                CoreEngineAction::Commit(inner) => EngineAction::Commit(CommitTicket { inner }),
+                CoreEngineAction::FailureCleanup(inner) => {
+                    EngineAction::FailureCleanup(FailureCleanupRequest { inner })
+                }
+                CoreEngineAction::BackResolution(inner) => EngineAction::BackResolution(inner),
+            }),
             Err((owner, completion, physical, error)) => Err(RetainedMissCleanupCompletionError {
                 owner: RetainedMissCleanupOwner {
                     inner: owner,
@@ -9065,59 +9668,6 @@ impl RouterEngine {
         )))
     }
 
-    pub fn prepare_retained_hit_commit(
-        &mut self,
-        task: FrameTask,
-        plan: RetainedHitPlan,
-        manifest: CleanupManifest,
-        owners: Vec<RetainedLeafOwner>,
-        back: Option<(&HistoryExecutionBindingView, &LifecycleContinuationCapacity)>,
-    ) -> Result<PreparedRetainedCommit, RetainedHitPreparationError> {
-        let back_target = match self.prepare_retained_back_binding(
-            back,
-            CoreBackTargetPhysicalReceiverRef::FrameTask(&task.inner),
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                return Err(RetainedHitPreparationError {
-                    task,
-                    plan,
-                    manifest,
-                    owners,
-                    error,
-                });
-            }
-        };
-        let seal = CleanupManifestSeal::new(
-            manifest.logical_roots.clone(),
-            CleanupManifestDigest::from_opaque(manifest.manifest_digest),
-            manifest.obligation_count,
-        );
-        let retained = plan.commit_plan().retained().cloned();
-        match self
-            .inner
-            .prepare_retained_hit_publication(task.inner, &plan, seal, owners)
-        {
-            Ok((publication, token)) => Ok(PreparedRetainedCommit {
-                publication,
-                cleanup: CleanupBatch {
-                    inner: token,
-                    manifest_digest: manifest.manifest_digest,
-                    obligation_count: manifest.obligation_count,
-                },
-                retained,
-                back_target,
-            }),
-            Err((task, owners, error)) => Err(RetainedHitPreparationError {
-                task: FrameTask { inner: task },
-                plan,
-                manifest,
-                owners,
-                error: RetainedPublicationError::Integration(map_commit_error(error)),
-            }),
-        }
-    }
-
     pub fn prepare_commit_with_retention(
         &mut self,
         ticket: &CommitTicket,
@@ -9146,7 +9696,7 @@ impl RouterEngine {
             manifest.obligation_count,
         );
         // All owner/projection composition precedes installation of Ready.
-        let retained = plan.retained().cloned();
+        let retained = plan.retained().to_vec();
         match self
             .inner
             .prepare_retained_publication(&ticket.inner, &plan, seal, owners)
@@ -10135,6 +10685,11 @@ impl RouterEngine {
                 commit_ledger_and_clear_holder,
             )
             .map(|disposition| match disposition {
+                CoreFailureCleanupCompletionDisposition::ResumeInstanceInvalidation(inner) => {
+                    FailureCleanupCompletionDisposition::ResumeInstanceInvalidation(
+                        RetainedInvalidationContinuation { inner },
+                    )
+                }
                 CoreFailureCleanupCompletionDisposition::Settled => {
                     FailureCleanupCompletionDisposition::Settled
                 }

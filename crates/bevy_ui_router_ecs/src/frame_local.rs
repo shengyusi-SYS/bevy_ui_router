@@ -324,6 +324,72 @@ pub(crate) fn validate_reconciliation_entering_branch<'payload>(
     validate_branch_descendants(world, entering).map(|_| ())
 }
 
+/// The target proof supplies the complete own-slot set across stock and fresh
+/// sources. Fresh payload ownership itself remains separate for rejection.
+pub(crate) fn validate_mixed_fresh_entering(
+    world: &World,
+    fresh: crate::instance::PayloadRef<'_>,
+    preserved: &RealizedBranch,
+    leaving: &RealizedBranch,
+    entering_slots: &[&crate::mount::MountedChildSlot],
+) -> Result<(), FrameLocalError> {
+    for slot in fresh.child_slots() {
+        if !validate_mounted_child_slot(world, slot, EntityLifecycle::PreparedInert) {
+            return Err(FrameLocalError::OwnershipDrift(slot.slot()));
+        }
+    }
+    for frame in fresh.frames() {
+        let child_slots = entering_slots
+            .iter()
+            .filter(|slot| slot.parent() == frame.frame())
+            .map(|slot| (slot.anchor(), slot.expected_anchor_children().to_vec()))
+            .collect::<Vec<_>>();
+        let existing = leaving
+            .frames()
+            .iter()
+            .filter(|old| {
+                frame
+                    .sealed_reconciliation_entering_shell_for(old)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        let leaving_shells = leaving
+            .frames()
+            .iter()
+            .filter_map(|old| frame.sealed_reconciliation_leaving_sibling_shell_for(old))
+            .cloned()
+            .collect::<Vec<_>>();
+        if existing.len() > 1
+            || (existing.len() == 1
+                && preserved
+                    .child_slots()
+                    .iter()
+                    .filter(|slot| frame.mount_binding().matches_mounted_child_slot(slot))
+                    .count()
+                    != 1)
+            || !validate_reconciliation_entering_frame_with_child_slots(
+                world,
+                frame,
+                &child_slots,
+                existing.first().copied(),
+                &leaving_shells,
+            )
+        {
+            return Err(FrameLocalError::OwnershipDrift(frame.shell()));
+        }
+        validate_frame_claim_set(
+            world,
+            frame.frame(),
+            frame.shell(),
+            frame.claims(),
+            fresh,
+            ManifestPolicy::Strict,
+            &[],
+        )?;
+    }
+    validate_branch_descendants(world, fresh).map(|_| ())
+}
+
 pub(crate) fn validate_committed_branch(
     world: &World,
     branch: &RealizedBranch,

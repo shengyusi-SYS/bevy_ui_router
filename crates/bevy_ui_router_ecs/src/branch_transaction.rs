@@ -129,6 +129,7 @@ pub(crate) struct ReconciliationProjectionFacts {
     authority: ReconciliationAuthorityIdentity,
     existing: ReconciliationExistingProjection,
     entering: ReconciliationEnteringProjection,
+    selected: Vec<RetainedLeafProjection>,
 }
 
 pub(crate) struct SealedReconciliationStagingMount<'a> {
@@ -137,6 +138,7 @@ pub(crate) struct SealedReconciliationStagingMount<'a> {
     role: ReconciliationSlotRoleKind,
     expected_slot_lifecycle: EntityLifecycle,
     allowed_existing_shells: Vec<ExactRegistryClaim>,
+    retained_parent: Option<RetainedLeafProjection>,
 }
 
 impl<'a> SealedReconciliationStagingMount<'a> {
@@ -154,6 +156,10 @@ impl<'a> SealedReconciliationStagingMount<'a> {
 
     pub(crate) const fn expected_slot_lifecycle(&self) -> EntityLifecycle {
         self.expected_slot_lifecycle
+    }
+
+    pub(crate) fn retained_parent(&self) -> Option<&RetainedLeafProjection> {
+        self.retained_parent.as_ref()
     }
 
     pub(crate) fn allowed_existing_shells(&self) -> &[ExactRegistryClaim] {
@@ -235,6 +241,7 @@ impl ReconciliationProjectionFacts {
             });
         }
         Some(Self {
+            selected: projection.retained().cloned().collect(),
             authority,
             existing: ReconciliationExistingProjection {
                 preserved,
@@ -265,6 +272,24 @@ pub(crate) fn seal_reconciliation_staging_mount_with_retained<'a>(
     task: &RootFrameTask,
     retained_shells: &[ExactRegistryClaim],
 ) -> Option<SealedReconciliationStagingMount<'a>> {
+    seal_mixed_reconciliation_staging_mount(
+        projection,
+        active,
+        entering,
+        &[],
+        task,
+        retained_shells,
+    )
+}
+
+pub(crate) fn seal_mixed_reconciliation_staging_mount<'a>(
+    projection: &ReconciliationProjectionView<'_>,
+    active: Option<&'a RealizedBranch>,
+    entering: &'a PreparedBranch,
+    selected: &[(&RetainedLeafProjection, &'a InstancePayload)],
+    task: &RootFrameTask,
+    retained_shells: &[ExactRegistryClaim],
+) -> Option<SealedReconciliationStagingMount<'a>> {
     let root = active
         .and_then(RealizedBranch::first_frame)
         .or_else(|| entering.first_frame())?;
@@ -287,12 +312,18 @@ pub(crate) fn seal_reconciliation_staging_mount_with_retained<'a>(
         .frames()
         .iter()
         .chain(active.into_iter().flat_map(RealizedBranch::frames))
+        .chain(selected.iter().map(|(_, payload)| payload.frame()))
         .filter(|frame| frame.frame() == &parent)
         .collect::<Vec<_>>();
     let slots = entering
         .child_slots()
         .iter()
         .chain(active.into_iter().flat_map(RealizedBranch::child_slots))
+        .chain(
+            selected
+                .iter()
+                .flat_map(|(_, payload)| payload.child_slots()),
+        )
         .filter(|slot| {
             slot.parent() == &parent
                 && slot.outlet() == &outlet
@@ -334,8 +365,20 @@ pub(crate) fn seal_reconciliation_staging_mount_with_retained<'a>(
         }
         ReconciliationEnteringSlot::Existing(_) => return None,
     };
+    let retained_parent = selected
+        .iter()
+        .find(|(candidate, payload)| {
+            candidate.frame() == &parent && payload.frame().frame() == &parent
+        })
+        .map(|(projection, _)| (*projection).clone());
     let expected_slot_lifecycle = match role {
         ReconciliationSlotRoleKind::PreservedActive => EntityLifecycle::Active,
+        ReconciliationSlotRoleKind::ActivateExisting
+            if retained_parent.is_some()
+                && slots[0].slot_claim().lifecycle() == EntityLifecycle::Retained =>
+        {
+            EntityLifecycle::Retained
+        }
         ReconciliationSlotRoleKind::ActivateExisting | ReconciliationSlotRoleKind::MountNew => {
             EntityLifecycle::PreparedInert
         }
@@ -389,6 +432,7 @@ pub(crate) fn seal_reconciliation_staging_mount_with_retained<'a>(
             role,
             expected_slot_lifecycle,
             allowed_existing_shells,
+            retained_parent,
         },
     )
 }
@@ -688,6 +732,7 @@ pub(crate) struct SealedExistingReconciliation {
     leaving: RealizedBranch,
     slot_roles: Vec<SealedReconciliationSlotRole>,
     entering: ReconciliationEnteringProjection,
+    selected: Vec<RetainedLeafProjection>,
 }
 
 #[derive(Debug)]
@@ -715,73 +760,130 @@ pub(crate) struct SealedReconciliationSplice {
     entering: RealizedBranch,
     leaving: RealizedBranch,
     slot_roles: Vec<SealedReconciliationSlotRole>,
-    retained: Option<RetainedLeafProjection>,
-    retained_payload: Option<PreparedInstanceExtraction>,
-    retained_entering: Option<RetainedLeafProjection>,
+    retained: Vec<RetainedLeafProjection>,
+    retained_payloads: Vec<PreparedInstanceExtraction>,
+    retained_output: Vec<InstancePayload>,
+    activated: Vec<RetainedLeafProjection>,
+    final_slot_order: Vec<bevy_ecs::prelude::Entity>,
 }
 
-/// Owns only the original current split and readonly cache-hit preparation.
-/// The retained branch stays in its cache until Core accepts publication.
+/// Current/fresh owners remain here while selected original instances stay in
+/// inventory. Every receiver and final ordering is reserved before publication.
 #[derive(Debug)]
-pub(crate) struct PreparedRetainedEntering {
+pub(crate) struct PreparedMixedEntering {
     sealed: SealedExistingReconciliation,
-    hit: RetainedLeafProjection,
-    activation: PreparedRetainedFrameActivation,
+    fresh: PreparedBranch,
+    activated: Vec<RetainedLeafProjection>,
+    activations: Vec<PreparedRetainedFrameActivation>,
     entering_receiver: PreparedInstanceBranch,
-    retained: Option<RetainedLeafProjection>,
-    retained_payload: Option<PreparedInstanceExtraction>,
+    retained: Vec<RetainedLeafProjection>,
+    retained_payloads: Vec<PreparedInstanceExtraction>,
+    retained_output: Vec<InstancePayload>,
+    final_slot_order: Vec<bevy_ecs::prelude::Entity>,
 }
 
-impl PreparedRetainedEntering {
+impl PreparedMixedEntering {
     pub(crate) fn view<'a>(
         &'a self,
-        entering: &'a InstancePayload,
-    ) -> ReconciliationSpliceView<'a> {
-        ReconciliationSpliceView {
+        inventory: &'a crate::retained::RetainedLeaves,
+    ) -> Option<ReconciliationSpliceView<'a>> {
+        if self
+            .activated
+            .iter()
+            .any(|projection| inventory.payload_for(projection).is_none())
+        {
+            return None;
+        }
+        Some(ReconciliationSpliceView {
             preserved: &self.sealed.preserved,
-            entering: entering.as_payload_ref(),
+            entering: self.fresh.as_realized().as_payload_ref(),
             leaving: &self.sealed.leaving,
             slot_roles: &self.sealed.slot_roles,
-            retained: self.retained.as_ref(),
-            retained_entering: Some(&self.hit),
-            activation: Some(&self.activation),
-        }
+            retained: &self.retained,
+            activated: &self.activated,
+            inventory: Some(inventory),
+            activations: &self.activations,
+        })
     }
 
-    pub(crate) fn retain_leaf(
+    pub(crate) fn retain_instances(
         &mut self,
-        entering: &InstancePayload,
-        projection: &RetainedLeafProjection,
+        inventory: &crate::retained::RetainedLeaves,
+        projections: &[RetainedLeafProjection],
     ) -> bool {
-        let view = self.view(entering);
-        if self.retained.is_some()
-            || !view.leaf_retention_is_exact(projection.frame())
-            || view
-                .preserved
-                .frames
-                .iter()
-                .filter(|frame| frame.frame() == projection.parent())
-                .count()
-                != 1
-            || !view
-                .leaving
-                .frames
-                .iter()
-                .find(|frame| frame.frame() == projection.frame())
-                .is_some_and(|frame| frame.mount_binding().matches_retained_scope(projection))
-        {
+        if !self.retained.is_empty() {
             return false;
         }
-        let destination = PreparedInstanceExtraction::reserve(
-            self.sealed
+        let Some(view) = self.view(inventory) else {
+            return false;
+        };
+        for (index, projection) in projections.iter().enumerate() {
+            if projections[..index]
+                .iter()
+                .any(|prior| prior.frame() == projection.frame())
+                || !view.instance_retention_is_exact(projection.frame())
+                || !view
+                    .leaving
+                    .frames
+                    .iter()
+                    .find(|frame| frame.frame() == projection.frame())
+                    .is_some_and(|frame| frame.mount_binding().matches_retained_scope(projection))
+                || view
+                    .preserved
+                    .frames
+                    .iter()
+                    .chain(view.leaving.frames.iter())
+                    .filter(|frame| frame.frame() == projection.parent())
+                    .count()
+                    != 1
+                || (view
+                    .leaving
+                    .frames
+                    .iter()
+                    .any(|frame| frame.frame() == projection.parent())
+                    && !projections
+                        .iter()
+                        .any(|parent| parent.frame() == projection.parent()))
+            {
+                return false;
+            }
+            let own = self
+                .sealed
                 .leaving
                 .child_slots
                 .iter()
                 .filter(|slot| slot.parent() == projection.frame())
-                .count(),
-        );
-        self.retained_payload = Some(destination);
-        self.retained = Some(projection.clone());
+                .collect::<Vec<_>>();
+            if projection.own_slots().len() != own.len()
+                || projection.own_slots().iter().any(|binding| {
+                    own.iter()
+                        .filter(|slot| {
+                            slot.parent() == binding.parent()
+                                && slot.outlet() == binding.outlet()
+                                && slot.slot_id() == binding.slot()
+                        })
+                        .count()
+                        != 1
+                })
+            {
+                return false;
+            }
+        }
+        self.retained.reserve_exact(projections.len());
+        self.retained_payloads.reserve_exact(projections.len());
+        self.retained_output.reserve_exact(projections.len());
+        for projection in projections {
+            self.retained_payloads
+                .push(PreparedInstanceExtraction::reserve(
+                    self.sealed
+                        .leaving
+                        .child_slots
+                        .iter()
+                        .filter(|slot| slot.parent() == projection.frame())
+                        .count(),
+                ));
+            self.retained.push(projection.clone());
+        }
         true
     }
 
@@ -791,10 +893,10 @@ impl PreparedRetainedEntering {
         world: &mut bevy_ecs::world::World,
     ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
         for frame in &mut self.sealed.leaving.frames {
-            if self
+            if !self
                 .retained
-                .as_ref()
-                .is_none_or(|projection| projection.frame() != frame.frame())
+                .iter()
+                .any(|projection| projection.frame() == frame.frame())
             {
                 crate::presentation::native_frame::prepare_content_cleanup(world, frame)?;
             }
@@ -806,25 +908,39 @@ impl PreparedRetainedEntering {
         self.sealed
             .slot_roles
             .retain(|role| role.current() != EntityLifecycle::Retained);
-        self.sealed.reject()
+        let mut rejected = self.sealed.reject();
+        rejected.entering = self.fresh;
+        rejected
     }
 
-    /// The caller consumes the same cache entry it borrowed during preparation.
-    /// All identity checks, reservations and World observations precede Core acceptance.
-    pub(crate) fn finish_retained_entering(
-        self,
-        mut entering: InstancePayload,
-    ) -> SealedReconciliationSplice {
-        entering.apply_activation(self.activation);
-        let entering = self.entering_receiver.finish(entering);
+    pub(crate) fn into_sealed_when_unselected(self) -> Result<SealedReconciliationSplice, Self> {
+        if self.activated.is_empty() {
+            Ok(self.finish(Vec::new()))
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Infallible delivery of the same selected physical owners in target order.
+    pub(crate) fn finish(self, mut selected: Vec<InstancePayload>) -> SealedReconciliationSplice {
+        debug_assert_eq!(selected.len(), self.activations.len());
+        for (payload, activation) in selected.iter_mut().zip(self.activations) {
+            payload.apply_activation(activation);
+        }
+        let mut entering = self.entering_receiver.finish_instances(selected);
+        let mut fresh = self.fresh.into_realized();
+        entering.frames.append(&mut fresh.frames);
+        entering.child_slots.append(&mut fresh.child_slots);
         SealedReconciliationSplice {
             preserved: self.sealed.preserved,
             entering,
             leaving: self.sealed.leaving,
             slot_roles: self.sealed.slot_roles,
             retained: self.retained,
-            retained_payload: self.retained_payload,
-            retained_entering: Some(self.hit),
+            retained_payloads: self.retained_payloads,
+            retained_output: self.retained_output,
+            activated: self.activated,
+            final_slot_order: self.final_slot_order,
         }
     }
 }
@@ -834,8 +950,10 @@ pub(crate) struct ReconciliationSpliceOutcome {
     entering: RealizedBranch,
     leaving: RealizedBranch,
     slot_roles: Vec<SealedReconciliationSlotRole>,
-    retained: Option<RetainedLeafProjection>,
-    retained_payload: Option<PreparedInstanceExtraction>,
+    retained: Vec<RetainedLeafProjection>,
+    retained_payloads: Vec<PreparedInstanceExtraction>,
+    retained_output: Vec<InstancePayload>,
+    final_slot_order: Vec<bevy_ecs::prelude::Entity>,
 }
 
 pub(crate) struct PreparedReconciliationClaimRebind {
@@ -890,44 +1008,50 @@ impl ReconciliationSpliceOutcome {
 
     pub(crate) fn into_active_and_leaving(self) -> (RealizedBranch, RealizedBranch) {
         assert!(
-            self.retained.is_none(),
-            "retained payload must have a linear recipient"
+            self.retained.is_empty(),
+            "retained payloads need their linear recipients"
         );
         let (active, leaving, retained) = self.into_active_leaving_and_retained();
-        debug_assert!(retained.is_none());
+        debug_assert!(retained.is_empty());
         (active, leaving)
     }
 
     pub(crate) fn into_active_leaving_and_retained(
-        self,
-    ) -> (RealizedBranch, RealizedBranch, Option<InstancePayload>) {
-        let mut active = self.preserved;
-        let mut entering = self.entering;
-        active.frames.append(&mut entering.frames);
-        active.child_slots.append(&mut entering.child_slots);
-        sort_child_slots(&mut active);
-        let mut leaving = self.leaving;
-        let retained = self.retained.map(|projection| {
-            let frame_index = leaving
+        mut self,
+    ) -> (RealizedBranch, RealizedBranch, Vec<InstancePayload>) {
+        self.preserved.frames.append(&mut self.entering.frames);
+        self.preserved
+            .child_slots
+            .append(&mut self.entering.child_slots);
+        // The ordering was computed before Ready. Tail performs only swaps.
+        for (index, entity) in self.final_slot_order.into_iter().enumerate() {
+            let position = self
+                .preserved
+                .child_slots
+                .iter()
+                .position(|slot| slot.slot() == entity)
+                .expect("prepared slot remains owned");
+            self.preserved.child_slots.swap(index, position);
+        }
+        for (projection, mut receiver) in self.retained.into_iter().zip(self.retained_payloads) {
+            let index = self
+                .leaving
                 .frames
                 .iter()
                 .position(|frame| frame.frame() == projection.frame())
-                .expect("sealed retained leaf remains in its leaving partition");
-            let frame = leaving.frames.remove(frame_index);
-            let mut retained = self
-                .retained_payload
-                .expect("retention prepared its own-slot receiver");
-            let mut index = 0;
-            while index < leaving.child_slots.len() {
-                if leaving.child_slots[index].parent() == projection.frame() {
-                    retained.receive_slot(leaving.child_slots.remove(index));
+                .expect("retained original instance remains owned");
+            let frame = self.leaving.frames.remove(index);
+            let mut slot_index = 0;
+            while slot_index < self.leaving.child_slots.len() {
+                if self.leaving.child_slots[slot_index].parent() == projection.frame() {
+                    receiver.receive_slot(self.leaving.child_slots.remove(slot_index));
                 } else {
-                    index += 1;
+                    slot_index += 1;
                 }
             }
-            retained.finish(frame)
-        });
-        (active, leaving, retained)
+            self.retained_output.push(receiver.finish(frame));
+        }
+        (self.preserved, self.leaving, self.retained_output)
     }
 }
 
@@ -939,9 +1063,10 @@ pub(crate) struct ReconciliationSpliceView<'a> {
     entering: PayloadRef<'a>,
     leaving: &'a RealizedBranch,
     slot_roles: &'a [SealedReconciliationSlotRole],
-    retained: Option<&'a RetainedLeafProjection>,
-    retained_entering: Option<&'a RetainedLeafProjection>,
-    activation: Option<&'a PreparedRetainedFrameActivation>,
+    retained: &'a [RetainedLeafProjection],
+    activated: &'a [RetainedLeafProjection],
+    inventory: Option<&'a crate::retained::RetainedLeaves>,
+    activations: &'a [PreparedRetainedFrameActivation],
 }
 
 impl<'a> ReconciliationSpliceView<'a> {
@@ -958,123 +1083,126 @@ impl<'a> ReconciliationSpliceView<'a> {
         self.slot_roles
     }
 
+    pub(crate) fn entering_frames(self) -> impl Iterator<Item = &'a RealizedFrame> {
+        self.activated
+            .iter()
+            .filter_map(move |projection| {
+                self.inventory
+                    .and_then(|inventory| inventory.payload_for(projection))
+                    .map(InstancePayload::frame)
+            })
+            .chain(self.entering.frames.iter())
+    }
+    pub(crate) fn entering_child_slots(self) -> impl Iterator<Item = &'a MountedChildSlot> {
+        self.activated
+            .iter()
+            .filter_map(move |projection| {
+                self.inventory
+                    .and_then(|inventory| inventory.payload_for(projection))
+            })
+            .flat_map(InstancePayload::child_slots)
+            .chain(self.entering.child_slots.iter())
+    }
+    pub(crate) fn retained(self) -> &'a [RetainedLeafProjection] {
+        self.retained
+    }
+
     pub(crate) fn validate_entering(
         &self,
         world: &bevy_ecs::world::World,
     ) -> Result<(), crate::frame_local::FrameLocalError> {
-        if let Some(hit) = self.retained_entering {
-            crate::instance::validate_retained_entering_payload(world, self.entering, hit)?;
-            let frame = &self.entering.frames[0];
-            let mut slots = self.preserved.child_slots.iter().filter(|slot| {
-                slot.parent() == hit.parent()
-                    && slot.outlet() == hit.outlet()
-                    && slot.slot_id() == hit.slot()
-            });
-            let slot = slots
-                .next()
-                .ok_or(crate::frame_local::FrameLocalError::OwnershipDrift(
-                    frame.shell(),
-                ))?;
-            if slots.next().is_some() {
-                return Err(crate::frame_local::FrameLocalError::OwnershipDrift(
-                    slot.slot(),
-                ));
+        let leaving_shells = self
+            .leaving
+            .frames
+            .iter()
+            .flat_map(RealizedFrame::claims)
+            .filter(|claim| {
+                matches!(
+                    claim.owner(),
+                    RegistryOwner::Committed(EntityOwner::FrameShell(_))
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, projection) in self.activated.iter().enumerate() {
+            let payload = self
+                .inventory
+                .and_then(|inventory| inventory.payload_for(projection));
+            if let Some(payload) = payload {
+                crate::instance::validate_retained_entering_payload_with_fresh(
+                    world,
+                    payload.as_payload_ref(),
+                    projection,
+                    self.entering,
+                )?;
+                let mut slots = self
+                    .preserved
+                    .child_slots
+                    .iter()
+                    .chain(self.entering_child_slots())
+                    .filter(|slot| {
+                        slot.parent() == projection.parent()
+                            && slot.outlet() == projection.outlet()
+                            && slot.slot_id() == projection.slot()
+                    });
+                let slot =
+                    slots
+                        .next()
+                        .ok_or(crate::frame_local::FrameLocalError::OwnershipDrift(
+                            payload.frame().shell(),
+                        ))?;
+                let observed = payload.frame().prepare_retained_activation(
+                    world,
+                    projection,
+                    slot,
+                    &leaving_shells,
+                );
+                if slots.next().is_some() || observed.as_ref() != self.activations.get(index) {
+                    return Err(crate::frame_local::FrameLocalError::OwnershipDrift(
+                        payload.frame().shell(),
+                    ));
+                }
             }
-            let leaving_shells = self
-                .leaving
-                .frames
-                .iter()
-                .flat_map(RealizedFrame::claims)
-                .filter(|claim| {
-                    matches!(
-                        claim.owner(),
-                        RegistryOwner::Committed(EntityOwner::FrameShell(_))
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let observed = frame
-                .prepare_retained_activation(world, hit, slot, &leaving_shells)
-                .ok_or(crate::frame_local::FrameLocalError::OwnershipDrift(
-                    frame.shell(),
-                ))?;
-            let current = self.activation.map_or_else(
-                || observed.matches_frame(frame),
-                |expected| expected == &observed,
-            );
-            if current {
-                Ok(())
-            } else {
-                Err(crate::frame_local::FrameLocalError::OwnershipDrift(
-                    frame.shell(),
-                ))
-            }
-        } else {
-            crate::frame_local::validate_reconciliation_entering_branch(
-                world,
-                self.entering,
-                self.preserved,
-                self.leaving,
-            )
         }
+        crate::frame_local::validate_mixed_fresh_entering(
+            world,
+            self.entering,
+            self.preserved,
+            self.leaving,
+            &self.entering_child_slots().collect::<Vec<_>>(),
+        )
     }
 
     pub(crate) fn validate_active_for_splice(
         &self,
         world: &bevy_ecs::world::World,
     ) -> Result<Vec<bevy_ecs::prelude::Entity>, crate::frame_local::FrameLocalError> {
-        if self.retained_entering.is_some() {
-            let boundaries = self
-                .entering
-                .claims()
-                .map(ExactRegistryClaim::entity)
-                .collect::<Vec<_>>();
-            crate::frame_local::validate_preserved_branch_local(
-                world,
-                self.preserved,
-                self.slot_roles,
-                &boundaries,
-            )
-        } else {
-            crate::frame_local::validate_active_branch_for_splice(
-                world,
-                self.preserved,
-                self.entering,
-                self.slot_roles,
-            )
-        }
+        let boundaries = self
+            .entering_frames()
+            .flat_map(RealizedFrame::claims)
+            .map(ExactRegistryClaim::entity)
+            .chain(self.entering_child_slots().map(MountedChildSlot::slot))
+            .collect::<Vec<_>>();
+        crate::frame_local::validate_preserved_branch_local(
+            world,
+            self.preserved,
+            self.slot_roles,
+            &boundaries,
+        )
     }
 
-    fn leaf_retention_is_exact(&self, frame: &RouteFrameVersion) -> bool {
-        let Some(candidate) = self
+    fn instance_retention_is_exact(&self, frame: &RouteFrameVersion) -> bool {
+        let mut candidates = self
             .leaving
             .frames
             .iter()
-            .find(|candidate| candidate.frame() == frame)
-        else {
+            .filter(|candidate| candidate.frame() == frame);
+        let Some(candidate) = candidates.next() else {
             return false;
         };
-        candidate.mount_binding().is_child_outlet()
+        candidates.next().is_none()
+            && candidate.mount_binding().is_child_outlet()
             && matches!(frame.origin(), FrameOrigin::MatchedRoute(_))
-            && self
-                .leaving
-                .frames
-                .iter()
-                .filter(|candidate| candidate.frame() == frame)
-                .count()
-                == 1
-            && !self
-                .leaving
-                .frames
-                .iter()
-                .chain(&self.preserved.frames)
-                .chain(self.entering.frames)
-                .any(|child| {
-                    self.leaving.child_slots.iter().any(|slot| {
-                        slot.parent() == frame
-                            && child.mount_binding().matches_mounted_child_slot(slot)
-                    })
-                })
             && candidate
                 .claims()
                 .all(|claim| claim.lifecycle() == EntityLifecycle::Active)
@@ -1086,57 +1214,57 @@ impl<'a> ReconciliationSpliceView<'a> {
                 .all(|slot| {
                     matches!(
                         slot.slot_claim().lifecycle(),
-                        EntityLifecycle::PreparedInert | EntityLifecycle::Active
+                        EntityLifecycle::Active | EntityLifecycle::PreparedInert
                     )
                 })
     }
 
-    pub(crate) fn retained_frame(&self) -> Option<&'a RouteFrameVersion> {
-        self.retained.map(RetainedLeafProjection::frame)
-    }
-
     pub(crate) fn disposable_frames(self) -> impl Iterator<Item = &'a RealizedFrame> {
-        let retained = self.retained_frame();
-        self.leaving
-            .frames
-            .iter()
-            .filter(move |frame| retained != Some(frame.frame()))
+        self.leaving.frames.iter().filter(move |frame| {
+            !self
+                .retained
+                .iter()
+                .any(|projection| projection.frame() == frame.frame())
+        })
     }
-
     pub(crate) fn disposable_child_slots(self) -> impl Iterator<Item = &'a MountedChildSlot> {
-        let retained = self.retained_frame();
-        self.leaving
-            .child_slots
-            .iter()
-            .filter(move |slot| retained != Some(slot.parent()))
+        self.leaving.child_slots.iter().filter(move |slot| {
+            !self
+                .retained
+                .iter()
+                .any(|projection| projection.frame() == slot.parent())
+        })
     }
-
-    pub(crate) fn prepare_retained_boundary(
+    pub(crate) fn prepare_retained_boundaries(
         &self,
         claims: &[ExactRegistryClaim],
-    ) -> Option<crate::presentation::RetainedBoundaryProof> {
-        let projection = self.retained.as_ref()?;
-        let frame = self
-            .leaving
-            .frames
+    ) -> Option<Vec<crate::presentation::RetainedBoundaryProof>> {
+        self.retained
             .iter()
-            .find(|frame| frame.frame() == projection.frame())?;
-        crate::presentation::RetainedBoundaryProof::prepare(
-            projection,
-            frame,
-            self.leaving
-                .child_slots
-                .iter()
-                .filter(|slot| slot.parent() == projection.frame()),
-            claims,
-        )
+            .map(|projection| {
+                let frame = self
+                    .leaving
+                    .frames
+                    .iter()
+                    .find(|frame| frame.frame() == projection.frame())?;
+                crate::presentation::RetainedBoundaryProof::prepare(
+                    projection,
+                    frame,
+                    self.leaving
+                        .child_slots
+                        .iter()
+                        .filter(|slot| slot.parent() == projection.frame()),
+                    claims,
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn lifecycle_transitions(&self) -> Vec<(ExactRegistryClaim, EntityLifecycle)> {
         let mut transitions = self
             .leaving
             .lifecycle_transitions(EntityLifecycle::Leaving, true);
-        if let Some(frame) = self.retained_frame() {
+        for frame in self.retained.iter().map(RetainedLeafProjection::frame) {
             for (claim, next) in &mut transitions {
                 if matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameShell(owner) | EntityOwner::FrameContentTarget(owner)) if owner == frame)
                     || matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameOutput { frame: owner, .. } | EntityOwner::ChildSlot { parent: owner, .. }) if owner == frame)
@@ -1155,25 +1283,19 @@ impl<'a> ReconciliationSpliceView<'a> {
             .flatten()
             .map(|next| (role.claim().clone(), next))
         }));
-        let mount_new_entities = self
-            .slot_roles
-            .iter()
-            .filter(|role| role.kind() == ReconciliationSlotRoleKind::MountNew)
-            .map(SealedReconciliationSlotRole::entity)
-            .collect::<Vec<_>>();
         transitions.extend(
-            self.entering
-                .lifecycle_transitions(EntityLifecycle::Active, false)
-                .into_iter()
-                .filter(|(claim, _)| {
-                    !mount_new_entities.contains(&claim.entity())
-                        && !(self.retained_entering.is_some()
-                            && self
-                                .entering
-                                .child_slots
-                                .iter()
-                                .any(|slot| slot.slot() == claim.entity()))
-                }),
+            self.entering_frames()
+                .flat_map(|frame| frame.lifecycle_transitions(EntityLifecycle::Active)),
+        );
+        transitions.extend(
+            self.entering_child_slots()
+                .filter(|slot| {
+                    !self
+                        .slot_roles
+                        .iter()
+                        .any(|role| role.entity() == slot.slot())
+                })
+                .map(|slot| (slot.slot_claim().clone(), EntityLifecycle::Active)),
         );
         transitions.extend(self.slot_roles.iter().filter_map(|role| {
             (role.kind() == ReconciliationSlotRoleKind::MountNew)
@@ -1187,11 +1309,14 @@ impl<'a> ReconciliationSpliceView<'a> {
     pub(crate) fn presentation_mutation_targets(&self) -> (Vec<FrameMutationTarget>, usize) {
         let mut targets = Vec::new();
         for frame_index in (0..self.leaving.frames.len()).rev() {
-            let next = if self.retained_frame() == Some(self.leaving.frames[frame_index].frame()) {
-                EntityLifecycle::Retained
-            } else {
-                EntityLifecycle::Leaving
-            };
+            let next =
+                if self.retained.iter().any(|projection| {
+                    projection.frame() == self.leaving.frames[frame_index].frame()
+                }) {
+                    EntityLifecycle::Retained
+                } else {
+                    EntityLifecycle::Leaving
+                };
             targets.extend(
                 self.leaving
                     .child_slots
@@ -1216,7 +1341,7 @@ impl<'a> ReconciliationSpliceView<'a> {
                 self.preserved
                     .child_slots
                     .iter()
-                    .chain(self.entering.child_slots)
+                    .chain(self.entering_child_slots())
                     .find(|slot| slot.slot() == role.entity())
                     .expect("sealed retained-empty role retains its exact slot owner"),
                 role.current(),
@@ -1234,6 +1359,7 @@ impl<'a> ReconciliationSpliceView<'a> {
                 self.preserved
                     .child_slots
                     .iter()
+                    .chain(self.entering_child_slots())
                     .find(|slot| slot.slot() == role.entity())
                     .expect("sealed activate-existing role retains its exact slot owner"),
                 role.current(),
@@ -1241,43 +1367,41 @@ impl<'a> ReconciliationSpliceView<'a> {
                 true,
             ))
         }));
-        let mount_new_entities = self
-            .slot_roles
-            .iter()
-            .filter(|role| role.kind() == ReconciliationSlotRoleKind::MountNew)
-            .map(SealedReconciliationSlotRole::entity)
-            .collect::<Vec<_>>();
-        if self.retained_entering.is_some() {
-            for frame in self.entering.frames {
-                targets.extend(frame.mutation_targets(
-                    EntityLifecycle::Retained,
+        for frame in self.entering_frames() {
+            let current = if self
+                .activated
+                .iter()
+                .any(|projection| projection.frame() == frame.frame())
+            {
+                EntityLifecycle::Retained
+            } else {
+                EntityLifecycle::PreparedInert
+            };
+            targets.extend(frame.mutation_targets(current, EntityLifecycle::Active, true));
+        }
+        for slot in self.entering_child_slots() {
+            if let Some(role) = self
+                .slot_roles
+                .iter()
+                .find(|role| role.entity() == slot.slot())
+            {
+                if role.kind() == ReconciliationSlotRoleKind::MountNew {
+                    targets.push(child_slot_mutation_target(
+                        slot,
+                        role.current(),
+                        role.next().expect("mount role has next"),
+                        true,
+                    ));
+                }
+            } else {
+                targets.push(child_slot_mutation_target(
+                    slot,
+                    slot.slot_claim().lifecycle(),
                     EntityLifecycle::Active,
                     true,
                 ));
             }
-        } else {
-            targets.extend(self.entering.entering_mutation_targets_excluding_slots(
-                EntityLifecycle::PreparedInert,
-                EntityLifecycle::Active,
-                &mount_new_entities,
-            ));
         }
-        targets.extend(self.slot_roles.iter().filter_map(|role| {
-            if role.kind() != ReconciliationSlotRoleKind::MountNew {
-                return None;
-            }
-            let slot = self
-                .entering
-                .child_slots
-                .iter()
-                .find(|slot| role.matches_mount_new_slot(slot))?;
-            Some(child_slot_mutation_target(
-                slot,
-                role.current(),
-                role.next()?,
-                true,
-            ))
-        }));
         (targets, isolate_count)
     }
 
@@ -1300,17 +1424,21 @@ impl<'a> ReconciliationSpliceView<'a> {
         self.preserved
             .frames()
             .iter()
-            .chain(self.entering.frames())
+            .chain(self.entering_frames())
             .flat_map(|frame| frame.content_input_facts(world, next).1)
             .collect()
     }
 
     pub(crate) fn prepare_root_rebase(&self) -> Option<PreparedRootRebase> {
-        if self.retained_entering.is_some() {
+        if !self.activated.is_empty() {
             None
         } else {
             self.entering.prepare_root_rebase(&self.leaving)
         }
+    }
+
+    pub(crate) fn requires_root_cleanup_rebase(&self) -> bool {
+        self.activated.is_empty() && self.entering.first_frame().is_some()
     }
 
     pub(crate) fn prepare_root_cleanup_rebase(
@@ -1318,6 +1446,9 @@ impl<'a> ReconciliationSpliceView<'a> {
         world: &bevy_ecs::world::World,
         cleanup: &crate::cleanup::FrozenCleanupManifest,
     ) -> Option<PreparedRootRebase> {
+        if !self.requires_root_cleanup_rebase() {
+            return None;
+        }
         Some(PreparedRootRebase {
             frame: cleanup.prepare_successor_mount_rebase(world, self.entering.first_frame()?)?,
         })
@@ -1349,14 +1480,18 @@ impl<'a> ReconciliationSpliceView<'a> {
             .preserved
             .frames
             .iter()
-            .chain(self.entering.frames)
+            .chain(self.entering_frames())
             .chain(&self.leaving.frames)
             .all(|frame| {
                 let mount = if self
-                    .retained_entering
-                    .is_some_and(|hit| hit.frame() == frame.frame())
+                    .activated
+                    .iter()
+                    .any(|hit| hit.frame() == frame.frame())
                 {
-                    self.activation
+                    self.activated
+                        .iter()
+                        .position(|projection| projection.frame() == frame.frame())
+                        .and_then(|index| self.activations.get(index))
                         .map(PreparedRetainedFrameActivation::mount)
                         .unwrap_or_else(|| frame.mount_binding())
                 } else {
@@ -1371,7 +1506,7 @@ impl<'a> ReconciliationSpliceView<'a> {
                 .preserved
                 .child_slots
                 .iter()
-                .chain(self.entering.child_slots)
+                .chain(self.entering_child_slots())
                 .chain(&self.leaving.child_slots)
                 .all(|slot| slot_aliases_match_transitions(slot, &transitions));
         if !aliases_are_exact {
@@ -1379,7 +1514,21 @@ impl<'a> ReconciliationSpliceView<'a> {
         }
         Some(PreparedReconciliationClaimRebind {
             preserved_frames: prepared_frame_claims(self.preserved, claims),
-            entering_frames: prepared_frame_claims(self.entering, claims),
+            entering_frames: self
+                .entering_frames()
+                .map(|frame| {
+                    frame
+                        .claims()
+                        .map(|current| {
+                            claims
+                                .iter()
+                                .find(|claim| claim.entity() == current.entity())
+                                .unwrap_or(current)
+                                .clone()
+                        })
+                        .collect()
+                })
+                .collect(),
             leaving_frames: prepared_frame_claims(self.leaving, claims),
             all_claims: claims.to_vec(),
         })
@@ -1393,48 +1542,11 @@ impl SealedReconciliationSplice {
             entering: self.entering.as_payload_ref(),
             leaving: &self.leaving,
             slot_roles: &self.slot_roles,
-            retained: self.retained.as_ref(),
-            retained_entering: self.retained_entering.as_ref(),
-            activation: None,
+            retained: &self.retained,
+            activated: &self.activated,
+            inventory: None,
+            activations: &[],
         }
-    }
-
-    fn leaf_retention_is_exact(&self, frame: &RouteFrameVersion) -> bool {
-        self.view().leaf_retention_is_exact(frame)
-    }
-
-    pub(crate) fn retain_leaf(&mut self, projection: &RetainedLeafProjection) -> bool {
-        if self.retained.is_some()
-            || !self.leaf_retention_is_exact(projection.frame())
-            || self
-                .preserved
-                .frames
-                .iter()
-                .filter(|frame| frame.frame() == projection.parent())
-                .count()
-                != 1
-        {
-            return false;
-        }
-        let frame = self
-            .leaving
-            .frames
-            .iter()
-            .find(|frame| frame.frame() == projection.frame())
-            .expect("exact leaf checked");
-        if !frame.mount_binding().matches_retained_scope(projection) {
-            return false;
-        }
-        let destination = PreparedInstanceExtraction::reserve(
-            self.leaving
-                .child_slots
-                .iter()
-                .filter(|slot| slot.parent() == projection.frame())
-                .count(),
-        );
-        self.retained_payload = Some(destination);
-        self.retained = Some(projection.clone());
-        true
     }
 
     #[cfg(feature = "bsn")]
@@ -1443,10 +1555,10 @@ impl SealedReconciliationSplice {
         world: &mut bevy_ecs::world::World,
     ) -> Result<(), crate::presentation::native_frame::NativeCleanupPreparationError> {
         for frame in &mut self.leaving.frames {
-            if self
+            if !self
                 .retained
-                .as_ref()
-                .is_none_or(|projection| projection.frame() != frame.frame())
+                .iter()
+                .any(|projection| projection.frame() == frame.frame())
             {
                 crate::presentation::native_frame::prepare_content_cleanup(world, frame)?;
             }
@@ -1713,7 +1825,9 @@ impl SealedReconciliationSplice {
             leaving: self.leaving,
             slot_roles: self.slot_roles,
             retained: self.retained,
-            retained_payload: self.retained_payload,
+            retained_payloads: self.retained_payloads,
+            retained_output: self.retained_output,
+            final_slot_order: self.final_slot_order,
         }
     }
 
@@ -1822,57 +1936,29 @@ impl SealedExistingReconciliation {
         )
     }
 
-    pub(crate) fn prepare_retained_from_projection(
-        branch: RealizedBranch,
-        mut projection: ReconciliationProjectionFacts,
-        hit: &RetainedLeafProjection,
-    ) -> Result<Self, ReconciliationPreparationFailure> {
-        let expected = hit.empty_child_slots().collect::<Vec<_>>();
-        let observed = projection
-            .existing
-            .child_slots
-            .iter()
-            .filter(|slot| &slot.parent == hit.frame())
-            .collect::<Vec<_>>();
-        if observed.len() != expected.len()
-            || expected.iter().any(|binding| {
-                observed
-                    .iter()
-                    .filter(|slot| {
-                        slot.parent == *binding.parent()
-                            && slot.parent_branch_index == binding.parent_branch_index()
-                            && slot.outlet == *binding.outlet()
-                            && slot.slot == binding.slot()
-                            && slot.child.is_none()
-                            && binding.child().is_none()
-                            && slot.role == ReconciliationSlotRoleKind::RetainEmpty
-                    })
-                    .count()
-                    != 1
-            })
-        {
-            return Err(ReconciliationPreparationFailure {
-                branch,
-                error: ReconciliationSpliceError::InvalidSlotPartition,
-            });
-        }
-        projection
-            .existing
-            .child_slots
-            .retain(|slot| &slot.parent != hit.frame());
-        Self::prepare_from_projection(branch, projection)
-    }
-
     pub(crate) fn prepare_from_projection(
         branch: RealizedBranch,
-        projection: ReconciliationProjectionFacts,
+        mut projection: ReconciliationProjectionFacts,
     ) -> Result<Self, ReconciliationPreparationFailure> {
+        // Target roles of stock parents are not owners in the original current.
+        // Exact parent identity preserves a leaving Q at the same target index.
+        projection.existing.child_slots.retain(|slot| {
+            !projection
+                .selected
+                .iter()
+                .any(|selected| selected.frame() == &slot.parent)
+        });
+        let selected = projection.selected;
         Self::prepare_with_entering(
             branch,
             projection.authority,
             projection.existing,
             projection.entering,
         )
+        .map(|mut sealed| {
+            sealed.selected = selected;
+            sealed
+        })
     }
 
     fn prepare_with_entering(
@@ -1915,6 +2001,7 @@ impl SealedExistingReconciliation {
             leaving,
             slot_roles,
             entering,
+            selected: Vec::new(),
         })
     }
 
@@ -1930,135 +2017,45 @@ impl SealedExistingReconciliation {
         &self.slot_roles
     }
 
-    pub(crate) fn prepare_retained_entering(
+    pub(crate) fn prepare_mixed_entering(
         mut self,
         world: &bevy_ecs::world::World,
-        entering: &InstancePayload,
-        hit: &RetainedLeafProjection,
-    ) -> Result<PreparedRetainedEntering, (Self, ReconciliationSpliceError)> {
-        let preparation = (|| {
-            let frame = entering.frame();
-            let [projected] = self.entering.frames.as_slice() else {
-                return Err(ReconciliationSpliceError::InvalidEnteringBranch);
-            };
-            if !self.entering.mount_new_slots.is_empty()
-                || projected.branch_index != self.preserved.frames.len()
-                || self
-                    .preserved
-                    .frames
-                    .last()
-                    .is_none_or(|parent| parent.frame() != hit.parent())
-                || !self.authority.matches(hit.frame())
-                || frame.frame() != hit.frame()
-                || projected.frame != hit.frame().frame()
-                || projected.generation != hit.frame().generation()
-                || projected.origin != *hit.frame().origin()
-                || projected.slot != ReconciliationEnteringSlot::Existing(hit.slot())
-            {
-                return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+        fresh: PreparedBranch,
+        selected: &[(&RetainedLeafProjection, &InstancePayload)],
+    ) -> Result<PreparedMixedEntering, ReconciliationEnteringFailure> {
+        let preparation = prepare_mixed_target(&self, world, fresh.as_realized(), selected);
+        let (roles, activations, final_slot_order) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(ReconciliationEnteringFailure {
+                    sealed: self,
+                    entering: fresh,
+                    error,
+                });
             }
-            validate_realized_branch(entering.as_payload_ref())?;
-            validate_reconciliation_closure_authorities(
-                &self.preserved,
-                entering.as_payload_ref(),
-                &self.leaving,
-            )?;
-            crate::instance::validate_retained_entering_payload(
-                world,
-                entering.as_payload_ref(),
-                hit,
-            )
-            .map_err(|_| ReconciliationSpliceError::InvalidEnteringBranch)?;
-            let mut slots = self.preserved.child_slots.iter().filter(|slot| {
-                slot.parent() == hit.parent()
-                    && slot.outlet() == hit.outlet()
-                    && slot.slot_id() == hit.slot()
-            });
-            let slot = slots
-                .next()
-                .ok_or(ReconciliationSpliceError::InvalidEnteringBranch)?;
-            if slots.next().is_some()
-                || self
-                    .slot_roles
-                    .iter()
-                    .filter(|role| {
-                        role.entity() == slot.slot()
-                            && role.entering_use == ReconciliationSlotEnteringUse::Required
-                            && matches!(
-                                role.kind(),
-                                ReconciliationSlotRoleKind::PreservedActive
-                                    | ReconciliationSlotRoleKind::ActivateExisting
-                            )
-                    })
-                    .count()
-                    != 1
-            {
-                return Err(ReconciliationSpliceError::InvalidEnteringBranch);
-            }
-            let expected = hit.empty_child_slots().collect::<Vec<_>>();
-            if expected.len() != entering.child_slots().len()
-                || expected.iter().any(|binding| {
-                    binding.parent() != hit.frame()
-                        || binding.child().is_some()
-                        || binding.parent_branch_index() != projected.branch_index
-                        || entering
-                            .child_slots()
-                            .iter()
-                            .filter(|slot| {
-                                slot.parent() == binding.parent()
-                                    && slot.outlet() == binding.outlet()
-                                    && slot.slot_id() == binding.slot()
-                                    && slot.slot_claim().lifecycle() == EntityLifecycle::Retained
-                            })
-                            .count()
-                            != 1
-                })
-            {
-                return Err(ReconciliationSpliceError::InvalidSlotPartition);
-            }
-            let leaving_shells = self
-                .leaving
-                .frames
-                .iter()
-                .flat_map(RealizedFrame::claims)
-                .filter(|claim| {
-                    matches!(
-                        claim.owner(),
-                        RegistryOwner::Committed(EntityOwner::FrameShell(_))
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let activation = frame
-                .prepare_retained_activation(world, hit, slot, &leaving_shells)
-                .ok_or(ReconciliationSpliceError::InvalidEnteringBranch)?;
-            Ok(activation)
-        })();
-        let activation = match preparation {
-            Ok(activation) => activation,
-            Err(error) => return Err((self, error)),
         };
-        let entering_receiver = PreparedInstanceBranch::reserve();
-        self.slot_roles.reserve(entering.child_slots().len());
-        self.preserved.frames.reserve(entering.frames().len());
-        self.preserved
-            .child_slots
-            .reserve(entering.child_slots().len());
-        self.slot_roles
-            .extend(entering.child_slots().iter().map(|slot| {
-                sealed_slot_role(
-                    slot,
-                    ReconciliationSlotRoleKind::RetainEmpty,
-                    ReconciliationSlotEnteringUse::Forbidden,
-                )
-            }));
-        Ok(PreparedRetainedEntering {
+        self.slot_roles.extend(roles);
+        let slot_count = selected
+            .iter()
+            .map(|(_, payload)| payload.child_slots().len())
+            .sum::<usize>()
+            + fresh.child_slots().len();
+        let frame_count = selected.len() + fresh.frames().len();
+        self.preserved.frames.reserve_exact(frame_count);
+        self.preserved.child_slots.reserve_exact(slot_count);
+        Ok(PreparedMixedEntering {
             sealed: self,
-            hit: hit.clone(),
-            activation,
-            entering_receiver,
-            retained: None,
-            retained_payload: None,
+            fresh,
+            activated: selected
+                .iter()
+                .map(|(projection, _)| (*projection).clone())
+                .collect(),
+            activations,
+            entering_receiver: PreparedInstanceBranch::reserve_for(frame_count, slot_count),
+            retained: Vec::new(),
+            retained_payloads: Vec::new(),
+            retained_output: Vec::new(),
+            final_slot_order,
         })
     }
 
@@ -2089,14 +2086,45 @@ impl SealedExistingReconciliation {
             });
         }
         self.slot_roles.extend(mount_new_roles);
+        self.preserved.frames.reserve_exact(entering.frames().len());
+        self.preserved
+            .child_slots
+            .reserve_exact(entering.child_slots().len());
+        let final_frames = self
+            .preserved
+            .frames
+            .iter()
+            .chain(entering.frames().iter())
+            .map(|frame| frame.frame())
+            .collect::<Vec<_>>();
+        let mut ordered_slots = self
+            .preserved
+            .child_slots
+            .iter()
+            .chain(entering.child_slots().iter())
+            .collect::<Vec<_>>();
+        ordered_slots.sort_by(|left, right| {
+            final_frames
+                .iter()
+                .position(|frame| *frame == left.parent())
+                .cmp(
+                    &final_frames
+                        .iter()
+                        .position(|frame| *frame == right.parent()),
+                )
+                .then_with(|| left.outlet().cmp(right.outlet()))
+        });
+        let final_slot_order = ordered_slots.iter().map(|slot| slot.slot()).collect();
         Ok(SealedReconciliationSplice {
             preserved: self.preserved,
             entering: entering.into_realized(),
             leaving: self.leaving,
             slot_roles: self.slot_roles,
-            retained: None,
-            retained_payload: None,
-            retained_entering: None,
+            retained: Vec::new(),
+            retained_payloads: Vec::new(),
+            retained_output: Vec::new(),
+            activated: Vec::new(),
+            final_slot_order,
         })
     }
 
@@ -2107,6 +2135,289 @@ impl SealedExistingReconciliation {
             slot_roles: self.slot_roles,
         }
     }
+}
+
+fn prepare_mixed_target(
+    sealed: &SealedExistingReconciliation,
+    world: &bevy_ecs::world::World,
+    fresh: &RealizedBranch,
+    selected: &[(&RetainedLeafProjection, &InstancePayload)],
+) -> Result<
+    (
+        Vec<SealedReconciliationSlotRole>,
+        Vec<PreparedRetainedFrameActivation>,
+        Vec<bevy_ecs::prelude::Entity>,
+    ),
+    ReconciliationSpliceError,
+> {
+    let entering_frames = selected
+        .iter()
+        .map(|(_, payload)| payload.frame())
+        .chain(fresh.frames.iter())
+        .collect::<Vec<_>>();
+    let entering_slots = selected
+        .iter()
+        .flat_map(|(_, payload)| payload.child_slots())
+        .chain(fresh.child_slots.iter())
+        .collect::<Vec<_>>();
+    let target_frames = sealed
+        .preserved
+        .frames
+        .iter()
+        .chain(entering_frames.iter().copied())
+        .collect::<Vec<_>>();
+    let target_slots = sealed
+        .preserved
+        .child_slots
+        .iter()
+        .chain(entering_slots.iter().copied())
+        .collect::<Vec<_>>();
+    if sealed.selected.len() != selected.len()
+        || sealed
+            .selected
+            .iter()
+            .zip(selected)
+            .any(|(expected, (actual, _))| expected != *actual)
+        || entering_frames.len() != sealed.entering.frames.len()
+        || selected
+            .iter()
+            .enumerate()
+            .any(|(index, (projection, payload))| {
+                payload.frame().frame() != projection.frame()
+                    || selected[..index]
+                        .iter()
+                        .any(|(prior, _)| prior.frame() == projection.frame())
+            })
+    {
+        return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+    }
+    let all_claims = target_frames
+        .iter()
+        .copied()
+        .chain(sealed.leaving.frames.iter())
+        .flat_map(RealizedFrame::claims)
+        .chain(
+            target_slots
+                .iter()
+                .copied()
+                .chain(sealed.leaving.child_slots.iter())
+                .map(MountedChildSlot::slot_claim),
+        )
+        .collect::<Vec<_>>();
+    validate_unique_authorities(&all_claims)?;
+    for (index, slot) in target_slots.iter().enumerate() {
+        if target_slots[index + 1..].iter().any(|other| {
+            other.slot_id() == slot.slot_id()
+                || (other.parent() == slot.parent() && other.outlet() == slot.outlet())
+        }) {
+            return Err(ReconciliationSpliceError::DuplicateAuthority);
+        }
+        let mut parents = target_frames
+            .iter()
+            .filter(|frame| frame.frame() == slot.parent());
+        let Some(parent) = parents.next() else {
+            return Err(ReconciliationSpliceError::InvalidSlotPartition);
+        };
+        if parents.next().is_some()
+            || !parent.outlet(slot.outlet()).is_some_and(|outlet| {
+                outlet.anchor() == slot.anchor()
+                    && outlet.anchor_claim() == slot.anchor_claim()
+                    && parent.claims().any(|claim| claim == slot.anchor_claim())
+            })
+        {
+            return Err(ReconciliationSpliceError::InvalidSlotPartition);
+        }
+    }
+    let leaving_shells = sealed
+        .leaving
+        .frames
+        .iter()
+        .flat_map(RealizedFrame::claims)
+        .filter(|claim| {
+            matches!(
+                claim.owner(),
+                RegistryOwner::Committed(EntityOwner::FrameShell(_))
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut activations = Vec::with_capacity(selected.len());
+    let mut roles = Vec::with_capacity(entering_slots.len());
+    for (index, (projection, payload)) in selected.iter().enumerate() {
+        crate::instance::validate_retained_entering_payload_with_fresh(
+            world,
+            payload.as_payload_ref(),
+            projection,
+            fresh.as_payload_ref(),
+        )
+        .map_err(|_| ReconciliationSpliceError::InvalidEnteringBranch)?;
+        if projection.own_slots().len() != payload.child_slots().len()
+            || projection.own_slots().iter().any(|binding| {
+                payload
+                    .child_slots()
+                    .iter()
+                    .filter(|slot| {
+                        slot.parent() == binding.parent()
+                            && slot.outlet() == binding.outlet()
+                            && slot.slot_id() == binding.slot()
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            return Err(ReconciliationSpliceError::InvalidSlotPartition);
+        }
+        let projected = &sealed.entering.frames[index];
+        if projected.slot != ReconciliationEnteringSlot::Existing(projection.slot()) {
+            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+        }
+        let slot = target_slots
+            .iter()
+            .find(|slot| {
+                slot.parent() == projection.parent()
+                    && slot.outlet() == projection.outlet()
+                    && slot.slot_id() == projection.slot()
+            })
+            .ok_or(ReconciliationSpliceError::InvalidEnteringBranch)?;
+        activations.push(
+            payload
+                .frame()
+                .prepare_retained_activation(world, projection, slot, &leaving_shells)
+                .ok_or(ReconciliationSpliceError::InvalidEnteringBranch)?,
+        );
+        for slot in payload.child_slots() {
+            let occupied = entering_frames.iter().any(|child| {
+                child
+                    .mount_binding()
+                    .matches_mounted_child_slot_identity(slot)
+            });
+            let mut role = sealed_slot_role(
+                slot,
+                ReconciliationSlotRoleKind::RetainEmpty,
+                if occupied {
+                    ReconciliationSlotEnteringUse::Required
+                } else {
+                    ReconciliationSlotEnteringUse::Forbidden
+                },
+            );
+            role.kind = if occupied {
+                ReconciliationSlotRoleKind::ActivateExisting
+            } else {
+                ReconciliationSlotRoleKind::RetainEmpty
+            };
+            // This role belongs to a selected retained parent, proven above.
+            // Its own slot becomes active/empty independently of child inventory.
+            role.next = Some(if occupied {
+                EntityLifecycle::Active
+            } else {
+                EntityLifecycle::PreparedInert
+            });
+            roles.push(role);
+        }
+    }
+    let mut used_new = Vec::new();
+    for (offset, (frame, projection)) in entering_frames
+        .iter()
+        .zip(&sealed.entering.frames)
+        .enumerate()
+    {
+        if projection.branch_index != sealed.preserved.frames.len() + offset
+            || !sealed.authority.matches(frame.frame())
+            || frame.frame().frame() != projection.frame
+            || frame.frame().generation() != projection.generation
+            || frame.frame().origin() != &projection.origin
+            || matches!(projection.slot, ReconciliationEnteringSlot::Existing(slot) if slot != frame.frame().slot())
+        {
+            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+        }
+        if projection.branch_index == 0 {
+            if frame.frame().slot() != sealed.authority.top_slot {
+                return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+            }
+            continue;
+        }
+        let parent = target_frames[projection.branch_index - 1];
+        let matches = target_slots
+            .iter()
+            .filter(|slot| {
+                slot.parent() == parent.frame()
+                    && frame
+                        .mount_binding()
+                        .matches_mounted_child_slot_identity(slot)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+        }
+        let slot = matches[0];
+        if let Some(role) = sealed
+            .slot_roles
+            .iter()
+            .chain(roles.iter())
+            .find(|role| role.entity() == slot.slot())
+        {
+            if role.entering_use != ReconciliationSlotEnteringUse::Required {
+                return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+            }
+        } else {
+            let specs = sealed
+                .entering
+                .mount_new_slots
+                .iter()
+                .enumerate()
+                .filter(|(_, spec)| {
+                    spec.parent_branch_index == projection.branch_index - 1
+                        && &spec.outlet == slot.outlet()
+                })
+                .collect::<Vec<_>>();
+            if specs.len() != 1
+                || used_new.contains(&specs[0].0)
+                || slot.slot_claim().lifecycle() != EntityLifecycle::PreparedInert
+            {
+                return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+            }
+            used_new.push(specs[0].0);
+            roles.push(sealed_slot_role(
+                slot,
+                ReconciliationSlotRoleKind::MountNew,
+                ReconciliationSlotEnteringUse::Required,
+            ));
+        }
+    }
+    if used_new.len() != sealed.entering.mount_new_slots.len()
+        || sealed.slot_roles.iter().chain(roles.iter()).any(|role| {
+            let used = entering_frames
+                .iter()
+                .any(|frame| frame.mount_binding().slot() == role.entity());
+            match role.entering_use {
+                ReconciliationSlotEnteringUse::Required => !used,
+                ReconciliationSlotEnteringUse::Forbidden => used,
+            }
+        })
+    {
+        return Err(ReconciliationSpliceError::InvalidEnteringBranch);
+    }
+    // Physical drift is classified by the independent current/next preflight
+    // on this prepared view. Rejecting here would bypass its terminal owner.
+    let mut ordered = target_slots;
+    ordered.sort_by(|left, right| {
+        let left_index = target_frames
+            .iter()
+            .position(|frame| frame.frame() == left.parent())
+            .expect("target parent checked");
+        let right_index = target_frames
+            .iter()
+            .position(|frame| frame.frame() == right.parent())
+            .expect("target parent checked");
+        left_index
+            .cmp(&right_index)
+            .then_with(|| left.outlet().cmp(right.outlet()))
+    });
+    Ok((
+        roles,
+        activations,
+        ordered.iter().map(|slot| slot.slot()).collect(),
+    ))
 }
 
 fn restore_active_branch(
@@ -3356,7 +3667,6 @@ impl PreparedBranch {
 pub(crate) struct PendingCommit {
     pub(crate) ticket: Option<CommitTicket>,
     pub(crate) final_task: Option<RootFrameTask>,
-    pub(crate) retained_hit: Option<Box<bevy_ui_router_core::integration::RetainedHitPlan>>,
     pub(crate) rejected_retained_publication:
         Option<Box<bevy_ui_router_core::integration::PreparedRetainedCommit>>,
     pub(crate) branch: PreparedBranch,
@@ -3367,7 +3677,6 @@ impl PendingCommit {
         Self {
             ticket: None,
             final_task: None,
-            retained_hit: None,
             rejected_retained_publication: None,
             branch: PreparedBranch::empty(),
         }
@@ -3697,8 +4006,8 @@ mod tests {
             .unwrap()
             .bind_entering(PreparedBranch::empty())
             .unwrap();
-        assert!(splice.leaf_retention_is_exact(&leaf));
-        assert!(!splice.leaf_retention_is_exact(&parent));
+        assert!(splice.view().instance_retention_is_exact(&leaf));
+        assert!(!splice.view().instance_retention_is_exact(&parent));
         let (restored, entering, _) = splice.reject().into_parts();
         assert!(entering.frames().is_empty());
         assert_eq!(restored.claims().cloned().collect::<Vec<_>>(), original);
@@ -4144,6 +4453,7 @@ mod tests {
         let child = entering.frames()[1].frame().clone();
         let slot = &entering.child_slots()[0];
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&entering),
             existing: ReconciliationExistingProjection {
                 preserved: Vec::new(),
@@ -4196,6 +4506,7 @@ mod tests {
         let child = entering.frames()[1].frame().clone();
         let slot = &entering.child_slots()[0];
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&entering),
             existing: ReconciliationExistingProjection {
                 preserved: Vec::new(),
@@ -4309,6 +4620,7 @@ mod tests {
         let child_version = child.frame().clone();
         let retained = &active.child_slots()[0];
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&active),
             existing: ReconciliationExistingProjection {
                 preserved: vec![ReconciliationExistingFrame {
@@ -4362,6 +4674,7 @@ mod tests {
         let child = entering.frames()[1].frame().clone();
         let slot = &entering.child_slots()[0];
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&entering),
             existing: ReconciliationExistingProjection {
                 preserved: Vec::new(),
@@ -4413,6 +4726,7 @@ mod tests {
         let child = entering.frames()[1].frame().clone();
         let slot = &entering.child_slots()[0];
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&entering),
             existing: ReconciliationExistingProjection {
                 preserved: Vec::new(),
@@ -4500,6 +4814,7 @@ mod tests {
         let parent = branch.frames()[0].frame().clone();
         let child_version = child.frame().clone();
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&branch),
             existing: ReconciliationExistingProjection {
                 preserved: vec![ReconciliationExistingFrame {
@@ -4675,6 +4990,7 @@ mod tests {
         let parent = active.frames()[0].frame().clone();
 
         let activate = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&active),
             existing: ReconciliationExistingProjection {
                 preserved: vec![ReconciliationExistingFrame {
@@ -4706,6 +5022,7 @@ mod tests {
         let retained = &retained_branch.child_slots()[0];
         let child_version = child.frame().clone();
         let retain = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: reconciliation_authority(&retained_branch),
             existing: ReconciliationExistingProjection {
                 preserved: vec![ReconciliationExistingFrame {
@@ -4873,6 +5190,7 @@ mod tests {
         )
         .expect("fixture raw host ids may coincide while router provenance differs");
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: foreign_authority,
             existing: projection,
             entering: ReconciliationEnteringProjection {
@@ -4896,6 +5214,7 @@ mod tests {
         )
         .unwrap();
         let facts = ReconciliationProjectionFacts {
+            selected: Vec::new(),
             authority: wrong_top,
             existing: projection,
             entering: ReconciliationEnteringProjection {

@@ -13,7 +13,7 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-[quick start](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)演示 Scene runtime、factory、路由注册、host、导航和 snapshot；[嵌套示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_nested.rs)演示侧栏、工具栏、内部 outlet、布局状态保留及真实 UI 布局。这两个程序都是有限次更新的 headless 演示，不打开 OS 窗口；quick start 不运行 UI 布局。
+[quick start](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)演示 Scene runtime、factory、路由注册、host、导航和 snapshot；[嵌套示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_nested.rs)演示侧栏、工具栏、内部 outlet 及真实 UI 布局，离开布局后返回另一子页仍保留原工具栏状态。这两个程序都是有限次更新的 headless 演示，不打开 OS 窗口；quick start 不运行 UI 布局。
 
 交互窗口是独立、不可发布的应用 crate，图形依赖不进入 Router 库：
 

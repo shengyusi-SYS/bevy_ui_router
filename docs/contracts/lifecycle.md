@@ -34,13 +34,15 @@ pending 不等于 active。resolve/apply 成功且身份与 adoption 校验通�
 
 ## 非活动实例与长期 owner
 
-符合[同父 leaf 保留](navigation.md#同父-leaf-保留)的离场实例移交 Core 签发的独立、不可 Clone 的长期 owner；ECS 持有原物理内容。原请求在移交及其余清理完成后可以终结，缓存不挂在旧请求的 task、ticket 或 lifecycle capability 上。
+符合[实例保留](navigation.md#实例保留)的离场实例逐一移交 Core 签发的独立、不可 Clone 的长期 owner；ECS 持有原物理内容和实例自有 slots，父子各自持有责任。原请求在移交及其余清理完成后可以终结，库存不挂在旧请求的 task、ticket 或 lifecycle capability 上。
 
 retained shell 留在原 child slot 下，具有独立 retained role/claim，与当前 active sibling 共存。它隐藏且不参与布局；只有与完整 scope 和原 owner 匹配的实例才是合法 protected 内容，任意 sibling 不能借此获得授权。命中前复验原缓存、当前 active 与独立 next，原 owner 在拒绝、取消或清理错误时仍须返还或由明确责任继续持有。
 
 容量淘汰、父 scope 失效及 host loss 都通过 cleanup owner 结算缓存。原 normal cleanup 已接收的退休责任保留原 token；仍由缓存持有的 live owner 只在受控移交时绑定相应 cleanup token，不能重复移交，也不能先递归销毁其他 owner 的内容。host 重新接纳仍等待原 settlement；缓存不跨新的 host incarnation 复活，history 按原规则保留。
 
-缓存自身失效与当前 authority loss 分开判断。内容根已删除，或缓存 leaf 自身空 slot 的 outlet 声明被移除时，只有在共享父/slot/host 仍合法、原实例安全清理完成后，才以同一个 request 和原 fresh task 继续构建；期间合法 active 页面保持。无法证明安全清理时停止物理删除并保留明确责任，不承诺任意 World 修改都能自动恢复为 miss。
+库存自身失效与当前 authority loss 分开判断。只有共享父/slot/host 仍合法、原失效实例及依赖安全清理完成后，才以同一个 request 和原 continuation 从失效位置起 fresh；期间合法 active 页面保持。新子失败先清理本次 fresh 产物，再独立结算失效库存，不把库存实例记成新建实体。
+
+无法证明安全清理时停止物理删除并保留明确责任。若停止的依赖清理仍有存活目标，且真实 host authority 已失效，原 token、receipt、owners 和物理内容移交现有私有残留责任；原前台请求以 `AuthorityLost` 终结，Router 保持 unavailable，不伪造 cleanup completion 或承诺重新接纳。已全部删除或可证明为空且 inert 的原 shell，仍按既有受控结算路径处理。不承诺任意 World 修改都能自动恢复为 miss。
 
 普通新内容失败不无理由清空仍合法父 scope 的 active 或其他缓存；error boundary 只保留其上方仍合法的 scope，fallback/父 scope 替换则结算离场库存。撤权和应用后台工作边界见[输入与活动资格](input-focus.md)。
 

@@ -14,9 +14,9 @@ use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     ids::RouteSlotId,
     integration::{
-        FailureCleanupPrepareOutcome, FailureCleanupRequest, MountGrant, MountReceiptProof,
-        MountRegistrationBeginError, MountRegistrationPermit, RouterEngine,
-        mount_grant_matches_target,
+        FailureCleanupPrepareOutcome, FailureCleanupRequest, IntegrationError, MountGrant,
+        MountReceiptProof, MountRegistrationBeginError, MountRegistrationPermit,
+        MountRegistrationSession, RouterEngine, mount_grant_matches_target,
     },
     slot::RouteSlotKey,
 };
@@ -27,7 +27,10 @@ use crate::{
         ChildSlotNodeProbe, ChildSlotRelationshipProbe, RouteOwnershipSeal, RouterInputBarrier,
     },
     input::RouteFocusState,
-    presentation::{OutletBinding, RealizedFrame, RealizedOutlet},
+    presentation::{
+        OutletBinding, RealizedFrame, RealizedOutlet, RetainedInvalidationEvidence,
+        RetainedPayloadClassification,
+    },
     registry::{
         ComponentManifest, EntityLifecycle, ExactRegistryClaim, ProvisionalOwner, RegistryOwner,
         RouteEntityRegistry,
@@ -71,6 +74,13 @@ impl ProvisionalChildSlot {
 
     pub(crate) const fn slot_claim(&self) -> &ExactRegistryClaim {
         &self.slot_claim
+    }
+
+    pub(crate) const fn parent(&self) -> &RouteFrameVersion {
+        &self.parent
+    }
+    pub(crate) const fn anchor_binding(&self) -> &OutletBinding {
+        &self.anchor_binding
     }
 
     pub(crate) fn prior_anchor_children(&self) -> &[Entity] {
@@ -410,12 +420,14 @@ pub(crate) enum ChildSlotConfirmationErrorKind {
     ReceiptDrift,
     OwnerCasRejected,
     PostCasDrift,
+    RetainedInvalidationRejected(IntegrationError),
 }
 
 pub(crate) struct ChildSlotConfirmationFailure {
     kind: ChildSlotConfirmationErrorKind,
     terminal: ChildSlotConfirmationTerminal,
     residual: ChildSlotResidual,
+    retained_invalidation: Option<RetainedInvalidationEvidence>,
 }
 
 enum ChildSlotConfirmationTerminal {
@@ -445,6 +457,10 @@ impl ChildSlotConfirmationFailure {
         self.kind
     }
 
+    pub(crate) fn take_retained_invalidation(&mut self) -> Option<RetainedInvalidationEvidence> {
+        self.retained_invalidation.take()
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -457,6 +473,46 @@ impl ChildSlotConfirmationFailure {
             ChildSlotConfirmationTerminal::BeginError(error) => (None, Some(error), self.residual),
         }
     }
+}
+
+/// Only the selected original stock parent can authorize this fresh mount.
+/// The ordinary slot staging machinery still observes and rechecks each write.
+pub(crate) fn stage_retained_child_slot(
+    world: &mut World,
+    projection: &bevy_ui_router_core::integration::RetainedLeafProjection,
+    payload: &crate::instance::InstancePayload,
+    outlet: &RouteSlotKey,
+    grant: &MountGrant,
+) -> Result<StagedChildSlot, ChildSlotStageFailure> {
+    if payload.frame().frame() != projection.frame()
+        || crate::instance::validate_retained_entering_payload(
+            world,
+            payload.as_payload_ref(),
+            projection,
+        )
+        .is_err()
+    {
+        return Err(ChildSlotStageFailure {
+            kind: ChildSlotStageErrorKind::InvalidOutlet,
+            residual: None,
+        });
+    }
+    let staged = stage_child_slot(world, payload.frame(), outlet, grant)?;
+    if !world
+        .resource::<RouteEntityRegistry>()
+        .retained_payload_is_current_with_staged_slot(
+            world,
+            projection,
+            payload,
+            &staged.provisional,
+        )
+    {
+        return Err(ChildSlotStageFailure {
+            kind: ChildSlotStageErrorKind::InvalidOutlet,
+            residual: Some(staged.into_residual(world)),
+        });
+    }
+    Ok(staged)
 }
 
 pub(crate) fn stage_child_slot(
@@ -691,6 +747,39 @@ pub(crate) fn confirm_child_slot(
     permit: MountRegistrationPermit,
     proof: &MountReceiptProof,
 ) -> Result<MountedChildSlot, ChildSlotConfirmationFailure> {
+    confirm_child_slot_with_parent(world, engine, staged, permit, proof, None)
+}
+
+pub(crate) fn confirm_child_slot_with_retained_parent(
+    world: &mut World,
+    engine: &mut RouterEngine,
+    staged: StagedChildSlot,
+    permit: MountRegistrationPermit,
+    proof: &MountReceiptProof,
+    projection: &bevy_ui_router_core::integration::RetainedLeafProjection,
+    payload: &crate::instance::InstancePayload,
+) -> Result<MountedChildSlot, ChildSlotConfirmationFailure> {
+    confirm_child_slot_with_parent(
+        world,
+        engine,
+        staged,
+        permit,
+        proof,
+        Some((projection, payload)),
+    )
+}
+
+fn confirm_child_slot_with_parent(
+    world: &mut World,
+    engine: &mut RouterEngine,
+    staged: StagedChildSlot,
+    permit: MountRegistrationPermit,
+    proof: &MountReceiptProof,
+    retained_parent: Option<(
+        &bevy_ui_router_core::integration::RetainedLeafProjection,
+        &crate::instance::InstancePayload,
+    )>,
+) -> Result<MountedChildSlot, ChildSlotConfirmationFailure> {
     let StagedChildSlot {
         mut provisional,
         receipt,
@@ -715,13 +804,24 @@ pub(crate) fn confirm_child_slot(
         }
     };
     let slot_id = session.slot();
-    if !receipt_matches_provisional(world, &provisional, &receipt, slot_id) {
-        let cleanup = session.reject();
-        return Err(confirmation_failure(
+    if !receipt_matches_provisional(world, &provisional, &receipt, slot_id)
+        || retained_parent.is_some_and(|(projection, payload)| {
+            !world
+                .resource::<RouteEntityRegistry>()
+                .retained_payload_is_current_with_staged_slot(
+                    world,
+                    projection,
+                    payload,
+                    &provisional,
+                )
+        })
+    {
+        return Err(reject_child_slot_confirmation(
             world,
             ChildSlotConfirmationErrorKind::ReceiptDrift,
             provisional,
-            ChildSlotConfirmationTerminal::Cleanup(cleanup),
+            session,
+            retained_parent,
         ));
     }
 
@@ -738,12 +838,12 @@ pub(crate) fn confirm_child_slot(
         .resource_mut::<RouteEntityRegistry>()
         .compare_exchange_owner(&expected_claim, committed_owner);
     let Some(committed_claim) = committed_claim else {
-        let cleanup = session.reject();
-        return Err(confirmation_failure(
+        return Err(reject_child_slot_confirmation(
             world,
             ChildSlotConfirmationErrorKind::OwnerCasRejected,
             provisional,
-            ChildSlotConfirmationTerminal::Cleanup(cleanup),
+            session,
+            retained_parent,
         ));
     };
     provisional.slot_claim = committed_claim.clone();
@@ -764,13 +864,24 @@ pub(crate) fn confirm_child_slot(
         expected_anchor_children: receipt.expected_anchor_children.clone(),
         slot_id,
     };
-    if !validate_registered_slot(world, &mounted, &receipt) {
-        let cleanup = session.reject();
-        return Err(confirmation_failure(
+    if !validate_registered_slot(world, &mounted, &receipt)
+        || retained_parent.is_some_and(|(projection, payload)| {
+            !world
+                .resource::<RouteEntityRegistry>()
+                .retained_payload_is_current_with_staged_slot(
+                    world,
+                    projection,
+                    payload,
+                    &provisional,
+                )
+        })
+    {
+        return Err(reject_child_slot_confirmation(
             world,
             ChildSlotConfirmationErrorKind::PostCasDrift,
             provisional,
-            ChildSlotConfirmationTerminal::Cleanup(cleanup),
+            session,
+            retained_parent,
         ));
     }
     let registration_digest = mounted_registration_digest(&mounted, &receipt);
@@ -1139,6 +1250,64 @@ pub(crate) fn residual_child_slot_local_is_isolated(
         && authority_is_exact
 }
 
+fn reject_child_slot_confirmation(
+    world: &mut World,
+    kind: ChildSlotConfirmationErrorKind,
+    provisional: ProvisionalChildSlot,
+    session: MountRegistrationSession<'_>,
+    retained_parent: Option<(
+        &bevy_ui_router_core::integration::RetainedLeafProjection,
+        &crate::instance::InstancePayload,
+    )>,
+) -> ChildSlotConfirmationFailure {
+    let classification = retained_parent.and_then(|(projection, payload)| {
+        world
+            .resource::<RouteEntityRegistry>()
+            .classify_retained_payload_with_staged_slot(world, projection, payload, &provisional)
+    });
+    match classification {
+        Some(RetainedPayloadClassification::OwnInvalid(evidence)) => {
+            match session.reject_retained_invalidation(evidence.projection().frame().clone()) {
+                Ok(cleanup) => {
+                    let mut failure = confirmation_failure(
+                        world,
+                        kind,
+                        provisional,
+                        ChildSlotConfirmationTerminal::Cleanup(cleanup),
+                    );
+                    failure.retained_invalidation = Some(evidence);
+                    failure
+                }
+                Err(error) => {
+                    let rejection_kind = error.kind();
+                    let cleanup = error.into_session().reject();
+                    confirmation_failure(
+                        world,
+                        ChildSlotConfirmationErrorKind::RetainedInvalidationRejected(
+                            rejection_kind,
+                        ),
+                        provisional,
+                        ChildSlotConfirmationTerminal::Cleanup(cleanup),
+                    )
+                }
+            }
+        }
+        Some(
+            RetainedPayloadClassification::Current
+            | RetainedPayloadClassification::AuthorityLost(_),
+        )
+        | None => {
+            let cleanup = session.reject();
+            confirmation_failure(
+                world,
+                kind,
+                provisional,
+                ChildSlotConfirmationTerminal::Cleanup(cleanup),
+            )
+        }
+    }
+}
+
 fn confirmation_failure(
     world: &mut World,
     kind: ChildSlotConfirmationErrorKind,
@@ -1170,6 +1339,7 @@ fn confirmation_failure(
             provisional,
             authorized_manifest,
         },
+        retained_invalidation: None,
     }
 }
 

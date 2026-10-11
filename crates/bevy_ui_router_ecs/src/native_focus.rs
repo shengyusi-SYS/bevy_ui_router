@@ -282,12 +282,20 @@ pub(crate) fn prepare_publication(
     frames: &[crate::presentation::RealizedFrame],
     eligible: &[Entity],
 ) -> Option<PublicationFocus> {
+    prepare_publication_frames(world, frames.iter(), eligible)
+}
+
+pub(crate) fn prepare_publication_frames<'a>(
+    world: &mut World,
+    mut frames: impl Iterator<Item = &'a crate::presentation::RealizedFrame>,
+    eligible: &[Entity],
+) -> Option<PublicationFocus> {
     observe(world, &[]).ok()?;
     let cursor = world.get_resource::<NativeFocusCursor>();
     let candidate = cursor
         .and_then(|cursor| cursor.latest.as_ref())
         .and_then(|latest| {
-            frames.iter().find_map(|frame| {
+            frames.find_map(|frame| {
                 let owner = frame.native_focus_owner()?;
                 if owner.source != latest.source
                     || latest.order <= owner.after

@@ -75,9 +75,9 @@ impl ValidatedPublication<'_> {
         }
     }
 
-    pub(crate) fn publish(self, mutation: impl FnOnce(Option<RetainedLeafOwner>)) {
+    pub(crate) fn publish(self, mutation: impl FnOnce(Vec<RetainedLeafOwner>)) {
         match self {
-            Self::Ordinary(commit) => commit.publish(|| mutation(None)),
+            Self::Ordinary(commit) => commit.publish(|| mutation(Vec::new())),
             Self::Retained(commit) => commit.publish(mutation),
         }
     }
@@ -101,14 +101,17 @@ pub(crate) struct RetainedLeaves {
 /// entries in the cache; only Core acceptance permits physical handoff.
 pub(crate) struct PreparedRetainedChange {
     indices: Vec<usize>,
-    hit: Option<usize>,
+    activated: Vec<usize>,
     removals: Vec<usize>,
     owners: Vec<RetainedLeafOwner>,
     payloads: Vec<InstancePayload>,
+    activated_payloads: Vec<InstancePayload>,
+    retiring_receivers: Vec<Option<InstancePayload>>,
+    activated_receivers: Vec<Option<InstancePayload>>,
 }
 
 pub(crate) struct RetainedPayloads {
-    pub(crate) hit: Option<InstancePayload>,
+    pub(crate) activated: Vec<InstancePayload>,
     pub(crate) retiring: Vec<InstancePayload>,
 }
 
@@ -123,6 +126,21 @@ impl PreparedRetainedChange {
         })
     }
 
+    pub(crate) fn selected_in_storage_order<'a>(
+        &'a self,
+        leaves: &'a RetainedLeaves,
+    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a InstancePayload)> {
+        leaves
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, entry)| {
+                self.indices
+                    .contains(&index)
+                    .then_some((&entry.projection, &entry.payload))
+            })
+    }
+
     pub(crate) fn selected_mut<'a>(
         &'a self,
         leaves: &'a mut RetainedLeaves,
@@ -133,14 +151,23 @@ impl PreparedRetainedChange {
             .enumerate()
             .filter_map(move |(index, entry)| {
                 self.indices
-                    .binary_search(&index)
-                    .is_ok()
+                    .contains(&index)
                     .then_some((&entry.projection, &mut entry.payload))
             })
     }
 
-    /// The cache cannot change membership between preparation and handoff.
-    /// Rejection returns these same capabilities through restore_owners.
+    pub(crate) fn activated<'a>(
+        &'a self,
+        leaves: &'a RetainedLeaves,
+    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a InstancePayload)> {
+        self.activated.iter().map(move |index| {
+            let entry = &leaves.entries[*index];
+            (&entry.projection, &entry.payload)
+        })
+    }
+
+    /// Cache membership is frozen through the accepted handoff. Rejection
+    /// restores these same capabilities without moving any physical payload.
     pub(crate) fn take_owners(&mut self, leaves: &mut RetainedLeaves) -> Vec<RetainedLeafOwner> {
         for index in &self.removals {
             self.owners.push(
@@ -153,25 +180,48 @@ impl PreparedRetainedChange {
         std::mem::take(&mut self.owners)
     }
 
-    pub(crate) fn into_payloads(mut self, leaves: &mut RetainedLeaves) -> Vec<InstancePayload> {
-        for index in self.removals.into_iter().rev() {
-            self.payloads.push(leaves.entries.remove(index).payload);
-        }
-        self.payloads
+    pub(crate) fn into_payloads(self, leaves: &mut RetainedLeaves) -> Vec<InstancePayload> {
+        debug_assert!(self.activated.is_empty());
+        self.into_activated_and_payloads(leaves).retiring
     }
 
-    pub(crate) fn into_hit_and_payloads(mut self, leaves: &mut RetainedLeaves) -> RetainedPayloads {
-        let mut hit = None;
+    /// All receivers and output vectors were reserved while entries still
+    /// held their original owners. Consume by exact prepared index, then
+    /// deliver in the Core plan's dependency/target order rather than Vec order.
+    pub(crate) fn into_activated_and_payloads(
+        mut self,
+        leaves: &mut RetainedLeaves,
+    ) -> RetainedPayloads {
         for index in self.removals.into_iter().rev() {
             let payload = leaves.entries.remove(index).payload;
-            if Some(index) == self.hit {
-                hit = Some(payload);
+            if let Some(position) = self
+                .activated
+                .iter()
+                .position(|selected| *selected == index)
+            {
+                self.activated_receivers[position] = Some(payload);
             } else {
-                self.payloads.push(payload);
+                let position = self
+                    .indices
+                    .iter()
+                    .position(|selected| *selected == index)
+                    .expect("every removal has one prepared destination");
+                self.retiring_receivers[position] = Some(payload);
             }
         }
+        for receiver in &mut self.activated_receivers {
+            self.activated_payloads.push(
+                receiver
+                    .take()
+                    .expect("activated original payload received"),
+            );
+        }
+        for receiver in &mut self.retiring_receivers {
+            self.payloads
+                .push(receiver.take().expect("retiring original payload received"));
+        }
         RetainedPayloads {
-            hit,
+            activated: self.activated_payloads,
             retiring: self.payloads,
         }
     }
@@ -193,67 +243,69 @@ impl RetainedLeaves {
         retiring: &[RetainedLeafProjection],
         reserve_addition: bool,
     ) -> Option<PreparedRetainedChange> {
-        self.prepare_change_with_hit(retiring, None, reserve_addition)
+        self.prepare_change_with_selected(retiring, &[], usize::from(reserve_addition))
     }
 
-    pub(crate) fn prepare_change_with_hit(
+    pub(crate) fn prepare_change_with_selected(
         &mut self,
         retiring: &[RetainedLeafProjection],
-        hit: Option<&RetainedLeafProjection>,
-        reserve_addition: bool,
+        activated: &[RetainedLeafProjection],
+        addition_count: usize,
     ) -> Option<PreparedRetainedChange> {
-        let mut indices = Vec::new();
-        indices.try_reserve_exact(retiring.len()).ok()?;
-        for projection in retiring {
-            let mut matches = self.entries.iter().enumerate().filter(|(_, entry)| {
-                &entry.projection == projection
-                    && entry
-                        .owner
-                        .as_ref()
-                        .is_some_and(|owner| owner.projection() == projection)
-            });
-            let (index, _) = matches.next()?;
-            if matches.next().is_some() || indices.contains(&index) {
-                return None;
+        let locate = |projections: &[RetainedLeafProjection]| -> Option<Vec<usize>> {
+            let mut indices = Vec::new();
+            indices.try_reserve_exact(projections.len()).ok()?;
+            for projection in projections {
+                let mut matches = self.entries.iter().enumerate().filter(|(_, entry)| {
+                    &entry.projection == projection
+                        && entry
+                            .owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.projection() == projection)
+                });
+                let (index, _) = matches.next()?;
+                if matches.next().is_some() || indices.contains(&index) {
+                    return None;
+                }
+                indices.push(index);
             }
-            indices.push(index);
-        }
-        indices.sort_unstable();
-        let hit = if let Some(projection) = hit {
-            let mut matches = self.entries.iter().enumerate().filter(|(_, entry)| {
-                &entry.projection == projection
-                    && entry
-                        .owner
-                        .as_ref()
-                        .is_some_and(|owner| owner.projection() == projection)
-            });
-            let (index, _) = matches.next()?;
-            if matches.next().is_some() || indices.binary_search(&index).is_ok() {
-                return None;
-            }
-            Some(index)
-        } else {
-            None
+            Some(indices)
         };
-        let transfer_count = indices.len().checked_add(usize::from(hit.is_some()))?;
+        let indices = locate(retiring)?;
+        let activated = locate(activated)?;
+        if activated.iter().any(|index| indices.contains(index)) {
+            return None;
+        }
+        let transfer_count = indices.len().checked_add(activated.len())?;
         let mut removals = Vec::new();
         removals.try_reserve_exact(transfer_count).ok()?;
         removals.extend(indices.iter().copied());
-        removals.extend(hit);
+        removals.extend(activated.iter().copied());
         removals.sort_unstable();
         let mut owners = Vec::new();
         owners.try_reserve_exact(transfer_count).ok()?;
         let mut payloads = Vec::new();
         payloads.try_reserve_exact(indices.len()).ok()?;
-        if reserve_addition {
-            self.entries.try_reserve(1).ok()?;
-        }
+        let mut activated_payloads = Vec::new();
+        activated_payloads.try_reserve_exact(activated.len()).ok()?;
+        let mut retiring_receivers = Vec::new();
+        retiring_receivers.try_reserve_exact(indices.len()).ok()?;
+        retiring_receivers.resize_with(indices.len(), || None);
+        let mut activated_receivers = Vec::new();
+        activated_receivers
+            .try_reserve_exact(activated.len())
+            .ok()?;
+        activated_receivers.resize_with(activated.len(), || None);
+        self.entries.try_reserve(addition_count).ok()?;
         Some(PreparedRetainedChange {
             indices,
-            hit,
+            activated,
             removals,
             owners,
             payloads,
+            activated_payloads,
+            retiring_receivers,
+            activated_receivers,
         })
     }
 
@@ -275,6 +327,10 @@ impl RetainedLeaves {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub(crate) fn payloads(&self) -> impl Iterator<Item = &InstancePayload> {
+        self.entries.iter().map(|entry| &entry.payload)
     }
 
     pub(crate) fn len(&self) -> usize {
