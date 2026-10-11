@@ -17,6 +17,7 @@
 | [performance-shape-2026-09-27.csv](performance-shape-2026-09-27.csv) | 576 | flat/nested 与读取合并候选，三轮 | b0dbc3b 基线；candidate 未采用；仅 run 1 uncontended_pair 可比较 |
 | [performance-window-2026-09-27.csv](performance-window-2026-09-27.csv) | 960 | 简单窗口逐帧诊断，非 Router headless 基准 | b0dbc3b；临时 release BRP/采样副本，两轮 |
 | [performance-keep-alive-2026-10-08.csv](performance-keep-alive-2026-10-08.csv) | 96 | 默认关闭、miss/hit、idle、容量淘汰；两轮 flat/nested | `3d6ca2c62a4f1011eb9449e25f1ed237b4c8f35e`；完整已提交 crate/benchmark 源码 |
+| [performance-instances-2026-10-11.csv](performance-instances-2026-10-11.csv) | 168 | 父子 fresh、原父/新子、父子命中和依赖淘汰；其中 96 行为两轮完整串行配对 | `dc3ef59e57434f2730fb7a5958e0f660d8294f7a`；完整已提交 crate/benchmark 源码 |
 
 上述日期和 revision 是测量身份；部分局部提交在后续整理历史时已合并，不承诺其短 SHA 在当前分支仍可检出。`b0dbc3b7486e71cd41e5a8cd05e84ac031b10ce0` 当前仍可解析，但不在当前分支祖先链内。完整历史测量说明固定保存于 `6de4233e2c636daa5892807b05af8a19d6e2cc0f:docs/performance.md`，可用 `git show` 查询；它记录比较方法，不补足未保存的源码。
 
@@ -31,6 +32,16 @@
 环境为 Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 可见逻辑 CPU，`rustc 1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0，Bevy 0.19.1。默认优化 bench profile，构建并发 4；窗口已关闭、无并行 Cargo/rustc 或本任务的渲染/采样，未固定 CPU affinity/频率。方法为 CPU 侧 wall-clock，不含 layout/GPU/I/O；idle 是 32 update 批次均值的分布。
 
 `Cargo.lock` SHA-256 为 `1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`；实测 benchmark 二进制 SHA-256 为 `7cc3e143254610b5c790564fc885f81d1c34d6c17811ae345c460327d34f7fef`。版本与历史测量工具链不同，不将二者时间差解释为单一改动收益。
+
+## 父子库存 2026-10-11
+
+源码为完整提交 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a`，生产实现包含父子独立库存。使用[父子库存模式](../../performance.md#父子库存对照)，先按 Cargo `compiler-artifact` 输出确认实际优化 executable，再直接顺序运行同一二进制；每组 24 行、128 样本、64 次导航预热，全部行为断言启用。父与子各自有 1/32/128 个内容节点。
+
+`round=3/4` 的 flat→nested 为两个完整串行配对，标记 `uncontended_pair`，用于结果估算。早期 round 1 nested 与 round 2 flat 因启动重叠，整组标记 `contended`；round 1 flat 标记 `unpaired`，不混入配对范围。所有 168 行及最大值原样保留，没有从较慢组或组内样本中挑选结果；汇总分位数不能还原原始逐操作样本。
+
+Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 可见逻辑 CPU；`rustc 1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0、官方 Bevy 0.19.1、默认 bench profile（opt-level 3，debug assertions 关闭）、bsn feature。本任务正式配对期间没有并行 Cargo/rustc、窗口或 renderer；未固定 CPU affinity/频率，也未控制宿主全部负载。计时为 CPU 侧 wall-clock，不含 layout/GPU/I/O；idle 为 32 update 批次均值。
+
+`Cargo.lock` SHA-256：`1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`；实际 benchmark executable SHA-256：`bcd55bee6885f4911709d2e6163c0f8fa24e94a6f1b93718aefc813b4820e619`。运行前后核对二进制一致，crate/lock/benchmark 无未提交修改。旧 keep-alive 数据的内容预算与请求预热不同，不能将时间差解释为父子实现本身的版本回归。
 
 ## 历史测量共同环境与统计
 

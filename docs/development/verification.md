@@ -89,6 +89,7 @@ CI 只检查性能夹具行为，不设耗时门禁：
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
 ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=instances cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
 正式时间比较使用 [性能基线](../performance.md) 的优化构建方法，不能使用 smoke 的 debug 时间。
@@ -106,9 +107,11 @@ python3 scripts/check-packaged-consumer.py
 
 历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；组合回归覆盖混用 Back/Push、淘汰后的后续普通导航、非目标缓存自身失效、暂缺布局后正常离场，以及部分清理中途 host loss 后的同 host 重新接纳与后续 fresh 导航。authority 隔离还须核对 native 内容根的 authored Visibility、Pickable 与应用局部状态保持。不能把跳过失败用例的检查称为全量通过。
 
-修复源码 `c570e125c943643c8ebf128b100e61b371a92148` 已通过 workspace 格式、all-targets/all-features 静态检查及未跳过用例的全特性测试，包含公开导航、保留、滚动、原生输入/focus 和独立 consumer；ECS 无 BSN 及独立窗口全特性检查也通过。当前版本在 Linux/WSLg、960×640、软件渲染的 `ui-debug` 窗口重跑了缓存身份/计数、Back 滚动、focus/跨页手势撤权和 fallback 后 fresh 恢复，并核对 renderer 截图。
+修复源码 `c570e125c943643c8ebf128b100e61b371a92148` 已通过 workspace 格式、all-targets/all-features 静态检查及未跳过用例的全特性测试，包含公开导航、保留、滚动、原生输入/focus 和独立 consumer；ECS 无 BSN 及独立窗口全特性检查也通过。该修复树在 Linux/WSLg、960×640、软件渲染的 `ui-debug` 窗口重跑了缓存身份/计数、Back 滚动、focus/跨页手势撤权和 fallback 后 fresh 恢复，并核对 renderer 截图。
 
 2026-10-08 的缓存/滚动组合已在窗口源码 `1a30dc58d41c91dd3bcadc3d9795edbdd129a6ad` 验证：Linux/WSLg、960×640、软件渲染、debug `ui-debug`，通过应用内 BRP 发送真实 WindowEvent 与 typed messages。已验证原 Entity/页面和布局计数保留、多 entry 各自恢复位置、旧手势与 focus 撤权、命中后的新点击/Space，以及 fallback 清理旧库存后重新构建；renderer 截图检查最终呈现。库侧完成 workspace 全特性、独立 consumer、无 BSN 和新旧性能夹具行为检查；正式耗时结果归[性能基线](../performance.md)。
+
+父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。尚未在窗口或打包产物重跑这棵扩展树；不以历史证据替代。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 
