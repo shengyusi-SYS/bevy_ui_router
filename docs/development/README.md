@@ -25,7 +25,7 @@
 
 复杂功能可以组织为 `docs/changes/<feature>/design.md` 与 `plan.md`；独立子问题可拆分设计，多个功能不必塞入一份全局 spec。设计说明行为、边界、理由与验收，计划安排交付依赖、验证和审查。简单修复直接维护相关代码与基线，不为模板创建空文档。
 
-当前实施收口专题：[实例协调与当前路由输入](../changes/instance-coordination/design.md)，执行拆分见[计划](../changes/instance-coordination/plan.md)。其它候选输入/滚动工作从[长期评估](../changes/navigation-experience/assessment.md)进入，尚未扩展为实现合同。
+当前实例收口专题：[实例协调与当前路由输入](../changes/instance-coordination/design.md)，执行拆分见[计划](../changes/instance-coordination/plan.md)。下一个实施专题为[访问级滚动意图设计](../changes/scroll-intent/design.md)与[计划](../changes/scroll-intent/plan.md)，尚未交付；输入正式接缝从[长期评估](../changes/navigation-experience/assessment.md)进入。
 
 未落地设计在页首标明草案、已确认或实施中及影响范围，链接相关当前合同。方案描述的是待改变部分，不重复抄写整个基线，也不能静默覆盖现行行为。当前没有需要恢复执行的旧 MVP 阶段计划。
 
