@@ -111,7 +111,9 @@ python3 scripts/check-packaged-consumer.py
 
 2026-10-08 的缓存/滚动组合已在窗口源码 `1a30dc58d41c91dd3bcadc3d9795edbdd129a6ad` 验证：Linux/WSLg、960×640、软件渲染、debug `ui-debug`，通过应用内 BRP 发送真实 WindowEvent 与 typed messages。已验证原 Entity/页面和布局计数保留、多 entry 各自恢复位置、旧手势与 focus 撤权、命中后的新点击/Space，以及 fallback 清理旧库存后重新构建；renderer 截图检查最终呈现。库侧完成 workspace 全特性、独立 consumer、无 BSN 和新旧性能夹具行为检查；正式耗时结果归[性能基线](../performance.md)。
 
-父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。尚未在窗口或打包产物重跑这棵扩展树；不以历史证据替代。
+父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。尚未在窗口重跑父子独立库存。
+
+完整提交树 `efe1989a415c30e83ee9e9b07e2dfcdb48d054cb` 已执行 `cargo package --workspace --locked`，六个包均验证成功；`scripts/check-packaged-consumer.py` 核对来源后，从六个解压 Router 产物运行公开 BSN consumer 成功。标准打包在可用 registry 网络下完成，未跳过验证或上传。该证据覆盖现行树，不覆盖尚未实现的滚动/输入扩展；最终发布树仍需复核。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 

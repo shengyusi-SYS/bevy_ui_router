@@ -1,6 +1,6 @@
 # 实例协调实施计划
 
-状态：第 1–4 步的实现和公开回归已完成；workspace 全特性、Core/ECS 完整 crate、无默认特性与独立 consumer 通过。第 5 步的父/fresh 子 Back、当前输入与既有 entry 滚动组合、示例、现行文档和代表性能调查已闭合；发布环境验收仍待收口。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理交叉审查。沿当前 main 推进，不新建分支。
+状态：第 1–4 步的实现和公开回归已完成；workspace 全特性、Core/ECS 完整 crate、无默认特性与独立 consumer 通过。第 5 步的父/fresh 子 Back、当前输入与既有 entry 滚动组合、示例、现行文档、代表性能和现行树打包/产物 consumer 已闭合；剩余窗口验收纳入最终扩展树收口。与[设计](design.md)配套，根代理统一 index/提交与 Cargo 验证，独立子代理交叉审查。沿当前 main 推进，不新建分支。
 
 **目标：** 先交付当前已发布输入，再将 leaf 保留替换为按实例和 exact 父依赖的协调，闭合混合激活/fresh、失败及依赖淘汰。
 
@@ -88,8 +88,8 @@
 - [x] 在同一个公开旅程组合 Back、原 P 激活/fresh D、当前输入与既有 entry 滚动；用真实 BSN 内容和动态后代观察活动资格，复用已闭合 pointer/focus gate，确认旧访问意图不因相同 Entity 复活而串用。
 - [x] 用独立 facade consumer 接入 RouteInputs 和父/子保留；示例演示布局状态存续与新 location，保持业务中立。相同输入/no-op、params/search/fragment 和 fallback/readmission 回归全部保留。
 - [x] 对选定代表规模复测切换/命中/依赖淘汰，两轮完整串行 flat/nested 优化结果归[性能基线](../../performance.md#父子库存实测)。不含 layout/render，尚未作严格 cleanup 内部归因；真实优化按证据另估。
-- [ ] 运行最终门禁；审查设计五组验收是否都有生产入口证据，报告平台/窗口未跑项，不通过临时探针冒充消费接入。
-- [ ] 按实际落地行为更新合同、当前架构图、指南、示例和验证入口；路线图只留未完成工作。本设计必要语义迁入所属合同，完成的 plan 退出默认树，由 Git 追溯；提交 `docs: document instance coordination and current inputs`。
+- [ ] 最终扩展树组合/窗口验收；实现树完整门禁及现行打包/产物 consumer 已通过，源码和边界归[验证指南](../../development/verification.md)。不以历史窗口或临时探针冒充父子新路径。
+- [x] 已按落地行为更新合同、当前架构图、指南、示例和验证入口；路线图仅留未完成工作。必要语义已迁入所属合同，最终窗口收口后本设计/计划退出默认树，由 Git 追溯。
 
 统一滚动意图和通用 UI 输入 hook 的跨专题最终组合，只有各自功能落地后才执行，不用本步骤预先声称完成。集中验收预算 4–7 人日还包含那部分，不在各专题重复加算。
 
