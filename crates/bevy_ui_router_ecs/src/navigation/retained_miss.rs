@@ -136,17 +136,19 @@ fn prepare(world: &mut World, entry: &mut RouterEntry, source: Preparation) {
         reject_preparation(entry, source, Rejection::PhysicalSource);
         return;
     };
-    let reserved = match CleanupLedger::reserve_retained_invalidation(world, manifest) {
-        Ok(reserved) => reserved,
-        Err(error) if error.kind() == CleanupLedgerReserveErrorKind::RetryableCapacity => {
-            entry.retained_miss_cleanup = Some(Box::new(RetainedMissCleanup::Preparing(source)));
-            return;
-        }
-        Err(error) => {
-            reject_preparation(entry, source, Rejection::Ledger(error.kind()));
-            return;
-        }
-    };
+    let reserved =
+        match CleanupLedger::reserve_retained_invalidation(world, manifest, branch.frame()) {
+            Ok(reserved) => reserved,
+            Err(error) if error.kind() == CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                entry.retained_miss_cleanup =
+                    Some(Box::new(RetainedMissCleanup::Preparing(source)));
+                return;
+            }
+            Err(error) => {
+                reject_preparation(entry, source, Rejection::Ledger(error.kind()));
+                return;
+            }
+        };
     let prepared = match reserved.prepare_retained_invalidation_removal(world, branch) {
         Ok(prepared) => prepared,
         Err(error) if error.is_retryable() => {

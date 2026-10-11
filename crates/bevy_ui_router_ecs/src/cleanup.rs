@@ -8320,32 +8320,63 @@ pub(crate) struct CleanupLedger {
 struct CleanupProtectedEntity {
     observed: FrozenFailureCleanupObservedEntity,
     display: Option<bevy_ui::Display>,
+    scope: CleanupProtectedScope,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CleanupProtectedScope {
+    RelatedClosure,
+    AuthoritySource,
+}
+
+fn append_cleanup_host_sources(
+    world: &World,
+    protected: &mut Vec<CleanupProtectedEntity>,
+    frames: &[RealizedFrame],
+) {
+    let registry = world.resource::<RouteEntityRegistry>();
+    for frame in frames {
+        let host = frame.cleanup_host();
+        if protected.iter().any(|fact| {
+            matches!(fact.scope, CleanupProtectedScope::AuthoritySource)
+                && fact.observed.entity == host
+        }) {
+            continue;
+        }
+        // Preserve the exact source observation during this attempt. Authority
+        // loss already present at capture follows the existing settlement path;
+        // this snapshot cannot authorize or reconstruct the original owner.
+        let observed = FrozenFailureCleanupObservedEntity::observe(world, registry, host);
+        protected.push(CleanupProtectedEntity {
+            observed,
+            display: None,
+            scope: CleanupProtectedScope::AuthoritySource,
+        });
+    }
+}
+
+fn cleanup_related_roots(world: &World, obligations: &[CleanupObligation]) -> Vec<Entity> {
+    // Deletion touches the original units and their authorized mount parents.
+    // Application ancestors and their unrelated UI are outside that write set.
+    let mut roots = obligations
+        .iter()
+        .flat_map(|obligation| [obligation.unit_root, obligation.authorized_parent])
+        .filter(|entity| world.get_entity(*entity).is_ok())
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|entity| entity.to_bits());
+    roots.dedup();
+    roots
 }
 
 fn freeze_retained_invalidation_protected(
     world: &World,
     obligations: &[CleanupObligation],
 ) -> Option<Vec<CleanupProtectedEntity>> {
-    let mut roots = HashSet::new();
-    for obligation in obligations {
-        let mut root = obligation.unit_root;
-        let mut seen = HashSet::new();
-        while let Some(parent) = world.get::<ChildOf>(root).map(ChildOf::parent) {
-            if !seen.insert(root) {
-                return None;
-            }
-            root = parent;
-        }
-        if world.get_entity(root).is_ok() {
-            roots.insert(root);
-        }
-    }
+    let roots = cleanup_related_roots(world, obligations);
     let targets = obligations
         .iter()
         .map(CleanupObligation::entity)
         .collect::<HashSet<_>>();
-    let mut roots = roots.into_iter().collect::<Vec<_>>();
-    roots.sort_by_key(|entity| entity.to_bits());
     let closure = freeze_failure_cleanup_closure(world, &roots, &[])?;
     let registry = world.get_resource::<RouteEntityRegistry>()?;
     Some(
@@ -8355,6 +8386,7 @@ fn freeze_retained_invalidation_protected(
             .map(|entity| CleanupProtectedEntity {
                 observed: FrozenFailureCleanupObservedEntity::observe(world, registry, entity),
                 display: world.get::<bevy_ui::Node>(entity).map(|node| node.display),
+                scope: CleanupProtectedScope::RelatedClosure,
             })
             .collect(),
     )
@@ -8366,56 +8398,54 @@ impl CleanupLedger {
     pub(crate) fn reserve_retained_invalidation(
         world: &World,
         manifest: FrozenCleanupManifest,
+        frame: &RealizedFrame,
     ) -> Result<PreparedCleanupLedger, CleanupLedgerReserveError> {
-        let Some(protected) = freeze_retained_invalidation_protected(world, &manifest.obligations)
+        let Some(mut protected) =
+            freeze_retained_invalidation_protected(world, &manifest.obligations)
         else {
             return Err(CleanupLedgerReserveError::new(
                 CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts,
                 manifest,
             ));
         };
+        append_cleanup_host_sources(world, &mut protected, std::slice::from_ref(frame));
         let mut prepared = Self::reserve(manifest)?;
         prepared.related_protected = Some(protected);
         Ok(prepared)
     }
 
     fn prepare_related_protected(&mut self, world: &World) -> bool {
-        if self.related_protected.is_some()
-            || !self
-                .obligations
-                .iter()
-                .any(|o| o.identity.registered().is_none())
-        {
+        if self.related_protected.is_some() {
             return true;
         }
-        let mut roots = HashSet::new();
-        for obligation in &self.obligations {
-            let mut root = obligation.unit_root;
-            let mut seen = HashSet::new();
-            while let Some(parent) = world.get::<ChildOf>(root).map(ChildOf::parent) {
-                if !seen.insert(root) {
-                    return false;
-                }
-                root = parent;
-            }
-            roots.insert(root);
-        }
+        let roots = if self
+            .obligations
+            .iter()
+            .any(|obligation| obligation.identity.registered().is_none())
+        {
+            cleanup_related_roots(world, &self.obligations)
+        } else {
+            Vec::new()
+        };
         let targets = self
             .obligations
             .iter()
             .map(CleanupObligation::entity)
             .collect::<HashSet<_>>();
         let registry = world.resource::<RouteEntityRegistry>();
-        self.related_protected = Some(
-            observed_descendant_closure(world, roots.into_iter())
-                .into_iter()
-                .filter(|entity| !targets.contains(entity))
-                .map(|entity| CleanupProtectedEntity {
-                    observed: FrozenFailureCleanupObservedEntity::observe(world, registry, entity),
-                    display: world.get::<bevy_ui::Node>(entity).map(|node| node.display),
-                })
-                .collect(),
-        );
+        let mut protected = observed_descendant_closure(world, roots.into_iter())
+            .into_iter()
+            .filter(|entity| !targets.contains(entity))
+            .map(|entity| CleanupProtectedEntity {
+                observed: FrozenFailureCleanupObservedEntity::observe(world, registry, entity),
+                display: world.get::<bevy_ui::Node>(entity).map(|node| node.display),
+                scope: CleanupProtectedScope::RelatedClosure,
+            })
+            .collect();
+        if let Some(CleanupOwner::Leaving(branch)) = &self.owner {
+            append_cleanup_host_sources(world, &mut protected, branch.frames());
+        }
+        self.related_protected = Some(protected);
         true
     }
 
@@ -8445,6 +8475,13 @@ impl CleanupLedger {
         protected.iter().all(|fact| {
             let expected = &fact.observed;
             let entity = expected.entity;
+            if matches!(fact.scope, CleanupProtectedScope::AuthoritySource) {
+                return world.get_entity(entity).is_ok() == expected.present
+                    && world
+                        .get::<RouterHostRegistration>(entity)
+                        .map(|registration| (registration.router(), registration.incarnation()))
+                        == expected.host_registration;
+            }
             world.get_entity(entity).is_ok() == expected.present
                 && world.get::<ChildOf>(entity).map(ChildOf::parent) == expected.parent
                 && world

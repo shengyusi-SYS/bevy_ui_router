@@ -2819,6 +2819,113 @@ fn native_idle_host_loss_despawn_escape_is_bounded_and_returns_app_focus() {
 }
 
 #[test]
+fn native_cleanup_allows_unrelated_app_sibling_presentation_update() {
+    use bevy_ecs::prelude::{Commands, Despawn, On};
+
+    let (mut app, router, host, sibling, _) = fixture(false);
+    app.world_mut().entity_mut(host).add_child(sibling);
+    app.world_mut()
+        .entity_mut(sibling)
+        .insert(Visibility::Visible);
+    let first = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, RouteLocation::new("/"))
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<RouterNavigation>().entries[0]
+            .engine
+            .request(first)
+            .unwrap()
+            .status(),
+        &RequestStatus::Succeeded
+    );
+    let root = app.world().resource::<RouterNavigation>().entries[0]
+        .active
+        .as_ref()
+        .unwrap()
+        .frames()[0]
+        .native_root()
+        .unwrap();
+    let child = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+    app.update();
+    let updated = Arc::new(AtomicBool::new(false));
+    let observed_update = updated.clone();
+    // A normal application callback runs after the cleanup plan has frozen its
+    // protected facts. This sibling is outside the routed content and target set.
+    app.world_mut()
+        .add_observer(move |event: On<Despawn, Node>, mut commands: Commands| {
+            if event.entity == child {
+                let updated = updated.clone();
+                commands.queue(move |world: &mut World| {
+                    world.get_mut::<Node>(sibling).unwrap().display = bevy_ui::Display::None;
+                    world.entity_mut(sibling).insert(Visibility::Hidden);
+                    updated.store(true, Ordering::Relaxed);
+                });
+            }
+        });
+    let replacement = app
+        .world_mut()
+        .resource_mut::<RouterNavigation>()
+        .replace(router, RouteLocation::new("/").with_fragment("app-update"))
+        .unwrap();
+    settle(&mut app);
+
+    assert!(observed_update.load(Ordering::Relaxed));
+    assert_eq!(
+        app.world().get::<ChildOf>(sibling).map(ChildOf::parent),
+        Some(host)
+    );
+    assert_eq!(
+        app.world().get::<Node>(sibling).unwrap().display,
+        bevy_ui::Display::None
+    );
+    assert_eq!(
+        app.world().get::<Visibility>(sibling),
+        Some(&Visibility::Hidden)
+    );
+    assert!(
+        app.world()
+            .resource::<RouteEntityRegistry>()
+            .record(sibling)
+            .is_none()
+    );
+    let entry = &app.world().resource::<RouterNavigation>().entries[0];
+    let record = entry.engine.request(replacement).unwrap();
+    assert_eq!(
+        record.status(),
+        &RequestStatus::Succeeded,
+        "unrelated app presentation must not stop cleanup: {:?}",
+        entry
+            .cleanup_ledger
+            .as_ref()
+            .and_then(CleanupLedger::cleanup_settlement_permanent_evidence)
+    );
+    assert!(entry.cleanup_ledger.is_none());
+    assert!(
+        entry.authority_protocol_residual.is_none(),
+        "authority residual: CleanupStopped={}, retained cleanup source={:?}",
+        entry
+            .authority_protocol_residual
+            .as_ref()
+            .is_some_and(|residual| {
+                matches!(
+                    &residual.kind,
+                    AuthorityProtocolResidualKind::CleanupStopped
+                )
+            }),
+        entry
+            .authority_protocol_residual
+            .as_ref()
+            .and_then(AuthorityProtocolResidualOwner::retained_cleanup_settlement_ledger)
+            .and_then(CleanupLedger::cleanup_settlement_permanent_evidence)
+    );
+    assert!(app.world().get_entity(child).is_err());
+    assert!(app.world().get_entity(root).is_err());
+}
+
+#[test]
 fn native_cleanup_despawn_registered_ancestor_stops_remaining_content_removal() {
     use crate::presentation::FrameLifecycle;
     use crate::registry::ComponentManifest;

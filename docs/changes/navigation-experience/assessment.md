@@ -51,6 +51,8 @@ Router 提供允许、禁止、范围外的自身资格，通用 UI 结合控件
 
 优先围绕公开 hook 设计和实现，不要求消费者采用特定 Bevy fork。官方 0.19.1 缺少过滤入口，循环调用 navigate 的薄 adapter 只能是可替换迁移桥：它反复采集/排序候选，还依赖 doc(hidden) helper 和私有插件 glue 的替代接线，不能作为长期完成状态。
 
+本次核查的官方 [0.20.0](https://github.com/bevyengine/bevy/releases/tag/v0.20.0) 已让 [Tab 跳过隐藏 UI](https://github.com/bevyengine/bevy/blob/v0.20.0/crates/bevy_input_focus/src/tab_navigation.rs)，但仍未提供 Router 资格 hook；[dispatch 和焦点队列](https://github.com/bevyengine/bevy/blob/v0.20.0/crates/bevy_input_focus/src/lib.rs)也未补齐所需公开接缝。它超出当前 0.19 支持范围，单纯升级不足以交付本项。
+
 若正式接缝尚不可用且交付需要迁移桥，将兼容实现隔离在一个模块，接口服从同一资格合同，并用真实插件旅程验证等价行为。是否投入这段过渡工作须单独决定；不因较短工期默认先做，也不同时建设两条路线却只计算一条预算。
 
 ### 统一的访问级滚动恢复意图

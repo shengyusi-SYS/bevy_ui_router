@@ -40,7 +40,7 @@ Bevy 的便利借用 API 也要检查实际副作用。资源 take/reinsert、sc
 
 ## 保护内容边界，按真实写入复验
 
-可信 Scene/template/observer 可以修改应用资源。Router 只管理自有结构与授权内容边界，不承诺回滚任意应用副作用，也不冻结 app-owned host 的无关组件。
+可信 Scene/template/observer 可以修改应用资源。Router 只管理自有结构与授权内容边界，不承诺回滚任意应用副作用。cleanup 的相关保护从实际清理单元和授权挂载范围展开，不能上溯整个应用树、冻结无关 UI。原 host 的注册观察单独保护：它证明操作期间事实保持，不要求已经进入 authority-loss 结算的来源重新有效；原 authority、owner 与 continuation 仍由各自协议判定。
 
 创建期先登记 exact allocation obligations，覆盖尚未挂接的产物；成功 adoption 后按当前 containment 管理普通内容。普通组件新增不是 ownership 转移，普通内容也不必临时转成永久登记结构。
 

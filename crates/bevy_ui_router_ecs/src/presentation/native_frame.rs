@@ -1326,18 +1326,30 @@ mod tests {
         let RequestLookup::Found(request) = snapshots.request(router, request) else {
             panic!("request missing");
         };
-        if action == 2 {
+        if action != 1 {
             assert_eq!(request.status(), &RequestStatus::Succeeded);
             assert!(app.world().get_entity(remaining).is_err());
-            assert_eq!(
-                app.world().get::<Node>(protected).unwrap().width,
-                Val::Px(404.0)
-            );
             assert!(
-                app.world()
-                    .get::<UnrelatedApplicationData>(protected)
-                    .is_some()
+                app.world().resource::<RouterNavigation>().entries[0]
+                    .authority_protocol_residual
+                    .is_none()
             );
+            if action == 0 {
+                assert_eq!(
+                    app.world().get::<ChildOf>(protected).map(ChildOf::parent),
+                    Some(application)
+                );
+            } else {
+                assert_eq!(
+                    app.world().get::<Node>(protected).unwrap().width,
+                    Val::Px(404.0)
+                );
+                assert!(
+                    app.world()
+                        .get::<UnrelatedApplicationData>(protected)
+                        .is_some()
+                );
+            }
         } else {
             // Publication already succeeded; protected drift retires authority without
             // rewriting the original navigation result.
@@ -1384,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_protected_relationship_drift_stops_before_next_removal_and_terminates() {
+    fn cleanup_unrelated_app_relationship_change_remains_legal() {
         cleanup_protected_hook_case(0);
     }
     #[test]

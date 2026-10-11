@@ -1608,6 +1608,10 @@ pub(crate) fn child_slot_mutation_target(
 }
 
 impl RealizedFrame {
+    pub(crate) fn cleanup_host(&self) -> Entity {
+        self.host_candidate.host()
+    }
+
     #[cfg(feature = "bsn")]
     pub(crate) fn native_focus_owner(&self) -> Option<&crate::native_focus::NativeFocusOwner> {
         self.native.as_ref()?.focus_owner.as_ref()
