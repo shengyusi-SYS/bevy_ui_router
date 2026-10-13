@@ -55,13 +55,15 @@ Router 在 Scene apply 期间需要真实 task 的来源事实及暂存内容归
 
 上述是可采用接口的最低行为条件，不预定新的上游 API 形状。现有固定版本 [native focus 桥](../../../crates/bevy_ui_router_ecs/src/native_focus.rs)依赖私有字段反射与官方处理器替换；正式接线完成时应整体退休这段兼容责任，不能只在它旁边再加一层 adapter。
 
-优先围绕公开 hook 设计和实现，不要求消费者采用特定 Bevy fork。官方 0.19.1 缺少过滤入口，循环调用 navigate 的薄 adapter 只能是可替换迁移桥：它反复采集/排序候选，还依赖 doc(hidden) helper 和私有插件 glue 的替代接线，不能作为长期完成状态。
+可采用接口须有公开合同、明确的依赖来源和维护责任。官方接口、最小上游扩展或独立 UI 扩展按同一行为标准评估；职责归属 UI 层不要求等待官方发布。先用最小可执行验证确认接缝能闭合，再选择一条生产接入路线；独立扩展应复用原生机制，不能把完整候选、modal 或分发算法复制进 Router。
+
+官方 0.19.1 缺少过滤入口，循环调用 navigate 的薄 adapter 只能是可替换迁移桥：它反复采集/排序候选，还依赖 doc(hidden) helper 和私有插件 glue 的替代接线，不能作为长期完成状态。
 
 本次核查的官方 [0.20.0](https://github.com/bevyengine/bevy/releases/tag/v0.20.0) 已让 [Tab 跳过隐藏 UI](https://github.com/bevyengine/bevy/blob/v0.20.0/crates/bevy_input_focus/src/tab_navigation.rs)，但仍未提供 Router 资格 hook；[dispatch 和焦点队列](https://github.com/bevyengine/bevy/blob/v0.20.0/crates/bevy_input_focus/src/lib.rs)也未补齐所需公开接缝。它超出当前 0.19 支持范围，单纯升级不足以交付本项。
 
 官方 main 在固定版本 `0e93c7ab7d5ec016990dcb226ec544aee1636d70` 新增公开 [Focusable](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/lib.rs#L65)，[Tab 候选采集](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/tab_navigation.rs#L334)与 AcquireFocus 消费它，缺少组件不剪掉后代。这是未来候选接缝的部分进展；[dispatch](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/lib.rs#L414)仍只验证 Entity 存活，[焦点队列](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/gained_and_lost.rs#L64)仍无过滤。动态增删 Focusable 尚不能闭合直接设焦后的分发与排队焦点事件，当前不为此迁移整个 workspace。
 
-若正式接缝尚不可用且交付需要迁移桥，将兼容实现隔离在一个模块，接口服从同一资格合同，并用真实插件旅程验证等价行为。是否投入这段过渡工作须单独决定；不因较短工期默认先做，也不同时建设两条路线却只计算一条预算。
+候选验证可以局部修改 UI 依赖以证明最小接缝，产物和成功范围明确标为验证，不计作正式交付。实际改变支持的 Bevy 版本、依赖来源或消费者装配要求前，给出候选补丁、公开旅程及维护成本，完成依赖选择裁决。若另选迁移桥，兼容责任隔离在一个模块并服从同一资格合同，不同时建设两条生产路线。
 
 ### 统一的访问级滚动恢复意图
 
@@ -75,7 +77,7 @@ Router 在 Scene apply 期间需要真实 task 的来源事实及暂存内容归
 
 ## 规划与投入依据
 
-实例协调和访问级滚动统一意图已交付，被替代的 leaf 专用路径已退出。通用输入公开接缝需先闭合上游可行性；不把整条路线图捆成一次发布前置。迁移桥与长期完成分别验收。
+实例协调和访问级滚动统一意图已交付，被替代的 leaf 专用路径已退出。通用输入先主动验证接缝及可采用路径，接口缺口不能直接成为无限等待的执行安排。验证、迁移桥与长期交付分别报告，不把整条路线图捆成一次发布前置。
 
 整体主线、依赖关系、分项风险与预算统一归[路线图](../../roadmap.md#工作量风险与-roi)。实例模型设计不等于实现预算；消费者接入核查计入所属专题，应用迁移与业务政策由应用单独估算。预算不能以重复计算共享设计/验收放大，也不能以省去必要门禁缩小。
 
