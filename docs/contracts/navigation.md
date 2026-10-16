@@ -18,11 +18,13 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 | --- | --- |
 | 同祖先切换子页 | 保留不变 prefix；suffix 默认 fresh，符合下述 keep-alive 条件时逐实例复用 |
 | 某段 params 或复用身份变化 | 从该段起替换，保留此前 prefix |
-| raw search 变化 | 按上述精确比较重建整链 |
+| raw search 变化 | 默认从 root 重建；连续 opt-in 的相同身份 prefix 可保留，在首个默认节点或身份变化处开始替换 |
 | 仅 fragment 变化 | 保留祖先，重建最深 normal frame；frame/slot 身份保持，generation 推进 |
 | canonical path/search/fragment 全部等价 | normal presentation 保持原结构，history 仍按命令语义提交；显式滚动恢复可写入位置 |
 
 新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留布局和命中的库存实例不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用通过 `RouteInputs::current(Entity)` 读取所属 active frame 的本次已发布输入，而不是把旧 factory 快照当作当前值。
+
+`RouteNodeOptions::with_preserve_on_search(true)` 显式允许该节点在 raw search 变化时复用，默认 false。它同时用于当前 prefix 和下述库存命中，不归一化 query，也不忽略 params、route/view/slot/key 或父 scope 身份。各层独立选择；父布局开启不使默认子页自动复用。同时改变 search 和 fragment 时，若整链原可复用，仍保留祖先并替换最深 frame、推进其 generation，不能命中旧 fragment 的缓存代替本次重建。需要读取新 query 的保留内容使用 `RouteInputs::current`。
 
 `RouteInputRef` 提供 `route()`、`params()`、`location()`、`origin()`、`failure()` 五个只读 getters；search/fragment 经 `location()` 读取。每层 params 仅属于该 route，完整 location 属于本次 presentation。normal frame 的 failure 为 None；route-error frame 使用错误边界 route/local params 和原 failure，正常前缀不继承 failure；router fallback 的 route 为 None、params 为空、failure 为原失败。error/fallback location 是失败请求位置，不能从未推进的成功 history 反推。
 
@@ -42,13 +44,13 @@ normal 页面和布局可分别保留，exact parent frame/generation、outlet�
 
 实例优先选择符合复用政策的当前内容，再选择 exact 父作用域内的库存，最后 fresh；多个合法库存候选选择最近成功离场者。父复用身份不以旧子目标或旧完整 location 决定。
 
-命中使用该父作用域内的 route/view 复用身份、params 和 raw search；最深目标还要求 raw fragment 精确匹配。命中保留原 Entity、局部组件状态和内容 handles，跳过 factory、Scene resolve/apply；本次请求仍沿合法的新执行与 publication 合同运行，不重放旧 task。未命中创建 fresh Scene。
+命中使用该父作用域内的 route/view 复用身份、params 和 raw search；该节点显式开启 `preserve_on_search` 时允许 search 不同。最深目标仍要求 raw fragment 精确匹配。命中保留原 Entity、局部组件状态和内容 handles，跳过 factory、Scene resolve/apply；本次请求仍沿合法的新执行与 publication 合同运行，不重放旧 task。未命中创建 fresh Scene。
 
 库存按成功离场维护简单 LRU，失败不刷新顺序。命中实例移出非活动库存，各层独立计算保留条件；超出容量时选最旧候选，并受控清理其依赖闭包，所以实际剩余数可以小于容量。parent/outlet/slot 或 host scope 失效时不能跨 scope 命中，旧责任须经[生命周期结算](lifecycle.md#非活动实例与长期-owner)。
 
 同次离场按子到父加入 LRU，所以父子都允许保留而容量为 1 时可留下父、清理子；本次选中的实例及其父依赖不作为容量淘汰目标。
 
-keep-alive 不改变输入更新规则：raw search 变化仍重建整条分支并失效旧父 scope；仅 fragment 变化仍重建 deepest normal frame，不把此次重建解释为缓存命中。
+keep-alive 本身不改变输入更新规则：默认 raw search 变化仍重建整条分支，稳定布局需要单独 opt-in `preserve_on_search` 才能保持父 scope；仅 fragment 变化仍重建 deepest normal frame，不把此次重建解释为缓存命中。
 
 history entry 标识一次访问，缓存标识页面实例。不同 entry 可以命中同一个 Entity；Push/Replace 的新 entry 与 Back 的既有 entry 语义保持。显式滚动仍按目标 entry 恢复，不按共享实例当前值冒充该次访问的记录。
 

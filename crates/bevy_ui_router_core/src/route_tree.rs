@@ -47,6 +47,7 @@ pub struct RouteNodeOptions {
     error_view: Option<(ErrorBoundaryKey, RouteViewKey)>,
     meta: RouteMeta,
     keep_alive: bool,
+    preserve_on_search: bool,
 }
 
 impl RouteNodeOptions {
@@ -59,6 +60,7 @@ impl RouteNodeOptions {
             error_view: None,
             meta: RouteMeta::new(),
             keep_alive: false,
+            preserve_on_search: false,
         }
     }
 
@@ -98,6 +100,20 @@ impl RouteNodeOptions {
 
     pub const fn keep_alive(&self) -> bool {
         self.keep_alive
+    }
+
+    /// Reuses this route across raw search changes when its other identity and
+    /// exact parent scope still match. Descendants choose independently.
+    ///
+    /// The default is false. Reused content reads the new published location
+    /// through `RouteInputs`; its factory input remains a creation snapshot.
+    pub fn with_preserve_on_search(mut self, preserve: bool) -> Self {
+        self.preserve_on_search = preserve;
+        self
+    }
+
+    pub const fn preserve_on_search(&self) -> bool {
+        self.preserve_on_search
     }
 
     pub fn with_meta(mut self, meta: RouteMeta) -> Self {

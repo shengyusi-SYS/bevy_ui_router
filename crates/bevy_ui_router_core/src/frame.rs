@@ -664,7 +664,7 @@ impl RouteReconciliationProjection {
         active_child_slots: &[LogicalChildSlotBinding],
         target: &MatchedBranch,
         reserved_frames: &[RouteFrameId],
-        fragment_only: bool,
+        fragment_replacement: bool,
     ) -> Result<Self, ReconciliationProjectionError> {
         if reserved_frames.len() != target.routes().len()
             || !active_baseline_is_consistent(
@@ -681,7 +681,7 @@ impl RouteReconciliationProjection {
         }
 
         let common_prefix = match active_branch {
-            Some(active) if fragment_only => active.routes().len().saturating_sub(1),
+            Some(active) if fragment_replacement => active.routes().len().saturating_sub(1),
             Some(active) => BranchDiff::compare(active, target).common_prefix_len(),
             None => 0,
         };
@@ -707,7 +707,7 @@ impl RouteReconciliationProjection {
         let mut entering = Vec::with_capacity(target.routes().len() - common_prefix);
         for branch_index in common_prefix..target.routes().len() {
             let route = &target.routes()[branch_index];
-            let (frame, generation) = if fragment_only
+            let (frame, generation) = if fragment_replacement
                 && branch_index + 1 == target.routes().len()
                 && branch_index < active_frames.len()
             {

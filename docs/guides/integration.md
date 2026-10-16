@@ -127,6 +127,8 @@ let router = app.add_ui_router(config)?;
 
 父、子分别配置：保留父布局不要求保留当前子页；返回时由目标路由选择子页。[嵌套示例](../../crates/bevy_ui_router/examples/bsn_nested.rs)演示离开整个布局再返回另一子页，保留原工具栏状态，并读取新的当前输入。
 
+带 query 的页面之间导航时，稳定 root/layout 可单独设置 `RouteNodeOptions::with_preserve_on_search(true)`，允许同一实例和该父 scope 下的缓存跨 search 复用。默认关闭，子页仍按各自政策重建；参数及其它复用身份必须相同。复用内容从 `RouteInputs::current` 读取本次位置，factory 不会重新运行。
+
 命中继续使用原实体与组件状态，应用的后台系统通过下述 `RouteActivity` 查询决定是否工作；布局仍由正常 Bevy UI 管线执行，滚动接入不需要另换容器或记录接口。
 
 ## 滚动恢复

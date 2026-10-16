@@ -13,6 +13,7 @@ use crate::admission::{
     RetiredHostAuthorityProjection,
 };
 use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RouteParams};
+use crate::branch_diff::BranchDiff;
 use crate::cleanup::{
     CleanupBatchToken, CleanupCompletion, CleanupCompletionDigest, CleanupManifestDigest,
     CleanupManifestSeal,
@@ -10182,13 +10183,7 @@ impl RouterEngine {
             .map(|reserved| reserved.frame())
             .collect::<Vec<_>>();
         let active_location = self.state.active().location();
-        let reconciliation_fragment = active_location.is_some_and(|active| {
-            active.path() == location.path()
-                && active.search() == location.search()
-                && active.fragment() != location.fragment()
-        }) && self
-            .current_active_branch()
-            .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
+        let reconciliation_fragment = self.requires_fragment_replacement(&location, &branch);
         let reconciliation = match RouteReconciliationProjection::from_running(
             self.router,
             host.host(),
@@ -14493,13 +14488,7 @@ impl RouterEngine {
             .expect("match is written once");
         let active_location = self.state.active().location();
         let active_frames = self.state.active().frames();
-        let reconciliation_fragment = active_location.is_some_and(|active| {
-            active.path() == location.path()
-                && active.search() == location.search()
-                && active.fragment() != location.fragment()
-        }) && self
-            .current_active_branch()
-            .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
+        let reconciliation_fragment = self.requires_fragment_replacement(&location, &branch);
 
         let host = self
             .state
@@ -16437,6 +16426,24 @@ impl RouterEngine {
 
     fn current_active_branch(&self) -> Option<&MatchedBranch> {
         self.active_branch.as_ref()
+    }
+
+    fn requires_fragment_replacement(
+        &self,
+        location: &RouteLocation,
+        target: &MatchedBranch,
+    ) -> bool {
+        let (Some(active_location), Some(active)) =
+            (self.state.active().location(), self.current_active_branch())
+        else {
+            return false;
+        };
+        // Search opt-in can preserve the whole branch, but never waives the
+        // deepest fragment replacement. Otherwise normal branch diff owns it.
+        active_location.path() == location.path()
+            && active_location.fragment() != location.fragment()
+            && active.routes().len() == target.routes().len()
+            && BranchDiff::compare(active, target).common_prefix_len() == target.routes().len()
     }
 
     fn back_target_preparation_baseline(&self) -> BackTargetPreparationBaseline {

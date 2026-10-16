@@ -170,6 +170,7 @@ pub struct MatchedRoute {
     meta: RouteMeta,
     params_fingerprint: RouteParamsFingerprint,
     segment_reuse_key: RouteSegmentReuseKey,
+    preserve_on_search: bool,
 }
 
 impl MatchedRoute {
@@ -194,6 +195,7 @@ impl MatchedRoute {
             meta,
             params_fingerprint,
             segment_reuse_key,
+            preserve_on_search: false,
         }
     }
 
@@ -235,6 +237,15 @@ impl MatchedRoute {
 
     pub const fn segment_reuse_key(&self) -> &RouteSegmentReuseKey {
         &self.segment_reuse_key
+    }
+
+    pub(crate) fn with_preserve_on_search(mut self, preserve: bool) -> Self {
+        self.preserve_on_search = preserve;
+        self
+    }
+
+    pub(crate) const fn preserve_on_search(&self) -> bool {
+        self.preserve_on_search
     }
 }
 

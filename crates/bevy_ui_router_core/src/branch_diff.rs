@@ -54,13 +54,17 @@ impl BranchDiff {
     pub fn compare(old: &MatchedBranch, new: &MatchedBranch) -> Self {
         let provenance_changed = old.provenance() != new.provenance();
         let search_changed = old.search_fingerprint() != new.search_fingerprint();
-        let common_prefix_len = if provenance_changed || search_changed {
+        let common_prefix_len = if provenance_changed {
             0
         } else {
             old.routes()
                 .iter()
                 .zip(new.routes().iter())
-                .take_while(|(old_route, new_route)| reusable_segment(old_route, new_route))
+                .take_while(|(old_route, new_route)| {
+                    reusable_segment(old_route, new_route)
+                        && (!search_changed
+                            || (old_route.preserve_on_search() && new_route.preserve_on_search()))
+                })
                 .count()
         };
 
@@ -321,6 +325,41 @@ mod tests {
         let diff = BranchDiff::compare(&old, &new);
         assert!(diff.provenance_changed());
         assert_eq!(diff.common_prefix_len(), 0);
+    }
+
+    #[test]
+    fn search_opt_in_keeps_layout_prefix_and_rebuilds_default_leaf() {
+        let mut builder = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path(":scope").unwrap(),
+                RouteNodeOptions::new().with_preserve_on_search(true),
+            )
+            .unwrap();
+        let root = builder.root_id().unwrap();
+        let layout = builder
+            .route_with_options(
+                root,
+                RoutePattern::path("items").unwrap(),
+                RouteNodeOptions::new().with_preserve_on_search(true),
+            )
+            .unwrap();
+        builder
+            .route(layout, RoutePattern::path(":id").unwrap())
+            .unwrap();
+        let matcher = RouteMatcher::new(builder.build().unwrap());
+        let old = matcher
+            .match_location(&RouteLocation::new("/north/items/1").with_search("sort=name"))
+            .unwrap();
+
+        for (path, preserved) in [("/north/items/1", 2), ("/south/items/1", 0)] {
+            let new = matcher
+                .match_location(&RouteLocation::new(path).with_search("sort=date"))
+                .unwrap();
+            let diff = BranchDiff::compare(&old, &new);
+            assert!(diff.search_changed());
+            assert_eq!(diff.common_prefix_len(), preserved, "{path}");
+            assert_eq!(diff.entering().len(), 3 - preserved);
+        }
     }
 
     #[test]

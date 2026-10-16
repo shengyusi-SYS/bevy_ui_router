@@ -108,7 +108,8 @@ impl RouteMatcher {
                 params_fingerprint,
                 segment_reuse_key,
             )
-            .with_nearest_error_view(nearest_error_view.clone()),
+            .with_nearest_error_view(nearest_error_view.clone())
+            .with_preserve_on_search(options.preserve_on_search()),
         );
         let next_specificity = specificity.add(matched.specificity);
 

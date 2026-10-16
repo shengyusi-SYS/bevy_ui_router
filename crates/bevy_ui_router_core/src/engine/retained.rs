@@ -1175,14 +1175,7 @@ impl RouterEngine {
         let branch = current.branch.as_ref().ok_or(CommitError::Stale)?;
         let projection = current.reconciliation.as_ref().ok_or(CommitError::Stale)?;
         let host = self.state.host().ok_or(CommitError::Stale)?;
-        let fragment_only = self.state.active().location().is_some_and(|active| {
-            active.path() == task.location.path()
-                && active.search() == task.location.search()
-                && active.fragment() != task.location.fragment()
-        }) && self
-            .active_branch
-            .as_ref()
-            .is_some_and(|active| active.branch_fingerprint() == branch.branch_fingerprint());
+        let fragment_replacement = self.requires_fragment_replacement(&task.location, branch);
         let mut selected = Vec::new();
         if self.keep_alive_capacity == 0 || task.identity.branch_index == 0 {
             return Ok(selected);
@@ -1190,7 +1183,7 @@ impl RouterEngine {
         for index in task.identity.branch_index..branch.routes().len() {
             let matched = &branch.routes()[index];
             if !self.matcher.keep_alive(matched.route())
-                || (fragment_only && index + 1 == branch.routes().len())
+                || (fragment_replacement && index + 1 == branch.routes().len())
             {
                 break;
             }
@@ -1232,7 +1225,8 @@ impl RouterEngine {
                         && hit.slot() == slot
                         && hit.segment_reuse_key() == matched.segment_reuse_key()
                         && hit.view() == view
-                        && hit.location().search() == task.location.search()
+                        && (matched.preserve_on_search()
+                            || hit.location().search() == task.location.search())
                         && (index + 1 != branch.routes().len()
                             || hit.location().fragment() == task.location.fragment())
                 });

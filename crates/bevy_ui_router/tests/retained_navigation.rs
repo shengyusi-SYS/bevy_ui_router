@@ -30,6 +30,10 @@ struct Fixture {
 
 impl Fixture {
     fn nested(capacity: usize, keep_child: bool) -> Self {
+        Self::nested_with_search_policy(capacity, keep_child, false)
+    }
+
+    fn nested_with_search_policy(capacity: usize, keep_child: bool, preserve_search: bool) -> Self {
         let mut app = App::new();
         app.add_plugins((
             TaskPoolPlugin::default(),
@@ -76,7 +80,9 @@ impl Fixture {
         let mut tree = RouteTree::builder()
             .root_with_options(
                 RoutePattern::pathless(),
-                RouteNodeOptions::new().with_view(RouteViewKey::new("layout").unwrap()),
+                RouteNodeOptions::new()
+                    .with_view(RouteViewKey::new("layout").unwrap())
+                    .with_preserve_on_search(preserve_search),
             )
             .unwrap();
         let root = tree.root_id().unwrap();
@@ -86,6 +92,7 @@ impl Fixture {
                 RoutePattern::path("p").unwrap(),
                 RouteNodeOptions::new()
                     .with_view(RouteViewKey::new("p").unwrap())
+                    .with_preserve_on_search(preserve_search)
                     .with_keep_alive(true),
             )
             .unwrap();
@@ -228,11 +235,14 @@ impl Fixture {
         );
     }
     fn push(&mut self, path: &str) {
+        self.push_location(RouteLocation::new(path));
+    }
+    fn push_location(&mut self, location: RouteLocation) {
         let request = self
             .app
             .world_mut()
             .resource_mut::<RouterNavigation>()
-            .push(self.router, RouteLocation::new(path))
+            .push(self.router, location)
             .unwrap();
         self.settle(request);
     }
@@ -283,6 +293,158 @@ impl Fixture {
         }
         panic!("the original request must terminate");
     }
+}
+
+#[test]
+fn search_opt_in_still_replaces_deepest_fragment_for_push_replace_and_back() {
+    for replace in [false, true] {
+        let mut fixture = Fixture::nested_with_search_policy(3, false, true);
+        fixture.push_location(
+            RouteLocation::new("/p")
+                .with_search("sort=name")
+                .with_fragment("a"),
+        );
+        let root = fixture.active("layout");
+        let initial = fixture.active("p");
+        let frame = |fixture: &Fixture| {
+            fixture
+                .app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(fixture.router)
+                .unwrap()
+                .active()
+                .frames()
+                .last()
+                .unwrap()
+                .clone()
+        };
+        let initial_frame = frame(&fixture);
+        let target = RouteLocation::new("/p")
+            .with_search("sort=date")
+            .with_fragment("b");
+        if replace {
+            let request = fixture
+                .app
+                .world_mut()
+                .resource_mut::<RouterNavigation>()
+                .replace(fixture.router, target.clone())
+                .unwrap();
+            fixture.settle(request);
+        } else {
+            fixture.push_location(target.clone());
+        }
+        assert_eq!(fixture.active("layout"), root);
+        assert_ne!(
+            fixture.active("p"),
+            initial,
+            "search opt-in must not bypass fragment replacement"
+        );
+        let changed = frame(&fixture);
+        assert_eq!(changed.frame(), initial_frame.frame());
+        assert_eq!(changed.slot(), initial_frame.slot());
+        assert_eq!(
+            changed.generation().raw(),
+            initial_frame.generation().raw() + 1
+        );
+
+        fixture.push_location(
+            RouteLocation::new("/p")
+                .with_search("sort=duration")
+                .with_fragment("c"),
+        );
+        let before_back = fixture.active("p");
+        let before_back_frame = frame(&fixture);
+        fixture.back();
+        assert_eq!(fixture.active("layout"), root);
+        assert_ne!(fixture.active("p"), before_back);
+        let returned = frame(&fixture);
+        assert_eq!(returned.frame(), before_back_frame.frame());
+        assert_eq!(returned.slot(), before_back_frame.slot());
+        assert_eq!(
+            returned.generation().raw(),
+            before_back_frame.generation().raw() + 1
+        );
+        assert_eq!(
+            fixture
+                .app
+                .world()
+                .resource::<RouterSnapshots>()
+                .get(fixture.router)
+                .unwrap()
+                .active()
+                .location(),
+            Some(&target)
+        );
+        assert_eq!(fixture.calls("p"), 4);
+    }
+}
+
+#[test]
+fn search_opt_in_reuses_current_and_retained_layouts_with_fresh_children() {
+    let mut fixture = Fixture::nested_with_search_policy(3, false, true);
+    fixture.push_location(RouteLocation::new("/p/c").with_search("sort=name"));
+    let root = fixture.active("layout");
+    let parent = fixture.active("p");
+    let first_child = fixture.active("c");
+    fixture
+        .app
+        .world_mut()
+        .get_mut::<LocalValue>(parent)
+        .unwrap()
+        .0 = 41;
+
+    fixture.push_location(RouteLocation::new("/p/c").with_search("sort=date"));
+    assert_eq!(fixture.active("layout"), root);
+    assert_eq!(fixture.active("p"), parent);
+    assert_ne!(fixture.active("c"), first_child);
+    assert_eq!(fixture.calls("p"), 1);
+    assert_eq!(fixture.calls("c"), 2);
+
+    fixture.push_location(RouteLocation::new("/q").with_search("filter=other"));
+    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(fixture.app.world_mut());
+    assert!(
+        inputs
+            .get(fixture.app.world())
+            .unwrap()
+            .current(parent)
+            .is_none()
+    );
+    let returned = RouteLocation::new("/p/d").with_search("sort=duration");
+    fixture.push_location(returned.clone());
+    assert_eq!(fixture.active("layout"), root);
+    assert_eq!(fixture.active("p"), parent);
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(41))
+    );
+    assert_eq!(fixture.calls("p"), 1);
+    assert_eq!(fixture.calls("d"), 1);
+    assert_eq!(
+        inputs
+            .get(fixture.app.world())
+            .unwrap()
+            .current(parent)
+            .unwrap()
+            .location(),
+        &returned,
+    );
+    fixture.back();
+    fixture.back();
+    assert_eq!(fixture.active("p"), parent);
+    assert_eq!(
+        fixture.app.world().get::<LocalValue>(parent),
+        Some(&LocalValue(41))
+    );
+    assert_eq!(
+        inputs
+            .get(fixture.app.world())
+            .unwrap()
+            .current(parent)
+            .unwrap()
+            .location(),
+        &RouteLocation::new("/p/c").with_search("sort=date"),
+    );
 }
 
 fn assert_parent_and_child_retention_are_independent(keep_child: bool) {

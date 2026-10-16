@@ -366,7 +366,9 @@ fn main() {
     let mut routes = RouteTree::builder()
         .root_with_options(
             RoutePattern::path("/").unwrap(),
-            RouteNodeOptions::new().with_view(layout.clone()),
+            RouteNodeOptions::new()
+                .with_view(layout.clone())
+                .with_preserve_on_search(true),
         )
         .unwrap();
     let root = routes.root_id().unwrap();
@@ -628,7 +630,8 @@ fn main() {
     let live_count = app.world().entities().count_spawned();
     for index in 0..96 {
         let item = format!("repeat-{index}");
-        let location = RouteLocation::new(format!("/items/{item}"));
+        let location = RouteLocation::new(format!("/items/{item}"))
+            .with_search(format!("sort={index}"));
         let request = app
             .world_mut()
             .resource_mut::<RouterNavigation>()
