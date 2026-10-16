@@ -91,8 +91,11 @@ impl RouteNodeOptions {
         self
     }
 
-    /// Retains an eligible normal leaf while its exact parent scope survives.
-    /// Router capacity must also be nonzero; the default is disabled.
+    /// Retains an eligible normal page or layout after it leaves the active branch.
+    ///
+    /// Requires nonzero Router capacity and a surviving normal parent scope;
+    /// a route directly under the host cannot enter the inactive inventory.
+    /// Parent and child routes opt in independently. The default is disabled.
     pub fn with_keep_alive(mut self, keep_alive: bool) -> Self {
         self.keep_alive = keep_alive;
         self

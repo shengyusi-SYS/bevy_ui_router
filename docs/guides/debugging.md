@@ -20,7 +20,7 @@ python3 examples/windowed/ui_debug.py capture /tmp/router-ui.png
 
 需要桌面显示与图形驱动，Python client 仅使用标准库。上述 `ui-debug` 模式不请求启动焦点；`ui-debug` 仅在 debug 构建显式启用时监听 `127.0.0.1:15703`，窗口持续更新以处理请求。标准 release 构建不会启用此调试入口。
 
-`snapshot` 返回窗口 Entity、scale factor、实际 UI 布局、文本、焦点、`router_active`、输入资格、当前路由输入及请求/实际滚动位置。`pending_restore` 是当前 scope 的 `list` 恢复目标，容器尚未创建时也可查询。`find` 按名称或显示文本检索节点；缓存节点仍存在，定位当前页面时选 `router_active=true`。点击使用窗口内**逻辑坐标**；从 snapshot 取得的 `center_physical` 应除以对应窗口的 `scale_factor`：
+`snapshot` 返回窗口 Entity、scale factor、实际 UI 布局、文本、焦点、`router_active`、输入资格、当前路由输入及请求/实际滚动位置。`route_location` 保持为 path，`route_search`、`route_fragment` 分别保留原字符串，`route_id` 标识所属 frame 的 route；非活动内容的这些字段为 null，fallback 的 route ID 也为 null。状态栏同样分开显示 path、search 和 fragment，不拼接或归一化 URL。`pending_restore` 是当前 scope 的 `list` 恢复目标，容器尚未创建时也可查询。`find` 按名称或显示文本检索节点；缓存节点仍存在，定位当前页面时选 `router_active=true`。点击使用窗口内**逻辑坐标**；从 snapshot 取得的 `center_physical` 应除以对应窗口的 `scale_factor`：
 
 ```sh
 python3 examples/windowed/ui_debug.py click 100 120
@@ -49,6 +49,8 @@ python3 examples/windowed/ui_debug.py key Space
 fallback 会替换路由布局并清理旧缓存；恢复后布局和页面为新实例。终端输出和状态栏可核对请求、目标 Entity、history cursor 与 focus；页面键盘 handler 在 `RouterInputSet::Ready` 后检查 gate。
 
 示例容量为 3，布局 A、Overview、Settings 分别开启保留，Delayed 和 Outside 未开启。Load 仅模拟应用在稍后创建内容，Ready/Cancel 通过公开滚动命令消费意图；它没有引入异步 Scene 或加载框架。
+
+滚动未恢复时，先核对是否为成功 Back 及目标访问是否已有记录，再检查 `router_active`、`pending_restore` 与请求/实际位置。显式策略等待应用 ready；应用主动滚动、取消或绑定失效也会消费意图，`pending_restore=null` 本身不说明是哪种原因。重复 key 和缺少正常 layout/camera 的终端警告附带首次发现的 Router、frame、generation 和 key；每个 Router 每类警告仍最多一次，不枚举后续所有问题。恢复规则见[导航合同](../contracts/navigation.md#按访问恢复滚动)。
 
 列表滚动使用实际 `MouseWheel` 消息：先把 cursor 移到 snapshot 中的 `overview-scroll`、`settings-scroll` 或已加载的 `delayed-scroll` 区域，再向 `router/input` 发送 `MouseWheel`，字段为 `window`、`unit: "Pixel"`、`x: 0.0`、`y` 和 `phase: "Moved"`；负 `y` 向下滚动。Router marker 负责访问记录，示例自己的 scroll observer 负责修改 Bevy `ScrollPosition`。
 

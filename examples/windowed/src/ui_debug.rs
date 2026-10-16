@@ -116,6 +116,7 @@ fn snapshot(
         .map(|(entity, node, transform, name, text, parent, scroll)| {
             let actual_scroll = node.scroll_position * node.inverse_scale_factor();
             let pending = restorations.pending(entity, "list");
+            let input = inputs.current(entity);
             json!({
                 "entity": entity.to_bits(), "name": name.map(Name::as_str),
                 "text": text.map(|text| text.0.as_str()),
@@ -125,7 +126,10 @@ fn snapshot(
                 "router_active": activity.is_active(entity),
                 "pointer_allowed": gate.allows_pointer(entity),
                 "keyboard_allowed": gate.allows_keyboard(entity),
-                "route_location": inputs.current(entity).map(|input| input.location().path()),
+                "route_location": input.map(|input| input.location().path()),
+                "route_search": input.and_then(|input| input.location().search()),
+                "route_fragment": input.and_then(|input| input.location().fragment()),
+                "route_id": input.and_then(|input| input.route()).map(|route| route.raw()),
                 "pending_restore": pending.map(|intent| [intent.position().0.x, intent.position().0.y]),
                 "scroll_requested": scroll.map(|scroll| [scroll.0.x, scroll.0.y]),
                 "scroll_actual": [actual_scroll.x, actual_scroll.y]

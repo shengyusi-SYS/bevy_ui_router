@@ -16,7 +16,7 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 | 示例 | 用途 | 运行环境 |
 | --- | --- | --- |
 | [bsn_quick_start.rs](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) | 最短装配、入队、request 终态与 active 快照 | 有限次 headless 更新，不计算 UI 布局 |
-| [bsn_nested.rs](../../crates/bevy_ui_router/examples/bsn_nested.rs) | 侧栏/工具栏、内部 outlet、push/replace/back 与局部状态保持 | 有限次 headless 更新，执行真实 UI 布局，无 GPU renderer |
+| [bsn_nested.rs](../../crates/bevy_ui_router/examples/bsn_nested.rs) | 内部 outlet、跨 query 复用、push/replace/back、应用异步内容与显式滚动恢复 | 有限次 headless 更新，执行真实 UI 布局，无 GPU renderer |
 | [windowed](../../examples/windowed/) | 可见页面、交互、focus、错误恢复 | 独立应用 workspace，配置窗口和 renderer |
 
 前两个程序运行完成后退出，不打开操作系统窗口。
@@ -123,13 +123,29 @@ let config = RouterConfig::new(routes.build()?, views, fallback)
 let router = app.add_ui_router(config)?;
 ```
 
-默认容量为 0；只设 route 或只设容量不会使所有页面自动保留。适用范围、LRU、search/fragment 与 history entry 的区别见[导航合同](../contracts/navigation.md#实例保留)，失效和原 owner 结算见[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。不需要额外缓存 runtime、factory wrapper 或应用自建 Entity 仓库。
+按三个独立问题配置：
 
-父、子分别配置：保留父布局不要求保留当前子页；返回时由目标路由选择子页。[嵌套示例](../../crates/bevy_ui_router/examples/bsn_nested.rs)演示离开整个布局再返回另一子页，保留原工具栏状态，并读取新的当前输入。
+| 问题 | 配置与含义 |
+| --- | --- |
+| 离开后要留下这个实例吗？ | route 的 `with_keep_alive(true)`，默认关闭；不影响仍在 active 分支中的正常复用。 |
+| 最多留下多少实例？ | Router 的 `with_keep_alive_capacity(n)`，默认 0；只计算非活动实例，父布局和子页分别计数。 |
+| query 改变时还适用吗？ | route 的 `with_preserve_on_search(true)`，默认关闭；对当前内容和库存命中使用同一政策，不忽略 params 或其它复用身份。 |
 
-带 query 的页面之间导航时，稳定 root/layout 可单独设置 `RouteNodeOptions::with_preserve_on_search(true)`，允许同一实例和该父 scope 下的缓存跨 search 复用。默认关闭，子页仍按各自政策重建；参数及其它复用身份必须相同。复用内容从 `RouteInputs::current` 读取本次位置，factory 不会重新运行。
+只设 route 或只设容量不会使所有页面自动保留。库存绑定原来的 normal 父实例及其 outlet/slot；父实例可以 active 或 retained，直接挂在 host 下、没有 normal 父 frame 的 root 不能进入库存。父实例清理或被淘汰时，其依赖库存一并清理，所以实际库存可能少于容量。无需额外缓存 runtime、factory wrapper 或应用自建 Entity 仓库。
 
-命中继续使用原实体与组件状态，应用的后台系统通过下述 `RouteActivity` 查询决定是否工作；布局仍由正常 Bevy UI 管线执行，滚动接入不需要另换容器或记录接口。
+父、子分别配置：保留父布局不要求保留当前子页；返回时由目标路由选择子页，不自动恢复旧子目标。带 query 的页面之间导航时，稳定 root/layout 可开启 `preserve_on_search`；从第一个未开启或身份变化的节点起重建，子页不会继承父配置。search 与 fragment 同时变化时仍遵守最深 frame 的 fragment 重建政策。完整 LRU、命中与 history entry 规则见[导航合同](../contracts/navigation.md#实例保留)，失效结算见[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。
+
+## 动态内容与重新激活
+
+动态页面沿用现有 Scene、Bevy 系统和 UI 布局：
+
+1. layout Scene 用 `DefaultOutlet` 提供子路由插槽；factory 创建页面结构，`RouteViewInput` 只代表创建时输入。
+2. 页面发布后，应用通过 `RouteInputs::current` 读取当前位置，再按应用自己的数据标识启动或更新后台任务。保留或缓存命中的实例不会重跑 factory。
+3. 任务携带可移动数据或句柄，应用系统接回结果并更新页面内容；应用负责核对任务与数据是否仍匹配，并决定离场后继续还是取消。业务加载不交给 Router。
+4. 重新激活继续使用原 Entity 和组件状态；需要随当前路由工作的系统使用 `RouteActivity` 与当前输入，隐藏页面不会自动暂停应用系统。
+5. 晚到内容按正常 Bevy 调度创建和布局；需要等内容就绪再恢复滚动时，使用下一节的 `Explicit` 策略，对当前恢复意图发送 ready。
+
+组合用法见[嵌套示例](../../crates/bevy_ui_router/examples/bsn_nested.rs)。当前输入、后台工作资格和输入 gate 的具体接法见下文；保留实例不需要更换 UI 容器或另建加载框架。
 
 ## 滚动恢复
 

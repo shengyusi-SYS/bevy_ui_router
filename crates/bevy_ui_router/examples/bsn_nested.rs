@@ -1,7 +1,8 @@
 //! A finite headless demonstration of real UI layout, with no GPU or OS window.
 //! Sidebar and toolbar survive child navigation and a visit outside the layout.
-//! A fresh child restores its history-entry scroll after the application is ready.
-use bevy_app::App;
+//! Query reuse is explicit. Application tasks populate content after publication,
+//! then allow a fresh child's history-entry scroll to restore through normal UI layout.
+use bevy_app::{App, Update};
 use bevy_asset::AssetPlugin;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
@@ -10,9 +11,11 @@ use bevy_internal::{
     DefaultPlugins,
     camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo},
     math::{UVec2, Vec2},
+    tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future, poll_once},
 };
 use bevy_scene::{PatchFromTemplate, ScenePlugin, bsn};
 use bevy_ui::{ComputedNode, FlexDirection, Node, Overflow, ScrollPosition, Val};
+use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
 
 #[derive(Component, Clone, Default)]
@@ -27,6 +30,17 @@ struct WorkspaceOutlet;
 struct ToolbarState(u32);
 #[derive(Component, Clone, Default)]
 struct Page(&'static str);
+#[derive(Component, Clone, Default)]
+struct PageBody;
+#[derive(Component)]
+struct ContentTask(Task<LoadedRows>);
+#[derive(Component)]
+struct LoadedContent(RouteLocation);
+
+struct LoadedRows {
+    source: RouteLocation,
+    rows: Vec<Vec2>,
+}
 
 fn main() {
     let mut app = App::new();
@@ -39,6 +53,10 @@ fn main() {
         app.add_plugins(ScenePlugin);
     }
     app.add_plugins(InputFocusPlugin);
+    app.add_systems(
+        Update,
+        install_loaded_content.after(RouterScheduleSet::PublishSnapshots),
+    );
     // The headless app supplies the target information normally provided by the
     // renderer; propagation and layout still run through Bevy's normal systems.
     app.world_mut().spawn((
@@ -93,7 +111,9 @@ fn main() {
     let mut routes = RouteTree::builder()
         .root_with_options(
             RoutePattern::pathless(),
-            RouteNodeOptions::new().with_view(app_view),
+            RouteNodeOptions::new()
+                .with_view(app_view)
+                .with_preserve_on_search(true),
         )
         .unwrap();
     let root = routes.root_id().unwrap();
@@ -103,7 +123,8 @@ fn main() {
             RoutePattern::path("workspace").unwrap(),
             RouteNodeOptions::new()
                 .with_view(layout_view)
-                .with_keep_alive(true),
+                .with_keep_alive(true)
+                .with_preserve_on_search(true),
         )
         .unwrap();
     for name in ["overview", "settings", "help", "outside"] {
@@ -120,8 +141,9 @@ fn main() {
                     }) }
                     Page(name)
                     Children [(Node {
-                        width: Val::Px(720.0), height: Val::Px(600.0), flex_shrink: 0.0,
-                    })]
+                        width: Val::Px(720.0), flex_shrink: 0.0,
+                        flex_direction: FlexDirection::Column,
+                    } PageBody)]
                 })
             })
             .unwrap();
@@ -162,12 +184,13 @@ fn main() {
     ));
     app.update();
 
+    let initial_location = RouteLocation::new("/workspace/overview").with_search("sort=name");
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/workspace/overview"))
+        .push(router, initial_location.clone())
         .unwrap();
-    settle(&mut app, router, request, "/workspace/overview", 1, 0);
+    settle(&mut app, router, request, &initial_location, 1, 0);
     let layout = only::<Layout>(&mut app);
     let sidebar = only::<Sidebar>(&mut app);
     let column = only::<MainColumn>(&mut app);
@@ -183,6 +206,7 @@ fn main() {
     app.world_mut().get_mut::<ToolbarState>(toolbar).unwrap().0 = 7;
     assert_preserved(&mut app, &preserved, &parents);
     let first_page = show_page(&mut app, "overview", slot, &preserved);
+    load_content(&mut app, first_page);
     let saved_scroll = Vec2::new(24.0, 96.0);
     app.world_mut()
         .get_mut::<ScrollPosition>(first_page)
@@ -191,31 +215,37 @@ fn main() {
     app.update();
     assert_scroll(&app, first_page, saved_scroll);
 
+    // Only the stable root/layout opt in. The default leaf is rebuilt on query
+    // changes, while the existing toolbar reads the new published input.
+    let changed_location = RouteLocation::new("/workspace/overview").with_search("sort=date");
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/workspace/settings"))
+        .push(router, changed_location.clone())
         .unwrap();
-    settle(&mut app, router, request, "/workspace/settings", 2, 1);
+    settle(&mut app, router, request, &changed_location, 2, 1);
     assert_preserved(&mut app, &preserved, &parents);
-    let settings_page = show_page(&mut app, "settings", slot, &preserved);
+    let changed_overview = show_page(&mut app, "overview", slot, &preserved);
+    assert_ne!(changed_overview, first_page);
     assert!(app.world().get_entity(first_page).is_err());
+    assert_current_input(&mut app, toolbar, Some(&changed_location));
     // Replace the second history entry; Back still returns to the first one.
+    let help_location = RouteLocation::new("/workspace/help").with_search("sort=date");
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .replace(router, RouteLocation::new("/workspace/help"))
+        .replace(router, help_location.clone())
         .unwrap();
-    settle(&mut app, router, request, "/workspace/help", 2, 1);
+    settle(&mut app, router, request, &help_location, 2, 1);
     assert_preserved(&mut app, &preserved, &parents);
     let help_page = show_page(&mut app, "help", slot, &preserved);
-    assert!(app.world().get_entity(settings_page).is_err());
+    assert!(app.world().get_entity(changed_overview).is_err());
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
         .back(router)
         .unwrap();
-    settle(&mut app, router, request, "/workspace/overview", 2, 0);
+    settle(&mut app, router, request, &initial_location, 2, 0);
     assert_preserved(&mut app, &preserved, &parents);
     let returned_overview = show_page(&mut app, "overview", slot, &preserved);
     assert_ne!(returned_overview, first_page);
@@ -228,16 +258,15 @@ fn main() {
         .unwrap()
         .expect("Back freezes the original entry's scroll for the fresh child");
     assert_eq!(restoration.position().0, saved_scroll);
-    // Navigation is already terminal while Explicit restoration waits for the
-    // application's content readiness. Signal this exact publication's intent.
+    // Navigation is terminal even though application content has not arrived.
+    // The result installation below readies this exact publication's intent.
     assert_scroll(&app, returned_overview, Vec2::ZERO);
-    let ready = restoration.id();
-    app.world_mut()
-        .run_system_once(move |mut commands: Commands| {
-            commands.ready_route_scroll(ready.clone());
-        })
-        .unwrap();
-    app.update();
+    assert!(
+        app.world()
+            .get::<LoadedContent>(returned_overview)
+            .is_none()
+    );
+    load_content(&mut app, returned_overview);
     assert_scroll(&app, returned_overview, saved_scroll);
     assert!(
         app.world_mut()
@@ -251,16 +280,18 @@ fn main() {
 
     // Leave the whole layout. Only it opts into retention; its child is disposed.
     let overview = only::<Page>(&mut app);
+    let outside_location = RouteLocation::new("/outside").with_search("filter=other");
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/outside"))
+        .push(router, outside_location.clone())
         .unwrap();
-    settle(&mut app, router, request, "/outside", 2, 1);
+    settle(&mut app, router, request, &outside_location, 2, 1);
     let outside = only::<Page>(&mut app);
     assert_eq!(app.world().get::<Page>(outside).unwrap().0, "outside");
     assert!(app.world().get_entity(overview).is_err());
     assert_preserved(&mut app, &preserved, &parents);
+    assert_current_input(&mut app, toolbar, None);
     assert!(
         !app.world()
             .resource::<RouterInputGate>()
@@ -268,33 +299,114 @@ fn main() {
     );
 
     // Reuse the original layout, but let the new route select a fresh child.
+    let returned_location = RouteLocation::new("/workspace/settings").with_search("sort=duration");
     let request = app
         .world_mut()
         .resource_mut::<RouterNavigation>()
-        .push(router, RouteLocation::new("/workspace/settings"))
+        .push(router, returned_location.clone())
         .unwrap();
-    settle(&mut app, router, request, "/workspace/settings", 3, 2);
+    settle(&mut app, router, request, &returned_location, 3, 2);
     assert_preserved(&mut app, &preserved, &parents);
     let returned_settings = show_page(&mut app, "settings", slot, &preserved);
-    assert_ne!(returned_settings, settings_page);
+    assert_ne!(returned_settings, changed_overview);
     assert!(app.world().get_entity(outside).is_err());
     assert!(
         app.world()
             .resource::<RouterInputGate>()
             .allows_pointer(layout)
     );
-    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
-    assert_eq!(
-        inputs
-            .get(app.world())
-            .unwrap()
-            .current(toolbar)
-            .unwrap()
-            .location(),
-        &RouteLocation::new("/workspace/settings")
-    );
+    assert_current_input(&mut app, toolbar, Some(&returned_location));
+    load_content(&mut app, returned_settings);
 
     println!("Reused the original layout and toolbar state=7 with the newly selected child.");
+}
+
+/// Application work owns only ordinary input/data, never a World borrow or a
+/// Router lifecycle capability. A real application can replace this computation
+/// with its own data source without changing the route or scroll contracts.
+fn load_content(app: &mut App, page: Entity) {
+    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
+    let source = inputs
+        .get(app.world())
+        .unwrap()
+        .current(page)
+        .expect("the application starts work for its active page")
+        .location()
+        .clone();
+    let task_source = source.clone();
+    let task = AsyncComputeTaskPool::get().spawn(async move {
+        future::yield_now().await;
+        LoadedRows {
+            source: task_source,
+            rows: vec![Vec2::new(720.0, 20.0); 30],
+        }
+    });
+    app.world_mut().entity_mut(page).insert(ContentTask(task));
+    for _ in 0..32 {
+        app.update();
+        if app
+            .world()
+            .get::<LoadedContent>(page)
+            .is_some_and(|loaded| loaded.0 == source)
+        {
+            return;
+        }
+    }
+    panic!("application content did not arrive within 32 updates");
+}
+
+fn install_loaded_content(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut ContentTask)>,
+    bodies: Query<(Entity, &ChildOf), With<PageBody>>,
+    inputs: RouteInputs,
+    restorations: RouteScrollRestorations,
+) {
+    for (page, mut task) in &mut tasks {
+        // This application chooses to install only on active pages. Keeping a
+        // task while hidden is a policy choice; retention does not cancel it.
+        let Some(current) = inputs.current(page) else {
+            continue;
+        };
+        let Some(result) = block_on(poll_once(&mut task.0)) else {
+            continue;
+        };
+        commands.entity(page).remove::<ContentTask>();
+        if &result.source != current.location() {
+            continue;
+        }
+        let (body, _) = bodies
+            .iter()
+            .find(|(_, parent)| parent.parent() == page)
+            .expect("the application owns a stable content region below the page");
+        for size in result.rows {
+            commands.spawn((
+                Node {
+                    width: Val::Px(size.x),
+                    height: Val::Px(size.y),
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+                ChildOf(body),
+            ));
+        }
+        commands.entity(page).insert(LoadedContent(result.source));
+        // These Commands install content before the normal layout/scroll pass.
+        // Look up the current intent now rather than carrying an old restore ID
+        // through the task or guessing readiness from a number of frames.
+        if let Some(intent) = restorations.pending(page, "body") {
+            commands.ready_route_scroll(intent.id());
+        }
+    }
+}
+
+fn assert_current_input(app: &mut App, target: Entity, expected: Option<&RouteLocation>) {
+    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
+    let input = inputs.get(app.world()).unwrap();
+    assert_eq!(
+        input.current(target).map(|input| input.location()),
+        expected
+    );
 }
 
 fn assert_preserved(app: &mut App, entities: &[Entity; 6], parents: &[Entity; 6]) {
@@ -314,7 +426,7 @@ fn settle(
     app: &mut App,
     router: RouterHandle,
     request: NavigationRequestId,
-    location: &str,
+    location: &RouteLocation,
     entries: usize,
     cursor: usize,
 ) {
@@ -325,13 +437,10 @@ fn settle(
             match result.status() {
                 RequestStatus::Succeeded => {
                     let snapshot = snapshots.get(router).unwrap();
-                    assert_eq!(
-                        snapshot.active().location(),
-                        Some(&RouteLocation::new(location))
-                    );
+                    assert_eq!(snapshot.active().location(), Some(location));
                     assert_eq!(snapshot.history().entries().len(), entries);
                     assert_eq!(snapshot.history().cursor(), Some(cursor));
-                    println!("Succeeded: {location}; history entries={entries}, cursor={cursor}");
+                    println!("Succeeded: {location:?}; history entries={entries}, cursor={cursor}");
                     return;
                 }
                 RequestStatus::Failed(failure) => panic!("navigation failed: {failure:?}"),

@@ -63,7 +63,7 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-quick start 验证最小 Scene runtime 和请求结果；nested 示例执行真实 UI 布局，Back 到 fresh 子页后查询并 ready 该访问的滚动意图；离开布局后返回新子页，核对原父 Entity、工具栏状态、活动资格和新的当前输入。两者均不打开操作系统窗口或启用 GPU renderer；独立 consumer 原样编译运行两者。
+quick start 验证最小 Scene runtime 和请求结果；nested 示例执行真实 UI 布局，跨 query 保留原父布局并更新当前输入，默认子页重建。应用任务只返回普通数据，主线程安装内容后 ready 当前滚动意图，Back 的 fresh 子页在正常布局后恢复二维位置；离开布局后返回新子页，核对原父 Entity、工具栏状态、活动资格和新的当前输入。两者均不打开操作系统窗口或启用 GPU renderer；独立 consumer 原样编译运行两者。
 
 窗口应用是独立 workspace，图形依赖与 headless 库验证分开：
 
@@ -105,6 +105,8 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
+跨 search 复用源码 `a737b4d` 的公开回归覆盖 current/retained 命中及 Push/Replace/Back 与 fragment 的组合。扩展后的 nested 示例进一步验证应用任务安装内容、当前输入与显式滚动 ready，已实际运行并由独立 consumer 原样消费；对应变更通过全特性 ECS、公开保留/滚动/活动旅程、workspace 全目标/全特性静态检查和格式检查。窗口诊断字段通过独立 workspace 全目标/全特性编译与格式检查，未重跑窗口交互或打包。
+
 原生输入扩展候选的补丁与重建入口保存在提交 `8ac20ab`，可用 `git show 8ac20ab:scripts/native-input-candidate/README.md` 查询。候选曾通过 UI 协议、完整 ECS crate 与原生 Tab/dispatch、焦点、pointer、保留和滚动公开旅程；未完成独立下游装配、打包、窗口、硬件输入或性能验收。该方案需要引擎 patch，现已延期并退出工作树，结果不代表当前官方依赖树交付了原生自动接线。
 
 历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；组合回归覆盖混用 Back/Push、淘汰后的后续普通导航、非目标缓存自身失效、暂缺布局后正常离场，以及部分清理中途 host loss 后的同 host 重新接纳与后续 fresh 导航。authority 隔离还须核对 native 内容根的 authored Visibility、Pickable 与应用局部状态保持。不能把跳过失败用例的检查称为全量通过。
@@ -113,7 +115,7 @@ python3 scripts/check-packaged-consumer.py
 
 父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。
 
-滚动统一意图源码 `69615784830b3b4f425f6e7991fd4a503b31c26c` 已通过格式、workspace 全目标/全特性静态检查、未跳过用例的全特性测试、ECS 无默认特性及独立 consumer。nested 原样消费与实际运行在正常 UI 布局中验证 fresh 子页 Back 后 ready。该提交树执行 `cargo package --workspace --locked`，六个包均验证成功；产物 consumer 复编译解压 Router 源码，核对实际来源后运行公开 BSN 旅程成功。后续窗口收口仅修改独立示例和文档，库源码保持该验证树；未上传，选定发布树变化后按风险复核。
+滚动统一意图源码 `69615784830b3b4f425f6e7991fd4a503b31c26c` 已通过格式、workspace 全目标/全特性静态检查、未跳过用例的全特性测试、ECS 无默认特性及独立 consumer。nested 原样消费与实际运行在正常 UI 布局中验证 fresh 子页 Back 后 ready。该提交树执行 `cargo package --workspace --locked`，六个包均验证成功；产物 consumer 复编译解压 Router 源码，核对实际来源后运行公开 BSN 旅程成功。该轮窗口收口仅修改独立示例和文档，库源码仍为该验证树；未上传，最终发布树按后续变更复核。
 
 以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
 

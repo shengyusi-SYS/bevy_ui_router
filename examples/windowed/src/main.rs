@@ -633,12 +633,20 @@ fn update_status(
             }
         }
     }
+    let location = snapshot.active().location().map_or_else(
+        || "No active route".to_owned(),
+        |location| {
+            format!(
+                "{} | search {:?} | fragment {:?}",
+                location.path(),
+                location.search(),
+                location.fragment()
+            )
+        },
+    );
     let state = format!(
         "{} | history {} / {:?} | focus {:?}\n{}",
-        snapshot
-            .active()
-            .location()
-            .map_or("No active route", RouteLocation::path),
+        location,
         snapshot.history().entries().len(),
         snapshot.history().cursor(),
         focus.get(),

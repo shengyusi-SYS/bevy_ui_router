@@ -330,7 +330,12 @@ impl ScrollState {
         let mut state = self.clone();
         state.pending.clear();
         state.warn_duplicate(
-            !observation.source_duplicates.is_empty() || !observation.target_duplicates.is_empty(),
+            observation
+                .source_duplicates
+                .iter()
+                .chain(&observation.target_duplicates)
+                .next()
+                .map(|(frame, key)| (frame, key.as_str())),
         );
         if let Some(entry) = facts.source_entry() {
             // Navigation can publish before this update's scroll systems. Do
@@ -486,18 +491,31 @@ impl ScrollState {
         }
     }
 
-    fn warn_duplicate(&mut self, duplicates: bool) {
-        if duplicates && !self.warned_duplicate {
+    fn warn_duplicate(&mut self, duplicate: Option<(&RouteFrameVersion, &str)>) {
+        if !self.warned_duplicate
+            && let Some((frame, key)) = duplicate
+        {
             eprintln!(
-                "bevy_ui_router: duplicate RouteScroll key within a frame; that key is excluded"
+                "bevy_ui_router: duplicate RouteScroll key within a frame \
+                 (router={}, frame={}, generation={}, key={key:?}); that key is excluded",
+                frame.router().raw(),
+                frame.frame().raw(),
+                frame.generation().raw()
             );
             self.warned_duplicate = true;
         }
     }
-    fn warn_layout(&mut self, missing: bool) {
-        if missing && !self.warned_layout {
+    fn warn_layout(&mut self, missing: Option<&Container>) {
+        if !self.warned_layout
+            && let Some(container) = missing
+        {
             eprintln!(
-                "bevy_ui_router: RouteScroll restoration requires the normal UI layout and camera"
+                "bevy_ui_router: RouteScroll restoration requires the normal UI layout and camera \
+                 (router={}, frame={}, generation={}, key={:?})",
+                container.frame.router().raw(),
+                container.frame.frame().raw(),
+                container.frame.generation().raw(),
+                container.key
             );
             self.warned_layout = true;
         }
@@ -634,7 +652,12 @@ pub(crate) fn prepare_scroll_system(world: &mut World) {
             .unwrap()
             .scroll;
         state.pending = waiting;
-        state.warn_duplicate(!observation.duplicates.is_empty());
+        state.warn_duplicate(
+            observation
+                .duplicates
+                .first()
+                .map(|(frame, key)| (frame, key.as_str())),
+        );
     }
 }
 
@@ -660,8 +683,10 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
     for handle in handles {
         let mut observation = observe_active(world, handle, &eligible);
         let laid_out = laid_out_containers(world, &observation.containers);
-        let lacks_layout =
-            !observation.containers.is_empty() && laid_out.len() != observation.containers.len();
+        let missing_layout = observation
+            .containers
+            .iter()
+            .position(|container| !laid_out.contains(&container.entity));
         let pending = {
             let mut navigation = world.resource_mut::<RouterNavigation>();
             std::mem::take(
@@ -675,7 +700,6 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
             )
         };
         let mut waiting = Vec::with_capacity(pending.len());
-        let mut missing_layout = false;
         for intent in pending {
             if !observation.accepts(&intent) {
                 continue;
@@ -701,7 +725,6 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
                 let node = world.get::<ComputedNode>(current.entity).unwrap();
                 ScrollPosition(node.scroll_position * node.inverse_scale_factor)
             } else {
-                missing_layout = true;
                 binding.position.clone()
             };
             if current.position.0 != settled.0 {
@@ -722,15 +745,20 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
             .find(|entry| entry.handle == handle)
             .unwrap();
         entry.scroll.pending = waiting;
+        entry.scroll.warn_duplicate(
+            observation
+                .duplicates
+                .first()
+                .map(|(frame, key)| (frame, key.as_str())),
+        );
+        entry
+            .scroll
+            .warn_layout(missing_layout.map(|index| &observation.containers[index]));
         entry.scroll.sample_displayed(
             entry.engine.canonical_history().current_entry(),
             observation.containers,
             &laid_out,
         );
-        entry
-            .scroll
-            .warn_duplicate(!observation.duplicates.is_empty());
-        entry.scroll.warn_layout(missing_layout || lacks_layout);
     }
 }
 
