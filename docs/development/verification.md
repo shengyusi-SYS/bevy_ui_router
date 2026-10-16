@@ -105,6 +105,8 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
+原生输入扩展候选的补丁与重建入口保存在提交 `8ac20ab`，可用 `git show 8ac20ab:scripts/native-input-candidate/README.md` 查询。候选曾通过 UI 协议、完整 ECS crate 与原生 Tab/dispatch、焦点、pointer、保留和滚动公开旅程；未完成独立下游装配、打包、窗口、硬件输入或性能验收。该方案需要引擎 patch，现已延期并退出工作树，结果不代表当前官方依赖树交付了原生自动接线。
+
 历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；组合回归覆盖混用 Back/Push、淘汰后的后续普通导航、非目标缓存自身失效、暂缺布局后正常离场，以及部分清理中途 host loss 后的同 host 重新接纳与后续 fresh 导航。authority 隔离还须核对 native 内容根的 authored Visibility、Pickable 与应用局部状态保持。不能把跳过失败用例的检查称为全量通过。
 
 窗口源码 `042ee400892e83f8957307752586eb7e98a83c00` 已通过独立 workspace 格式、默认和全特性全目标静态检查，并在 Linux/WSLg、960×640、软件渲染、debug `ui-debug` 中完成组合验收。通过应用内 BRP 的真实 WindowEvent 与 typed messages，验证原父 Entity/计数返回新子且读取新输入、leaf 原 Entity/计数及不同 entry 位置、焦点与已开始手势撤权、replace/失败 history/fallback 后 fresh 恢复。fresh Delayed 返回时容器尚无而意图存在，先 ready 再 load 恢复；取消后 load 保持初值，应用主动滚动取消等待目标。renderer 截图另核对父/新子与晚容器恢复的最终呈现。

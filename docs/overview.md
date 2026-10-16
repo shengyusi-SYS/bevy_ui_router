@@ -16,7 +16,7 @@ keep-alive 和滚动恢复是按需启用的体验增强：前者让布局与子
 
 正确性底线是当前展示与路由输入相符，访问记录按导航结果更新，非活动内容不继续响应集成输入或保留焦点，失败不会误动应用拥有的 host。内部身份、owner 和 publication 协议用于落实这些行为，具体合同见[生命周期](contracts/lifecycle.md)。
 
-输入目标是离场或缓存内容退出 Tab 候选、输入目标和有效焦点，已开始手势随离场撤销，应用公共控件及其它有效路由内容照常工作。当前原生 pointer 和显式 keyboard/gamepad gate 已接通，原生 Tab/Dispatch 尚未自动消费路由资格；现行接入见[输入合同](contracts/input-focus.md)，剩余交付见[路线图](roadmap.md)。
+输入目标是离场或缓存内容退出 Tab 候选、输入目标和有效焦点，已开始手势随离场撤销，应用公共控件及其它有效路由内容照常工作。当前原生 pointer 和显式 keyboard/gamepad gate 已接通；原生 Tab/Dispatch 自动资格接入因需要 patch 引擎而延期，不是当前发布前置。现行接入见[输入合同](contracts/input-focus.md)，剩余交付见[路线图](roadmap.md)。
 
 当前实现范围：
 

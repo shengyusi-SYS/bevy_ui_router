@@ -1,6 +1,6 @@
 # 路由长期演进：职责与机制评估
 
-状态：长期方向与职责评估；实例协调与访问级滚动已交付，原生输入正式接线尚未完成，剩余安排见[路线图](../../roadmap.md)。以已暴露的通用问题选择长期方向，消费者当前可接受和短期实现成本不能作为架构收口依据。本文维护选型理由，不重复专题 spec/plan；现行行为以[导航](../../contracts/navigation.md)、[输入与焦点](../../contracts/input-focus.md)和[生命周期](../../contracts/lifecycle.md)合同为准。
+状态：长期方向与职责评估；实例协调与访问级滚动已交付，原生输入自动接线因需要引擎 patch 而延期，剩余安排见[路线图](../../roadmap.md)。以已暴露的通用问题选择长期方向，消费者当前可接受和短期实现成本不能作为架构收口依据。本文维护选型理由，不重复专题 spec/plan；现行行为以[导航](../../contracts/navigation.md)、[输入与焦点](../../contracts/input-focus.md)和[生命周期](../../contracts/lifecycle.md)合同为准。
 
 ## 决策依据与职责
 
@@ -45,6 +45,8 @@ React Activity 清理隐藏内容的 Effects 是其 runtime 能力，不等于 B
 
 ### 公开的通用输入资格接缝
 
+本专题延期：当前可执行方案需要修改 UI crate 并由消费方根 manifest patch 依赖，按用户决策不采用。保持官方依赖与现行输入合同，不继续建设补丁或替代桥，也不以该专题阻塞现行能力的发布。以下保留未来重启时的行为要求与固定来源核查。
+
 长期目标是在 Bevy/UI 的候选加入、AcquireFocus 接受及 dispatch 起始目标生成前消费 route-neutral 资格，继续使用原生排序、TabGroup、modal 和 bubbling。候选拒绝不剪掉其后代；合法起始目标继续原生冒泡，不逐祖先套用 Router gate。失效焦点按原无焦点语义释放并回退窗口。
 
 Router 桥内部区分允许、禁止、范围外；通用 UI 再结合控件与应用政策，不要求公开新的路由身份或资格资源。`RouterInputGate=false` 也包含范围外应用控件，不能直接用作全局拒绝。最近已登记的非活动或失效边界拒绝，不能借活动父布局资格；不同 Router 按目标自身 scope 判定。动态拓扑沿用 Refresh/Ready 合同，原生 dispatch 排在 Ready 后，publication/隔离保持同次撤权。
@@ -55,7 +57,7 @@ Router 在 Scene apply 期间需要真实 task 的来源事实及暂存内容归
 
 上述是可采用接口的最低行为条件，不预定新的上游 API 形状。现有固定版本 [native focus 桥](../../../crates/bevy_ui_router_ecs/src/native_focus.rs)依赖私有字段反射与官方处理器替换；正式接线完成时应整体退休这段兼容责任，不能只在它旁边再加一层 adapter。
 
-可采用接口须有公开合同、明确的依赖来源和维护责任。官方接口、最小上游扩展或独立 UI 扩展按同一行为标准评估；职责归属 UI 层不要求等待官方发布。先用最小可执行验证确认接缝能闭合，再选择一条生产接入路线；独立扩展应复用原生机制，不能把完整候选、modal 或分发算法复制进 Router。
+可采用接口须有公开合同、明确的依赖来源和维护责任，并能在不修改引擎依赖、不要求消费方根 patch 的前提下满足行为要求。未来有可采用的公开接口或用户明确重开本专题时再评估；独立扩展仍应复用原生机制，不能把完整候选、modal 或分发算法复制进 Router。
 
 官方 0.19.1 缺少过滤入口，循环调用 navigate 的薄 adapter 只能是可替换迁移桥：它反复采集/排序候选，还依赖 doc(hidden) helper 和私有插件 glue 的替代接线，不能作为长期完成状态。
 
@@ -63,9 +65,7 @@ Router 在 Scene apply 期间需要真实 task 的来源事实及暂存内容归
 
 官方 main 在固定版本 `0e93c7ab7d5ec016990dcb226ec544aee1636d70` 新增公开 [Focusable](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/lib.rs#L65)，[Tab 候选采集](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/tab_navigation.rs#L334)与 AcquireFocus 消费它，缺少组件不剪掉后代。这是未来候选接缝的部分进展；[dispatch](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/lib.rs#L414)仍只验证 Entity 存活，[焦点队列](https://github.com/bevyengine/bevy/blob/0e93c7ab7d5ec016990dcb226ec544aee1636d70/crates/bevy_input_focus/src/gained_and_lost.rs#L64)仍无过滤。动态增删 Focusable 尚不能闭合直接设焦后的分发与排队焦点事件，当前不为此迁移整个 workspace。
 
-候选验证可以局部修改 UI 依赖以证明最小接缝，产物和成功范围明确标为验证，不计作正式交付。实际改变支持的 Bevy 版本、依赖来源或消费者装配要求前，给出候选补丁、公开旅程及维护成本，完成依赖选择裁决。若另选迁移桥，兼容责任隔离在一个模块并服从同一资格合同，不同时建设两条生产路线。
-
-可执行候选见[重建入口与采用成本](../../../scripts/native-input-candidate/README.md)。它已接通 World-aware 焦点操作、来源观察和预备发布，复用现有活动证明与原生算法；实际消费核查确认扩展需同时覆盖 `bevy_input_focus` 与 `bevy_ui`，不能只替换一个 crate。原生 Tab/dispatch 与既有焦点、pointer、保留和滚动公开旅程用于检验桥的可行性，完整 ECS crate 检验已有 ownership/失败边界。候选仍不改变当前支持来源，也不等于下游装配或窗口交付。
+候选验证确认需要配套扩展 `bevy_input_focus` 与 `bevy_ui`。可行性及原生公开旅程通过不等于依赖方案已获采用，生产 workspace 从未切换来源。候选补丁与重建脚本已冻结并退出工作树，通过提交 `8ac20ab` 追溯；证据边界见[验证指南](../../development/verification.md#已有证据与未验证范围)。重启时应核对届时接口，不直接把旧候选当作当前实现。
 
 ### 统一的访问级滚动恢复意图
 
@@ -79,7 +79,7 @@ Router 在 Scene apply 期间需要真实 task 的来源事实及暂存内容归
 
 ## 规划与投入依据
 
-实例协调和访问级滚动统一意图已交付，被替代的 leaf 专用路径已退出。通用输入先主动验证接缝及可采用路径，接口缺口不能直接成为无限等待的执行安排。验证、迁移桥与长期交付分别报告，不把整条路线图捆成一次发布前置。
+实例协调和访问级滚动统一意图已交付，被替代的 leaf 专用路径已退出。通用输入候选已证明可行，但因采用成本延期；当前收口现行能力的发布准备。验证、延期与正式交付分别报告，不将未采用方案计入当前工程余量。
 
 整体主线、依赖关系、分项风险与预算统一归[路线图](../../roadmap.md#工作量风险与-roi)。实例模型设计不等于实现预算；消费者接入核查计入所属专题，应用迁移与业务政策由应用单独估算。预算不能以重复计算共享设计/验收放大，也不能以省去必要门禁缩小。
 
