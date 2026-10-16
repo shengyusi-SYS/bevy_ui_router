@@ -55,6 +55,11 @@ impl RouteScroll {
         }
     }
 
+    /// The container's stable key within its owning route frame.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     pub fn with_restore_policy(mut self, policy: RouteScrollRestorePolicy) -> Self {
         self.policy = policy;
         self

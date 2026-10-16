@@ -176,7 +176,7 @@ fn allow_restore(
 }
 ```
 
-`scope` 是该 active frame 内的内容 Entity，容器尚未创建也能查询；`restore.position()` 是被冻结的二维逻辑像素目标。取消或应用决定其它滚动政策时使用 `commands.cancel_route_scroll(restore.id())`。旧 ID 不影响下一次 Back；ready 不会等待范围继续增长，完成后内容增长也不再次跳动。
+`scope` 是该 active frame 内的内容 Entity，容器尚未创建也能查询；`restore.position()` 是被冻结的二维逻辑像素目标。取消或应用决定其它滚动政策时使用 `commands.cancel_route_scroll(restore.id())`。处理用户滚动事件时可读取容器的 `RouteScroll::key()`，查询并取消对应意图，尤其适用于已经表达滚动意图但边界处数值未变的情况。旧 ID 不影响下一次 Back；ready 不会等待范围继续增长，完成后内容增长也不再次跳动。
 
 新 UI 结构在 `Update` 或 `UiSystems::Prepare` 前创建并完成 deferred 写入，使相机等正常 propagation 生效。ready/cancel 与已有组件数值在 `RouterScrollSet::Prepare` 前生效；要覆盖本次恢复请求值，系统明确排在 Prepare 后、Layout 前。Commands 使用 Bevy 正常 deferred 同步。publication 与导航成功不代表本轮布局或恢复已经完成，最终位置在正常 Layout 后读取。
 
