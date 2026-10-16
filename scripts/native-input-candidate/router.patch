@@ -1,0 +1,2905 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -576,8 +576,6 @@
+ [[package]]
+ name = "bevy_input_focus"
+ version = "0.19.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c4d5573eb503387f73d12acde3010d49c808c790d34691e2fb410fc54b8c72b9"
+ dependencies = [
+  "bevy_app",
+  "bevy_ecs",
+@@ -1109,8 +1107,6 @@
+ [[package]]
+ name = "bevy_ui"
+ version = "0.19.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8a2f97c39dadfef97dbe295fc1ce212825bb9fda2becc8f558d1d7e7d7dbbedf"
+ dependencies = [
+  "accesskit",
+  "bevy_a11y",
+@@ -1192,7 +1188,6 @@
+  "bevy_input_focus",
+  "bevy_internal",
+  "bevy_picking",
+- "bevy_reflect",
+  "bevy_scene",
+  "bevy_ui",
+  "bevy_ui_router_bsn",
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,3 +15,7 @@
+ edition = "2024"
+ repository = "https://github.com/shengyusi-SYS/bevy_ui_router"
+ readme = "README.md"
++
++[patch.crates-io]
++bevy_input_focus = { path = "../input-seam-probe/bevy_input_focus" }
++bevy_ui = { path = "../input-seam-probe/bevy_ui" }
+diff --git a/crates/bevy_ui_router/Cargo.toml b/crates/bevy_ui_router/Cargo.toml
+--- a/crates/bevy_ui_router/Cargo.toml
++++ b/crates/bevy_ui_router/Cargo.toml
+@@ -27,7 +27,7 @@
+ bevy_asset = { version = "0.19", default-features = false }
+ bevy_camera = { version = "0.19", default-features = false }
+ bevy_ecs = { version = "0.19", default-features = false }
+-bevy_input_focus = { version = "0.19", default-features = false }
++bevy_input_focus = { version = "0.19", default-features = false, features = ["keyboard"] }
+ bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
+ bevy_picking = { version = "0.19", default-features = false }
+ bevy_scene = { version = "0.19", default-features = false }
+@@ -98,6 +98,11 @@
+ required-features = ["bsn"]
+ 
+ [[test]]
++name = "bsn_native_navigation"
++path = "tests/bsn_native_navigation.rs"
++required-features = ["bsn"]
++
++[[test]]
+ name = "dependency_contract"
+ path = "tests/dependency_contract.rs"
+ 
+diff --git a/crates/bevy_ui_router/tests/bsn_native_focus.rs b/crates/bevy_ui_router/tests/bsn_native_focus.rs
+--- a/crates/bevy_ui_router/tests/bsn_native_focus.rs
++++ b/crates/bevy_ui_router/tests/bsn_native_focus.rs
+@@ -7,9 +7,11 @@
+     prelude::*,
+     schedule::IntoScheduleConfigs,
+     template::{Template, TemplateContext},
++    world::DeferredWorld,
+ };
+ use bevy_input_focus::{
+-    AutoFocus, FocusCause, FocusGained, FocusLost, InputFocus, InputFocusPlugin, InputFocusSystems,
++    AutoFocus, FocusCause, FocusGained, FocusLost, FocusWriter, InputFocus, InputFocusPlugin,
++    InputFocusSystems, InputTargetEligibility, clear_focus, set_focus,
+ };
+ use bevy_scene::{ResolvedScene, SceneFunction, ScenePlugin};
+ use bevy_ui::Node;
+@@ -31,13 +33,13 @@
+ 
+ fn apply_operations(world: &mut World, operations: &[Operation]) {
+     let targets = *world.resource::<ApplicationTargets>();
+-    let mut focus = world.resource_mut::<InputFocus>();
++    let mut world = DeferredWorld::from(world);
+     for operation in operations {
+         match operation {
+-            Operation::SetA => focus.set(targets.a, FocusCause::Pressed),
+-            Operation::SetB => focus.set(targets.b, FocusCause::Navigated),
+-            Operation::Clear => focus.clear(),
+-            Operation::BorrowOnly => focus.set_changed(),
++            Operation::SetA => set_focus(&mut world, targets.a, FocusCause::Pressed),
++            Operation::SetB => set_focus(&mut world, targets.b, FocusCause::Navigated),
++            Operation::Clear => clear_focus(&mut world),
++            Operation::BorrowOnly => world.resource_mut::<InputFocus>().set_changed(),
+         }
+     }
+ }
+@@ -46,10 +48,23 @@
+ struct Attempts {
+     targets: Vec<Entity>,
+     child_saw_focus: Vec<Option<Entity>>,
++    autofocus_saw_focus: Vec<Option<Entity>>,
+ }
+ 
+ #[derive(Component)]
+ struct NativeFocusTarget;
++
++#[derive(Resource, Default)]
++struct ApplicationFocusPolicy {
++    reject_native_targets: bool,
++}
++
++fn application_focus_eligible(world: &World, target: Entity) -> bool {
++    !world
++        .resource::<ApplicationFocusPolicy>()
++        .reject_native_targets
++        || world.get::<NativeFocusTarget>(target).is_none()
++}
+ 
+ #[derive(Resource, Default)]
+ struct PlainAutoFocus(bool);
+@@ -97,6 +112,13 @@
+         // This is the real official on_add hook, not a simulated focus request.
+         if self.autofocus {
+             context.entity.insert(AutoFocus);
++            context.entity.world_scope(|world| {
++                let effective = world.resource::<InputFocus>().get();
++                world
++                    .resource_mut::<Attempts>()
++                    .autofocus_saw_focus
++                    .push(effective);
++            });
+         }
+         context.entity.world_scope(|world| {
+             world.resource_mut::<Attempts>().targets.push(entity);
+@@ -201,6 +223,8 @@
+         app.add_plugins(InputFocusPlugin);
+     }
+     app.init_resource::<Attempts>()
++        .init_resource::<ApplicationFocusPolicy>()
++        .insert_resource(InputTargetEligibility::new(application_focus_eligible))
+         .init_resource::<PlainAutoFocus>()
+         .init_resource::<Events>()
+         .init_resource::<LaterOperations>();
+@@ -300,17 +324,17 @@
+ 
+ fn prepare_prefix(fixture: &mut Fixture, queued: bool, initially_focused: bool) {
+     if initially_focused {
+-        fixture
+-            .app
+-            .world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(fixture.prefix, FocusCause::Navigated);
++        set_focus(
++            &mut fixture.app.world_mut().into(),
++            fixture.prefix,
++            FocusCause::Navigated,
++        );
+         fixture.app.update();
+-        fixture
+-            .app
+-            .world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(fixture.a, FocusCause::Pressed);
++        set_focus(
++            &mut fixture.app.world_mut().into(),
++            fixture.a,
++            FocusCause::Pressed,
++        );
+         if !queued {
+             fixture.app.update();
+         }
+@@ -473,15 +497,14 @@
+             1,
+             "real child failure was reached"
+         );
+-        if after.is_empty() {
+-            assert_eq!(
+-                attempts.child_saw_focus[0],
+-                Some(target),
+-                "AutoFocus actually ran inside Scene before failure"
+-            );
+-        }
++        let expected_target = expected.map(|b| if b { fixture.b } else { fixture.a });
++        // Synchronous admission keeps pending AutoFocus from replacing the
++        // effective application focus, even inside the failing child Scene.
++        assert_eq!(
++            attempts.child_saw_focus[0], expected_target,
++            "pending AutoFocus must not leak through InputFocus::get"
++        );
+         assert_no_target_events(&fixture, target);
+-        let expected_target = expected.map(|b| if b { fixture.b } else { fixture.a });
+         assert_eq!(
+             fixture.app.world().resource::<InputFocus>().get(),
+             expected_target,
+@@ -662,22 +685,22 @@
+             },
+         );
+         let old = fixture.app.world().resource::<Attempts>().targets[0];
+-        fixture
+-            .app
+-            .world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(old, FocusCause::Navigated);
++        set_focus(
++            &mut fixture.app.world_mut().into(),
++            old,
++            FocusCause::Navigated,
++        );
+         fixture.app.update();
+-        fixture
+-            .app
+-            .world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(fixture.a, FocusCause::Pressed);
+-        fixture
+-            .app
+-            .world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(old, FocusCause::Navigated);
++        set_focus(
++            &mut fixture.app.world_mut().into(),
++            fixture.a,
++            FocusCause::Pressed,
++        );
++        set_focus(
++            &mut fixture.app.world_mut().into(),
++            old,
++            FocusCause::Navigated,
++        );
+         fixture.app.world_mut().resource_mut::<Events>().0.clear();
+         let lost = fixture
+             .app
+@@ -794,6 +817,70 @@
+ }
+ 
+ #[test]
++fn application_eligibility_also_rejects_pending_autofocus_at_publication() {
++    let mut fixture = fixture(vec![], vec![], false, true);
++    prepare_prefix(&mut fixture, false, true);
++    let previous_focus = fixture.app.world().resource::<InputFocus>().get();
++    fixture
++        .app
++        .world_mut()
++        .resource_mut::<ApplicationFocusPolicy>()
++        .reject_native_targets = true;
++    let request = push(&mut fixture, true);
++    fixture.app.update();
++    let target = fixture.app.world().resource::<Attempts>().targets[0];
++    assert_eq!(
++        fixture
++            .app
++            .world()
++            .resource::<Attempts>()
++            .autofocus_saw_focus,
++        vec![previous_focus],
++        "the real AutoFocus hook must preserve eligible application focus synchronously"
++    );
++    assert_eq!(
++        fixture.app.world().resource::<InputFocus>().get(),
++        previous_focus
++    );
++    let denied = fixture
++        .app
++        .world()
++        .resource::<InputFocus>()
++        .latest_operation()
++        .unwrap();
++    assert_eq!(denied.target, Some(target));
++    assert_eq!(denied.cause, Some(FocusCause::Navigated));
++    assert!(!denied.accepted);
++    assert_no_target_events(&fixture, target);
++
++    settle(&mut fixture, request, false);
++    assert!(
++        fixture
++            .app
++            .world()
++            .resource::<RouterInputGate>()
++            .allows_keyboard(target),
++        "navigation publishes an active page; the independent application policy only denies its focus"
++    );
++    assert_eq!(
++        fixture.app.world().resource::<InputFocus>().get(),
++        previous_focus
++    );
++    assert_no_target_events(&fixture, target);
++    let final_operation = fixture
++        .app
++        .world()
++        .resource::<InputFocus>()
++        .latest_operation()
++        .unwrap();
++    assert_eq!(final_operation.identity(), denied.identity());
++    assert!(
++        !final_operation.accepted,
++        "publication must recheck application eligibility"
++    );
++}
++
++#[test]
+ fn authored_hidden_native_target_cannot_consume_pending_autofocus() {
+     let mut fixture = fixture(vec![], vec![], false, false);
+     prepare_prefix(&mut fixture, false, true);
+@@ -876,11 +963,15 @@
+     fixture.app.world_mut().add_observer(
+         move |_: On<Insert, RouterNavigation>,
+               attempts: Res<Attempts>,
+-              mut fired: ResMut<TailFired>,
+-              mut focus: ResMut<InputFocus>| {
+-            if !attempts.targets.is_empty() && !fired.0 {
+-                fired.0 = true;
+-                focus.set(b, FocusCause::Pressed);
++              mut access: ParamSet<(ResMut<TailFired>, FocusWriter)>| {
++            let should_focus = {
++                let mut fired = access.p0();
++                let should_focus = !attempts.targets.is_empty() && !fired.0;
++                fired.0 |= should_focus;
++                should_focus
++            };
++            if should_focus {
++                access.p1().set(b, FocusCause::Pressed);
+             }
+         },
+     );
+@@ -905,6 +996,7 @@
+     target: Option<Entity>,
+     sibling: Option<Entity>,
+     hook_focus: Option<Entity>,
++    hook_request: Option<(Entity, FocusCause, bool)>,
+     tail_focus: Option<Entity>,
+     tail_parent: Option<Entity>,
+     tail_children: Vec<Entity>,
+@@ -929,13 +1021,18 @@
+             context.entity.insert(AutoFocus);
+         }
+         context.entity.world_scope(|world| {
+-            let focus = world.resource::<InputFocus>().get();
++            let focus = world.resource::<InputFocus>();
++            let effective = focus.get();
++            let request = focus.latest_operation().and_then(|operation| {
++                Some((operation.target?, operation.cause?, operation.accepted))
++            });
+             let mut evidence = world.resource_mut::<PendingSourceMove>();
+             match self {
+                 Self::Root => evidence.root = Some(entity),
+                 Self::Target => {
+                     evidence.target = Some(entity);
+-                    evidence.hook_focus = focus;
++                    evidence.hook_focus = effective;
++                    evidence.hook_request = request;
+                 }
+                 Self::Sibling => evidence.sibling = Some(entity),
+             }
+@@ -1050,6 +1147,7 @@
+             .allows_keyboard(parent)
+     );
+     prepare_prefix(&mut fixture, false, true);
++    let previous_focus = fixture.app.world().resource::<InputFocus>().get();
+     fixture.app.world_mut().add_observer(
+         move |_: On<Insert, RouterNavigation>,
+               mut evidence: ResMut<PendingSourceMove>,
+@@ -1090,13 +1188,14 @@
+     let sibling = evidence.sibling.unwrap();
+     assert!(evidence.observed);
+     assert_eq!(
+-        evidence.hook_focus,
+-        Some(target),
+-        "official AutoFocus hook ran"
+-    );
+-    assert_eq!(
+-        evidence.tail_focus,
+-        Some(fixture.a),
++        evidence.hook_request,
++        Some((target, FocusCause::Navigated, false)),
++        "official AutoFocus hook formed a real deferred request"
++    );
++    // Admission applies at the hook, before the publication/tail observation.
++    assert_eq!(evidence.hook_focus, previous_focus);
++    assert_eq!(
++        evidence.tail_focus, previous_focus,
+         "pending focus was isolated before the tail"
+     );
+     assert!(
+@@ -1213,11 +1312,15 @@
+     fixture.app.world_mut().add_observer(
+         move |_: On<Insert, RouterNavigation>,
+               attempts: Res<Attempts>,
+-              mut fired: ResMut<TailFired>,
+-              mut focus: ResMut<InputFocus>| {
+-            if !attempts.targets.is_empty() && !fired.0 {
+-                fired.0 = true;
+-                focus.set(other, FocusCause::Pressed);
++              mut access: ParamSet<(ResMut<TailFired>, FocusWriter)>| {
++            let should_focus = {
++                let mut fired = access.p0();
++                let should_focus = !attempts.targets.is_empty() && !fired.0;
++                fired.0 |= should_focus;
++                should_focus
++            };
++            if should_focus {
++                access.p1().set(other, FocusCause::Pressed);
+             }
+         },
+     );
+@@ -1260,16 +1363,16 @@
+         .single(fixture.app.world())
+         .unwrap();
+     fixture.app.world_mut().resource_mut::<Events>().0.clear();
+-    fixture
+-        .app
+-        .world_mut()
+-        .resource_mut::<InputFocus>()
+-        .set(fixture.a, FocusCause::Pressed);
+-    fixture
+-        .app
+-        .world_mut()
+-        .resource_mut::<InputFocus>()
+-        .set(old, FocusCause::Navigated);
++    set_focus(
++        &mut fixture.app.world_mut().into(),
++        fixture.a,
++        FocusCause::Pressed,
++    );
++    set_focus(
++        &mut fixture.app.world_mut().into(),
++        old,
++        FocusCause::Navigated,
++    );
+     fixture
+         .app
+         .world_mut()
+@@ -1488,23 +1591,25 @@
+             );
+             app.world_mut().add_observer(
+                 move |event: On<FocusGained>,
+-                      mut focus: ResMut<InputFocus>,
+-                      mut evidence: ResMut<Evidence>| {
+-                    assert_eq!(
+-                        evidence.calls.last(),
+-                        Some(&"before"),
+-                        "official function ordering/deferred delivery changed"
+-                    );
+-                    evidence.calls.push("event");
+-                    if event.entity == a && !evidence.observer_appended {
+-                        evidence.observer_appended = true;
+-                        focus.set(b, FocusCause::Pressed);
++                      mut access: ParamSet<(ResMut<Evidence>, FocusWriter)>| {
++                    let should_focus = {
++                        let mut evidence = access.p0();
++                        assert_eq!(
++                            evidence.calls.last(),
++                            Some(&"before"),
++                            "official function ordering/deferred delivery changed"
++                        );
++                        evidence.calls.push("event");
++                        let should_focus = event.entity == a && !evidence.observer_appended;
++                        evidence.observer_appended |= should_focus;
++                        should_focus
++                    };
++                    if should_focus {
++                        access.p1().set(b, FocusCause::Pressed);
+                     }
+                 },
+             );
+-            app.world_mut()
+-                .resource_mut::<InputFocus>()
+-                .set(a, FocusCause::Navigated);
++            set_focus(&mut app.world_mut().into(), a, FocusCause::Navigated);
+             app.world_mut()
+                 .resource_mut::<RouterNavigation>()
+                 .push(router, RouteLocation::new("/"))
+diff --git a/crates/bevy_ui_router/tests/bsn_native_input.rs b/crates/bevy_ui_router/tests/bsn_native_input.rs
+--- a/crates/bevy_ui_router/tests/bsn_native_input.rs
++++ b/crates/bevy_ui_router/tests/bsn_native_input.rs
+@@ -9,7 +9,7 @@
+ use bevy_app::App;
+ use bevy_asset::AssetPlugin;
+ use bevy_ecs::prelude::*;
+-use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
++use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin, set_focus};
+ use bevy_internal::{
+     DefaultPlugins,
+     camera::{Camera2d, NormalizedRenderTarget},
+@@ -372,9 +372,7 @@
+     } else {
+         router_target
+     };
+-    app.world_mut()
+-        .resource_mut::<InputFocus>()
+-        .set(focused, FocusCause::Navigated);
++    set_focus(&mut app.world_mut().into(), focused, FocusCause::Navigated);
+     app.update();
+     assert_eq!(app.world().resource::<InputFocus>().get(), Some(focused));
+ 
+@@ -1023,9 +1021,7 @@
+         );
+         let retained = preserve.map(|other_active| if other_active { other } else { application });
+         if let Some(retained) = retained {
+-            app.world_mut()
+-                .resource_mut::<InputFocus>()
+-                .set(retained, FocusCause::Pressed);
++            set_focus(&mut app.world_mut().into(), retained, FocusCause::Pressed);
+             app.update();
+             assert_eq!(app.world().resource::<InputFocus>().get(), Some(retained));
+         }
+@@ -1114,9 +1110,11 @@
+         let (mut app, _, target, application, _) = fixture(false);
+         app.world_mut().resource_mut::<FocusEvents>().lost.clear();
+         app.world_mut().resource_mut::<FocusEvents>().gained.clear();
+-        app.world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(application, FocusCause::Navigated);
++        set_focus(
++            &mut app.world_mut().into(),
++            application,
++            FocusCause::Navigated,
++        );
+         app.world_mut().get_mut::<Node>(target).unwrap().display = bevy_ui::Display::None;
+         app.update();
+         assert_eq!(
+diff --git a/crates/bevy_ui_router/tests/bsn_native_navigation.rs b/crates/bevy_ui_router/tests/bsn_native_navigation.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/bevy_ui_router/tests/bsn_native_navigation.rs
+@@ -0,0 +1,363 @@
++//! A complete public Router journey through the stock input, Tab and dispatch
++//! plugins. Route lifecycle facts come only from ordinary navigation.
++
++use bevy_app::App;
++use bevy_asset::AssetPlugin;
++use bevy_ecs::prelude::*;
++use bevy_input_focus::{
++    FocusCause, FocusGained, FocusLost, FocusedInput, InputDispatchPlugin, InputFocus,
++    InputFocusPlugin, set_focus,
++    tab_navigation::{TabGroup, TabIndex, TabNavigationPlugin},
++};
++use bevy_internal::{
++    DefaultPlugins,
++    camera::Camera2d,
++    input::{
++        ButtonState, InputPlugin,
++        keyboard::{Key, KeyCode, KeyboardInput},
++    },
++    window::{PrimaryWindow, Window},
++};
++use bevy_scene::{ScenePlugin, bsn};
++use bevy_ui::{ComputedNode, Node, Val};
++use bevy_ui_router::prelude::*;
++
++#[derive(Component, Clone, Default)]
++struct Page(&'static str);
++
++#[derive(Debug, PartialEq)]
++enum FocusEvent {
++    Gained(Entity, FocusCause),
++    Lost(Entity),
++}
++
++#[derive(Resource, Default)]
++struct Deliveries {
++    keyboard: Vec<Entity>,
++    focus: Vec<FocusEvent>,
++}
++
++fn keyboard(window: Entity, key_code: KeyCode, state: ButtonState) -> KeyboardInput {
++    KeyboardInput {
++        key_code,
++        logical_key: if key_code == KeyCode::Tab {
++            Key::Tab
++        } else {
++            Key::Character("a".into())
++        },
++        state,
++        text: None,
++        repeat: false,
++        window,
++    }
++}
++
++fn tab(app: &mut App, window: Entity) {
++    app.world_mut()
++        .write_message(keyboard(window, KeyCode::Tab, ButtonState::Released));
++    app.world_mut()
++        .write_message(keyboard(window, KeyCode::Tab, ButtonState::Pressed));
++    app.update();
++}
++
++fn assert_keyboard_delivery(app: &mut App, window: Entity, target: Entity) {
++    app.world_mut()
++        .resource_mut::<Deliveries>()
++        .keyboard
++        .clear();
++    app.world_mut()
++        .write_message(keyboard(window, KeyCode::KeyA, ButtonState::Released));
++    app.world_mut()
++        .write_message(keyboard(window, KeyCode::KeyA, ButtonState::Pressed));
++    app.update();
++    assert_eq!(app.world().resource::<Deliveries>().keyboard, vec![target]);
++}
++
++fn focus(app: &mut App, target: Entity, cause: FocusCause) {
++    set_focus(&mut app.world_mut().into(), target, cause);
++}
++
++fn current(app: &App) -> Option<Entity> {
++    app.world().resource::<InputFocus>().get()
++}
++
++fn settle(app: &mut App, router: RouterHandle, request: NavigationRequestId) {
++    for _ in 0..32 {
++        app.update();
++        match app
++            .world()
++            .resource::<RouterSnapshots>()
++            .request(router, request)
++        {
++            RequestLookup::Found(request) if request.status() == &RequestStatus::Succeeded => {
++                // Include normal layout after publication before native navigation.
++                app.update();
++                return;
++            }
++            RequestLookup::Found(request)
++                if matches!(request.status(), RequestStatus::Failed(_)) =>
++            {
++                panic!("native navigation failed: {:?}", request.status());
++            }
++            _ => {}
++        }
++    }
++    panic!("native navigation did not settle");
++}
++
++fn page(app: &mut App, name: &'static str) -> Entity {
++    app.world_mut()
++        .query::<(Entity, &Page)>()
++        .iter(app.world())
++        .find_map(|(entity, page)| (page.0 == name).then_some(entity))
++        .unwrap()
++}
++
++#[test]
++fn native_tab_and_dispatch_follow_retention_without_blocking_application_controls() {
++    let mut app = App::new();
++    // The selected default plugins run the real headless UI layout and input
++    // pipeline; no Winit loop, renderer or Router intermediate schedule is used.
++    app.add_plugins(DefaultPlugins);
++    if !app.is_plugin_added::<AssetPlugin>() {
++        app.add_plugins(AssetPlugin::default());
++    }
++    if !app.is_plugin_added::<ScenePlugin>() {
++        app.add_plugins(ScenePlugin);
++    }
++    if !app.is_plugin_added::<InputPlugin>() {
++        app.add_plugins(InputPlugin);
++    }
++    if !app.is_plugin_added::<InputFocusPlugin>() {
++        app.add_plugins(InputFocusPlugin);
++    }
++    if !app.is_plugin_added::<InputDispatchPlugin>() {
++        app.add_plugins(InputDispatchPlugin);
++    }
++    if !app.is_plugin_added::<TabNavigationPlugin>() {
++        app.add_plugins(TabNavigationPlugin);
++    }
++    app.init_resource::<Deliveries>();
++    app.add_observer(
++        |mut event: On<FocusedInput<KeyboardInput>>, mut deliveries: ResMut<Deliveries>| {
++            if event.input.key_code == KeyCode::KeyA && event.input.state == ButtonState::Pressed {
++                deliveries.keyboard.push(event.focused_entity);
++                event.propagate(false);
++            }
++        },
++    );
++    app.add_observer(
++        |mut event: On<FocusGained>, mut deliveries: ResMut<Deliveries>| {
++            deliveries
++                .focus
++                .push(FocusEvent::Gained(event.entity, event.cause));
++            event.propagate(false);
++        },
++    );
++    app.add_observer(
++        |mut event: On<FocusLost>, mut deliveries: ResMut<Deliveries>| {
++            deliveries.focus.push(FocusEvent::Lost(event.entity));
++            event.propagate(false);
++        },
++    );
++    let window = app
++        .world_mut()
++        .query_filtered::<Entity, With<PrimaryWindow>>()
++        .single(app.world())
++        .unwrap();
++    app.world_mut()
++        .get_mut::<Window>(window)
++        .unwrap()
++        .resolution
++        .set(320.0, 180.0);
++    app.world_mut().spawn(Camera2d);
++
++    let layout = app
++        .register_bsn_view(ViewDriverKey::new("native-tab-layout").unwrap(), |_| {
++            Ok(bsn! {
++                Node { width: Val::Percent(100.0), height: Val::Percent(100.0) }
++                DefaultOutlet
++            })
++        })
++        .unwrap();
++    let layout_key = RouteViewKey::new("layout").unwrap();
++    let mut views = RouteViewRegistry::new();
++    views
++        .insert(layout_key.clone(), RouteViewDescriptor::new(layout))
++        .unwrap();
++    for name in ["a", "b"] {
++        let driver = app
++            .register_bsn_view(ViewDriverKey::new(name).unwrap(), move |_| {
++                Ok(bsn! {
++                    Node { width: Val::Px(80.0), height: Val::Px(48.0) }
++                    TabIndex(10)
++                    Page(name)
++                })
++            })
++            .unwrap();
++        views
++            .insert(
++                RouteViewKey::new(name).unwrap(),
++                RouteViewDescriptor::new(driver),
++            )
++            .unwrap();
++    }
++    let mut routes = RouteTree::builder()
++        .root_with_options(
++            RoutePattern::pathless(),
++            RouteNodeOptions::new().with_view(layout_key.clone()),
++        )
++        .unwrap();
++    for name in ["a", "b"] {
++        routes
++            .route_with_options(
++                routes.root_id().unwrap(),
++                RoutePattern::path(name).unwrap(),
++                RouteNodeOptions::new()
++                    .with_view(RouteViewKey::new(name).unwrap())
++                    .with_keep_alive(true),
++            )
++            .unwrap();
++    }
++    let router = app
++        .add_ui_router(
++            RouterConfig::new(routes.build().unwrap(), views, layout_key)
++                .with_keep_alive_capacity(2),
++        )
++        .unwrap();
++    let group = app
++        .world_mut()
++        .spawn((
++            Node {
++                width: Val::Percent(100.0),
++                height: Val::Percent(100.0),
++                ..Node::default()
++            },
++            TabGroup::new(0),
++        ))
++        .id();
++    app.world_mut().spawn((
++        Node {
++            width: Val::Px(180.0),
++            height: Val::Px(120.0),
++            ..Node::default()
++        },
++        RouterHostRegistration::new(router),
++        ChildOf(group),
++    ));
++    let application = app
++        .world_mut()
++        .spawn((
++            Node {
++                width: Val::Px(40.0),
++                height: Val::Px(32.0),
++                ..Node::default()
++            },
++            TabIndex(30),
++            ChildOf(group),
++        ))
++        .id();
++    app.update();
++    let request = app
++        .world_mut()
++        .resource_mut::<RouterNavigation>()
++        .push(router, RouteLocation::new("/a"))
++        .unwrap();
++    settle(&mut app, router, request);
++    let a = page(&mut app, "a");
++    assert!(!app.world().get::<ComputedNode>(a).unwrap().is_empty());
++    assert!(app.world().resource::<RouterInputGate>().allows_keyboard(a));
++    tab(&mut app, window);
++    assert_eq!(current(&app), Some(a));
++    assert_keyboard_delivery(&mut app, window, a);
++
++    let request = app
++        .world_mut()
++        .resource_mut::<RouterNavigation>()
++        .push(router, RouteLocation::new("/b"))
++        .unwrap();
++    settle(&mut app, router, request);
++    let b = page(&mut app, "b");
++    // A remains the original real Entity and still declares a native TabIndex;
++    // navigation qualification must exclude it without destroying the page.
++    assert!(app.world().get_entity(a).is_ok());
++    assert_eq!(app.world().get::<TabIndex>(a).unwrap().0, 10);
++    assert!(!app.world().resource::<RouterInputGate>().allows_keyboard(a));
++    assert_ne!(current(&app), Some(a));
++    assert!(!app.world().get::<ComputedNode>(b).unwrap().is_empty());
++    tab(&mut app, window);
++    assert_eq!(current(&app), Some(b));
++    assert_keyboard_delivery(&mut app, window, b);
++
++    // An application focus request cannot make a retained page effective, even
++    // synchronously before the next Router refresh or native dispatch.
++    focus(&mut app, a, FocusCause::Pressed);
++    assert_eq!(current(&app), Some(b));
++    assert_keyboard_delivery(&mut app, window, b);
++
++    // New legitimate controls are authored under the active page after its
++    // publication. Native Tab sees the current hierarchy, without a cached list.
++    let dynamic = app
++        .world_mut()
++        .spawn((
++            Node {
++                width: Val::Px(20.0),
++                height: Val::Px(12.0),
++                ..Node::default()
++            },
++            TabIndex(20),
++            ChildOf(b),
++        ))
++        .id();
++    app.update();
++    assert!(!app.world().get::<ComputedNode>(dynamic).unwrap().is_empty());
++    tab(&mut app, window);
++    assert_eq!(current(&app), Some(dynamic));
++    assert_keyboard_delivery(&mut app, window, dynamic);
++    tab(&mut app, window);
++    assert_eq!(current(&app), Some(application));
++    assert_keyboard_delivery(&mut app, window, application);
++    tab(&mut app, window);
++    assert_eq!(
++        current(&app),
++        Some(b),
++        "retained A must also be skipped on wrap"
++    );
++
++    // The official event processor preserves application operation order and
++    // causes while moving between Router content and a public application UI.
++    app.world_mut().resource_mut::<Deliveries>().focus.clear();
++    focus(&mut app, dynamic, FocusCause::Navigated);
++    focus(&mut app, application, FocusCause::Pressed);
++    app.update();
++    assert_eq!(
++        app.world().resource::<Deliveries>().focus,
++        vec![
++            FocusEvent::Lost(b),
++            FocusEvent::Gained(dynamic, FocusCause::Navigated),
++            FocusEvent::Lost(dynamic),
++            FocusEvent::Gained(application, FocusCause::Pressed),
++        ]
++    );
++    assert_keyboard_delivery(&mut app, window, application);
++
++    // Returning reactivates the original A, with the stock plugins still in
++    // charge. B and its dynamic child now leave the input scope together.
++    let request = app
++        .world_mut()
++        .resource_mut::<RouterNavigation>()
++        .back(router)
++        .unwrap();
++    settle(&mut app, router, request);
++    assert_eq!(page(&mut app, "a"), a);
++    assert!(!app.world().resource::<RouterInputGate>().allows_keyboard(b));
++    assert!(
++        !app.world()
++            .resource::<RouterInputGate>()
++            .allows_keyboard(dynamic)
++    );
++    assert_eq!(current(&app), Some(application));
++    tab(&mut app, window);
++    assert_eq!(current(&app), Some(a));
++    assert_keyboard_delivery(&mut app, window, a);
++}
+diff --git a/crates/bevy_ui_router/tests/retained_navigation.rs b/crates/bevy_ui_router/tests/retained_navigation.rs
+--- a/crates/bevy_ui_router/tests/retained_navigation.rs
++++ b/crates/bevy_ui_router/tests/retained_navigation.rs
+@@ -729,11 +729,11 @@
+         .get_mut::<LocalValue>(original)
+         .unwrap()
+         .0 = 91;
+-    fixture
+-        .app
+-        .world_mut()
+-        .resource_mut::<InputFocus>()
+-        .set(original, FocusCause::Navigated);
++    bevy_input_focus::set_focus(
++        &mut fixture.app.world_mut().into(),
++        original,
++        FocusCause::Navigated,
++    );
+     fixture.push("/b");
+     let b = fixture.active("b");
+     assert!(
+diff --git a/crates/bevy_ui_router_ecs/Cargo.toml b/crates/bevy_ui_router_ecs/Cargo.toml
+--- a/crates/bevy_ui_router_ecs/Cargo.toml
++++ b/crates/bevy_ui_router_ecs/Cargo.toml
+@@ -8,7 +8,7 @@
+ 
+ [features]
+ default = []
+-bsn = ["dep:bevy_ui_router_bsn", "dep:bevy_asset", "dep:bevy_scene", "dep:bevy_reflect", "bevy_input_focus/bevy_reflect"]
++bsn = ["dep:bevy_ui_router_bsn", "dep:bevy_asset", "dep:bevy_scene"]
+ 
+ [dependencies]
+ bevy_app = { version = "0.19", default-features = false }
+@@ -18,7 +18,6 @@
+ bevy_ecs = { version = "0.19", default-features = false }
+ bevy_input_focus = { version = "0.19", default-features = false }
+ bevy_picking = { version = "0.19", default-features = false }
+-bevy_reflect = { version = "0.19", default-features = false, features = ["std"], optional = true }
+ bevy_scene = { version = "0.19", default-features = false, optional = true }
+ bevy_ui = { version = "0.19", default-features = false, features = ["bevy_picking"] }
+ bevy_ui_router_core = { path = "../bevy_ui_router_core", version = "0.1.0" }
+diff --git a/crates/bevy_ui_router_ecs/src/active_scope.rs b/crates/bevy_ui_router_ecs/src/active_scope.rs
+--- a/crates/bevy_ui_router_ecs/src/active_scope.rs
++++ b/crates/bevy_ui_router_ecs/src/active_scope.rs
+@@ -2,13 +2,13 @@
+ 
+ use bevy_ecs::{
+     hierarchy::{ChildOf, Children},
+-    prelude::{Entity, Query, Res},
++    prelude::{Entity, Query, Res, World},
+     query::QueryData,
+     system::SystemParam,
+ };
+ 
+ use crate::{
+-    app_ext::RouterHostRegistration,
++    app_ext::{RouterHandle, RouterHostRegistration},
+     components::{
+         ChildSlotAuthority, ChildSlotLifecycle, ProvisionalSlotLifecycle, RouteOwnershipSeal,
+     },
+@@ -35,97 +35,36 @@
+     host: Option<&'static RouterHostRegistration>,
+ }
+ 
+-/// Resolves current content to its exact logically and physically active frame.
+-///
+-/// This shared read-only proof observes dynamic descendants through live hierarchy
+-/// and stops at the nearest registered boundary. It reads only Router metadata and
+-/// hierarchy, not arbitrary application state, visibility or input eligibility.
+-#[derive(SystemParam)]
+-pub(crate) struct ActiveRouteScope<'w, 's> {
+-    navigation: Res<'w, RouterNavigation>,
+-    registry: Res<'w, RouteEntityRegistry>,
+-    quarantine: Res<'w, QuarantineLeaseTable>,
+-    entities: Query<'w, 's, ActiveScopeEntity>,
+-    #[cfg(feature = "bsn")]
+-    native_roots: Query<
+-        'w,
+-        's,
+-        (),
+-        bevy_ecs::query::With<crate::presentation::native_scene::NativeContentRoot>,
+-    >,
+-}
+-
+-impl ActiveRouteScope<'_, '_> {
+-    /// Resolves the exact nearest published frame; invalid boundaries stop lookup.
+-    pub(crate) fn resolve(&self, target: Entity) -> Option<(&RouterEntry, &RealizedFrame)> {
+-        let mut current = target;
+-        let mut seen = HashSet::new();
+-        while seen.insert(current) {
+-            if self.is_quarantined(current) || self.entities.get(current).is_err() {
+-                return None;
+-            }
+-            if let Some(record) = self.registry.record(current) {
+-                // The first registered boundary owns this content. A retained
+-                // leaf must never inherit activity or input from its active parent.
+-                for entry in &self.navigation.entries {
+-                    let Some(active) = entry.active.as_ref() else {
+-                        continue;
+-                    };
+-                    for frame in active.frames() {
+-                        let Some(claim) = frame.claims().find(|claim| claim.entity() == current)
+-                        else {
+-                            continue;
+-                        };
+-                        if claim.lifecycle() != EntityLifecycle::Active
+-                            || !record.matches_claim(claim)
+-                            || !self.frame_scope_is_current(entry, frame)
+-                        {
+-                            return None;
+-                        }
+-                        let valid = if current == target {
+-                            self.registered_content_is_current(frame, target)
+-                        } else {
+-                            frame.native_root() == Some(current)
+-                                && self.is_native_root(current)
+-                                && self.claim_is_current(claim)
+-                        };
+-                        return valid.then_some((entry, frame));
+-                    }
+-                }
+-                return None;
+-            }
+-            let facts = self.entities.get(current).ok()?;
+-            let parent = facts.parent.map(ChildOf::parent)?;
+-            if !self.edge_is_current(current, parent) {
+-                return None;
+-            }
+-            current = parent;
+-        }
+-        None
+-    }
++/// The two read access paths expose identical facts to the physical proof.
++struct EntityFacts<'a> {
++    parent: Option<&'a ChildOf>,
++    children: Option<&'a Children>,
++    seal: Option<&'a RouteOwnershipSeal>,
++    lifecycle: Option<&'a FrameLifecycle>,
++    shell: Option<&'a FrameShell>,
++    content: Option<&'a FrameContentTarget>,
++    output: Option<&'a FrameOutput>,
++    slot_authority: Option<&'a ChildSlotAuthority>,
++    slot_lifecycle: Option<&'a ChildSlotLifecycle>,
++    top_slot_lifecycle: Option<&'a ProvisionalSlotLifecycle>,
++    host: Option<&'a RouterHostRegistration>,
++}
++
++trait ScopeRead {
++    fn facts(&self, entity: Entity) -> Option<EntityFacts<'_>>;
++    fn registry(&self) -> &RouteEntityRegistry;
++    fn quarantine(&self) -> &QuarantineLeaseTable;
++    fn is_native_root(&self, entity: Entity) -> bool;
+ 
+     fn is_quarantined(&self, entity: Entity) -> bool {
+-        self.quarantine.record(entity).is_some()
+-            || self.quarantine.unresolved_record(entity).is_some()
+-    }
+-
+-    fn is_native_root(&self, entity: Entity) -> bool {
+-        #[cfg(feature = "bsn")]
+-        {
+-            self.native_roots.contains(entity)
+-        }
+-        #[cfg(not(feature = "bsn"))]
+-        {
+-            let _ = entity;
+-            false
+-        }
++        self.quarantine().record(entity).is_some()
++            || self.quarantine().unresolved_record(entity).is_some()
+     }
+ 
+     fn edge_is_current(&self, child: Entity, parent: Entity) -> bool {
+-        self.entities
+-            .get(child)
+-            .is_ok_and(|facts| facts.parent.map(ChildOf::parent) == Some(parent))
+-            && self.entities.get(parent).is_ok_and(|facts| {
++        self.facts(child)
++            .is_some_and(|facts| facts.parent.map(ChildOf::parent) == Some(parent))
++            && self.facts(parent).is_some_and(|facts| {
+                 facts
+                     .children
+                     .is_some_and(|children| children.contains(&child))
+@@ -135,13 +74,13 @@
+     fn claim_is_current(&self, claim: &ExactRegistryClaim) -> bool {
+         if self.is_quarantined(claim.entity())
+             || !self
+-                .registry
++                .registry()
+                 .record(claim.entity())
+                 .is_some_and(|record| record.matches_claim(claim))
+         {
+             return false;
+         }
+-        let Ok(facts) = self.entities.get(claim.entity()) else {
++        let Some(facts) = self.facts(claim.entity()) else {
+             return false;
+         };
+         if facts.seal.map(|seal| seal.seal()) != Some(claim.seal()) {
+@@ -193,142 +132,476 @@
+         }
+     }
+ 
+-    fn frame_scope_is_current(&self, entry: &RouterEntry, frame: &RealizedFrame) -> bool {
+-        self.frame_scope_is_current_with_parents(entry, frame, &mut HashSet::new())
+-    }
+-
+-    fn frame_scope_is_current_with_parents(
+-        &self,
++    fn native_containment_is_current(&self, target: Entity, root: Entity) -> bool {
++        if !self.is_native_root(root) {
++            return false;
++        }
++        let mut current = target;
++        let mut seen = HashSet::new();
++        while seen.insert(current) {
++            if current == root {
++                return true;
++            }
++            if self.registry().record(current).is_some() || self.is_quarantined(current) {
++                return false;
++            }
++            let Some(parent) = self
++                .facts(current)
++                .and_then(|facts| facts.parent.map(ChildOf::parent))
++            else {
++                return false;
++            };
++            if !self.edge_is_current(current, parent) {
++                return false;
++            }
++            current = parent;
++        }
++        false
++    }
++}
++
++/// Metadata-only expectations from the real published entry. No capability,
++/// owner, route inputs, or publication state can be reconstructed from these.
++struct FrameScopeFacts {
++    router: RouterHandle,
++    host: Entity,
++    host_incarnation: u64,
++    claims: Vec<ExactRegistryClaim>,
++    edges: Vec<(Entity, Entity)>,
++    native_roots: Vec<Entity>,
++    containments: Vec<(Entity, Entity)>,
++}
++
++impl FrameScopeFacts {
++    fn from_entry(entry: &RouterEntry, frame: &RealizedFrame) -> Option<Self> {
++        let host = entry.host.as_ref()?;
++        let mut facts = Self {
++            router: entry.handle,
++            host: host.host,
++            host_incarnation: host.registration_incarnation,
++            claims: Vec::new(),
++            edges: Vec::new(),
++            native_roots: Vec::new(),
++            containments: Vec::new(),
++        };
++        facts.include_frame(entry, frame, &mut HashSet::new())?;
++        Some(facts)
++    }
++
++    fn include_frame(
++        &mut self,
+         entry: &RouterEntry,
+         frame: &RealizedFrame,
+         seen: &mut HashSet<Entity>,
+-    ) -> bool {
++    ) -> Option<()> {
+         if !seen.insert(frame.shell())
+             || entry.engine.availability()
+                 != &bevy_ui_router_core::presentation::RouterAvailability::Ready
+             || !entry.engine.active().frames().contains(frame.frame())
+         {
+-            return false;
+-        }
+-        let Some(host) = entry.host.as_ref() else {
+-            return false;
+-        };
+-        if !self.entities.get(host.host).is_ok_and(|facts| {
+-            facts.host.is_some_and(|registration| {
+-                registration.router() == entry.handle
+-                    && registration.incarnation() == host.registration_incarnation
+-            })
+-        }) {
+-            return false;
+-        }
+-        let Some(shell) = frame.claims().find(|claim| claim.entity() == frame.shell()) else {
+-            return false;
+-        };
+-        if shell.lifecycle() != EntityLifecycle::Active
+-            || !self.claim_is_current(shell)
+-            || !self.edge_is_current(frame.shell(), frame.top_slot())
+-            || !self.claim_is_current(frame.mount_binding().slot_claim())
+-        {
+-            return false;
+-        }
++            return None;
++        }
++        let host = entry.host.as_ref()?;
++        let shell = frame
++            .claims()
++            .find(|claim| claim.entity() == frame.shell())?;
++        if shell.lifecycle() != EntityLifecycle::Active {
++            return None;
++        }
++        self.claims.push(shell.clone());
++        self.claims.push(frame.mount_binding().slot_claim().clone());
++        self.edges.push((frame.shell(), frame.top_slot()));
+         if let Some(root) = frame.native_root() {
+-            let Some(root_claim) = frame.claims().find(|claim| claim.entity() == root) else {
+-                return false;
+-            };
+-            if root_claim.lifecycle() != EntityLifecycle::Active
+-                || !self.claim_is_current(root_claim)
+-                || !self.is_native_root(root)
+-                || !self.edge_is_current(root, frame.shell())
+-            {
+-                return false;
+-            }
++            let claim = frame.claims().find(|claim| claim.entity() == root)?;
++            if claim.lifecycle() != EntityLifecycle::Active {
++                return None;
++            }
++            self.claims.push(claim.clone());
++            self.native_roots.push(root);
++            self.edges.push((root, frame.shell()));
+         }
+         let mount = frame.mount_binding();
+         match mount.slot_claim().owner() {
+             RegistryOwner::Committed(EntityOwner::HostTopSlot { .. }) => {
+-                mount.slot_claim() == &host.top_slot_claim
+-                    && frame.top_slot() == host.top_slot
+-                    && self.edge_is_current(host.top_slot, host.host)
++                if mount.slot_claim() != &host.top_slot_claim || frame.top_slot() != host.top_slot {
++                    return None;
++                }
++                self.edges.push((host.top_slot, host.host));
+             }
+             RegistryOwner::Committed(EntityOwner::ChildSlot { .. }) => {
+-                let Some(active) = entry.active.as_ref() else {
+-                    return false;
+-                };
+-                let Some(slot) = active.child_slots().iter().find(|slot| {
++                let active = entry.active.as_ref()?;
++                let slot = active.child_slots().iter().find(|slot| {
+                     slot.slot_claim() == mount.slot_claim()
+                         && mount.matches_mounted_child_slot(slot)
+-                }) else {
+-                    return false;
+-                };
+-                let Some(parent) = active
++                })?;
++                let parent = active
+                     .frames()
+                     .iter()
+-                    .find(|parent| parent.frame() == slot.parent())
+-                else {
+-                    return false;
+-                };
++                    .find(|parent| parent.frame() == slot.parent())?;
+                 let source = slot.anchor_binding().source_claim();
+-                // The anchor's source must belong to the exact published
+-                // parent, whose own mount chain must still reach this host.
+-                parent.claims().any(|claim| claim == source)
+-                    && self.registered_content_is_current(parent, source.entity())
+-                    && self.edge_is_current(slot.slot(), slot.anchor())
+-                    && (slot.anchor() == source.entity()
+-                        || self.native_containment_is_current(slot.anchor(), source.entity()))
+-                    && self.frame_scope_is_current_with_parents(entry, parent, seen)
+-            }
+-            _ => false,
+-        }
+-    }
+-
+-    fn registered_content_is_current(&self, frame: &RealizedFrame, target: Entity) -> bool {
++                if !parent.claims().any(|claim| claim == source) {
++                    return None;
++                }
++                self.include_registered_content(parent, source.entity())?;
++                self.edges.push((slot.slot(), slot.anchor()));
++                if slot.anchor() != source.entity() {
++                    self.containments.push((slot.anchor(), source.entity()));
++                }
++                self.include_frame(entry, parent, seen)?;
++            }
++            _ => return None,
++        }
++        Some(())
++    }
++
++    fn include_registered_content(&mut self, frame: &RealizedFrame, target: Entity) -> Option<()> {
+         let mut current = target;
+         let mut seen = HashSet::new();
+         while seen.insert(current) {
+-            let Some((claim, parent)) = frame
++            let (claim, parent) = frame
+                 .cleanup_members()
++                .find(|(claim, _)| claim.entity() == current)?;
++            if claim.lifecycle() != EntityLifecycle::Active {
++                return None;
++            }
++            self.claims.push(claim.clone());
++            self.edges.push((current, parent));
++            if current == frame.shell() {
++                return Some(());
++            }
++            current = parent;
++        }
++        None
++    }
++
++    fn is_current(&self, reader: &impl ScopeRead) -> bool {
++        reader.facts(self.host).is_some_and(|facts| {
++            facts.host.is_some_and(|host| {
++                host.router() == self.router && host.incarnation() == self.host_incarnation
++            })
++        }) && self
++            .claims
++            .iter()
++            .all(|claim| reader.claim_is_current(claim))
++            && self
++                .edges
++                .iter()
++                .all(|(child, parent)| reader.edge_is_current(*child, *parent))
++            && self
++                .native_roots
++                .iter()
++                .all(|root| reader.is_native_root(*root))
++            && self
++                .containments
++                .iter()
++                .all(|(target, root)| reader.native_containment_is_current(*target, *root))
++    }
++}
++
++/// Resolves exact published content. Visibility and input remain separate facts.
++#[derive(SystemParam)]
++pub(crate) struct ActiveRouteScope<'w, 's> {
++    navigation: Res<'w, RouterNavigation>,
++    registry: Res<'w, RouteEntityRegistry>,
++    quarantine: Res<'w, QuarantineLeaseTable>,
++    entities: Query<'w, 's, ActiveScopeEntity>,
++    #[cfg(feature = "bsn")]
++    native_roots: Query<
++        'w,
++        's,
++        (),
++        bevy_ecs::query::With<crate::presentation::native_scene::NativeContentRoot>,
++    >,
++}
++
++impl ScopeRead for ActiveRouteScope<'_, '_> {
++    fn facts(&self, entity: Entity) -> Option<EntityFacts<'_>> {
++        let facts = self.entities.get(entity).ok()?;
++        Some(EntityFacts {
++            parent: facts.parent,
++            children: facts.children,
++            seal: facts.seal,
++            lifecycle: facts.lifecycle,
++            shell: facts.shell,
++            content: facts.content,
++            output: facts.output,
++            slot_authority: facts.slot_authority,
++            slot_lifecycle: facts.slot_lifecycle,
++            top_slot_lifecycle: facts.top_slot_lifecycle,
++            host: facts.host,
++        })
++    }
++    fn registry(&self) -> &RouteEntityRegistry {
++        &self.registry
++    }
++    fn quarantine(&self) -> &QuarantineLeaseTable {
++        &self.quarantine
++    }
++    fn is_native_root(&self, entity: Entity) -> bool {
++        #[cfg(feature = "bsn")]
++        {
++            self.native_roots.contains(entity)
++        }
++        #[cfg(not(feature = "bsn"))]
++        {
++            let _ = entity;
++            false
++        }
++    }
++}
++
++impl ActiveRouteScope<'_, '_> {
++    pub(crate) fn resolve(&self, target: Entity) -> Option<(&RouterEntry, &RealizedFrame)> {
++        let boundary = nearest_boundary(self, target)?;
++        for entry in &self.navigation.entries {
++            for frame in entry
++                .active
++                .as_ref()
++                .into_iter()
++                .flat_map(|active| active.frames())
++            {
++                if frame.claims().any(|claim| claim.entity() == boundary) {
++                    return frame_accepts_target(self, entry, frame, target, boundary)
++                        .then_some((entry, frame));
++                }
++            }
++        }
++        None
++    }
++}
++
++fn frame_accepts_target(
++    reader: &impl ScopeRead,
++    entry: &RouterEntry,
++    frame: &RealizedFrame,
++    target: Entity,
++    boundary: Entity,
++) -> bool {
++    let Some(claim) = frame.claims().find(|claim| claim.entity() == boundary) else {
++        return false;
++    };
++    if claim.lifecycle() != EntityLifecycle::Active || !reader.claim_is_current(claim) {
++        return false;
++    }
++    let Some(mut proof) = FrameScopeFacts::from_entry(entry, frame) else {
++        return false;
++    };
++    if target == boundary {
++        if proof.include_registered_content(frame, target).is_none() {
++            return false;
++        }
++    } else if frame.native_root() != Some(boundary) {
++        return false;
++    }
++    proof.is_current(reader)
++}
++
++/// Stops at the nearest registered or quarantined boundary, using live edges.
++fn nearest_boundary(reader: &impl ScopeRead, target: Entity) -> Option<Entity> {
++    let mut current = target;
++    let mut seen = HashSet::new();
++    while seen.insert(current) {
++        if reader.is_quarantined(current) || reader.facts(current).is_none() {
++            return None;
++        }
++        if reader.registry().record(current).is_some() {
++            return Some(current);
++        }
++        let parent = reader.facts(current)?.parent.map(ChildOf::parent)?;
++        if !reader.edge_is_current(current, parent) {
++            return None;
++        }
++        current = parent;
++    }
++    None
++}
++
++#[cfg(feature = "bsn")]
++struct WorldScopeRead<'a>(&'a World);
++
++#[cfg(feature = "bsn")]
++impl ScopeRead for WorldScopeRead<'_> {
++    fn facts(&self, entity: Entity) -> Option<EntityFacts<'_>> {
++        let entity_ref = self.0.get_entity(entity).ok()?;
++        if self
++            .0
++            .get_resource::<bevy_ecs::entity_disabling::DefaultQueryFilters>()
++            .is_some_and(|filters| {
++                filters
++                    .disabling_ids()
++                    .any(|component| entity_ref.contains_id(component))
++            })
++        {
++            return None;
++        }
++        Some(EntityFacts {
++            parent: self.0.get::<ChildOf>(entity),
++            children: self.0.get::<Children>(entity),
++            seal: self.0.get::<RouteOwnershipSeal>(entity),
++            lifecycle: self.0.get::<FrameLifecycle>(entity),
++            shell: self.0.get::<FrameShell>(entity),
++            content: self.0.get::<FrameContentTarget>(entity),
++            output: self.0.get::<FrameOutput>(entity),
++            slot_authority: self.0.get::<ChildSlotAuthority>(entity),
++            slot_lifecycle: self.0.get::<ChildSlotLifecycle>(entity),
++            top_slot_lifecycle: self.0.get::<ProvisionalSlotLifecycle>(entity),
++            host: self.0.get::<RouterHostRegistration>(entity),
++        })
++    }
++    fn registry(&self) -> &RouteEntityRegistry {
++        self.0.resource::<RouteEntityRegistry>()
++    }
++    fn quarantine(&self) -> &QuarantineLeaseTable {
++        self.0.resource::<QuarantineLeaseTable>()
++    }
++    fn is_native_root(&self, entity: Entity) -> bool {
++        self.0
++            .get::<crate::presentation::native_scene::NativeContentRoot>(entity)
++            .is_some()
++    }
++}
++
++/// A short-lived copy of only validation facts while RouterNavigation is borrowed
++/// by the synchronous driver. Its contents are cleared on return; the carrier is
++/// initialized once with the plugin so a no-action pass creates no World entity.
++#[cfg(feature = "bsn")]
++#[derive(bevy_ecs::prelude::Resource, Default)]
++pub(crate) struct BorrowedActiveScopes(Vec<FrozenActiveFrame>);
++
++#[cfg(feature = "bsn")]
++struct FrozenActiveFrame {
++    router: RouterHandle,
++    proof: FrameScopeFacts,
++    boundaries: Vec<ExactRegistryClaim>,
++    root: Option<Entity>,
++    shell: Entity,
++    members: Vec<(ExactRegistryClaim, Entity)>,
++}
++
++#[cfg(feature = "bsn")]
++impl FrozenActiveFrame {
++    fn from_entry(entry: &RouterEntry) -> Vec<Self> {
++        entry
++            .active
++            .as_ref()
++            .into_iter()
++            .flat_map(|active| active.frames())
++            .filter_map(|frame| {
++                Some(Self {
++                    router: entry.handle,
++                    proof: FrameScopeFacts::from_entry(entry, frame)?,
++                    boundaries: frame.claims().cloned().collect(),
++                    root: frame.native_root(),
++                    shell: frame.shell(),
++                    members: frame
++                        .cleanup_members()
++                        .map(|(claim, parent)| (claim.clone(), parent))
++                        .collect(),
++                })
++            })
++            .collect()
++    }
++
++    fn resolves(&self, reader: &impl ScopeRead, target: Entity, boundary: Entity) -> bool {
++        let Some(claim) = self
++            .boundaries
++            .iter()
++            .find(|claim| claim.entity() == boundary)
++        else {
++            return false;
++        };
++        if claim.lifecycle() != EntityLifecycle::Active
++            || !reader.claim_is_current(claim)
++            || !self.proof.is_current(reader)
++        {
++            return false;
++        }
++        if target != boundary {
++            return self.root == Some(boundary) && reader.is_native_root(boundary);
++        }
++        let mut current = target;
++        let mut seen = HashSet::new();
++        while seen.insert(current) {
++            let Some((claim, parent)) = self
++                .members
++                .iter()
+                 .find(|(claim, _)| claim.entity() == current)
+             else {
+                 return false;
+             };
+             if claim.lifecycle() != EntityLifecycle::Active
+-                || !self.claim_is_current(claim)
+-                || !self.edge_is_current(current, parent)
++                || !reader.claim_is_current(claim)
++                || !reader.edge_is_current(current, *parent)
+             {
+                 return false;
+             }
+-            if current == frame.shell() {
++            if current == self.shell {
+                 return true;
+             }
+-            current = parent;
++            current = *parent;
+         }
+         false
+     }
+-
+-    fn native_containment_is_current(&self, target: Entity, root: Entity) -> bool {
+-        if !self.is_native_root(root) {
+-            return false;
+-        }
+-        let mut current = target;
+-        let mut seen = HashSet::new();
+-        while seen.insert(current) {
+-            if current == root {
+-                return true;
+-            }
+-            if self.registry.record(current).is_some() || self.is_quarantined(current) {
+-                return false;
+-            }
+-            let Ok(facts) = self.entities.get(current) else {
+-                return false;
+-            };
+-            let Some(parent) = facts.parent.map(ChildOf::parent) else {
+-                return false;
+-            };
+-            if !self.edge_is_current(current, parent) {
+-                return false;
+-            }
+-            current = parent;
+-        }
+-        false
+-    }
+-}
++}
++
++#[cfg(feature = "bsn")]
++pub(crate) fn freeze_borrowed_scopes(world: &mut World, entries: &[RouterEntry]) {
++    let frames = entries
++        .iter()
++        .flat_map(FrozenActiveFrame::from_entry)
++        .collect();
++    // This private synchronous read cache is not a semantic resource mutation.
++    // Keep its carrier and change ticks stable across no-action driver passes.
++    use bevy_ecs::change_detection::DetectChangesMut;
++    world
++        .resource_mut::<BorrowedActiveScopes>()
++        .bypass_change_detection()
++        .0 = frames;
++}
++
++#[cfg(feature = "bsn")]
++pub(crate) fn refresh_borrowed_entry(world: &mut World, entry: &RouterEntry) {
++    let replacement = FrozenActiveFrame::from_entry(entry);
++    use bevy_ecs::change_detection::DetectChangesMut;
++    let mut scopes = world.resource_mut::<BorrowedActiveScopes>();
++    let scopes = scopes.bypass_change_detection();
++    scopes.0.retain(|frame| frame.router != entry.handle);
++    scopes.0.extend(replacement);
++}
++
++#[cfg(feature = "bsn")]
++pub(crate) fn clear_borrowed_scopes(world: &mut World) {
++    use bevy_ecs::change_detection::DetectChangesMut;
++    world
++        .resource_mut::<BorrowedActiveScopes>()
++        .bypass_change_detection()
++        .0
++        .clear();
++}
++
++#[cfg(feature = "bsn")]
++pub(crate) fn target_is_active(world: &World, target: Entity) -> bool {
++    let reader = WorldScopeRead(world);
++    let Some(boundary) = nearest_boundary(&reader, target) else {
++        return false;
++    };
++    if let Some(navigation) = world.get_resource::<RouterNavigation>() {
++        navigation.entries.iter().any(|entry| {
++            entry.active.as_ref().is_some_and(|active| {
++                active
++                    .frames()
++                    .iter()
++                    .any(|frame| frame_accepts_target(&reader, entry, frame, target, boundary))
++            })
++        })
++    } else {
++        world
++            .get_resource::<BorrowedActiveScopes>()
++            .is_some_and(|scopes| {
++                scopes
++                    .0
++                    .iter()
++                    .any(|frame| frame.resolves(&reader, target, boundary))
++            })
++    }
++}
+diff --git a/crates/bevy_ui_router_ecs/src/cleanup.rs b/crates/bevy_ui_router_ecs/src/cleanup.rs
+--- a/crates/bevy_ui_router_ecs/src/cleanup.rs
++++ b/crates/bevy_ui_router_ecs/src/cleanup.rs
+@@ -18905,7 +18905,7 @@
+         .and_then(InputFocus::get)
+         .is_some_and(|focused| closure.contains(&focused));
+     if clear_input {
+-        world.resource_mut::<InputFocus>().clear();
++        world.resource_mut::<InputFocus>().revoke_if(closure);
+     }
+     let clear_route = world
+         .get_resource::<RouteFocusState>()
+diff --git a/crates/bevy_ui_router_ecs/src/host.rs b/crates/bevy_ui_router_ecs/src/host.rs
+--- a/crates/bevy_ui_router_ecs/src/host.rs
++++ b/crates/bevy_ui_router_ecs/src/host.rs
+@@ -3267,7 +3267,9 @@
+ fn clear_focus_in_subtree(world: &mut World, root: Entity) {
+     let input = world.get_resource::<InputFocus>().and_then(InputFocus::get);
+     if input.is_some_and(|focused| is_descendant_or_self(world, root, focused)) {
+-        world.resource_mut::<InputFocus>().clear();
++        world
++            .resource_mut::<InputFocus>()
++            .revoke_if(&[input.unwrap()]);
+     }
+     let route = world
+         .get_resource::<RouteFocusState>()
+diff --git a/crates/bevy_ui_router_ecs/src/input.rs b/crates/bevy_ui_router_ecs/src/input.rs
+--- a/crates/bevy_ui_router_ecs/src/input.rs
++++ b/crates/bevy_ui_router_ecs/src/input.rs
+@@ -273,29 +273,59 @@
+ }
+ 
+ impl PreparedFocusMutation<'_> {
+-    #[cfg(feature = "bsn")]
+-    pub(crate) fn with_native_publication(
+-        mut self,
+-        prepared: &crate::native_focus::PublicationFocus,
+-    ) -> Option<Self> {
+-        if !prepared.matches(&self.input) {
+-            return None;
+-        }
+-        if let Some((target, cause)) = prepared.candidate {
+-            self.next_input
+-                .get_or_insert_with(|| self.input.clone())
+-                .set(target, cause);
+-        }
+-        Some(self)
+-    }
+-    pub(crate) fn apply(mut self) {
+-        if let Some(next_input) = self.next_input {
+-            *self.input = next_input;
+-        }
++    pub(crate) fn apply(mut self) -> Option<InputFocus> {
++        let retired = self
++            .next_input
++            .map(|next| std::mem::replace(&mut *self.input, next));
+         if self.clear_route {
+             self.route.set_focused(None);
+         }
+-    }
++        retired
++    }
++}
++
++#[cfg(feature = "bsn")]
++pub(crate) struct PreparedNativeFocusMutation<'w> {
++    input: bevy_input_focus::BoundTrackedFocusChange<'w>,
++    route: Mut<'w, RouteFocusState>,
++    clear_route: bool,
++}
++
++#[cfg(feature = "bsn")]
++impl PreparedNativeFocusMutation<'_> {
++    pub(crate) fn apply(mut self) -> Option<InputFocus> {
++        let retired = self.input.apply();
++        if self.clear_route {
++            self.route.set_focused(None);
++        }
++        retired
++    }
++}
++
++#[cfg(feature = "bsn")]
++pub(crate) fn prepare_native_focus_mutation<'w>(
++    input: Mut<'w, InputFocus>,
++    route: Mut<'w, RouteFocusState>,
++    leaving: &[Entity],
++    publication: &crate::native_focus::PublicationFocus,
++) -> Option<PreparedNativeFocusMutation<'w>> {
++    if !publication.matches(&input) {
++        return None;
++    }
++    let mut prepared =
++        bevy_input_focus::PreparedFocusChange::prepare_revoke_if(&input, leaving).ok()?;
++    if let Some(operation) = publication.candidate.as_ref() {
++        prepared = prepared.with_deferred(operation).ok()?;
++    }
++    let clear_route = route
++        .focused()
++        .is_some_and(|target| leaving.contains(&target));
++    let input = prepared.bind_mut(input).ok()?;
++    Some(PreparedNativeFocusMutation {
++        input,
++        route,
++        clear_route,
++    })
+ }
+ 
+ pub(crate) fn prepare_focus_mutation<'w>(
+@@ -308,7 +338,7 @@
+         .is_some_and(|entity| leaving.contains(&entity))
+         .then(|| {
+             let mut next = input.clone();
+-            next.clear();
++            next.revoke_if(leaving);
+             next
+         });
+     let clear_route = route
+@@ -582,7 +612,9 @@
+         blocked.contains(&focused) || nearest_registry_boundary_is_inert(world, focused)
+     });
+     if clear_input {
+-        world.resource_mut::<InputFocus>().clear();
++        world
++            .resource_mut::<InputFocus>()
++            .revoke_if(&[input.unwrap()]);
+     }
+     let route = world
+         .get_resource::<RouteFocusState>()
+diff --git a/crates/bevy_ui_router_ecs/src/mount.rs b/crates/bevy_ui_router_ecs/src/mount.rs
+--- a/crates/bevy_ui_router_ecs/src/mount.rs
++++ b/crates/bevy_ui_router_ecs/src/mount.rs
+@@ -1713,12 +1713,11 @@
+ }
+ 
+ fn clear_slot_focus(world: &mut World, slot: Entity) {
+-    if world
+-        .get_resource::<InputFocus>()
+-        .and_then(InputFocus::get)
+-        .is_some_and(|focused| entity_is_in_slot_subtree(world, slot, focused))
+-    {
+-        world.resource_mut::<InputFocus>().clear();
++    let input = world.get_resource::<InputFocus>().and_then(InputFocus::get);
++    if input.is_some_and(|focused| entity_is_in_slot_subtree(world, slot, focused)) {
++        world
++            .resource_mut::<InputFocus>()
++            .revoke_if(&[input.unwrap()]);
+     }
+     if world
+         .get_resource::<RouteFocusState>()
+diff --git a/crates/bevy_ui_router_ecs/src/native_focus.rs b/crates/bevy_ui_router_ecs/src/native_focus.rs
+--- a/crates/bevy_ui_router_ecs/src/native_focus.rs
++++ b/crates/bevy_ui_router_ecs/src/native_focus.rs
+@@ -1,9 +1,10 @@
+-//! A fixed-version InputFocus queue adapter. Observations never confer lifecycle
+-//! authority: only the original native frame owner may consume a pending intent.
++//! Route qualification through the candidate UI focus protocol. Observations are
++//! read-only source facts; publication still requires the original frame owner.
++
++use std::{collections::HashSet, sync::Arc};
+ 
+ use crate::{
+     components::RouteOwnershipSeal,
+-    input::pointer_resource_entity,
+     presentation::{
+         FrameContentTarget, native_failure::NativeFailureSource, native_scene::NativeContentRoot,
+     },
+@@ -11,65 +12,28 @@
+         EntityLifecycle, EntityOwner, ExactRegistryClaim, RegistryOwner, RouteEntityRegistry,
+     },
+ };
+-use bevy_app::{App, MainScheduleOrder, PostUpdate};
+-use bevy_ecs::{
+-    prelude::*,
+-    schedule::{ScheduleCleanupPolicy, ScheduleLabel},
+-    system::{IntoSystem, System},
++use bevy_app::App;
++use bevy_ecs::prelude::*;
++use bevy_input_focus::{
++    FocusInstanceId, FocusObservation, FocusOperation, FocusOperationId, FocusOperationObserver,
++    InputFocus, InputTargetEligibility,
+ };
+-use bevy_input_focus::{FocusCause, InputFocus, InputFocusSystems, process_recorded_focus_changes};
+-use bevy_reflect::structs::Struct;
+-
+-type Change = Option<(Entity, FocusCause)>;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub(crate) enum NativeFocusError {
+     MissingResource,
+-    Schema,
+-    ResourceSource,
+-    OriginalSource,
+-    QueueSource,
+-    CurrentSource,
+-    SequenceExhausted,
+-    DrainSource,
+-    ScheduleSource,
+-}
+-
+-struct Fields<'a> {
+-    changes: &'a Vec<Change>,
+-    original: Option<Entity>,
+-    current: Option<Entity>,
+-}
+-
+-fn fields(focus: &InputFocus) -> Result<Fields<'_>, NativeFocusError> {
+-    let changes = focus
+-        .field("recorded_changes")
+-        .and_then(|field| field.try_downcast_ref::<Vec<Change>>())
+-        .ok_or(NativeFocusError::Schema)?;
+-    let original = *focus
+-        .field("original_focus")
+-        .and_then(|field| field.try_downcast_ref::<Option<Entity>>())
+-        .ok_or(NativeFocusError::Schema)?;
+-    let current = *focus
+-        .field("current_focus")
+-        .and_then(|field| field.try_downcast_ref::<Option<Entity>>())
+-        .ok_or(NativeFocusError::Schema)?;
+-    Ok(Fields {
+-        changes,
+-        original,
+-        current,
+-    })
++    Preparation(bevy_input_focus::FocusPreparationError),
+ }
+ 
+ #[derive(Component, Clone, Debug, Eq, PartialEq)]
+ pub(crate) struct NativeFocusSource(pub(crate) NativeFailureSource);
+ 
+-/// Created from the real FrameTask, moved with NativeFrameContent, consumed once
+-/// by successful publication or dropped with the original failed/terminal owner.
++/// Created once from the real task and moved with its realized frame.
+ #[derive(Debug)]
+ pub(crate) struct NativeFocusOwner {
+     pub(crate) source: NativeFailureSource,
+-    after: u64,
++    instance: FocusInstanceId,
++    after: Option<FocusOperationId>,
+ }
+ 
+ #[derive(Clone)]
+@@ -77,34 +41,64 @@
+     source: NativeFailureSource,
+     root: ExactRegistryClaim,
+     target: Entity,
+-    cause: FocusCause,
+-    order: u64,
+-}
+-
+-#[derive(Resource, Default, Clone)]
+-struct NativeFocusCursor {
+-    active: bool,
+-    baseline: Option<(Entity, InputFocus)>,
+-    order: u64,
+-    latest: Option<PendingObservation>,
+-    error: Option<NativeFocusError>,
++    operation: FocusOperationId,
++}
++
++/// Temporary declaration source facts, never a reconstructed lifecycle owner.
++struct CreationObservation {
++    source: NativeFailureSource,
++    root: ExactRegistryClaim,
++    declarations: Vec<ExactRegistryClaim>,
++}
++
++#[derive(Resource, Default)]
++struct NativeFocusSources {
++    building: Option<NativeFailureSource>,
++    creation: Option<CreationObservation>,
++    previous_eligibility: Option<InputTargetEligibility>,
+ }
+ 
+ enum Target {
++    Unmanaged,
+     Allowed,
+     Denied,
+     Pending(NativeFailureSource, ExactRegistryClaim),
+ }
+ 
+-fn classify(world: &World, target: Entity, denied: &[Entity]) -> Target {
+-    if denied.contains(&target) || world.get_entity(target).is_err() {
++fn classify(world: &World, target: Entity) -> Target {
++    if world.get_entity(target).is_err() {
+         return Target::Denied;
+     }
+     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+-        return Target::Allowed;
+-    };
++        return Target::Unmanaged;
++    };
++    // Scene application can focus a declared child before ChildOf has been
++    // installed. Its exact allocation source must be frozen now, not recovered
++    // from ancestry after application or from a later frame snapshot.
++    if let Some(creation) = world
++        .get_resource::<NativeFocusSources>()
++        .and_then(|sources| sources.creation.as_ref())
++        && let Some(claim) = creation
++            .declarations
++            .iter()
++            .find(|claim| claim.entity() == target)
++    {
++        let exact = registry
++            .record(target)
++            .is_some_and(|record| record.matches_claim(claim))
++            && registry
++                .record(creation.root.entity())
++                .is_some_and(|record| record.matches_claim(&creation.root))
++            && world.get::<RouteOwnershipSeal>(target)
++                == Some(&RouteOwnershipSeal::new(claim.seal()));
++        return if exact {
++            Target::Pending(creation.source.clone(), creation.root.clone())
++        } else {
++            Target::Denied
++        };
++    }
+     let mut current = target;
+-    let mut seen = std::collections::HashSet::new();
++    let mut seen = HashSet::new();
+     loop {
+         if !seen.insert(current) {
+             return Target::Denied;
+@@ -116,6 +110,9 @@
+                 return Target::Denied;
+             }
+             if record.lifecycle() == EntityLifecycle::Active {
++                if !crate::active_scope::target_is_active(world, target) {
++                    return Target::Denied;
++                }
+                 if crate::presentation::native_frame::is_native_content(world, current)
+                     && !crate::presentation::native_frame::authored_target_is_visible(
+                         world,
+@@ -145,7 +142,7 @@
+             return Target::Denied;
+         }
+         let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
+-            return Target::Allowed;
++            return Target::Unmanaged;
+         };
+         if world
+             .get::<Children>(parent)
+@@ -157,128 +154,131 @@
+     }
+ }
+ 
+-struct Observation {
+-    cursor: NativeFocusCursor,
+-    next: InputFocus,
+-}
+-
+-fn prepare_observation(world: &World, denied: &[Entity]) -> Result<Observation, NativeFocusError> {
+-    let mut cursor = world.resource::<NativeFocusCursor>().clone();
+-    if let Some(error) = cursor.error {
+-        return Err(error);
+-    }
+-    let entity =
+-        pointer_resource_entity::<InputFocus>(world).ok_or(NativeFocusError::MissingResource)?;
+-    let focus = world
+-        .get_resource::<InputFocus>()
+-        .ok_or(NativeFocusError::MissingResource)?;
+-    let new = fields(focus)?;
+-    let Some((source, before)) = &cursor.baseline else {
+-        cursor.baseline = Some((entity, focus.clone()));
+-        return Ok(Observation {
+-            cursor,
+-            next: focus.clone(),
+-        });
+-    };
+-    if *source != entity {
+-        return Err(NativeFocusError::ResourceSource);
+-    }
+-    let old = fields(before)?;
+-    if new.original != old.original {
+-        return Err(NativeFocusError::OriginalSource);
+-    }
+-    if !new.changes.starts_with(old.changes) {
+-        return Err(NativeFocusError::QueueSource);
+-    }
+-    let suffix = &new.changes[old.changes.len()..];
+-    let expected = suffix
+-        .last()
+-        .map(|change| change.map(|(entity, _)| entity))
+-        .unwrap_or(old.current);
+-    if new.current != expected || new.current != focus.get() {
+-        return Err(NativeFocusError::CurrentSource);
+-    }
+-    let mut next = before.clone();
+-    for change in suffix {
+-        cursor.order = cursor
+-            .order
+-            .checked_add(1)
+-            .ok_or(NativeFocusError::SequenceExhausted)?;
+-        cursor.latest = None;
+-        match *change {
+-            Some((target, cause)) => match classify(world, target, denied) {
+-                Target::Allowed => next.set(target, cause),
+-                Target::Denied => {}
+-                Target::Pending(source, root) => {
+-                    cursor.latest = Some(PendingObservation {
+-                        source,
+-                        root,
+-                        target,
+-                        cause,
+-                        order: cursor.order,
+-                    })
+-                }
+-            },
+-            None => next.clear(),
+-        }
+-    }
+-    cursor.baseline = Some((entity, next.clone()));
+-    Ok(Observation { cursor, next })
+-}
+-
+-pub(crate) fn observe(world: &mut World, denied: &[Entity]) -> Result<(), NativeFocusError> {
+-    if !world
+-        .get_resource::<NativeFocusCursor>()
+-        .is_some_and(|cursor| cursor.active)
+-    {
+-        return Ok(());
+-    }
+-    match prepare_observation(world, denied) {
+-        Ok(observation) => {
+-            if world.resource::<InputFocus>() != &observation.next {
+-                *world.resource_mut::<InputFocus>() = observation.next;
+-            }
+-            *world.resource_mut::<NativeFocusCursor>() = observation.cursor;
+-            Ok(())
+-        }
+-        Err(error) => {
+-            world.resource_mut::<NativeFocusCursor>().error = Some(error);
+-            Err(error)
+-        }
+-    }
++fn application_eligible(world: &World, target: Entity) -> bool {
++    world
++        .get_resource::<NativeFocusSources>()
++        .and_then(|sources| sources.previous_eligibility.as_ref())
++        .is_none_or(|policy| policy.accepts(world, target))
++}
++
++fn eligible(world: &World, target: Entity) -> bool {
++    matches!(classify(world, target), Target::Unmanaged | Target::Allowed)
++        && application_eligible(world, target)
++}
++
++fn freeze_operation(world: &World, operation: &FocusOperation) -> Option<FocusObservation> {
++    let target = operation.target?;
++    let Target::Pending(source, root) = classify(world, target) else {
++        return None;
++    };
++    Some(Arc::new(PendingObservation {
++        source,
++        root,
++        target,
++        operation: operation.identity().clone(),
++    }))
+ }
+ 
+ pub(crate) fn begin(
+     world: &mut World,
+     task: &bevy_ui_router_core::integration::RootFrameTask,
+ ) -> Result<NativeFocusOwner, NativeFocusError> {
+-    world.resource_mut::<NativeFocusCursor>().active = true;
+-    observe(world, &[])?;
+-    Ok(NativeFocusOwner {
++    let focus = world
++        .get_resource::<InputFocus>()
++        .ok_or(NativeFocusError::MissingResource)?;
++    let owner = NativeFocusOwner {
+         source: NativeFailureSource::from_task(task),
+-        after: world.resource::<NativeFocusCursor>().order,
+-    })
++        instance: focus.instance_id().clone(),
++        after: focus
++            .latest_operation()
++            .map(|operation| operation.identity().clone()),
++    };
++    world.resource_mut::<NativeFocusSources>().building = Some(owner.source.clone());
++    Ok(owner)
++}
++
++pub(crate) fn register_creation(
++    world: &mut World,
++    root: ExactRegistryClaim,
++    declarations: Vec<ExactRegistryClaim>,
++) {
++    let Some(mut sources) = world.get_resource_mut::<NativeFocusSources>() else {
++        return;
++    };
++    let Some(source) = sources.building.as_ref() else {
++        return;
++    };
++    if !matches!(root.owner(), RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame))
++        if *frame == source.frame)
++    {
++        return;
++    }
++    sources.creation = Some(CreationObservation {
++        source: source.clone(),
++        root,
++        declarations,
++    });
++}
++
++pub(crate) fn creation_source(
++    world: &World,
++    frame: &bevy_ui_router_core::frame::RouteFrameVersion,
++) -> Option<NativeFocusSource> {
++    let source = world
++        .get_resource::<NativeFocusSources>()?
++        .building
++        .as_ref()?;
++    (source.frame == *frame).then(|| NativeFocusSource(source.clone()))
++}
++
++pub(crate) fn finish_application(world: &mut World) {
++    if let Some(mut sources) = world.get_resource_mut::<NativeFocusSources>() {
++        sources.creation = None;
++    }
++}
++
++pub(crate) fn finish_creation(world: &mut World) {
++    if let Some(mut sources) = world.get_resource_mut::<NativeFocusSources>() {
++        sources.creation = None;
++        sources.building = None;
++    }
+ }
+ 
+ pub(crate) fn source_is_valid(world: &World) -> bool {
+-    world
+-        .get_resource::<NativeFocusCursor>()
+-        .is_none_or(|cursor| cursor.error.is_none())
++    world.contains_resource::<InputFocus>()
++}
++
++/// Creation failure may revoke only its already classified exact target set.
++/// General qualification belongs to native admission/dispatch, not an eager
++/// Router-wide cleanup that could cross an unproven ownership partition.
++pub(crate) fn observe(world: &mut World, denied: &[Entity]) -> Result<(), NativeFocusError> {
++    let focus = world
++        .get_resource::<InputFocus>()
++        .ok_or(NativeFocusError::MissingResource)?;
++    let prepared = bevy_input_focus::PreparedFocusChange::prepare_revoke_if(focus, denied)
++        .map_err(NativeFocusError::Preparation)?;
++    let focus = world.resource_mut::<InputFocus>();
++    let bound = prepared
++        .bind_mut(focus)
++        .map_err(|(_, error)| NativeFocusError::Preparation(error))?;
++    drop(bound.apply());
++    Ok(())
+ }
+ 
+ pub(crate) struct PublicationFocus {
+-    expected: InputFocus,
+-    pub(crate) candidate: Option<(Entity, FocusCause)>,
++    instance: FocusInstanceId,
++    latest: Option<FocusOperation>,
++    pub(crate) candidate: Option<FocusOperation>,
+ }
+ 
+ impl PublicationFocus {
+     pub(crate) fn matches(&self, focus: &InputFocus) -> bool {
+-        self.expected == *focus
++        self.instance == *focus.instance_id() && self.latest == focus.latest_operation()
+     }
+ }
+ 
+ pub(crate) fn prepare_publication(
+-    world: &mut World,
++    world: &World,
+     frames: &[crate::presentation::RealizedFrame],
+     eligible: &[Entity],
+ ) -> Option<PublicationFocus> {
+@@ -286,169 +286,66 @@
+ }
+ 
+ pub(crate) fn prepare_publication_frames<'a>(
+-    world: &mut World,
++    world: &World,
+     mut frames: impl Iterator<Item = &'a crate::presentation::RealizedFrame>,
+     eligible: &[Entity],
+ ) -> Option<PublicationFocus> {
+-    observe(world, &[]).ok()?;
+-    let cursor = world.get_resource::<NativeFocusCursor>();
+-    let candidate = cursor
+-        .and_then(|cursor| cursor.latest.as_ref())
+-        .and_then(|latest| {
+-            frames.find_map(|frame| {
+-                let owner = frame.native_focus_owner()?;
+-                if owner.source != latest.source
+-                    || latest.order <= owner.after
+-                    || latest.source.frame != *frame.frame()
+-                {
+-                    return None;
+-                }
+-                let root = frame.native_root()?;
+-                if latest.root.entity() != root
+-                    || world
+-                        .resource::<RouteEntityRegistry>()
+-                        .record(root)?
+-                        .claim()
+-                        != latest.root
+-                    || world.get::<NativeFocusSource>(root)?.0 != owner.source
+-                    || !eligible.contains(&latest.target)
+-                    || !crate::presentation::native_frame::collect_content(
+-                        world,
+-                        frame.frame(),
+-                        root,
+-                    )
++    let focus = world.get_resource::<InputFocus>()?;
++    let latest_operation = focus.latest_operation();
++    let candidate = latest_operation.as_ref().and_then(|operation| {
++        if operation.accepted {
++            return None;
++        }
++        let latest = operation.observation::<PendingObservation>()?;
++        if latest.operation != *operation.identity() || operation.target != Some(latest.target) {
++            return None;
++        }
++        frames.find_map(|frame| {
++            let owner = frame.native_focus_owner()?;
++            if owner.source != latest.source
++                || owner.instance != *focus.instance_id()
++                || owner.after.as_ref() == Some(operation.identity())
++                || latest.source.frame != *frame.frame()
++            {
++                return None;
++            }
++            let root = frame.native_root()?;
++            if latest.root.entity() != root
++                || world
++                    .resource::<RouteEntityRegistry>()
++                    .record(root)?
++                    .claim()
++                    != latest.root
++                || world.get::<NativeFocusSource>(root)?.0 != owner.source
++                || !eligible.contains(&latest.target)
++                || !application_eligible(world, latest.target)
++                || !crate::presentation::native_frame::collect_content(world, frame.frame(), root)
+                     .is_ok_and(|content| content.contains(&latest.target))
+-                {
+-                    return None;
+-                }
+-                Some((latest.target, latest.cause))
+-            })
+-        });
++            {
++                return None;
++            }
++            Some(operation.clone())
++        })
++    });
+     Some(PublicationFocus {
+-        expected: world.get_resource::<InputFocus>()?.clone(),
++        instance: focus.instance_id().clone(),
++        latest: latest_operation,
+         candidate,
+     })
+ }
+ 
+-// Normal parameters are important: no exclusive system's implicit World::flush
+-// may split the pipe or deliver the official processor's Commands early.
+-fn before_drain(mut params: ParamSet<(&World, ResMut<NativeFocusCursor>, ResMut<InputFocus>)>) {
+-    if !params.p1().active {
++pub(crate) fn install(app: &mut App) {
++    if app.world().contains_resource::<NativeFocusSources>() {
+         return;
+     }
+-    let result = prepare_observation(params.p0(), &[]);
+-    match result {
+-        Ok(observation) => {
+-            if *params.p2() != observation.next {
+-                *params.p2() = observation.next;
+-            }
+-            *params.p1() = observation.cursor;
+-        }
+-        Err(error) => params.p1().error = Some(error),
+-    }
+-}
+-
+-fn after_drain(mut params: ParamSet<(&World, ResMut<NativeFocusCursor>)>) {
+-    if !params.p1().active || params.p1().error.is_some() {
+-        return;
+-    }
+-    let result = (|| {
+-        let world = params.p0();
+-        let cursor = world.resource::<NativeFocusCursor>();
+-        let (source, before) = cursor
+-            .baseline
+-            .as_ref()
+-            .ok_or(NativeFocusError::DrainSource)?;
+-        if pointer_resource_entity::<InputFocus>(world) != Some(*source) {
+-            return Err(NativeFocusError::ResourceSource);
+-        }
+-        let focus = world
+-            .get_resource::<InputFocus>()
+-            .ok_or(NativeFocusError::MissingResource)?;
+-        let now = fields(focus)?;
+-        if !now.changes.is_empty() || now.current != before.get() || now.original != now.current {
+-            return Err(NativeFocusError::DrainSource);
+-        }
+-        Ok((*source, focus.clone()))
+-    })();
+-    match result {
+-        Ok(baseline) => params.p1().baseline = Some(baseline),
+-        Err(error) => params.p1().error = Some(error),
+-    }
+-}
+-
+-#[derive(ScheduleLabel, Clone, Debug, Eq, PartialEq, Hash)]
+-struct NativeFocusDrainBoundary;
+-
+-fn install_drain(world: &mut World) {
+-    if !world.resource::<NativeFocusCursor>().active {
+-        return;
+-    }
+-    if world
+-        .get_resource::<bevy_ecs::schedule::Schedules>()
+-        .and_then(|schedules| schedules.get(PostUpdate))
+-        .is_none()
+-    {
+-        let _ = observe(world, &[]);
+-        return;
+-    }
+-    let result = world.try_schedule_scope(PostUpdate, |world, schedule| {
+-        schedule
+-            .initialize(world)
+-            .map_err(|_| NativeFocusError::ScheduleSource)?;
+-        let stock = IntoSystem::into_system(process_recorded_focus_changes).system_type();
+-        let bridge = IntoSystem::into_system(
+-            before_drain
+-                .pipe(process_recorded_focus_changes)
+-                .pipe(after_drain),
+-        )
+-        .system_type();
+-        let types = schedule
+-            .systems()
+-            .map_err(|_| NativeFocusError::ScheduleSource)?
+-            .map(|(_, system)| system.system_type())
+-            .collect::<Vec<_>>();
+-        let stock_count = types.iter().filter(|kind| **kind == stock).count();
+-        let bridge_count = types.iter().filter(|kind| **kind == bridge).count();
+-        if stock_count + bridge_count > 1 {
+-            return Err(NativeFocusError::ScheduleSource);
+-        }
+-        if stock_count == 1 {
+-            if schedule
+-                .remove_systems_in_set(
+-                    process_recorded_focus_changes,
+-                    world,
+-                    ScheduleCleanupPolicy::RemoveSystemsOnly,
+-                )
+-                .map_err(|_| NativeFocusError::ScheduleSource)?
+-                != 1
+-            {
+-                return Err(NativeFocusError::ScheduleSource);
+-            }
+-            schedule.add_systems(
+-                before_drain
+-                    .pipe(process_recorded_focus_changes)
+-                    .pipe(after_drain)
+-                    .in_set(InputFocusSystems::FocusChangeEvents),
+-            );
+-        }
+-        Ok(())
++    let previous_eligibility = app
++        .world()
++        .get_resource::<InputTargetEligibility>()
++        .copied();
++    app.insert_resource(NativeFocusSources {
++        previous_eligibility,
++        ..Default::default()
+     });
+-    if result.is_err() || result.is_ok_and(|result| result.is_err()) {
+-        world.resource_mut::<NativeFocusCursor>().error = Some(NativeFocusError::ScheduleSource);
+-    }
+-    // Initialization/ScheduleBuilt callbacks append to the same old baseline.
+-    // Never reset it from an after-install snapshot and lose superseding writes.
+-    let _ = observe(world, &[]);
+-}
+-
+-pub(crate) fn install(app: &mut App) {
+-    if app.world().contains_resource::<NativeFocusCursor>() {
+-        return;
+-    }
+-    app.init_resource::<NativeFocusCursor>();
+-    app.world_mut()
+-        .resource_mut::<MainScheduleOrder>()
+-        .insert_before(PostUpdate, NativeFocusDrainBoundary);
+-    app.add_systems(NativeFocusDrainBoundary, install_drain);
+-}
++    app.insert_resource(InputTargetEligibility::new(eligible));
++    app.insert_resource(FocusOperationObserver::new(freeze_operation));
++}
+diff --git a/crates/bevy_ui_router_ecs/src/navigation.rs b/crates/bevy_ui_router_ecs/src/navigation.rs
+--- a/crates/bevy_ui_router_ecs/src/navigation.rs
++++ b/crates/bevy_ui_router_ecs/src/navigation.rs
+@@ -8986,7 +8986,10 @@
+         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+             world.resource_scope(
+                 |world, mut drivers: bevy_ecs::change_detection::Mut<ViewDriverStore>| {
+-                    for (entry_index, entry) in navigation.entries.iter_mut().enumerate() {
++                    for entry_index in 0..navigation.entries.len() {
++                        #[cfg(feature = "bsn")]
++                        crate::active_scope::freeze_borrowed_scopes(world, &navigation.entries);
++                        let entry = &mut navigation.entries[entry_index];
+                         if only_entries.is_some_and(|entries| !entries.contains(&entry_index)) {
+                             continue;
+                         }
+@@ -9238,6 +9241,8 @@
+                         let Some(action) = action else {
+                             continue;
+                         };
++                        #[cfg(feature = "bsn")]
++                        crate::active_scope::refresh_borrowed_entry(world, entry);
+                         match action {
+                             EngineAction::Commit(ticket) => {
+                                 let mut pending = entry.pending_commit.take().unwrap_or_else(PendingCommit::new);
+@@ -9614,6 +9619,7 @@
+                                         entry.pending_failed_branch = Some(stale_driver_report_owner(pending, task));
+                                         continue;
+                                     }
++                                    crate::active_scope::refresh_borrowed_entry(world, entry);
+                                     let focus_owner = match crate::native_focus::begin(world, &task) {
+                                         Ok(owner) => owner,
+                                         Err(error) => {
+@@ -9625,6 +9631,7 @@
+                                     let prepared = match crate::bsn::prepare_bsn_view(world, factory, task.input()) {
+                                         Ok(prepared) => prepared,
+                                         Err(failure) => {
++                                            crate::native_focus::finish_creation(world);
+                                             let failure = crate::presentation::native_failure::NativeFailureOwner::preparation(&task, failure);
+                                             reject_native_task(world, entry, pending, task, ViewFailureKind::Build, failure);
+                                             continue;
+@@ -10519,7 +10526,7 @@
+         },
+     );
+     #[cfg(feature = "bsn")]
+-    let _ = crate::native_focus::observe(world, &[]);
++    crate::active_scope::clear_borrowed_scopes(world);
+     newly_bound_entries
+ }
+ 
+@@ -15253,10 +15260,16 @@
+         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+         let resulting_claims = registry_plan.resulting_claims().to_vec();
+         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
++        #[cfg(not(feature = "bsn"))]
+         let focus_plan =
+             prepare_focus_mutation(input_focus, route_focus, &ready.physical.focus_leaving);
+         #[cfg(feature = "bsn")]
+-        let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
++        let focus_plan = crate::input::prepare_native_focus_mutation(
++            input_focus,
++            route_focus,
++            &ready.physical.focus_leaving,
++            native_focus.as_ref()?,
++        )?;
+         let claim_rebind = splice.prepare_claim_rebind(&resulting_claims)?;
+         let presentation_plan = presentation.seal_commit(isolate_count)?;
+         let BackTargetReadyAcceptanceOwner {
+@@ -15420,9 +15433,12 @@
+                 let active_owner = &mut entry.active;
+                 let cleanup_owner = &mut entry.cleanup_ledger;
+                 let scroll_owner = &mut entry.scroll;
++                let mut retired_focus = None;
+                 engine.publish(|| {
+                     presentation_plan.apply_staged(
+-                        |_| focus_plan.apply(),
++                        |_| {
++                            retired_focus = focus_plan.apply();
++                        },
+                         |_| {
+                             if registry_changes {
+                                 registry_plan.apply(&mut registry);
+@@ -15434,6 +15450,7 @@
+                     *cleanup_owner = next_cleanup;
+                     *scroll_owner = scroll.state;
+                 });
++                drop(retired_focus);
+                 Some(())
+             }
+         }
+@@ -15491,8 +15508,6 @@
+ }
+ 
+ pub(crate) fn commit_presentation_system(world: &mut World) {
+-    #[cfg(feature = "bsn")]
+-    let _ = crate::native_focus::observe(world, &[]);
+     let handles = world
+         .resource::<RouterNavigation>()
+         .entries
+diff --git a/crates/bevy_ui_router_ecs/src/navigation/authority_isolation.rs b/crates/bevy_ui_router_ecs/src/navigation/authority_isolation.rs
+--- a/crates/bevy_ui_router_ecs/src/navigation/authority_isolation.rs
++++ b/crates/bevy_ui_router_ecs/src/navigation/authority_isolation.rs
+@@ -60,11 +60,20 @@
+                 .claims()
+                 .cloned()
+                 .collect::<Vec<_>>();
++            bevy_input_focus::set_focus(
++                &mut app.world_mut().into(),
++                application_target,
++                bevy_input_focus::FocusCause::Pressed,
++            );
++            bevy_input_focus::set_focus(
++                &mut app.world_mut().into(),
++                target,
++                bevy_input_focus::FocusCause::Navigated,
++            );
++            // Clone the actual requests: a new set/clear operation would mint
++            // a different identity and cannot reproduce this queue snapshot.
+             let mut expected = app.world().resource::<InputFocus>().clone();
+-            expected.set(application_target, bevy_input_focus::FocusCause::Pressed);
+-            expected.set(target, bevy_input_focus::FocusCause::Navigated);
+-            *app.world_mut().resource_mut::<InputFocus>() = expected.clone();
+-            expected.clear();
++            expected.revoke_if(&[target]);
+             let prepared =
+                 prepare_authority_isolation_targets(app.world(), claims.iter(), [target], 0);
+             let AuthorityIsolationPreparation::Ready(prepared) = prepared else {
+@@ -675,7 +684,7 @@
+             .is_some_and(|focused| self.focus.contains(&focused))
+             && let Some(mut focus) = world.get_resource_mut::<InputFocus>()
+         {
+-            focus.clear();
++            focus.revoke_if(&self.focus);
+         }
+         if world
+             .get_resource::<RouteFocusState>()
+@@ -726,7 +735,7 @@
+             .is_some_and(|focused| self.focus.contains(&focused))
+             && let Some(mut focus) = world.get_resource_mut::<InputFocus>()
+         {
+-            focus.clear();
++            focus.revoke_if(&self.focus);
+         }
+         if world
+             .get_resource::<RouteFocusState>()
+diff --git a/crates/bevy_ui_router_ecs/src/navigation/native_tests.rs b/crates/bevy_ui_router_ecs/src/navigation/native_tests.rs
+--- a/crates/bevy_ui_router_ecs/src/navigation/native_tests.rs
++++ b/crates/bevy_ui_router_ecs/src/navigation/native_tests.rs
+@@ -1603,9 +1603,11 @@
+         app.world_mut()
+             .resource_mut::<crate::input::RouteFocusState>()
+             .set_focused(Some(target));
+-        app.world_mut()
+-            .resource_mut::<bevy_input_focus::InputFocus>()
+-            .set(target, bevy_input_focus::FocusCause::Pressed);
++        bevy_input_focus::set_focus(
++            &mut app.world_mut().into(),
++            target,
++            bevy_input_focus::FocusCause::Pressed,
++        );
+         if escaped {
+             app.world_mut().entity_mut(target).insert(ChildOf(host));
+         }
+@@ -1707,15 +1709,19 @@
+     settle(&mut app);
+     assert_retained_failure(&app, router, request, host, protected);
+     let failed_root = app.world().get::<ChildOf>(protected).unwrap().parent();
+-    app.world_mut()
+-        .resource_mut::<InputFocus>()
+-        .set(failed_root, bevy_input_focus::FocusCause::Navigated);
++    bevy_input_focus::set_focus(
++        &mut app.world_mut().into(),
++        failed_root,
++        bevy_input_focus::FocusCause::Navigated,
++    );
+     app.update();
+     assert_eq!(app.world().resource::<InputFocus>().get(), None);
+     let app_target = app.world_mut().spawn(Node::default()).id();
+-    app.world_mut()
+-        .resource_mut::<InputFocus>()
+-        .set(app_target, bevy_input_focus::FocusCause::Navigated);
++    bevy_input_focus::set_focus(
++        &mut app.world_mut().into(),
++        app_target,
++        bevy_input_focus::FocusCause::Navigated,
++    );
+     app.update();
+     assert_eq!(app.world().resource::<InputFocus>().get(), Some(app_target));
+     failure.store(false, Ordering::Relaxed);
+@@ -2787,9 +2793,11 @@
+                     assert!(world.get_entity(child).is_ok());
+                     world.resource_mut::<EscapeCalls>().0 += 1;
+                     world.entity_mut(child).insert(ChildOf(application));
+-                    world
+-                        .resource_mut::<InputFocus>()
+-                        .set(child, bevy_input_focus::FocusCause::Navigated);
++                    bevy_input_focus::set_focus(
++                        &mut world.into(),
++                        child,
++                        bevy_input_focus::FocusCause::Navigated,
++                    );
+                 });
+             }
+         },
+diff --git a/crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs b/crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs
+--- a/crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs
++++ b/crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs
+@@ -465,20 +465,15 @@
+         ))
+     })();
+     #[cfg(feature = "bsn")]
+-    let native_focus = world.resource_scope(
+-        |world, navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+-            let entry = navigation
+-                .entries
+-                .iter()
+-                .find(|entry| entry.handle == handle)?;
+-            let view = splice.view(&entry.retained)?;
+-            crate::native_focus::prepare_publication_frames(
+-                world,
+-                view.entering_frames(),
+-                &gate_after,
+-            )
+-        },
+-    );
++    let native_focus = (|| {
++        let navigation = world.get_resource::<RouterNavigation>()?;
++        let entry = navigation
++            .entries
++            .iter()
++            .find(|entry| entry.handle == handle)?;
++        let view = splice.view(&entry.retained)?;
++        crate::native_focus::prepare_publication_frames(world, view.entering_frames(), &gate_after)
++    })();
+     let mut splice_owner = Some(splice);
+     let mut cleanup_reserve_contradiction = None;
+     let mut commit_authority_contradiction = cleanup_preparation_contradiction
+@@ -578,9 +573,15 @@
+         };
+ 
+         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
++        #[cfg(not(feature = "bsn"))]
+         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
+         #[cfg(feature = "bsn")]
+-        let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
++        let focus_plan = crate::input::prepare_native_focus_mutation(
++            input_focus,
++            route_focus,
++            &focus_leaving,
++            native_focus.as_ref()?,
++        )?;
+         let splice_transitions = view.lifecycle_transitions();
+         let splice_claims = resulting_claims
+             .iter()
+@@ -751,9 +752,12 @@
+         let active_owner = &mut entry.active;
+         let cleanup_owner = &mut entry.cleanup_ledger;
+         let scroll_owner = &mut entry.scroll;
++        let mut retired_focus = None;
+         engine.publish(|owners| {
+             presentation_plan.apply_staged(
+-                |_| focus_plan.apply(),
++                |_| {
++                    retired_focus = focus_plan.apply();
++                },
+                 |_| {
+                     if registry_changes {
+                         registry_plan.apply(&mut registry);
+@@ -771,6 +775,7 @@
+                 retained_owner.install_published(projection, Some(owner), branch);
+             }
+         });
++        drop(retired_focus);
+         Some(())
+     })();
+     if committed.is_some() {
+diff --git a/crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs b/crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs
+--- a/crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs
++++ b/crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs
+@@ -1096,9 +1096,15 @@
+             .find(|entry| entry.handle == handle)?;
+         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
+         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
++        #[cfg(not(feature = "bsn"))]
+         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
+         #[cfg(feature = "bsn")]
+-        let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;
++        let focus_plan = crate::input::prepare_native_focus_mutation(
++            input_focus,
++            route_focus,
++            &focus_leaving,
++            native_focus.as_ref()?,
++        )?;
+         let presentation_plan = presentation.seal_commit(isolate_count)?;
+         let root_rebase = match entry.active.as_ref() {
+             Some(leaving) => Some(pending.branch.as_realized().prepare_root_rebase(leaving)?),
+@@ -1280,9 +1286,12 @@
+         let active_owner = &mut entry.active;
+         let cleanup_owner = &mut entry.cleanup_ledger;
+         let scroll_owner = &mut entry.scroll;
++        let mut retired_focus = None;
+         engine.publish(|_| {
+             presentation_plan.apply_staged(
+-                |_| focus_plan.apply(),
++                |_| {
++                    retired_focus = focus_plan.apply();
++                },
+                 |_| {
+                     registry_plan.apply(&mut registry);
+                     if let Some(boundaries) = retained_boundaries {
+@@ -1295,6 +1304,7 @@
+             *cleanup_owner = next_cleanup;
+             *scroll_owner = scroll.state;
+         });
++        drop(retired_focus);
+         Some(())
+     })();
+     if committed.is_some() {
+diff --git a/crates/bevy_ui_router_ecs/src/navigation_tests.rs b/crates/bevy_ui_router_ecs/src/navigation_tests.rs
+--- a/crates/bevy_ui_router_ecs/src/navigation_tests.rs
++++ b/crates/bevy_ui_router_ecs/src/navigation_tests.rs
+@@ -5274,9 +5274,11 @@
+         assert_eq!(children.len(), old.len());
+         assert!(old.iter().all(|(shell, _, _)| children.contains(shell)));
+         // A real focus input must be released when this leaf becomes retained.
+-        app.world_mut()
+-            .resource_mut::<InputFocus>()
+-            .set(current, bevy_input_focus::FocusCause::Navigated);
++        bevy_input_focus::set_focus(
++            &mut app.world_mut().into(),
++            current,
++            bevy_input_focus::FocusCause::Navigated,
++        );
+     }
+     let request = app
+         .world_mut()
+diff --git a/crates/bevy_ui_router_ecs/src/plugin.rs b/crates/bevy_ui_router_ecs/src/plugin.rs
+--- a/crates/bevy_ui_router_ecs/src/plugin.rs
++++ b/crates/bevy_ui_router_ecs/src/plugin.rs
+@@ -69,6 +69,12 @@
+         .init_resource::<RouteEntityRegistry>()
+         .init_resource::<QuarantineLeaseTable>();
+ 
++    #[cfg(feature = "bsn")]
++    {
++        app.init_resource::<crate::active_scope::BorrowedActiveScopes>();
++        crate::native_focus::install(app);
++    }
++
+     if !app.world().contains_resource::<RouterInputGate>() {
+         app.insert_resource(RouterInputGate::new());
+     }
+@@ -98,7 +104,9 @@
+         PreUpdate,
+         (
+             RouterInputSet::Refresh.before(PickingSystems::Hover),
+-            RouterInputSet::Ready.after(PickingSystems::Hover),
++            RouterInputSet::Ready
++                .after(PickingSystems::Hover)
++                .before(bevy_input_focus::InputFocusSystems::Dispatch),
+         )
+             .chain(),
+     )
+diff --git a/crates/bevy_ui_router_ecs/src/presentation.rs b/crates/bevy_ui_router_ecs/src/presentation.rs
+--- a/crates/bevy_ui_router_ecs/src/presentation.rs
++++ b/crates/bevy_ui_router_ecs/src/presentation.rs
+@@ -4954,7 +4954,9 @@
+ fn clear_frame_focus(world: &mut World, frame: &RealizedFrame) {
+     let input = world.get_resource::<InputFocus>().and_then(InputFocus::get);
+     if input.is_some_and(|focused| entity_is_in_frame_subtree(world, frame, focused)) {
+-        world.resource_mut::<InputFocus>().clear();
++        world
++            .resource_mut::<InputFocus>()
++            .revoke_if(&[input.unwrap()]);
+     }
+     let route = world
+         .get_resource::<RouteFocusState>()
+diff --git a/crates/bevy_ui_router_ecs/src/presentation/native_frame.rs b/crates/bevy_ui_router_ecs/src/presentation/native_frame.rs
+--- a/crates/bevy_ui_router_ecs/src/presentation/native_frame.rs
++++ b/crates/bevy_ui_router_ecs/src/presentation/native_frame.rs
+@@ -609,15 +609,13 @@
+     owner: crate::native_focus::NativeFocusOwner,
+     result: Result<RealizedFrame, NativeFrameFailure>,
+ ) -> Result<RealizedFrame, NativeFrameFailure> {
++    crate::native_focus::finish_creation(world);
+     match result {
+         Ok(mut frame) => {
+             let root = frame
+                 .native_root()
+                 .expect("native realization keeps its root");
+-            let source = crate::native_focus::NativeFocusSource(owner.source.clone());
+             frame.native.as_mut().unwrap().focus_owner = Some(owner);
+-            world.entity_mut(root).insert(source);
+-            world.flush();
+             let source_id = world.register_component::<crate::native_focus::NativeFocusSource>();
+             let sync = synchronize_manifest_allowing_additions(
+                 world,
+@@ -1188,9 +1186,7 @@
+                 } = *world.get::<EscapeOnDespawn>(context.entity).unwrap();
+                 world.commands().queue(move |world: &mut World| {
+                     world.entity_mut(escaped).insert(ChildOf(application));
+-                    world
+-                        .resource_mut::<InputFocus>()
+-                        .set(escaped, FocusCause::Navigated);
++                    bevy_input_focus::set_focus(&mut world.into(), escaped, FocusCause::Navigated);
+                 });
+             });
+         app.world_mut().entity_mut(trigger).insert(EscapeOnDespawn {
+diff --git a/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs b/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
+--- a/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
++++ b/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
+@@ -492,11 +492,20 @@
+         .scenes
+         .push(root.scene);
+     let wrapper = ResolvedSceneRoot { scene: wrapper };
++    crate::native_focus::register_creation(
++        world,
++        allocations[1].claim.clone(),
++        allocations[1..]
++            .iter()
++            .map(|allocation| allocation.claim.clone())
++            .collect(),
++    );
+     let apply_result = {
+         let mut shell_entity = world.entity_mut(shell);
+         wrapper.apply(&mut shell_entity, &mut BundleScratch::default())
+     };
+     world.flush();
++    crate::native_focus::finish_application(world);
+     if let Err(error) = apply_result {
+         let error = strip_private_wrapper_error(error);
+         synchronize_surviving_manifests(world, &mut allocations);
+@@ -664,6 +673,9 @@
+                     FrameContentTarget(frame.clone()),
+                     NativeContentRoot,
+                 ));
++                if let Some(source) = crate::native_focus::creation_source(world, frame) {
++                    world.entity_mut(allocation.entity()).insert(source);
++                }
+             }
+             NativeSceneAllocationRole::Declaration(_) => {
+                 world.entity_mut(allocation.entity()).insert(common);

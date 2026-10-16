@@ -1,0 +1,12 @@
+{
+  "base_commit": "c8a2997c57f7081e7e9ea2b239b14621cd1f5c77",
+  "bevy_version": "0.19.1",
+  "original_ui_sha256": {
+    "bevy_input_focus/src/autofocus.rs": "fb7b472cdc5289dda0a89cf3e4e9e2600361abee0f960c8ac29f1ef84d27f8d5",
+    "bevy_input_focus/src/directional_navigation.rs": "726f5ae8c423ecac28d3f4676efebc37cf2c693b91dce35c79a3599e61dbed80",
+    "bevy_input_focus/src/gained_and_lost.rs": "8a3ba9cbb63707b0854d2828ed25c22710b9a3a6265e2ab70c4f56da30491cbd",
+    "bevy_input_focus/src/lib.rs": "67f8364fbdc3f84187af2ab217f13db4bead549e217c63defe44401a97385595",
+    "bevy_input_focus/src/tab_navigation.rs": "b6e582e87982f581450524507f45e71dd7575e6735829a31d3372c1721aafa4a",
+    "bevy_ui/src/auto_directional_navigation.rs": "5f2bd599d1f4979362627604e7aadb9b504bab6f3e80e984ed722223ffba3348"
+  }
+}
