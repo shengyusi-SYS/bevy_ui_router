@@ -1,6 +1,6 @@
 # 性能测量数据
 
-这里保存测量数据；历史 CSV 原样迁移，新测量注明完整源码与环境身份，不混作现行合同。运行方法、统计边界和结果解读见[性能说明](../../performance.md)。除窗口文件为逐帧记录外，其余是样本汇总，不能从汇总分位数还原或合并原始样本。
+这里保存测量数据；历史 CSV 原样迁移，新测量注明完整源码与环境身份，不混作现行合同。运行方法、统计边界和结果解读见[性能说明](../../performance.md)。窗口与 focus 调度文件为逐帧记录，其余是样本汇总，不能从汇总分位数还原或合并原始样本。
 
 ## 数据身份
 
@@ -21,6 +21,7 @@
 | [performance-idle-2026-10-17.csv](performance-idle-2026-10-17.csv) | 192 | 输入/滚动观察与快照减法；before/after 各两轮完整 flat | before=`a6c0ef29d3c8d70532ed8e6ed7dcb4d8469e791e`；after=`9d80af9be3f20c170b6ee63140924de10dcaf906` |
 | [performance-steady-2026-10-17.csv](performance-steady-2026-10-17.csv) | 192 | 空工作执行减法、内容观察复用与 focus 冷路径；两轮交替 before/after flat | before=`9d80af9be3f20c170b6ee63140924de10dcaf906`；after=`e59a3ea0c8a7d6f56fe9dd8a4935fb6beeac3ed1` |
 | [performance-initial-steady-2026-10-18.csv](performance-initial-steady-2026-10-18.csv) | 40 | 一条初始请求、动态内容、两层/三层 native frame 与普通滚动 marker；两轮 before/after nested | before=`dab9bf0b042b0c86db6228c82013116500025ac5`；after=`6a0ab58f704e878efd7494c5f66ba92ea3cf956f` |
+| [performance-focus-schedule-2026-10-18.csv](performance-focus-schedule-2026-10-18.csv) | 2048 | 真实窗口空闲时私有 focus schedule 的 Multi/Single 对照；两轮逐帧 | `316a6d98e1451da9ef20c2f795683e1dae1fda47` + 完整[探针源码](focus-schedule-probe-2026-10-18.rs)与[窗口差异](focus-schedule-probe-2026-10-18.patch) |
 
 上述日期和 revision 是测量身份；部分局部提交在后续整理历史时已合并，不承诺其短 SHA 在当前分支仍可检出。`b0dbc3b7486e71cd41e5a8cd05e84ac031b10ce0` 当前仍可解析，但不在当前分支祖先链内。完整历史测量说明固定保存于 `6de4233e2c636daa5892807b05af8a19d6e2cc0f:docs/performance.md`，可用 `git show` 查询；它记录比较方法，不补足未保存的源码。
 
@@ -130,3 +131,26 @@ candidate 8d82769f351ecd8ca269f116179fc5ccc13e281fbc4bb34f95c8e1413c2504bf
 ```
 
 这些 hash 不能单独还原整个 runtime；必须结合表中源码身份与 Git 中原测量说明。共享 target 曾复用诊断产物的输出已作废，未计入这些 CSV；正式比较使用核对后的独立产物。
+
+## Focus 调度 2026-10-18
+
+完整生产源码固定为 `316a6d98e1451da9ef20c2f795683e1dae1fda47`；[身份记录](focus-schedule-identity-2026-10-18.json)保存工具链、lock/source/probe/实测 binary 的 SHA-256、实际 compiler artifacts、运行顺序和四组相同的完整 shape。生产代码在采样期间与该提交一致。Linux WSL2 / Ryzen 9 9950X / 24 可见逻辑 CPU，Bevy 0.19.1；ECS 与 tasks 的实际 artifact 均启用 `multi_threaded`，opt-level=3、无 debug assertions。WSLg renderer 报告软件渲染，未固定 affinity/频率。
+
+[探针](focus-schedule-probe-2026-10-18.rs)附加到该提交的窗口主文件，保持正式输入、focus、layout 和 renderer；启动前仅切换私有 executor。提前初始化 PostUpdate 记录官方 drain TypeId，结束时要求只移除该系统并新增一个非 exclusive pipe。采样前后与四组间均核对 Ready、无 running request、`/workspace/overview`、3 个 frame、41 个 Node/正尺寸布局节点、282 个活实体及全部 41 个 `ScrollPosition` 的坐标和 Entity；后者是组件数，不是滚动容器数。坐标均为零，未施加连续滚动输入。
+
+每组 128 帧预热、512 个逐帧样本；运行顺序为 round 1 Multi→Single，round 2 Single→Multi，无并行本任务编译/其它采样。CSV 按该运行顺序保留全部 2048 行与离群值。`boundary_us` 包含完整私有 Schedule 和两个固定 Single 探针的边界开销；`main_executor_us` 委托 Bevy 原有 Single Main executor，不含其外层初始化和 render 子应用/呈现。记录、形状断言和输出在该 Main 计时结束后。每轮用 nearest-rank 计算分位数，结果及限制归[性能说明](../../performance.md#私有-focus-调度实测)。
+
+在独立目录检出该源码提交后，可从保存的两个文件重建临时 binary；探针只作本次诊断来源，不加入默认示例或 CI：
+
+```sh
+mkdir -p examples/windowed/src/bin
+cp docs/data/performance/focus-schedule-probe-2026-10-18.rs /tmp/router-focus-schedule-probe-module.rs
+patch -o examples/windowed/src/bin/focus_schedule_probe.rs examples/windowed/src/main.rs < docs/data/performance/focus-schedule-probe-2026-10-18.patch
+CARGO_BUILD_JOBS=4 cargo build --offline --locked --release --manifest-path examples/windowed/Cargo.toml --bin focus_schedule_probe --message-format=json > artifacts.jsonl
+ROUTER_FOCUS_PROBE_EXECUTOR=multi examples/windowed/target/release/focus_schedule_probe > multi1.log 2>&1
+ROUTER_FOCUS_PROBE_EXECUTOR=single examples/windowed/target/release/focus_schedule_probe > single1.log 2>&1
+ROUTER_FOCUS_PROBE_EXECUTOR=single examples/windowed/target/release/focus_schedule_probe > single2.log 2>&1
+ROUTER_FOCUS_PROBE_EXECUTOR=multi examples/windowed/target/release/focus_schedule_probe > multi2.log 2>&1
+```
+
+生产提交早于本组数据文件；重建时须将本组保存的探针与差异文件带入该检出目录。四次运行应使用同一个已核对 hash 的优化 binary，并在构建结束后串行采样。临时窗口副本已从当前默认源码树移除，差异重建结果与实测副本逐字节一致。

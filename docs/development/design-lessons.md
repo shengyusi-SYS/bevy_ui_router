@@ -86,6 +86,8 @@ fault seam 只改变生产 predicate 的真实输入。编译拒绝核对目标�
 
 预热须覆盖计时路径的有界记录及其淘汰稳态；内容数量稳定，不代表请求快照成本已经稳定。否则样本数会改变增长期与稳态的混合比例。
 
+调度分析须核对实际编译 artifact 的 feature 图与 executor；同一源码在 headless 和窗口 consumer 中可能分别运行 Single 与 Multi。系统函数体计时不含 executor 的任务池与等待，判断调度收益还要测完整 schedule 和上层主世界；单个 exclusive system 的私有边界没有内部并行机会，不能据此将其它 schedule 一并串行化。
+
 测量绑定源码、二进制、环境和完整配对数据，隔离插桩及并行构建影响。跨 update 的整次操作累计耗时不能当作单帧耗时；限额 profile 应分别观察最慢 update 与热点占比。headless 导航、窗口主世界时间和屏幕呈现回答不同问题；方法及数据归[性能基线](../performance.md)。
 
 ## 文档只维护当前答案

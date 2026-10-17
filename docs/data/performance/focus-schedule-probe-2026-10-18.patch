@@ -1,0 +1,16 @@
+--- examples/windowed/src/main.rs
++++ examples/windowed/src/bin/focus_schedule_probe.rs
+@@ -1 +1,3 @@
+-//! A real window, renderer and device-input integration using only public APIs.
++//! Temporary controlled focus schedule probe.
++#[path = "/tmp/router-focus-schedule-probe-module.rs"]
++mod probe;
+@@ -59 +61 @@
+-            focused: !cfg!(all(debug_assertions, feature = "ui-debug")),
++            focused: false,
+@@ -247,2 +249,3 @@
+-    .add_observer(scroll)
+-    .run();
++    .add_observer(scroll);
++    probe::install(&mut app);
++    app.run();

@@ -1,0 +1,339 @@
+{
+  "source_revision": "316a6d98e1451da9ef20c2f795683e1dae1fda47",
+  "experiment": "real window idle native-focus schedule executor comparison",
+  "toolchain": "rustc 1.99.0-nightly (ba28ff76f 2026-08-13)\nbinary: rustc\ncommit-hash: ba28ff76f353a722f31c4f3dd2ac4e437d36411b\ncommit-date: 2026-08-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0",
+  "cargo": "cargo 1.99.0-nightly (eb98b54bc 2026-08-11)",
+  "os": "Linux 6.18.33.2-microsoft-standard-WSL2",
+  "cpu": "AMD Ryzen 9 9950X, 24 visible logical CPUs",
+  "renderer": "WSLg; selected adapter reported software rendering; hardware GPU not measured",
+  "build_command": "CARGO_BUILD_JOBS=4 cargo build --offline --locked --release --manifest-path examples/windowed/Cargo.toml --bin focus_schedule_probe --message-format=json",
+  "run_environment": "ROUTER_FOCUS_PROBE_EXECUTOR=multi|single; DISPLAY=:0; continuous Winit; original window presentation settings; unfocused window; no concurrent task build during samples",
+  "compiler_artifacts": [
+    {
+      "crate": "bevy_utils",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_utils@0.19.1",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": false
+      },
+      "features": [
+        "buffered_channel",
+        "default",
+        "parallel",
+        "std"
+      ]
+    },
+    {
+      "crate": "bevy_tasks",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_tasks@0.19.1",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": false
+      },
+      "features": [
+        "async_executor",
+        "default",
+        "futures-lite",
+        "multi_threaded"
+      ]
+    },
+    {
+      "crate": "bevy_ecs",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": false
+      },
+      "features": [
+        "async_executor",
+        "backtrace",
+        "bevy_reflect",
+        "default",
+        "multi_threaded",
+        "std"
+      ]
+    },
+    {
+      "crate": "focus_schedule_probe",
+      "package_id": "path+file:///workspace/projects/bevy_ui_router/examples/windowed#router_windowed@0.0.0",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": false
+      },
+      "features": [
+        "default"
+      ]
+    }
+  ],
+  "sha256": {
+    "Cargo.lock": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+    "examples/windowed/Cargo.lock": "3a03de073ff96cb1f4133346448ae002f365ffd88309e3d6b6e9142d43d9c0b3",
+    "examples/windowed/src/main.rs": "9e9da280b19951da9fb9dae6004641177e46e43683f420f03921947f7e691938",
+    "examples/windowed/src/bin/focus_schedule_probe.rs": "6baa01f262fb48dd8ec1aaa5ae988d58b9cfbad1315fba16bc3f0585c21fc06c",
+    "docs/data/performance/focus-schedule-probe-2026-10-18.rs": "e946c0ccea3a36c3928c59685574174924c99623976b51130f26173ba3ef46ab",
+    "docs/data/performance/focus-schedule-probe-2026-10-18.patch": "336f261385e74ec8a7f3760d674208ee1bbee56d499e641be0e9cabd6ee52472",
+    "docs/data/performance/performance-focus-schedule-2026-10-18.csv": "ab70e8bd701e057eef90697956611a1ea6a4f7f92408264af6d5c7a4313952bb"
+  },
+  "binary": {
+    "path": "examples/windowed/target/release/focus_schedule_probe",
+    "sha256": "125e542ad335a5a71389ade65fe879059a9ea267e42e6ea16047948d8dc2a249"
+  },
+  "runs_in_order": [
+    {
+      "round": 1,
+      "variant": "multi",
+      "warmup": 128,
+      "samples": 512,
+      "stock_replaced": 1
+    },
+    {
+      "round": 1,
+      "variant": "single",
+      "warmup": 128,
+      "samples": 512,
+      "stock_replaced": 1
+    },
+    {
+      "round": 2,
+      "variant": "single",
+      "warmup": 128,
+      "samples": 512,
+      "stock_replaced": 1
+    },
+    {
+      "round": 2,
+      "variant": "multi",
+      "warmup": 128,
+      "samples": 512,
+      "stock_replaced": 1
+    }
+  ],
+  "identical_shape": {
+    "location": "/workspace/overview",
+    "frames": 3,
+    "nodes": 41,
+    "positive_layout_nodes": 41,
+    "live_entities": 282,
+    "all_scroll_position_components": [
+      [
+        4294967014,
+        0.0,
+        0.0
+      ],
+      [
+        4294967015,
+        0.0,
+        0.0
+      ],
+      [
+        4294967016,
+        0.0,
+        0.0
+      ],
+      [
+        4294967017,
+        0.0,
+        0.0
+      ],
+      [
+        4294967018,
+        0.0,
+        0.0
+      ],
+      [
+        4294967019,
+        0.0,
+        0.0
+      ],
+      [
+        4294967020,
+        0.0,
+        0.0
+      ],
+      [
+        4294967021,
+        0.0,
+        0.0
+      ],
+      [
+        4294967022,
+        0.0,
+        0.0
+      ],
+      [
+        4294967023,
+        0.0,
+        0.0
+      ],
+      [
+        4294967024,
+        0.0,
+        0.0
+      ],
+      [
+        4294967025,
+        0.0,
+        0.0
+      ],
+      [
+        4294967026,
+        0.0,
+        0.0
+      ],
+      [
+        4294967027,
+        0.0,
+        0.0
+      ],
+      [
+        4294967028,
+        0.0,
+        0.0
+      ],
+      [
+        4294967029,
+        0.0,
+        0.0
+      ],
+      [
+        4294967030,
+        0.0,
+        0.0
+      ],
+      [
+        4294967031,
+        0.0,
+        0.0
+      ],
+      [
+        4294967032,
+        0.0,
+        0.0
+      ],
+      [
+        4294967033,
+        0.0,
+        0.0
+      ],
+      [
+        4294967034,
+        0.0,
+        0.0
+      ],
+      [
+        4294967035,
+        0.0,
+        0.0
+      ],
+      [
+        4294967037,
+        0.0,
+        0.0
+      ],
+      [
+        4294967038,
+        0.0,
+        0.0
+      ],
+      [
+        4294967039,
+        0.0,
+        0.0
+      ],
+      [
+        4294967040,
+        0.0,
+        0.0
+      ],
+      [
+        4294967041,
+        0.0,
+        0.0
+      ],
+      [
+        4294967042,
+        0.0,
+        0.0
+      ],
+      [
+        4294967043,
+        0.0,
+        0.0
+      ],
+      [
+        4294967044,
+        0.0,
+        0.0
+      ],
+      [
+        4294967045,
+        0.0,
+        0.0
+      ],
+      [
+        4294967046,
+        0.0,
+        0.0
+      ],
+      [
+        4294967047,
+        0.0,
+        0.0
+      ],
+      [
+        4294967048,
+        0.0,
+        0.0
+      ],
+      [
+        4294967049,
+        0.0,
+        0.0
+      ],
+      [
+        4294967050,
+        0.0,
+        0.0
+      ],
+      [
+        4294967051,
+        0.0,
+        0.0
+      ],
+      [
+        4294967052,
+        0.0,
+        0.0
+      ],
+      [
+        4294967053,
+        0.0,
+        0.0
+      ],
+      [
+        4294967054,
+        0.0,
+        0.0
+      ],
+      [
+        4294967055,
+        0.0,
+        0.0
+      ]
+    ]
+  },
+  "measurement": "boundary_us brackets the entire private Schedule with two fixed Single schedule probes; main_executor_us delegates the existing Single Main executor, excluding its outer Schedule initialization and render subapp/presentation; records and shape assertions occur after timing",
+  "statistics": "nearest-rank per run; all 2048 individual samples and outliers preserved"
+}

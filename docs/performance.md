@@ -85,6 +85,8 @@ ROUTER_BENCH_MODE=instances ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_rou
 
 Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `App::update` 和 snapshots 驱动。路由树固定为父布局及两个子路由，页面含 1/32/128 个 authored `Node + Content` 子节点，另有布局、工具栏和内部 outlet。它不测路由表规模。
 
+本节根 workspace 的 headless benchmark 默认命令没有启用 `bevy_ecs/multi_threaded`；其 CPU 结果不能证明多线程 executor 的调度等待已消除。窗口 consumer 独立启用 MT，比较前须核对实际 compiler artifact 的 features。
+
 时间为 `Instant` 的 CPU 侧 wall-clock，包含调度抢占，不是线程 CPU 计数器或屏幕显示延迟。**不含 UI layout、原生 picking、GPU、窗口、I/O 或异步加载**；Router 输入授权刷新在内。
 
 | 场景 | 计时工作与解释 |
@@ -103,6 +105,21 @@ Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `
 导航分位数是逐操作 nearest-rank；idle 每个样本连续 32 update 后取均值，其 p95 是批次均值的分布，不能当成单帧 p95。多轮同场景 p50 的算术均值也不是合并样本分位数。CSV 数量列在场景组结束后、计时外读取，表示稳定状态而非峰值；failure 行的数量在对应 recover 完成后读取。
 
 直接 BSN 对照保留 host/layout/toolbar/outlet，测 fresh Scene 构造、resolve/apply、旧页递归删除、flush 和普通 update。它没有 Router history、授权、隔离、失败/残留或写后复验，两者差值不构成严格 Router 开销归因。
+
+## 私有 focus 调度实测
+
+2026-10-18 用真实窗口示例的同一份优化二进制，在运行前仅切换 `NativeFocusDrainBoundary` 的 Multi/Single executor；保留原 focus pipe、其它 schedules、UI layout 和 renderer。按 Multi→Single→Single→Multi 串行完成两轮，每组预热 128 帧、记录 512 帧，共 2048 个逐帧样本。源码、实际 MT features、二进制 hash、重建方法和全部数据见[数据身份](data/performance/README.md#focus-调度-2026-10-18)。
+
+| 指标 | Multi 第 1 / 2 轮 | Single 第 1 / 2 轮 |
+| --- | --- | --- |
+| 私有边界 p50（µs） | 7.730 / 8.070 | 5.410 / 6.020 |
+| 私有边界 p95（µs） | 13.021 / 12.780 | 9.480 / 10.830 |
+| Main executor p50（ms） | 3.021 / 3.100 | 2.980 / 3.079 |
+| Main executor p95（ms） | 3.641 / 3.681 | 3.489 / 3.738 |
+
+边界 p50 两轮分别减少 2.32 / 2.05 µs。Main 的变化仍混有运行波动，第二轮 p95 反向，不能归因出稳定的整帧收益；Single 边界最大值 49.381 µs 也高于 Multi 的 35.311 µs，全部保留。这支持为单个 exclusive system 的私有 schedule 明确选择 Single，改动收益小、实现成本低，不构成整体调度重构的依据。
+
+边界由两个固定 Single 探针夹住完整 private Schedule，绝对值还含固定探针开销。Main 原本就是 Single，测量委托其 executor；不含 Main 外层初始化、render 子应用或呈现。四组首末与跨组页面、活实体、正尺寸布局节点及全部滚动坐标一致，原官方 drain 确被一个正常参数 pipe 替换。该窗口使用 WSLg 软件渲染且处于空闲页，没有连续滚动输入；结果不能用于硬件 GPU、移动设备、滚动 FPS 或纯 Router 总成本结论。
 
 ## 初始动态页面实测
 
