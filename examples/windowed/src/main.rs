@@ -614,11 +614,11 @@ fn update_status(
         for child in children {
             if let Ok(mut text) = texts.get_mut(*child) {
                 let path = inputs.current(*child).map(|input| input.location().path());
-                text.0 = format!(
+                text.set_if_neq(Text(format!(
                     "Layout counter: {} (click +1) / {}",
                     counter.0,
                     path.unwrap_or("inactive")
-                );
+                )));
             }
         }
     }
@@ -629,7 +629,7 @@ fn update_status(
         }
         for child in children {
             if let Ok(mut text) = texts.get_mut(*child) {
-                text.0 = format!("Page count: {} (click / Space)", page.0);
+                text.set_if_neq(Text(format!("Page count: {} (click / Space)", page.0)));
             }
         }
     }

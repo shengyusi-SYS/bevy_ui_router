@@ -203,7 +203,9 @@ activity 的范围和调度见[输入与活动合同](../contracts/input-focus.m
 ```rust
 fn update_route_labels(inputs: RouteInputs, mut labels: Query<(Entity, &mut Text)>) {
     for (entity, mut text) in &mut labels {
-        if let Some(input) = inputs.current(entity) {
+        if let Some(input) = inputs.current(entity)
+            && text.0 != input.location().path()
+        {
             text.0 = input.location().path().to_owned();
         }
     }
@@ -214,6 +216,8 @@ app.add_systems(
     update_route_labels.after(RouterScheduleSet::PublishSnapshots),
 );
 ```
+
+每轮仍查询当前归属和输入；仅文字变化时写入，避免相同值反复触发 `Changed<Text>`。
 
 `RouteInputs` 和中立借用类型 `RouteInputRef` 从 facade/prelude 导入。`params()` 为所属 frame 的 route-local 参数，不自动合并祖先参数；`location()` 包含完整 path/search/fragment。错误呈现的 `failure()` 和 `origin()` 按该 frame 定义，正常前缀的 failure 仍为 None；fallback 的 `route()` 为 None、params 为空。非活动或失效归属返回 None，范围与 `RouteActivity` 相同。这是只读观察，不推进生命周期，也不替代输入 gate；跨 World mutation/await 前复制所需普通值。真实 Scene consumer 见[独立 BSN 消费者](../../crates/bevy_ui_router/tests/consumers/bsn.rs)。
 
