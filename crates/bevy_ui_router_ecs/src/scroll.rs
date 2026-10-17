@@ -7,7 +7,10 @@ use std::{
 
 use bevy_camera::Camera;
 use bevy_ecs::{
+    component::ComponentId,
+    entity_disabling::DefaultQueryFilters,
     prelude::*,
+    query::QueryState,
     system::{SystemParam, SystemState},
 };
 use bevy_ui::{
@@ -243,11 +246,45 @@ impl ScrollObservation {
     }
 }
 
-pub(crate) fn eligible_containers(world: &mut World) -> HashSet<Entity> {
+type EligibleScrollQuery =
+    QueryState<Entity, (With<RouteScroll>, With<Node>, With<ScrollPosition>)>;
+
+/// Query metadata only; matches and values are read from the current World.
+pub(crate) struct ScrollQueries {
+    eligible: EligibleScrollQuery,
+    marked: QueryState<(Entity, &'static RouteScroll)>,
+    disabling: Vec<ComponentId>,
+}
+
+fn disabling_ids(world: &World) -> impl Iterator<Item = ComponentId> + '_ {
     world
-        .query_filtered::<Entity, (With<RouteScroll>, With<Node>, With<ScrollPosition>)>()
-        .iter(world)
-        .collect()
+        .get_resource::<DefaultQueryFilters>()
+        .into_iter()
+        .flat_map(DefaultQueryFilters::disabling_ids)
+}
+
+impl FromWorld for ScrollQueries {
+    fn from_world(world: &mut World) -> Self {
+        Self {
+            eligible: EligibleScrollQuery::new(world),
+            marked: crate::input::query_including_disabled(world),
+            disabling: disabling_ids(world).collect(),
+        }
+    }
+}
+
+impl ScrollQueries {
+    fn refresh_filters(&mut self, world: &mut World) {
+        // Fresh queries previously observed the latest filter IDs. Preserve that
+        // behavior without rebuilding for ordinary archetype or value changes.
+        if !self.disabling.iter().copied().eq(disabling_ids(world)) {
+            *self = Self::from_world(world);
+        }
+    }
+}
+
+pub(crate) fn eligible_containers(world: &mut World) -> HashSet<Entity> {
+    EligibleScrollQuery::new(world).iter(world).collect()
 }
 
 fn marked_containers(world: &mut World) -> Vec<Entity> {
@@ -716,8 +753,10 @@ pub(crate) fn prepare_scroll_system(world: &mut World) {
 pub(crate) fn settle_scroll_system(
     world: &mut World,
     layout: &mut SystemState<ScrollLayout<'static, 'static>>,
+    mut queries: Local<ScrollQueries>,
 ) {
-    let eligible = eligible_containers(world);
+    queries.refresh_filters(world);
+    let eligible = queries.eligible.iter(world).collect::<HashSet<_>>();
     if eligible.is_empty()
         && world
             .resource::<RouterNavigation>()
@@ -733,7 +772,11 @@ pub(crate) fn settle_scroll_system(
         .iter()
         .map(|entry| entry.handle)
         .collect::<Vec<_>>();
-    let marked = marked_containers(world);
+    let marked = queries
+        .marked
+        .iter(world)
+        .map(|(entity, _)| entity)
+        .collect::<Vec<_>>();
     for handle in handles {
         let mut observation = observe_active(world, handle, &eligible, &marked);
         let laid_out = laid_out_containers(world, &observation.containers, layout);
@@ -899,4 +942,66 @@ fn laid_out_containers(
                 .then_some(container.entity)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Component)]
+    struct AppDisabled;
+
+    #[test]
+    fn cached_queries_read_new_archetypes_and_current_disabling_filters() {
+        let mut world = World::new();
+        let mut queries = ScrollQueries::from_world(&mut world);
+        assert_eq!(queries.eligible.iter(&world).count(), 0);
+        assert_eq!(queries.marked.iter(&world).count(), 0);
+
+        let complete = world
+            .spawn((RouteScroll::new("body"), Node::default(), AppDisabled))
+            .id();
+        let incomplete = world.spawn((RouteScroll::new("body"), AppDisabled)).id();
+        assert!(
+            queries
+                .eligible
+                .iter(&world)
+                .any(|entity| entity == complete)
+        );
+
+        world.register_disabling_component::<AppDisabled>();
+        queries.refresh_filters(&mut world);
+        assert!(
+            !queries
+                .eligible
+                .iter(&world)
+                .any(|entity| entity == complete)
+        );
+        let marked = queries
+            .marked
+            .iter(&world)
+            .map(|(entity, _)| entity)
+            .collect::<HashSet<_>>();
+        assert!(marked.contains(&complete));
+        assert!(marked.contains(&incomplete));
+
+        let late = world
+            .spawn((RouteScroll::new("late"), Node::default()))
+            .id();
+        assert!(queries.eligible.iter(&world).any(|entity| entity == late));
+        assert!(
+            queries
+                .marked
+                .iter(&world)
+                .any(|(entity, _)| entity == late)
+        );
+        world.entity_mut(late).remove::<RouteScroll>();
+        assert!(!queries.eligible.iter(&world).any(|entity| entity == late));
+        assert!(
+            !queries
+                .marked
+                .iter(&world)
+                .any(|(entity, _)| entity == late)
+        );
+    }
 }

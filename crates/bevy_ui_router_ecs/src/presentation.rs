@@ -1082,22 +1082,6 @@ impl RetainedBoundaryProof {
             if !seen.insert(entity) || world.get_entity(entity).is_err() {
                 return false;
             }
-            if world
-                .get_resource::<crate::input::RouterInputGate>()
-                .is_some_and(|gate| {
-                    gate.allows_pointer(entity)
-                        || gate.allows_keyboard(entity)
-                        || gate.allows_gamepad(entity)
-                })
-                || world
-                    .get_resource::<InputFocus>()
-                    .is_some_and(|focus| focus.get() == Some(entity))
-                || world
-                    .get_resource::<RouteFocusState>()
-                    .is_some_and(|focus| focus.focused() == Some(entity))
-            {
-                return false;
-            }
             if let Some(children) = world.get::<Children>(entity) {
                 for child in children.iter().copied() {
                     if world.get::<ChildOf>(child).map(ChildOf::parent) != Some(entity) {
@@ -1107,7 +1091,22 @@ impl RetainedBoundaryProof {
                 }
             }
         }
-        true
+        // The complete live closure is already needed for structural validation.
+        // Intersect it with the gate once instead of scanning all permissions for
+        // every retained descendant. No observation survives this World borrow.
+        !world
+            .get_resource::<crate::input::RouterInputGate>()
+            .is_some_and(|gate| {
+                gate.allowed_projection()
+                    .iter()
+                    .any(|entity| seen.contains(entity))
+            })
+            && !world
+                .get_resource::<InputFocus>()
+                .is_some_and(|focus| focus.get().is_some_and(|entity| seen.contains(&entity)))
+            && !world
+                .get_resource::<RouteFocusState>()
+                .is_some_and(|focus| focus.focused().is_some_and(|entity| seen.contains(&entity)))
     }
 
     pub(crate) fn is_shared_authority_current(&self, world: &World) -> bool {
