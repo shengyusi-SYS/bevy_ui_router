@@ -14,7 +14,7 @@ use crate::{
 use bevy_app::{App, MainScheduleOrder, PostUpdate};
 use bevy_ecs::{
     prelude::*,
-    schedule::{ScheduleBuilt, ScheduleCleanupPolicy, ScheduleLabel},
+    schedule::{ScheduleBuilt, ScheduleCleanupPolicy, ScheduleLabel, SingleThreadedExecutor},
     system::{IntoSystem, System},
 };
 use bevy_input_focus::{FocusCause, InputFocus, InputFocusSystems, process_recorded_focus_changes};
@@ -479,5 +479,9 @@ pub(crate) fn install(app: &mut App) {
     app.world_mut()
         .resource_mut::<MainScheduleOrder>()
         .insert_before(PostUpdate, NativeFocusDrainBoundary);
-    app.add_systems(NativeFocusDrainBoundary, install_drain);
+    app.add_systems(NativeFocusDrainBoundary, install_drain)
+        .edit_schedule(NativeFocusDrainBoundary, |schedule| {
+            // This private boundary runs one exclusive system, with no parallel work.
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
 }

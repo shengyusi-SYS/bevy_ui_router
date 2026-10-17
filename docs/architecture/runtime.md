@@ -166,4 +166,4 @@ drag 与 focus，避免旧手势在下一轮继续命中。
 `RouterInputGate`。它们仍由应用编写；安装 Router 不会自动让所有原生焦点导航或
 输入分发插件遵守 gate。具体接入见[集成指南](../guides/integration.md)。
 
-现有 BSN focus 桥只在首次使用或 `PostUpdate` 调度图变化、重建后核查官方 drain 的组合；稳定调度继续观察焦点队列，不再逐帧枚举系统。
+现有 BSN focus 桥只在首次使用或 `PostUpdate` 调度图变化、重建后核查官方 drain 的组合；稳定调度继续观察焦点队列，不再逐帧枚举系统。安装边界在 `PostUpdate` 前运行，私有 schedule 仅含一个 exclusive system，显式使用 Single executor；官方 drain 仍在原 `PostUpdate` 管线执行。
