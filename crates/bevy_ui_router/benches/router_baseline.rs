@@ -174,6 +174,15 @@ impl Fixture {
     }
 
     fn configured(content: usize, shape: ContentShape, capacity: Option<usize>) -> Self {
+        Self::configured_layers(content, shape, capacity, false)
+    }
+
+    fn configured_layers(
+        content: usize,
+        shape: ContentShape,
+        capacity: Option<usize>,
+        middle: bool,
+    ) -> Self {
         let mut app = base_app();
         let factory_calls = capacity.map(|_| Arc::new(AtomicUsize::new(0)));
         let page_calls = factory_calls.clone();
@@ -233,6 +242,18 @@ impl Fixture {
                 )
                 .unwrap();
         }
+        let middle_key = middle.then(|| {
+            let driver = app
+                .register_bsn_view(ViewDriverKey::new("middle").unwrap(), |_| {
+                    Ok(bsn! { Node DefaultOutlet })
+                })
+                .unwrap();
+            let key = RouteViewKey::new("middle").unwrap();
+            views
+                .insert(key.clone(), RouteViewDescriptor::new(driver))
+                .unwrap();
+            key
+        });
         let mut routes = RouteTree::builder()
             .root_with_options(
                 RoutePattern::path(if capacity.is_some() { "/:section" } else { "/" }).unwrap(),
@@ -240,6 +261,17 @@ impl Fixture {
             )
             .unwrap();
         let root = routes.root_id().unwrap();
+        let page_parent = if let Some(key) = middle_key {
+            routes
+                .route_with_options(
+                    root,
+                    RoutePattern::pathless(),
+                    RouteNodeOptions::new().with_view(key),
+                )
+                .unwrap()
+        } else {
+            root
+        };
         let page_pattern = if capacity.is_some() {
             ":id"
         } else {
@@ -251,7 +283,7 @@ impl Fixture {
                 options = options.with_keep_alive(true);
             }
             routes
-                .route_with_options(root, RoutePattern::path(path).unwrap(), options)
+                .route_with_options(page_parent, RoutePattern::path(path).unwrap(), options)
                 .unwrap();
         }
         let mut config = RouterConfig::new(routes.build().unwrap(), views, fallback_key);

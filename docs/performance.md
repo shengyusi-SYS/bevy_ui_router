@@ -33,7 +33,7 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > initial-steady.csv
 ```
 
-每组 6 行：128/1024 个普通内容节点各测无 Router 控制、两层 native frame 的初始页，以及同页增加一个普通 `RouteScroll + ScrollPosition` 后的空闲更新。内容通过公开 World 在 publication 后动态创建；仅一条请求、一项 history，不使用 keep-alive。`nested` 沿用四层内容树；`flat` 可按需作形状对照。普通样本数和 32 update 批均值沿用现有方法。
+每组 10 行：128/1024 个普通内容节点各测无 Router 控制、两层及三层 native frame 的初始页，以及同页增加一个普通 `RouteScroll + ScrollPosition` 后的空闲更新。三层仅增加透明 pathless layout，内容预算相同；内容通过公开 World 在 publication 后动态创建。仅一条请求、一项 history，不使用 keep-alive。`nested` 沿用四层内容树；`flat` 可按需作形状对照。普通样本数和 32 update 批均值沿用现有方法。
 
 这个对照隔离路由归属和输入/滚动观察，不安装 UI layout、camera、picking 或 renderer；它不能测布局采样、视觉滚动或整应用开销。行为 smoke 将 `cargo bench` 换为 `cargo test` 并加 `-- --test`。
 
