@@ -258,11 +258,7 @@ fn containers<'a>(
     let mut result = Vec::new();
     let mut duplicates = Vec::new();
     for frame in frames {
-        let managed = if frame.native_root().is_some() {
-            frame.content_input_facts(world, &[]).0
-        } else {
-            frame.claims().map(|claim| claim.entity()).collect()
-        };
+        let managed = frame.managed_content_entities(world);
         let mut keys = HashMap::<&str, usize>::new();
         for entity in &managed {
             if let Some(marker) = world.get::<RouteScroll>(*entity) {

@@ -1841,6 +1841,16 @@ impl RealizedFrame {
         self.content_input_facts(world, &[]).1
     }
 
+    /// Observe membership without computing authored visibility or input eligibility.
+    pub(crate) fn managed_content_entities(&self, world: &World) -> Vec<Entity> {
+        #[cfg(feature = "bsn")]
+        if let Some(root) = self.native_root() {
+            return native_frame::collect_content(world, self.frame(), root).unwrap_or_default();
+        }
+        let _ = world;
+        self.claims().map(|claim| claim.entity()).collect()
+    }
+
     /// Current managed content and its eligible subset. A visual ancestor is
     /// observed without extending this frame's content/ownership boundary.
     pub(crate) fn content_input_facts(
@@ -1849,15 +1859,14 @@ impl RealizedFrame {
         next: &[FrameMutationTarget],
     ) -> (Vec<Entity>, Vec<Entity>) {
         #[cfg(feature = "bsn")]
-        if let Some(root) = self.native_root() {
-            let managed =
-                native_frame::collect_content(world, self.frame(), root).unwrap_or_default();
+        if self.native_root().is_some() {
+            let managed = self.managed_content_entities(world);
+            let mut visibility = native_frame::AuthoredVisibilityObservation::new(world, next);
             let eligible = managed
                 .iter()
                 .copied()
                 .filter(|entity| {
-                    world.get::<Node>(*entity).is_some()
-                        && native_frame::authored_target_is_visible(world, *entity, next)
+                    world.get::<Node>(*entity).is_some() && visibility.is_visible(*entity)
                 })
                 .collect();
             return (managed, eligible);

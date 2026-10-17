@@ -401,6 +401,7 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
             {
                 for frame in active.frames() {
                     let (managed, eligible) = frame.content_input_facts(world, &[]);
+                    let eligible = eligible.into_iter().collect::<HashSet<_>>();
                     ineligible_content.extend(
                         managed
                             .into_iter()

@@ -1,6 +1,6 @@
 //! Native content retains its frame owner; ordinary content follows current containment.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bevy_asset::UntypedHandle;
 use bevy_ecs::{
@@ -71,11 +71,66 @@ pub(crate) fn authored_target_is_visible(
     entity: Entity,
     next: &[FrameMutationTarget],
 ) -> bool {
-    let mut current = entity;
-    let mut seen = HashSet::new();
-    let mut visible = None;
-    while seen.insert(current) {
-        let prepared = next.iter().find(|target| target.entity == current);
+    AuthoredVisibilityObservation::new(world, next).is_visible(entity)
+}
+
+#[derive(Clone, Copy)]
+struct VisualAncestry {
+    /// Every ancestor permits display and the parent chain is acyclic.
+    displayed: bool,
+    visible: bool,
+}
+
+/// Facts are shared only while World and the prepared next projection are borrowed.
+/// They never survive a mutation or become lifecycle/ownership evidence.
+pub(super) struct AuthoredVisibilityObservation<'w, 'n> {
+    world: &'w World,
+    next: &'n [FrameMutationTarget],
+    facts: HashMap<Entity, Option<VisualAncestry>>,
+    path: Vec<Entity>,
+}
+
+impl<'w, 'n> AuthoredVisibilityObservation<'w, 'n> {
+    pub(super) fn new(world: &'w World, next: &'n [FrameMutationTarget]) -> Self {
+        Self {
+            world,
+            next,
+            facts: HashMap::new(),
+            path: Vec::new(),
+        }
+    }
+
+    pub(super) fn is_visible(&mut self, entity: Entity) -> bool {
+        let mut current = entity;
+        let mut ancestry = loop {
+            if let Some(facts) = self.facts.get(&current) {
+                // An unfinished ancestor closes a cycle. Display rejection also
+                // propagates through descendants that explicitly set Visible.
+                break facts.unwrap_or(VisualAncestry {
+                    displayed: false,
+                    visible: false,
+                });
+            }
+            self.facts.insert(current, None);
+            self.path.push(current);
+            let Some(parent) = self.world.get::<ChildOf>(current).map(ChildOf::parent) else {
+                break VisualAncestry {
+                    displayed: true,
+                    visible: true,
+                };
+            };
+            current = parent;
+        };
+        while let Some(current) = self.path.pop() {
+            ancestry = self.local_ancestry(current, ancestry);
+            self.facts.insert(current, Some(ancestry));
+        }
+        let facts = self.facts[&entity].unwrap();
+        facts.displayed && facts.visible
+    }
+
+    fn local_ancestry(&self, current: Entity, parent: VisualAncestry) -> VisualAncestry {
+        let prepared = self.next.iter().find(|target| target.entity == current);
         let display = prepared
             .filter(|target| matches!(target.kind, PresentationTargetKind::NativeShell))
             .map(|target| {
@@ -85,33 +140,26 @@ pub(crate) fn authored_target_is_visible(
                     Display::None
                 }
             })
-            .or_else(|| world.get::<Node>(current).map(|node| node.display));
-        if display == Some(Display::None) {
-            return false;
+            .or_else(|| self.world.get::<Node>(current).map(|node| node.display));
+        let visibility = prepared
+            .filter(|target| !matches!(target.kind, PresentationTargetKind::NativeContent))
+            .map(|target| {
+                if target.active_after {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                }
+            })
+            .or_else(|| self.world.get::<Visibility>(current).copied());
+        VisualAncestry {
+            displayed: display != Some(Display::None) && parent.displayed,
+            visible: match visibility {
+                Some(Visibility::Inherited) => parent.visible,
+                Some(Visibility::Hidden) => false,
+                Some(Visibility::Visible) | None => true,
+            },
         }
-        if visible.is_none() {
-            let visibility = prepared
-                .filter(|target| !matches!(target.kind, PresentationTargetKind::NativeContent))
-                .map(|target| {
-                    if target.active_after {
-                        Visibility::Visible
-                    } else {
-                        Visibility::Hidden
-                    }
-                })
-                .or_else(|| world.get::<Visibility>(current).copied());
-            visible = match visibility {
-                Some(Visibility::Inherited) => None,
-                Some(Visibility::Hidden) => Some(false),
-                Some(Visibility::Visible) | None => Some(true),
-            };
-        }
-        let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
-            return visible.unwrap_or(true);
-        };
-        current = parent;
     }
-    false
 }
 
 #[cfg(test)]
