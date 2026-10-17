@@ -753,8 +753,11 @@ pub(crate) fn prepare_scroll_system(world: &mut World) {
 pub(crate) fn settle_scroll_system(
     world: &mut World,
     layout: &mut SystemState<ScrollLayout<'static, 'static>>,
-    mut queries: Local<ScrollQueries>,
+    mut queries: Local<Option<ScrollQueries>>,
 ) {
+    // Match the original first-use timing instead of registering query metadata
+    // while the schedule is initialized.
+    let queries = queries.get_or_insert_with(|| ScrollQueries::from_world(world));
     queries.refresh_filters(world);
     let eligible = queries.eligible.iter(world).collect::<HashSet<_>>();
     if eligible.is_empty()
