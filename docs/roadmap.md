@@ -8,7 +8,7 @@
 
 匹配、嵌套导航、memory history、同步 BSN、错误与 host 失效恢复、当前只读路由输入、父子独立 keep-alive 和访问级滚动恢复均已完成。已有公开组合、完整回归、独立 consumer、打包和 Linux/WSLg 窗口证据，具体源码与环境归[验证指南](development/verification.md)。现有输入范围是原生 pointer、离场手势/焦点撤权，以及 Ready 后显式消费的 keyboard/gamepad gate。
 
-稳态执行减法已完成：空目标和空工作阶段直接退出，同一只读阶段复用内容归属，focus 安装核查只在首次或调度变化时运行。沿用现有领域边界与官方依赖，保留正常滚动采样、异步轮询和真实写后复验；不扩展公共状态协议或重建整库架构。验证与测量分别归[验证指南](development/verification.md)和[性能基线](performance.md)。
+稳态执行减法已完成：空目标和空工作阶段直接退出，同一只读阶段复用 native 内容与切口事实，普通滚动按 marker 查找，focus 安装核查只在首次或调度变化时运行。沿用现有领域边界与官方依赖，保留正常滚动采样、异步轮询和真实写后复验；不扩展公共状态协议或重建整库架构。验证与测量分别归[验证指南](development/verification.md)和[性能基线](performance.md)。
 
 **当前收口现行能力，不引入需要 patch 引擎或要求消费方根 manifest 替换 UI crate 的方案。** 原生 Tab/Dispatch 自动消费路由资格及其专属组合验收延期，不再是当前发布前置；最低行为合同与恢复条件见[输入评估](changes/navigation-experience/assessment.md#公开的通用输入资格接缝)。现有保留、滚动、pointer 和显式输入接入继续有效。
 
