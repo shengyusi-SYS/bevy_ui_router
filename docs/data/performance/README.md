@@ -1,6 +1,6 @@
 # 性能测量数据
 
-这里保存测量数据；历史 CSV 原样迁移，新测量注明完整源码与环境身份，不混作现行合同。运行方法、统计边界和结果解读见[性能说明](../../performance.md)。窗口与 focus 调度文件为逐帧记录，其余是样本汇总，不能从汇总分位数还原或合并原始样本。
+这里保存测量数据；历史 CSV 原样迁移，新测量注明完整源码与环境身份，不混作现行合同。运行方法、统计边界和结果解读见[性能说明](../../performance.md)。窗口与调度诊断文件为逐帧记录，其余是样本汇总，不能从汇总分位数还原或合并原始样本。
 
 ## 数据身份
 
@@ -22,6 +22,7 @@
 | [performance-steady-2026-10-17.csv](performance-steady-2026-10-17.csv) | 192 | 空工作执行减法、内容观察复用与 focus 冷路径；两轮交替 before/after flat | before=`9d80af9be3f20c170b6ee63140924de10dcaf906`；after=`e59a3ea0c8a7d6f56fe9dd8a4935fb6beeac3ed1` |
 | [performance-initial-steady-2026-10-18.csv](performance-initial-steady-2026-10-18.csv) | 40 | 一条初始请求、动态内容、两层/三层 native frame 与普通滚动 marker；两轮 before/after nested | before=`dab9bf0b042b0c86db6228c82013116500025ac5`；after=`6a0ab58f704e878efd7494c5f66ba92ea3cf956f` |
 | [performance-focus-schedule-2026-10-18.csv](performance-focus-schedule-2026-10-18.csv) | 2048 | 真实窗口空闲时私有 focus schedule 的 Multi/Single 对照；两轮逐帧 | `316a6d98e1451da9ef20c2f795683e1dae1fda47` + 完整[探针源码](focus-schedule-probe-2026-10-18.rs)与[窗口差异](focus-schedule-probe-2026-10-18.patch) |
+| [performance-scroll-prepare-2026-10-18.csv](performance-scroll-prepare-2026-10-18.csv) | 2048 | 完整 MT 窗口与移除空闲 Prepare 节点的诊断；两轮逐帧，非采用候选 | `3fc65c333cc498dfcf05f975476485a4049aefe2` + 完整[探针](scroll-prepare-probe-2026-10-18.rs)与[差异](scroll-prepare-probe-2026-10-18.patch) |
 
 上述日期和 revision 是测量身份；部分局部提交在后续整理历史时已合并，不承诺其短 SHA 在当前分支仍可检出。`b0dbc3b7486e71cd41e5a8cd05e84ac031b10ce0` 当前仍可解析，但不在当前分支祖先链内。完整历史测量说明固定保存于 `6de4233e2c636daa5892807b05af8a19d6e2cc0f:docs/performance.md`，可用 `git show` 查询；它记录比较方法，不补足未保存的源码。
 
@@ -154,3 +155,30 @@ ROUTER_FOCUS_PROBE_EXECUTOR=multi examples/windowed/target/release/focus_schedul
 ```
 
 生产提交早于本组数据文件；重建时须将本组保存的探针与差异文件带入该检出目录。四次运行应使用同一个已核对 hash 的优化 binary，并在构建结束后串行采样。临时窗口副本已从当前默认源码树移除，差异重建结果与实测副本逐字节一致。
+
+## 空闲 Prepare 2026-10-18
+
+生产来源固定为 `3fc65c333cc498dfcf05f975476485a4049aefe2`，采样期间生产源码、lock 与该提交一致。[身份记录](scroll-prepare-identity-2026-10-18.json)保存实际 opt-level=3、MT compiler artifacts、工具链、source/lock/probe/binary/CSV SHA-256、运行顺序和四组相同的 shape。Linux WSL2 / Ryzen 9 9950X / 24 可见逻辑 CPU，Bevy 0.19.1，WSLg 软件渲染；未固定 affinity/频率。采样期间没有本任务的并行构建或其它采样。
+
+[探针源码](scroll-prepare-probe-2026-10-18.rs)与[窗口差异](scroll-prepare-probe-2026-10-18.patch)完整保存。`full` 保持生产管线；`without_empty_prepare` 用 `RemoveSystemsOnly` 移除 Prepare set 的唯一系统，断言数量为 1，并保留 set 的 Content→Layout 顺序。其它 UI 系统、Settle 和私有 focus schedule 均保留。窗口只做初始 Push，无 Back；首末核对 history 长度 1、Ready、无 running，marker 的公开恢复查询为 None 作交叉证据。此查询单独不能排除无容器意图；无 pending 的主要依据是夹具导航创建路径。
+
+四组首末及跨组相同的证据限于 `/workspace/overview`、3 个 frame、41 个 Node/正尺寸布局节点、282 个活实体的计数、唯一 marker 的 Entity/key、全部 41 个原始 `ScrollPosition` 的 Entity/坐标；没有记录完整几何或活实体集合。正常 focus processor 被唯一非 exclusive pipe 替换；PostUpdate 总系统数 full=81、without=80。位置固定，没有持续滚动输入。
+
+每组预热 128 帧、记录 512 帧，按 full1→without1→without2→full2 运行同一 binary。CSV 的 `post_executor_us` 委托原 Multi PostUpdate executor，`main_executor_us` 委托原 Single Main executor；不含各自外层初始化及 render 子应用/呈现。Main 包含 Post 计时结果写入的固定开销；形状检查、记录与输出在 Main 计时结束后。保留全部 2048 行和离群值，各组分位数按 nearest-rank；解释归[性能说明](../../performance.md#空闲滚动-prepare-节点诊断)。
+
+此对照只用于节点移除诊断：差值同时含派发、flush、同步和其它 ready 系统调度变化，不是纯 barrier、typed 实现收益或其严格上限。没有生产改动，也没有降低正常 Settle 采样频率。
+
+在独立目录检出上述生产来源，并带入本组保存的探针与差异文件后重建：
+
+```sh
+mkdir -p examples/windowed/src/bin
+cp docs/data/performance/scroll-prepare-probe-2026-10-18.rs /tmp/router-scroll-schedule-probe-module.rs
+patch -o examples/windowed/src/bin/scroll_schedule_probe.rs examples/windowed/src/main.rs < docs/data/performance/scroll-prepare-probe-2026-10-18.patch
+CARGO_BUILD_JOBS=4 cargo build --offline --locked --release --manifest-path examples/windowed/Cargo.toml --bin scroll_schedule_probe --message-format=json > artifacts.jsonl
+ROUTER_SCROLL_PROBE=full examples/windowed/target/release/scroll_schedule_probe > full1.log 2>&1
+ROUTER_SCROLL_PROBE=without_empty_prepare examples/windowed/target/release/scroll_schedule_probe > without1.log 2>&1
+ROUTER_SCROLL_PROBE=without_empty_prepare examples/windowed/target/release/scroll_schedule_probe > without2.log 2>&1
+ROUTER_SCROLL_PROBE=full examples/windowed/target/release/scroll_schedule_probe > full2.log 2>&1
+```
+
+差异重建结果与实测窗口副本逐字节相同；该临时副本已从默认示例源码树移除。四组应在构建结束后串行运行，先核对同一优化 binary 的 hash。

@@ -121,6 +121,29 @@ Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `
 
 边界由两个固定 Single 探针夹住完整 private Schedule，绝对值还含固定探针开销。Main 原本就是 Single，测量委托其 executor；不含 Main 外层初始化、render 子应用或呈现。四组首末与跨组页面、活实体、正尺寸布局节点及全部滚动坐标一致，原官方 drain 确被一个正常参数 pipe 替换。该窗口使用 WSLg 软件渲染且处于空闲页，没有连续滚动输入；结果不能用于硬件 GPU、移动设备、滚动 FPS 或纯 Router 总成本结论。
 
+## 空闲滚动 Prepare 节点诊断
+
+2026-10-18 在真实 MT 窗口上，用同一优化 binary 对照完整管线与仅移除空闲 Prepare 节点。保留正常 Settle 的完整归属复验、布局采样、focus 和其它 UI 系统；夹具只执行初始 Push，无 Back/恢复意图。每组预热 128 帧、记录 512 帧，顺序 full→without→without→full；[完整 2048 行及可重建来源](data/performance/README.md#空闲-prepare-2026-10-18)保留全部样本。
+
+| 指标 | 完整管线第 1 / 2 轮 | 移除空闲 Prepare 第 1 / 2 轮 |
+| --- | --- | --- |
+| PostUpdate executor p50（ms） | 1.573 / 1.600 | 1.528 / 1.558 |
+| PostUpdate executor p95（ms） | 1.952 / 1.993 | 1.955 / 1.989 |
+| Main executor p50（ms） | 2.910 / 2.987 | 2.919 / 2.964 |
+| Main executor p95（ms） | 3.475 / 3.584 | 3.491 / 3.642 |
+
+PostUpdate p50 两轮分别减少 44.656 / 41.992 µs，但 Main p50 一轮增加 8.994 µs、一轮减少 22.520 µs，Main p95 均未改善；尚无稳定主世界收益。该差值包括整个 exclusive 节点的派发、`World::flush`、同步及其它 ready 系统的调度变化，不能拆称纯 barrier 时间，也不是 typed 方案收益的严格上限。
+
+这是固定位置的空闲诊断，没有连续滚动输入。两侧核对路由/history、Ready、marker 身份/原始位置，以及活实体、Node 和正尺寸布局节点的计数稳定；没有比较完整几何或实体集合。计时委托原 Multi PostUpdate 与 Single Main executor，不含外层 schedule 初始化和 render 子应用/呈现。环境仍为 WSLg 软件渲染。生产中没有删除或跳过 Prepare，临时窗口副本已移除。
+
+### 窄读取方案的取舍
+
+Bevy 0.19.1 的 Multi executor 先 `can_run` 再 `should_run`；exclusive 系统即使最终 `run_if=false`，也要先等正在运行的系统结束。`ParamSet<(&World, …)>` 则声明读取全部数据，仍与所有写入冲突。这两条路线都不能替代真正窄访问。
+
+正确的窄 reader 应让现有 World 入口与 Query/Res 入口共享同一套只读判定；同次普通系统内完成观察、数值结算和记录采样，不新增队列、跨帧证明缓存或 authority 来源。访问必须保留 host/slot/manifest、native outlet 唯一性、retained 的输入/focus 保护及 legacy 值验证。结构读取须覆盖原 World 可见的 disabling 实体，正常 eligible/layout 查询则保持 Bevy 过滤；manifest 可用 Entities/Archetypes/Components metadata，不必读取全部应用组件值。基础机制来自现有 Bevy，无需增加依赖。
+
+这项迁移跨多个只读证明模块，粗估 **2–4 人日、风险中等**；不能靠只改 scroll 的参数完成。当前诊断没有建立足以抵偿迁移成本的整体运行收益，因此本轮保留现有实现，也不补 `run_if` 或全 World 参数中转。后续只有在同一 MT 消费入口确认相关等待占比后，再比较完整最小候选；本诊断不否定其它页面的收益，也不为发布增加平台门禁。
+
 ## 初始动态页面实测
 
 2026-10-18 对同一只读阶段的 native 内容证明复用、Entity 集合与滚动 marker 查找做两轮 before/after 优化构建对照。使用上述 `steady` 模式、nested 四层内容树，每场景 128 样本；完整 40 行、源码与二进制身份见[数据说明](data/performance/README.md#初始动态页面-2026-10-18)。下表为 1024 个动态内容节点时 idle 批均值 p50 的两轮范围，单位 µs。
