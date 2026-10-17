@@ -7760,7 +7760,7 @@ impl RouterEngine {
             self.router,
             self.history.incarnation(),
             self.history.revision(),
-            self.history.snapshot().can_back(),
+            self.history.projection().can_back(),
         ))
     }
 
@@ -14396,6 +14396,10 @@ impl RouterEngine {
 
     pub(crate) fn request(&self, id: NavigationRequestId) -> Option<&NavigationRequestRecord> {
         self.records.iter().find(|record| record.id() == id)
+    }
+
+    pub(crate) fn requests(&self) -> impl ExactSizeIterator<Item = &NavigationRequestRecord> {
+        self.records.iter()
     }
 
     pub(crate) fn private_lookup(&self, id: NavigationRequestId) -> PrivateRequestLookup<'_> {

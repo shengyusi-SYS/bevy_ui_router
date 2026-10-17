@@ -22059,13 +22059,18 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
 }
 
 pub(crate) fn publish_snapshots_system(world: &mut World) {
+    use bevy_ecs::change_detection::DetectChangesMut;
+
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-            world.resource_scope(
-                |_world, mut snapshots: bevy_ecs::change_detection::Mut<RouterSnapshots>| {
-                    snapshots.publish(&mut navigation.entries);
-                },
-            );
+            // resource_scope reinsertion would mark even unchanged snapshots changed.
+            let mut snapshots = world.resource_mut::<RouterSnapshots>();
+            if snapshots
+                .bypass_change_detection()
+                .publish(&mut navigation.entries)
+            {
+                snapshots.set_changed();
+            }
         },
     );
 }

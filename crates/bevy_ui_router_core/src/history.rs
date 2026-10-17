@@ -13,6 +13,10 @@ pub struct HistorySnapshot {
 }
 
 impl HistorySnapshot {
+    pub(crate) fn matches(&self, history: &MemoryHistory) -> bool {
+        self.cursor == history.cursor && self.entries == history.entries
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn project(history: &MemoryHistory) -> Self {
         Self {
@@ -57,6 +61,10 @@ pub struct MemoryHistory {
 impl MemoryHistory {
     pub(crate) const fn cursor(&self) -> Option<usize> {
         self.cursor
+    }
+
+    pub(crate) fn can_back(&self) -> bool {
+        self.cursor.is_some_and(|cursor| cursor > 0)
     }
 
     pub fn new() -> Self {

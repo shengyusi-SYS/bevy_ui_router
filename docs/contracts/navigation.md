@@ -98,6 +98,8 @@ queued/last-terminal 不冒充 running；error presentation 的 requested locati
 
 公开稳定读取边界为 `Update` 中 `RouterScheduleSet::PublishSnapshots` 之后，可读本轮 snapshots。内部 Observe/Drive/Commit/Cleanup 顺序由 ECS 持有，不成为应用推进 lifecycle 的 API。
 
+Router 发布 `RouterSnapshots` 时仅在可观察值变化后标记资源 changed；应用可用 Bevy change detection 跳过无变化快照的投影。该信号覆盖所有 Router 与请求，不代表动态内容归属、activity 或滚动变化；需要当前归属时仍使用 `RouteInputs` / `RouteActivity`。
+
 诊断定位 Router/request、route（若匹配）、失败来源与阶段，区分恢复失败和已提交后的异常。仅在语义转移时记录，不按 polling 次数制造事件。
 
 每个 Router 保留最近 64 个 terminal 请求，queued/running 不参与淘汰。exact domain/Router 已签发但淘汰的请求为 `RequestLookup::NotRetained`；跨 App/Router、未来或错误配对身份为 `Unknown`。可读取 `earliest_retained_sequence` 判断保留范围。淘汰不改变 authority。

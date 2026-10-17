@@ -1,10 +1,14 @@
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
+
 use crate::app_ext::RouterHandle;
 use bevy_ecs::resource::Resource;
 use bevy_ui_router_core::diagnostics::DiagnosticEvent;
 use bevy_ui_router_core::fingerprint::RouteBranchFingerprint;
-use bevy_ui_router_core::integration::{MissingRequestClassification, RouterSnapshotProjection};
+use bevy_ui_router_core::integration::{
+    MissingRequestClassification, NavigationRequestView, RouterSnapshotProjection,
+};
 use bevy_ui_router_core::prelude::{
     ActivePresentation, CleanupSummary, DiagnosticSnapshot, HistorySnapshot, HostSnapshot,
     NavigationPhase, NavigationRequestId, NavigationTraceEvent, RequestStatus, RouteLocation,
@@ -21,6 +25,14 @@ pub struct NavigationRequestSnapshot {
 }
 
 impl NavigationRequestSnapshot {
+    fn matches(&self, view: &NavigationRequestView<'_>) -> bool {
+        self.requested.as_ref() == view.requested()
+            && self.matched.as_ref() == view.matched()
+            && &self.status == view.status()
+            && self.trace == view.trace()
+            && self.diagnostics == view.diagnostics()
+    }
+
     fn new(
         requested: Option<RouteLocation>,
         matched: Option<RouteBranchFingerprint>,
@@ -124,24 +136,17 @@ pub enum RequestLookup<'a> {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RequestSnapshotEntry {
-    router: RouterHandle,
-    request: NavigationRequestId,
-    snapshot: NavigationRequestSnapshot,
-}
-
 #[derive(Resource)]
 pub struct RouterSnapshots {
     routers: Vec<(RouterHandle, RouterSnapshot)>,
-    requests: Vec<RequestSnapshotEntry>,
+    requests: HashMap<(RouterHandle, NavigationRequestId), NavigationRequestSnapshot>,
 }
 
 impl RouterSnapshots {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             routers: Vec::new(),
-            requests: Vec::new(),
+            requests: HashMap::new(),
         }
     }
 
@@ -155,9 +160,7 @@ impl RouterSnapshots {
         let Some(router_snapshot) = self.get(router) else {
             return RequestLookup::Unknown;
         };
-        if let Some(snapshot) = self.requests.iter().find_map(|entry| {
-            (entry.router == router && entry.request == request).then_some(&entry.snapshot)
-        }) {
+        if let Some(snapshot) = self.requests.get(&(router, request)) {
             return RequestLookup::Found(snapshot);
         }
         match router_snapshot
@@ -186,47 +189,117 @@ impl RouterSnapshots {
         }
     }
 
-    pub(crate) fn publish(&mut self, entries: &mut [crate::navigation::RouterEntry]) {
-        self.requests.clear();
+    fn matches(&self, entries: &[crate::navigation::RouterEntry]) -> bool {
+        let mut request_count = 0;
         for entry in entries {
+            let Some(snapshot) = self.get(entry.handle) else {
+                return false;
+            };
+            if !entry.engine.snapshot_matches(&snapshot.projection)
+                || entry.cleanup_summary() != snapshot.cleanup
+            {
+                return false;
+            }
+            let views = entry.engine.requests();
+            if entry.requests.len() != views.len()
+                || entry
+                    .requests
+                    .iter()
+                    .any(|request| !self.requests.contains_key(&(entry.handle, *request)))
+            {
+                return false;
+            }
+            for view in views {
+                request_count += 1;
+                if !self
+                    .requests
+                    .get(&(entry.handle, view.id()))
+                    .is_some_and(|snapshot| snapshot.matches(&view))
+                {
+                    return false;
+                }
+            }
+        }
+        request_count == self.requests.len()
+    }
+
+    /// Returns whether any publicly readable snapshot value changed.
+    pub(crate) fn publish(&mut self, entries: &mut [crate::navigation::RouterEntry]) -> bool {
+        for entry in &mut *entries {
             entry.publish_history_admission_stamp();
-            entry
-                .requests
-                .retain(|request| entry.engine.request(*request).is_some());
-            let projected =
-                RouterSnapshot::project(entry.engine.snapshot(), entry.cleanup_summary());
+        }
+        if self.matches(entries) {
+            return false;
+        }
+        let mut changed = false;
+        let mut retained = HashSet::new();
+        for entry in entries {
+            // A shallow borrowed index replaces two scans of all Core records
+            // for each request. It is only needed when published values differ.
+            let views = entry
+                .engine
+                .requests()
+                .map(|view| (view.id(), view))
+                .collect::<HashMap<_, _>>();
+            entry.requests.retain(|request| views.contains_key(request));
+            let cleanup = entry.cleanup_summary();
             if let Some((_, snapshot)) = self
                 .routers
                 .iter_mut()
                 .find(|(stored, _)| *stored == entry.handle)
             {
-                *snapshot = projected;
+                if cleanup != snapshot.cleanup
+                    || !entry.engine.snapshot_matches(&snapshot.projection)
+                {
+                    *snapshot = RouterSnapshot::project(entry.engine.snapshot(), cleanup);
+                    changed = true;
+                }
             } else {
-                self.routers.push((entry.handle, projected));
+                self.routers.push((
+                    entry.handle,
+                    RouterSnapshot::project(entry.engine.snapshot(), cleanup),
+                ));
+                changed = true;
             }
             for request in &entry.requests {
-                let Some(view) = entry.engine.request(*request) else {
+                let view = &views[request];
+                let key = (entry.handle, *request);
+                retained.insert(key);
+                if self
+                    .requests
+                    .get(&key)
+                    .is_some_and(|stored| stored.matches(view))
+                {
                     continue;
-                };
-                self.requests.push(RequestSnapshotEntry {
-                    router: entry.handle,
-                    request: *request,
-                    snapshot: NavigationRequestSnapshot::new(
+                }
+                self.requests.insert(
+                    key,
+                    NavigationRequestSnapshot::new(
                         view.requested().cloned(),
                         view.matched().cloned(),
                         view.status().clone(),
                         view.trace().to_vec(),
                         view.diagnostics().to_vec(),
                     ),
-                });
+                );
+                changed = true;
             }
         }
+        let previous_count = self.requests.len();
+        self.requests.retain(|key, _| retained.contains(key));
+        changed || previous_count != self.requests.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_app::{App, Update};
+    use bevy_ecs::{
+        change_detection::DetectChanges,
+        prelude::{Res, ResMut},
+        schedule::IntoScheduleConfigs,
+    };
     use bevy_ui_router_core::fingerprint::RouteBranchFingerprint;
     use bevy_ui_router_core::{
         integration::{CleanupManifest, EngineAction, RouterEngine},
@@ -281,6 +354,118 @@ mod tests {
         validated.publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         request
+    }
+
+    fn snapshot_app() -> (App, RouterHandle) {
+        let mut app = App::new();
+        let router = crate::navigation::tests::install_retained_slice_router(&mut app, 0);
+        app.update();
+        (app, router)
+    }
+
+    fn settle_app_request(app: &mut App, router: RouterHandle, request: NavigationRequestId) {
+        for _ in 0..32 {
+            app.update();
+            if matches!(
+                app.world().resource::<RouterSnapshots>().request(router, request),
+                RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Succeeded
+            ) {
+                return;
+            }
+        }
+        panic!("the public snapshot did not reach a successful terminal request");
+    }
+
+    #[derive(Resource, Default)]
+    struct SnapshotChanges(Vec<bool>);
+
+    fn observe_snapshot_changes(
+        snapshots: Res<RouterSnapshots>,
+        mut changes: ResMut<SnapshotChanges>,
+    ) {
+        changes.0.push(snapshots.is_changed());
+    }
+
+    #[test]
+    fn idle_publication_keeps_snapshot_storage_and_change_detection_stable() {
+        let (mut app, router) = snapshot_app();
+        app.init_resource::<SnapshotChanges>().add_systems(
+            Update,
+            observe_snapshot_changes.after(crate::RouterScheduleSet::PublishSnapshots),
+        );
+        let request = app
+            .world_mut()
+            .resource_mut::<crate::RouterNavigation>()
+            .push(router, RouteLocation::new("/items/1"))
+            .unwrap();
+        settle_app_request(&mut app, router, request);
+        assert!(
+            app.world()
+                .resource::<SnapshotChanges>()
+                .0
+                .iter()
+                .any(|changed| *changed)
+        );
+        let (trace, history) = {
+            let snapshots = app.world().resource::<RouterSnapshots>();
+            let RequestLookup::Found(request) = snapshots.request(router, request) else {
+                panic!("the successful request is retained");
+            };
+            assert!(!request.trace().is_empty());
+            (
+                request.trace().as_ptr(),
+                snapshots.get(router).unwrap().history().entries().as_ptr(),
+            )
+        };
+        app.world_mut().resource_mut::<SnapshotChanges>().0.clear();
+        app.update();
+        app.update();
+        assert_eq!(app.world().resource::<SnapshotChanges>().0, [false, false]);
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        let RequestLookup::Found(retained) = snapshots.request(router, request) else {
+            panic!("the successful request remains retained");
+        };
+        assert_eq!(retained.trace().as_ptr(), trace);
+        assert_eq!(
+            snapshots.get(router).unwrap().history().entries().as_ptr(),
+            history
+        );
+    }
+
+    #[test]
+    fn terminal_request_comparison_includes_late_report_diagnostics() {
+        let mut engine = confirmed_engine();
+        let request = engine.push(RouteLocation::new("/")).unwrap();
+        engine.collect();
+        let Some(EngineAction::FrameTask(task)) = engine.action() else {
+            panic!("the real initial request issues a frame task");
+        };
+        let duplicate = task.testing_duplicate();
+        let ticket = engine.report_applied(task).unwrap();
+        let prepared = engine
+            .prepare_commit(&ticket, CleanupManifest::empty())
+            .unwrap();
+        let cleanup = prepared.cleanup().clone();
+        engine
+            .validate_publication(prepared)
+            .unwrap()
+            .publish(|| {});
+        engine.complete_cleanup(cleanup.complete_empty()).unwrap();
+        let view = engine.request(request).unwrap();
+        let frozen = NavigationRequestSnapshot::new(
+            view.requested().cloned(),
+            view.matched().cloned(),
+            view.status().clone(),
+            view.trace().to_vec(),
+            view.diagnostics().to_vec(),
+        );
+        assert!(frozen.matches(&view));
+        assert!(engine.validate_report_identity(&duplicate).is_err());
+        let observed = engine.requests().find(|view| view.id() == request).unwrap();
+        assert_eq!(observed.status(), &RequestStatus::Succeeded);
+        assert_eq!(observed.trace(), frozen.trace());
+        assert_eq!(observed.diagnostics().len(), frozen.diagnostics().len() + 1);
+        assert!(!frozen.matches(&observed));
     }
 
     #[test]
@@ -344,17 +529,16 @@ mod tests {
         let router = crate::app_ext::RouterHandle::fixture(3, 5);
         let mut snapshots = RouterSnapshots::new();
         snapshots.install_router(router, frozen);
-        snapshots.requests.push(RequestSnapshotEntry {
-            router,
-            request: newest,
-            snapshot: NavigationRequestSnapshot::new(
+        snapshots.requests.insert(
+            (router, newest),
+            NavigationRequestSnapshot::new(
                 newest_view.requested().cloned(),
                 newest_view.matched().cloned(),
                 newest_view.status().clone(),
                 newest_view.trace().to_vec(),
                 newest_view.diagnostics().to_vec(),
             ),
-        });
+        );
 
         assert!(matches!(
             snapshots.request(router, newest),
@@ -374,6 +558,61 @@ mod tests {
         assert_eq!(
             snapshots.request(crate::app_ext::RouterHandle::fixture(3, 6), newest),
             RequestLookup::Unknown
+        );
+    }
+
+    #[test]
+    fn publication_retains_queued_requests_and_prunes_evicted_terminal_records() {
+        let (mut app, router) = snapshot_app();
+        let mut requests = Vec::new();
+        for _ in 0..66 {
+            let request = app
+                .world_mut()
+                .resource_mut::<crate::RouterNavigation>()
+                .push(router, RouteLocation::new("/items/1"))
+                .unwrap();
+            requests.push(request);
+            settle_app_request(&mut app, router, request);
+        }
+        let snapshots = app.world().resource::<RouterSnapshots>();
+        assert_eq!(
+            snapshots.request(router, requests[0]),
+            RequestLookup::NotRetained
+        );
+        assert!(matches!(
+            snapshots.request(router, requests[2]),
+            RequestLookup::Found(_)
+        ));
+        assert_eq!(snapshots.get(router).unwrap().history().len(), 66);
+        assert!(snapshots.get(router).unwrap().history().can_back());
+
+        let queued = app
+            .world_mut()
+            .resource_mut::<crate::RouterNavigation>()
+            .push(router, RouteLocation::new("/items/2"))
+            .unwrap();
+        crate::navigation::publish_snapshots_system(app.world_mut());
+        assert!(matches!(
+            app.world().resource::<RouterSnapshots>().request(router, queued),
+            RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Queued
+        ));
+        settle_app_request(&mut app, router, queued);
+        app.update();
+        app.update();
+        let back = app
+            .world_mut()
+            .resource_mut::<crate::RouterNavigation>()
+            .back(router)
+            .unwrap();
+        settle_app_request(&mut app, router, back);
+        assert_eq!(
+            app.world()
+                .resource::<RouterSnapshots>()
+                .get(router)
+                .unwrap()
+                .history()
+                .cursor(),
+            Some(65)
         );
     }
 }

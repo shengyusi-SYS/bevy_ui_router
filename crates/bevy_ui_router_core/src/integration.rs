@@ -10779,6 +10779,28 @@ impl RouterEngine {
         }
     }
 
+    /// Compares the complete frozen projection without cloning its collections.
+    #[doc(hidden)]
+    pub fn snapshot_matches(&self, snapshot: &RouterSnapshotProjection) -> bool {
+        let (router, evicted_through, highest_issued) = self.inner.request_retention_facts();
+        self.inner.requested() == snapshot.requested()
+            && self.inner.matched() == snapshot.matched()
+            && self.inner.active() == snapshot.active()
+            && self.inner.availability() == snapshot.availability()
+            && self.inner.pending_phase() == snapshot.pending_phase()
+            && snapshot.history.matches(self.inner.history())
+            && self.inner.running_request() == snapshot.running_request()
+            && self.inner.earliest_retained_sequence() == snapshot.earliest_retained_sequence()
+            && snapshot.request_retention
+                == RequestRetentionClassifier::project(router, evicted_through, highest_issued)
+            && snapshot.diagnostics.requested().is_none()
+            && snapshot.diagnostics.active().is_none()
+            && self.inner.router_diagnostics() == snapshot.diagnostics.events()
+            && self.inner.host() == snapshot.host.version()
+            && self.inner.top_slot() == snapshot.host.top_slot()
+            && self.host_trace.events == snapshot.host.trace()
+    }
+
     pub fn active(&self) -> &ActivePresentation {
         self.inner.active()
     }
@@ -10850,6 +10872,14 @@ impl RouterEngine {
     pub fn request(&self, id: NavigationRequestId) -> Option<NavigationRequestView<'_>> {
         self.inner
             .request(id)
+            .map(|record| NavigationRequestView { record })
+    }
+
+    /// Borrows retained records, including queued requests, without cloning.
+    #[doc(hidden)]
+    pub fn requests(&self) -> impl ExactSizeIterator<Item = NavigationRequestView<'_>> {
+        self.inner
+            .requests()
             .map(|record| NavigationRequestView { record })
     }
 
