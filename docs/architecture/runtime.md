@@ -156,7 +156,9 @@ flowchart TB
 
 输入刷新与滚动观察各自在连续的只读 World 借用内复用逐 frame 事实。native 活动观察一次遍历得到受管内容、membership 与 child-slot 切口，再分别验证值、claims 和完整 focus 范围；focus 还包括 shell、已验证的 committed 切口与 slot 外侧闭包，不能只用 managed 内容代替。需要有序 focus 投影的通用调用保持原遍历与排序。内容观察复用不表示完整 branch 仅遍历一次；native outlet 绑定仍独立验证当前 anchor 与唯一 `DefaultOutlet`，retained 也保留自身的保护证明。
 
-写入后或进入另一调度阶段重新观察。两个滚动系统目前仍为 exclusive；Prepare 没有恢复意图时直接返回，Settle 继续观察当前归属与实际布局。普通滚动采样只用当前全部 `RouteScroll` marker 与已证明的内容 membership 相交，先判重复 key 再筛布局资格；disabled 或缺组件的 marker 也参与判重。publication 仍完整观察原内容边界。滚动保留查询元数据，每轮读取当前布局和位置；等值快照不标记变化，权限不变且无待处理撤权时不写输入 gate。
+retained preservation 先完整遍历当前 shell 闭包，验证实体存在、无重复和子级回链，再复用这份集合检查它与当前 gate 权限及两种 focus 均不相交。该集合仅在本次只读 World 借用内有效；隐藏 shell 本身不能替代完整后代保护证明。
+
+写入后或进入另一调度阶段重新观察。两个滚动系统目前仍为 exclusive；Prepare 没有恢复意图时直接返回，Settle 继续观察当前归属与实际布局。普通滚动采样只用当前全部 `RouteScroll` marker 与已证明的内容 membership 相交，先判重复 key 再筛布局资格；disabled 或缺组件的 marker 也参与判重。publication 仍完整观察原内容边界。滚动布局保留查询元数据，每轮读取当前布局和位置；等值快照不标记变化，权限不变且无待处理撤权时不写输入 gate。
 
 `Refresh` 在 picking hover 前更新当前内容资格；hovermap 生成后、interaction 更新前
 过滤非活动目标。正常 publication 同次调用撤销离场目标的历史 hover、press、click、

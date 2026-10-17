@@ -23,6 +23,7 @@
 | [performance-initial-steady-2026-10-18.csv](performance-initial-steady-2026-10-18.csv) | 40 | 一条初始请求、动态内容、两层/三层 native frame 与普通滚动 marker；两轮 before/after nested | before=`dab9bf0b042b0c86db6228c82013116500025ac5`；after=`6a0ab58f704e878efd7494c5f66ba92ea3cf956f` |
 | [performance-focus-schedule-2026-10-18.csv](performance-focus-schedule-2026-10-18.csv) | 2048 | 真实窗口空闲时私有 focus schedule 的 Multi/Single 对照；两轮逐帧 | `316a6d98e1451da9ef20c2f795683e1dae1fda47` + 完整[探针源码](focus-schedule-probe-2026-10-18.rs)与[窗口差异](focus-schedule-probe-2026-10-18.patch) |
 | [performance-scroll-prepare-2026-10-18.csv](performance-scroll-prepare-2026-10-18.csv) | 2048 | 完整 MT 窗口与移除空闲 Prepare 节点的诊断；两轮逐帧，非采用候选 | `3fc65c333cc498dfcf05f975476485a4049aefe2` + 完整[探针](scroll-prepare-probe-2026-10-18.rs)与[差异](scroll-prepare-probe-2026-10-18.patch) |
+| [performance-retained-read-2026-10-18.csv](performance-retained-read-2026-10-18.csv) | 288 | retained 权限相交与查询缓存的三组 MT 对照；各两轮，含撤回候选及最后一轮受干扰配对 | 基线 `58e24d2`；组合 `b655f14`、懒初始化 `95de4eb`；仅权限相交 `b7a5140`，完整身份见[本组说明](#retained-读取-2026-10-18) |
 
 上述日期和 revision 是测量身份；部分局部提交在后续整理历史时已合并，不承诺其短 SHA 在当前分支仍可检出。`b0dbc3b7486e71cd41e5a8cd05e84ac031b10ce0` 当前仍可解析，但不在当前分支祖先链内。完整历史测量说明固定保存于 `6de4233e2c636daa5892807b05af8a19d6e2cc0f:docs/performance.md`，可用 `git show` 查询；它记录比较方法，不补足未保存的源码。
 
@@ -182,3 +183,28 @@ ROUTER_SCROLL_PROBE=full examples/windowed/target/release/scroll_schedule_probe 
 ```
 
 差异重建结果与实测窗口副本逐字节相同；该临时副本已从默认示例源码树移除。四组应在构建结束后串行运行，先核对同一优化 binary 的 hash。
+
+## Retained 读取 2026-10-18
+
+使用现有 keep-alive 模式，flat、1/32/128 内容预算，每场景 128 样本；导航预热 32 个循环，idle 另预热 64 次 update，每个 idle 样本为 32 update 均值。未改 benchmark 或计时边界。环境沿用[初始动态页面](#初始动态页面-2026-10-18)的 Linux/WSL2、CPU、工具链、官方 Bevy 0.19.1 和 lock；本组额外显式启用 `bevy_internal/multi_threaded`，不能与旧默认非 MT 数据直接作版本收益比较。
+
+| CSV series / variant | 完整源码提交 | 实测 executable SHA-256 |
+| --- | --- | --- |
+| 全部 / before | `58e24d26cd85c142b83080252591c4b41d2cc828` | `5ccd15dd4d9c9bcdfea7a2b96c9ce396a01a698c1ae636afa75493d8f1677a62` |
+| eager / after | `b655f1458ae056257e19465ea092888870701ab2` | `d22686682435b859f49cab0a5ad14965eada9abf231873bba74e917916f12ad8` |
+| lazy / after | `95de4eb0f28256effbd01c6666fa4aa3d82ac362` | `b7f28524dffa1ecb5d1946528635c650dd000fd18aa5ce69052350d3ce97875b` |
+| retained / after | `b7a5140aa28a403b6aabed78e58afc82151bafe5` | `02f25d32ce7dfa82cfba7ce13b1f5231b998724568c6067346a6a0ba90f5c294` |
+
+`eager` 同时包含 retained 权限相交和 Settle eligible/marker 查询元数据缓存；`lazy` 仅将缓存初始化移到首次 Settle；`retained` 撤回整个查询缓存，只保留权限相交。三组依次运行，各组都是 before 1→after 1→after 2→before 2；CSV 的 `run_order` 为全局顺序，`round` 为配对编号。每次构建结束后保存独立 executable，再直接串行运行，不复用 target 路径作为版本身份。
+
+构建命令如下；从对应输出的 `compiler-artifact` 取 `router_baseline` executable，复制并核对 hash，再以 `ROUTER_BENCH_MODE=keep_alive ROUTER_BENCH_SHAPE=flat` 运行该文件：
+
+```sh
+CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench router_baseline --features bsn,bevy_internal/multi_threaded --no-run --message-format=json > artifacts.jsonl
+```
+
+四份产物的完整 compiler-artifact features/profile 投影相同，`bevy_ecs` 均含 `multi_threaded`；bench 为 opt-level 3、debuginfo 0、debug assertions 与 overflow checks 关闭。crate/benchmark/lock 在各自构建和计时期间没有未提交修改；本任务自身没有并行 Cargo/rustc、renderer 或窗口。未固定 CPU affinity/频率，也未控制宿主全部负载。
+
+另一个工作区事后反馈 Cargo 编译区间为 2026-10-17 UTC 20:25:35–20:25:43、20:25:49–20:26:13。文件时间确认与 `retained` 第 2 轮重叠：after CSV 从创建至末写为 20:25:10.515–20:25:46.323，before 为 20:25:46.343–20:26:22.095。整个配对 48 行均标为 `contended_pair`，不用于收益估算；没有按单行猜测或裁剪受影响样本，也没有重跑追加矩阵。其余组未与该已知区间重叠，标为 `uncontended_pair`，不表示控制了宿主全部负载。
+
+每次完整输出 24 行，全部 288 行保留，含受干扰轮次、较慢导航、尾部和最大值；不删除候选或挑选较快轮次。三组各轮的样本数、min/max update、实体、活动/非活动页面和 factory 次数逐项一致。结果是 CPU wall-clock 汇总，不含 UI layout、picking、窗口、GPU 或持续视觉滚动；没有合并不同运行的分位数。采用结论与未确定归因见[性能说明](../../performance.md#retained-权限读取对照)。
