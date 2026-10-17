@@ -14,7 +14,7 @@ use crate::{
 use bevy_app::{App, MainScheduleOrder, PostUpdate};
 use bevy_ecs::{
     prelude::*,
-    schedule::{ScheduleCleanupPolicy, ScheduleLabel},
+    schedule::{ScheduleBuilt, ScheduleCleanupPolicy, ScheduleLabel},
     system::{IntoSystem, System},
 };
 use bevy_input_focus::{FocusCause, InputFocus, InputFocusSystems, process_recorded_focus_changes};
@@ -380,15 +380,32 @@ fn after_drain(mut params: ParamSet<(&World, ResMut<NativeFocusCursor>)>) {
 #[derive(ScheduleLabel, Clone, Debug, Eq, PartialEq, Hash)]
 struct NativeFocusDrainBoundary;
 
+#[derive(Resource, Default)]
+struct NativeFocusDrainCheck {
+    checked: bool,
+    built_since_check: bool,
+}
+
+fn invalidate_drain_check(event: On<ScheduleBuilt>, mut check: ResMut<NativeFocusDrainCheck>) {
+    if event.label == PostUpdate.intern() {
+        check.built_since_check = true;
+    }
+}
+
 fn install_drain(world: &mut World) {
     if !world.resource::<NativeFocusCursor>().active {
         return;
     }
-    if world
+    let Some(schedule) = world
         .get_resource::<bevy_ecs::schedule::Schedules>()
         .and_then(|schedules| schedules.get(PostUpdate))
-        .is_none()
-    {
+    else {
+        world.resource_mut::<NativeFocusDrainCheck>().checked = false;
+        let _ = observe(world, &[]);
+        return;
+    };
+    let check = world.resource::<NativeFocusDrainCheck>();
+    if check.checked && !check.built_since_check && !schedule.is_changed() {
         let _ = observe(world, &[]);
         return;
     }
@@ -403,13 +420,16 @@ fn install_drain(world: &mut World) {
                 .pipe(after_drain),
         )
         .system_type();
-        let types = schedule
+        let mut stock_count = 0;
+        let mut bridge_count = 0;
+        for (_, system) in schedule
             .systems()
             .map_err(|_| NativeFocusError::ScheduleSource)?
-            .map(|(_, system)| system.system_type())
-            .collect::<Vec<_>>();
-        let stock_count = types.iter().filter(|kind| **kind == stock).count();
-        let bridge_count = types.iter().filter(|kind| **kind == bridge).count();
+        {
+            let kind = system.system_type();
+            stock_count += usize::from(kind == stock);
+            bridge_count += usize::from(kind == bridge);
+        }
         if stock_count + bridge_count > 1 {
             return Err(NativeFocusError::ScheduleSource);
         }
@@ -436,6 +456,13 @@ fn install_drain(world: &mut World) {
     });
     if result.is_err() || result.is_ok_and(|result| result.is_err()) {
         world.resource_mut::<NativeFocusCursor>().error = Some(NativeFocusError::ScheduleSource);
+    } else {
+        // This also caches a valid schedule without an official processor.
+        // Late plugin installation changes its graph; an explicit intervening
+        // initialize is detected by ScheduleBuilt even after is_changed resets.
+        let mut check = world.resource_mut::<NativeFocusDrainCheck>();
+        check.checked = true;
+        check.built_since_check = false;
     }
     // Initialization/ScheduleBuilt callbacks append to the same old baseline.
     // Never reset it from an after-install snapshot and lose superseding writes.
@@ -446,7 +473,9 @@ pub(crate) fn install(app: &mut App) {
     if app.world().contains_resource::<NativeFocusCursor>() {
         return;
     }
-    app.init_resource::<NativeFocusCursor>();
+    app.init_resource::<NativeFocusCursor>()
+        .init_resource::<NativeFocusDrainCheck>()
+        .add_observer(invalidate_drain_check);
     app.world_mut()
         .resource_mut::<MainScheduleOrder>()
         .insert_before(PostUpdate, NativeFocusDrainBoundary);

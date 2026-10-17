@@ -1413,6 +1413,7 @@ fn native_projectionless_fallback_consumes_its_own_autofocus_not_the_failed_owne
 mod drain_installation {
     use super::*;
     use bevy_app::Update;
+    use bevy_ecs::schedule::ScheduleCleanupPolicy;
     use bevy_input_focus::process_recorded_focus_changes;
 
     #[derive(Resource, Default)]
@@ -1455,6 +1456,96 @@ mod drain_installation {
     }
     fn enabled(enabled: Res<Enabled>) -> bool {
         enabled.0
+    }
+
+    #[derive(Resource)]
+    struct RefocusPendingOnce(Option<Entity>);
+
+    fn refocus_pending_once(
+        mut pending: ResMut<RefocusPendingOnce>,
+        mut focus: ResMut<InputFocus>,
+    ) {
+        if let Some(target) = pending.0.take() {
+            focus.set(target, FocusCause::Pressed);
+        }
+    }
+
+    #[test]
+    fn externally_initialized_post_update_rechecks_the_drain_before_pending_focus() {
+        let mut fixture = fixture(Vec::new(), Vec::new(), false, true);
+        prepare_prefix(&mut fixture, false, true);
+        let request = push(&mut fixture, true);
+        fixture.app.update();
+        let target = fixture.app.world().resource::<Attempts>().targets[0];
+        assert!(
+            !fixture
+                .app
+                .world()
+                .resource::<RouterInputGate>()
+                .allows_keyboard(target)
+        );
+        assert_no_target_events(&fixture, target);
+
+        // An application reconfigures and builds PostUpdate before the next
+        // Router boundary. The graph flag is already clear at that boundary.
+        fixture
+            .app
+            .insert_resource(RefocusPendingOnce(Some(target)))
+            .add_systems(
+                PostUpdate,
+                refocus_pending_once.before(InputFocusSystems::FocusChangeEvents),
+            );
+        fixture
+            .app
+            .world_mut()
+            .schedule_scope(PostUpdate, |world, schedule| {
+                assert_eq!(
+                    schedule
+                        .remove_systems_in_set(
+                            process_recorded_focus_changes,
+                            world,
+                            ScheduleCleanupPolicy::RemoveSystemsOnly,
+                        )
+                        .unwrap(),
+                    1
+                );
+                schedule.add_systems(
+                    process_recorded_focus_changes.in_set(InputFocusSystems::FocusChangeEvents),
+                );
+                schedule.initialize(world).unwrap();
+                assert!(!schedule.is_changed());
+            });
+
+        fixture.app.update();
+        assert!(
+            fixture
+                .app
+                .world()
+                .resource::<RefocusPendingOnce>()
+                .0
+                .is_none()
+        );
+        assert!(
+            !fixture
+                .app
+                .world()
+                .resource::<RouterInputGate>()
+                .allows_keyboard(target),
+            "the real nested branch is still pending during the rebuilt drain"
+        );
+        assert_no_target_events(&fixture, target);
+        settle(&mut fixture, request, false);
+        assert_eq!(
+            fixture.app.world().resource::<InputFocus>().get(),
+            Some(target)
+        );
+        assert_eq!(
+            fixture.app.world().resource::<Events>().0,
+            vec![
+                FocusEvent::Lost(fixture.a),
+                FocusEvent::Gained(target, FocusCause::Pressed),
+            ]
+        );
     }
 
     #[test]
