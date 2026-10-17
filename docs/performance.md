@@ -92,6 +92,20 @@ Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `
 
 直接 BSN 对照保留 host/layout/toolbar/outlet，测 fresh Scene 构造、resolve/apply、旧页递归删除、flush 和普通 update。它没有 Router history、授权、隔离、失败/残留或写后复验，两者差值不构成严格 Router 开销归因。
 
+## 空闲更新实测
+
+2026-10-17 对输入/滚动只读观察与快照增量更新进行两轮 before/after 优化构建对照。使用相同公开 `router_baseline`、flat 形状、1/32/128 内容预算和每普通场景 128 样本；完整 192 行、源码与构建身份见[数据说明](data/performance/README.md#空闲更新-2026-10-17)。下表是 128 内容节点时两轮 idle 批均值 p50 的范围，单位 µs，不是单帧分位数。
+
+| 场景 | before p50 | after p50 |
+| --- | --- | --- |
+| 无 Router 的调度对照 | 3.407–3.471 | 3.378–4.380 |
+| 1 条终态请求记录 | 98.553–99.344 | 67.897–70.859 |
+| 64 条终态请求记录 | 150.040–154.012 | 103.592–104.451 |
+
+两种 Router 场景均为 179 个活实体、一项 history，before/after 数量与 update 边界保持相同；64 是请求记录数，不是缓存页面数。该预算下空闲 p50 下降约三成。未更改 lifecycle、真实写后复验或正常滚动采样，也未通过降低更新频率取得结果。
+
+1/32 节点的结果不一致，首轮 after 的调度对照和其它场景也有较大波动；全部输出与离群值保留，不据此宣称小页面、导航或尾延迟普遍改善。该夹具不含 UI layout、原生 picking、窗口、renderer 或 I/O，不能推导整应用 CPU、持续重绘或功耗的改善幅度。
+
 ## Keep-alive 实测
 
 2026-10-08 在同机顺序完成两轮 flat/nested 优化构建对照，每场景 128 样本，共四组完整结果。运行前已关闭窗口和 renderer；源码、工具链、环境及全部 CSV 见[数据身份](data/performance/README.md#keep-alive-2026-10-08)。下表为四组逐操作 p50 范围，单位 ms；p95、最大值、idle 与实例数量保留在[完整数据](data/performance/performance-keep-alive-2026-10-08.csv)。

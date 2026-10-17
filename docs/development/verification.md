@@ -105,6 +105,8 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
+空闲更新优化源码 `9d80af9be3f20c170b6ee63140924de10dcaf906`（包含 `ecfb01f` 的输入/滚动观察减法）通过 workspace 全特性测试、ECS 无默认特性测试、workspace 全目标/全特性静态检查与格式检查，独立 consumer 在完整测试中实际运行。新增回归确认稳定快照不复制原存储且不标记 changed，终态后的诊断仍可更新，queued/淘汰/Back 行为保持。独立窗口 workspace 全目标/全特性编译通过，本轮未重跑窗口交互或打包；优化构建的配对结果归[性能说明](../performance.md)。
+
 跨 search 复用源码 `a737b4d` 的公开回归覆盖 current/retained 命中及 Push/Replace/Back 与 fragment 的组合。扩展后的 nested 示例进一步验证应用任务安装内容、当前输入与显式滚动 ready，已实际运行并由独立 consumer 原样消费；对应变更通过全特性 ECS、公开保留/滚动/活动旅程、workspace 全目标/全特性静态检查和格式检查。窗口诊断字段通过独立 workspace 全目标/全特性编译与格式检查，未重跑窗口交互或打包。
 
 原生输入扩展候选的补丁与重建入口保存在提交 `8ac20ab`，可用 `git show 8ac20ab:scripts/native-input-candidate/README.md` 查询。候选曾通过 UI 协议、完整 ECS crate 与原生 Tab/dispatch、焦点、pointer、保留和滚动公开旅程；未完成独立下游装配、打包、窗口、硬件输入或性能验收。该方案需要引擎 patch，现已延期并退出工作树，结果不代表当前官方依赖树交付了原生自动接线。
