@@ -105,6 +105,8 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
+稳态执行优化源码 `e59a3ea0c8a7d6f56fe9dd8a4935fb6beeac3ed1`（含 `b873705` 的 focus 调度核查）通过 workspace 全特性 1,420 项测试、ECS 无默认特性 652 项测试、workspace 全目标/全特性静态检查、格式检查和独立窗口 workspace 全目标/全特性编译；独立 consumer 在完整测试中实际运行。真实布局稳态回归覆盖 retained/active 身份、focus、输入拒绝、公开资源 change detection 与后续访问滚动恢复；原生 focus 回归覆盖晚安装、外部初始化和原调度条件/顺序。仅复用连续只读观察与查询元数据，保留异步轮询、host 失效和写后复验。性能范围归[性能说明](../performance.md)，本轮未重跑窗口交互或打包。
+
 空闲更新优化源码 `9d80af9be3f20c170b6ee63140924de10dcaf906`（包含 `ecfb01f` 的输入/滚动观察减法）通过 workspace 全特性测试、ECS 无默认特性测试、workspace 全目标/全特性静态检查与格式检查，独立 consumer 在完整测试中实际运行。新增回归确认稳定快照不复制原存储且不标记 changed，终态后的诊断仍可更新，queued/淘汰/Back 行为保持。独立窗口 workspace 全目标/全特性编译通过，本轮未重跑窗口交互或打包；优化构建的配对结果归[性能说明](../performance.md)。
 
 跨 search 复用源码 `a737b4d` 的公开回归覆盖 current/retained 命中及 Push/Replace/Back 与 fragment 的组合。扩展后的 nested 示例进一步验证应用任务安装内容、当前输入与显式滚动 ready，已实际运行并由独立 consumer 原样消费；对应变更通过全特性 ECS、公开保留/滚动/活动旅程、workspace 全目标/全特性静态检查和格式检查。窗口诊断字段通过独立 workspace 全目标/全特性编译与格式检查，未重跑窗口交互或打包。

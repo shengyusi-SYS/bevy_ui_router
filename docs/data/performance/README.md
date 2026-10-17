@@ -19,6 +19,7 @@
 | [performance-keep-alive-2026-10-08.csv](performance-keep-alive-2026-10-08.csv) | 96 | 默认关闭、miss/hit、idle、容量淘汰；两轮 flat/nested | `3d6ca2c62a4f1011eb9449e25f1ed237b4c8f35e`；完整已提交 crate/benchmark 源码 |
 | [performance-instances-2026-10-11.csv](performance-instances-2026-10-11.csv) | 168 | 父子 fresh、原父/新子、父子命中和依赖淘汰；其中 96 行为两轮完整串行配对 | `dc3ef59e57434f2730fb7a5958e0f660d8294f7a`；完整已提交 crate/benchmark 源码 |
 | [performance-idle-2026-10-17.csv](performance-idle-2026-10-17.csv) | 192 | 输入/滚动观察与快照减法；before/after 各两轮完整 flat | before=`a6c0ef29d3c8d70532ed8e6ed7dcb4d8469e791e`；after=`9d80af9be3f20c170b6ee63140924de10dcaf906` |
+| [performance-steady-2026-10-17.csv](performance-steady-2026-10-17.csv) | 192 | 空工作执行减法、内容观察复用与 focus 冷路径；两轮交替 before/after flat | before=`9d80af9be3f20c170b6ee63140924de10dcaf906`；after=`e59a3ea0c8a7d6f56fe9dd8a4935fb6beeac3ed1` |
 
 上述日期和 revision 是测量身份；部分局部提交在后续整理历史时已合并，不承诺其短 SHA 在当前分支仍可检出。`b0dbc3b7486e71cd41e5a8cd05e84ac031b10ce0` 当前仍可解析，但不在当前分支祖先链内。完整历史测量说明固定保存于 `6de4233e2c636daa5892807b05af8a19d6e2cc0f:docs/performance.md`，可用 `git show` 查询；它记录比较方法，不补足未保存的源码。
 
@@ -58,6 +59,21 @@ Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 可见�
 | --- | --- |
 | before | `5fef98b47f41029b3f37b29870531dbfa6db9d43a27ad1f8a39a9f2dc7f0784e` |
 | after | `68322ed332e32f940c357787198deeff67cefa76f77f1d5d919433638e6ace81` |
+
+## 稳态执行 2026-10-17
+
+before 为完整提交 `9d80af9be3f20c170b6ee63140924de10dcaf906` 的保留优化 executable；after 为 `e59a3ea0c8a7d6f56fe9dd8a4935fb6beeac3ed1`，包含 `b873705` 的 focus 调度核查。benchmark、features、lock 与计时边界不变；after 构建与计时期间 crate/lock/benchmark 无未提交修改。两份 executable 在运行前后核对 hash，优化构建由 Cargo 的 compiler-artifact 确认实际文件。
+
+先完成 after 构建，再按 before round 1→after round 1→before round 2→after round 2 串行运行。每组完整 48 行，flat、1/32/128 内容预算，每普通场景 128 样本；idle 为每样本 32 update 的均值。CSV 附加 `variant` / `round` / `shape`，保留全部汇总值、较慢组及离群值。请求保留数、样本数和 min/max update 边界逐项一致。Router 组总实体固定增加 2，对应 focus 核查资源与 `ScheduleBuilt` observer；无 Router 的控制组不变。新增基础实体不随页面预算、请求或 update 增长。
+
+环境仍为 Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 可见逻辑 CPU，`rustc 1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0、官方 Bevy 0.19.1；features 为 default/bsn/ecs/view，bench profile 为 opt-level 3、debuginfo 0、debug assertions 与 overflow checks 关闭。没有本任务的并行 Cargo/rustc、renderer、窗口或插桩；未固定 CPU affinity/频率，未控制宿主全部负载。
+
+这组计时仍不含 UI layout、原生 picking、窗口、GPU 或 I/O。真实布局、滚动、focus 与 retained 共存的新增公开用例是行为验证，不能替代这些场景的性能数据。`Cargo.lock` SHA-256 为 `1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`。
+
+| executable | SHA-256 |
+| --- | --- |
+| before | `68322ed332e32f940c357787198deeff67cefa76f77f1d5d919433638e6ace81` |
+| after | `b2c8411f7ab816d533d4bc92ccc10c87997853cf0b6d4d319a5e15a08b4ece1a` |
 
 ## 历史测量共同环境与统计
 

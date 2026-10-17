@@ -92,6 +92,20 @@ Router 夹具安装 TaskPool/Asset/Scene runtime，通过公开导航、普通 `
 
 直接 BSN 对照保留 host/layout/toolbar/outlet，测 fresh Scene 构造、resolve/apply、旧页递归删除、flush 和普通 update。它没有 Router history、授权、隔离、失败/残留或写后复验，两者差值不构成严格 Router 开销归因。
 
+## 稳态执行实测
+
+2026-10-17 继续对空目标隔离、空工作资源作用域、内容观察复用和 focus 安装核查做两轮交替 before/after 对照。完整 192 行、源码和二进制身份见[数据说明](data/performance/README.md#稳态执行-2026-10-17)。沿用同一 flat 夹具、1/32/128 内容预算和每普通场景 128 样本；下表为 128 内容节点时 idle 批均值 p50 的两轮范围，单位 µs。
+
+| 场景 | before p50 | after p50 |
+| --- | --- | --- |
+| 无 Router 的调度对照 | 3.453–3.456 | 3.451–3.487 |
+| 1 条终态请求记录 | 68.123–73.720 | 51.101–51.788 |
+| 64 条终态请求记录 | 102.330–104.315 | 85.672–90.309 |
+
+按各轮配对计算，两种 Router 空闲场景的 p50 分别降低约 24–31% 和 12–18%。页面预算、history、请求保留数量和 update 边界保持一致；Router 组总实体由 179 增为 181，来自固定的 focus 核查资源与 observer，不随请求或 update 增长。计时未通过降频或停止滚动采样取得收益，全部导航与连续操作数据也保留在 CSV 中，不据此推导所有导航或尾延迟普遍改善。
+
+这些时间不含 UI layout、原生 picking、窗口、GPU 或 I/O，也不能推导整应用 CPU 或功耗变化。新增真实布局、滚动、focus 与 retained 共存用例通过的是[行为验证](development/verification.md#已有证据与未验证范围)，没有对应场景的计时结论。
+
 ## 空闲更新实测
 
 2026-10-17 对输入/滚动只读观察与快照增量更新进行两轮 before/after 优化构建对照。使用相同公开 `router_baseline`、flat 形状、1/32/128 内容预算和每普通场景 128 样本；完整 192 行、源码与构建身份见[数据说明](data/performance/README.md#空闲更新-2026-10-17)。下表是 128 内容节点时两轮 idle 批均值 p50 的范围，单位 µs，不是单帧分位数。
