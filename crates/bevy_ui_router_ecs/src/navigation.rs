@@ -6370,8 +6370,17 @@ impl HostObservationDelivery {
 
 pub(crate) fn observe_authority_system(world: &mut World) {
     let count = world.resource::<RouterNavigation>().entries.len();
+    let mut confirmations_pending = world
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .any(|entry| entry.pending_host_confirmation.is_some());
     for index in 0..count {
-        world.resource_scope(|world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
+        if !idle_host_loss::healthy_observation_is_noop(
+            world,
+            &world.resource::<RouterNavigation>().entries[index],
+        ) {
+            world.resource_scope(|world, mut revisions: bevy_ecs::change_detection::Mut<HostCandidateRevisionState>| {
         world.resource_scope(|world, mut latch: bevy_ecs::change_detection::Mut<HostCandidateRevisionLatch>| {
             world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 'entry_work: {
@@ -6508,7 +6517,18 @@ pub(crate) fn observe_authority_system(world: &mut World) {
             });
         });
     });
-        complete_pending_host_confirmations(world);
+            confirmations_pending = true;
+        }
+        if confirmations_pending {
+            // Confirmation stays immediately after the same entry's scopes.
+            // Re-read after their hooks; healthy entries produce no new work.
+            complete_pending_host_confirmations(world);
+            confirmations_pending = world
+                .resource::<RouterNavigation>()
+                .entries
+                .iter()
+                .any(|entry| entry.pending_host_confirmation.is_some());
+        }
     }
     idle_host_loss::complete_ready(world);
 }
@@ -8982,6 +9002,26 @@ fn retain_frame_task_after_authority_retry(
 
 fn drive_navigation_pass(world: &mut World, only_entries: Option<&[usize]>) -> Vec<usize> {
     let mut newly_bound_entries = Vec::new();
+    let has_work = world
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .enumerate()
+        .any(|(index, entry)| {
+            only_entries.is_none_or(|entries| entries.contains(&index))
+                && (entry.engine.has_action()
+                    || entry.pending_mount_mutation_rejection.is_some()
+                    || entry.pending_frame_drive.is_some()
+                    || entry.pending_mount_frame_task.is_some()
+                    || entry.pending_mount_request.is_some()
+                    || entry.pending_bound_back_resolution.is_some()
+                    || entry.pending_back_target_execution.is_some()
+                    || entry.pending_back_resolution_action.is_some()
+                    || entry.pending_commit.is_some())
+        });
+    if !has_work {
+        return newly_bound_entries;
+    }
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             world.resource_scope(
@@ -15497,6 +15537,11 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
         .resource::<RouterNavigation>()
         .entries
         .iter()
+        .filter(|entry| {
+            entry.pending_commit.is_some()
+                || entry.pending_back_target_execution.is_some()
+                || entry.projectionless_fail_close.is_some()
+        })
         .map(|entry| entry.handle)
         .collect::<Vec<_>>();
     for handle in handles {
@@ -21041,6 +21086,9 @@ fn drive_post_commit_completion(
 
 fn drive_post_commit_compound(world: &mut World, entry: &mut RouterEntry) -> bool {
     if entry.post_commit_compound.is_none() {
+        if entry.cleanup_ledger.is_none() {
+            return false;
+        }
         let Some(host) = entry.host.as_ref() else {
             return false;
         };
@@ -21370,6 +21418,23 @@ fn drive_retained_invalidation_protocol(
 }
 
 pub(crate) fn settle_cleanup_system(world: &mut World) {
+    if world
+        .resource::<RouterNavigation>()
+        .entries
+        .iter()
+        .all(|entry| {
+            entry.retained_miss_cleanup.is_none()
+                && entry.post_commit_compound.is_none()
+                && entry.pending_back_target_permanent_cleanup.is_none()
+                && entry.pending_back_no_target_authority_cleanup.is_none()
+                && entry.pending_back_no_target_completion.is_none()
+                && entry.failure_cleanup_completion.is_none()
+                && entry.pending_failed_branch.is_none()
+                && entry.cleanup_ledger.is_none()
+        })
+    {
+        return;
+    }
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             for entry in &mut navigation.entries {
@@ -22058,21 +22123,18 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
     }
 }
 
-pub(crate) fn publish_snapshots_system(world: &mut World) {
+pub(crate) fn publish_snapshots_system(
+    mut navigation: bevy_ecs::prelude::ResMut<RouterNavigation>,
+    mut snapshots: bevy_ecs::prelude::ResMut<RouterSnapshots>,
+) {
     use bevy_ecs::change_detection::DetectChangesMut;
 
-    world.resource_scope(
-        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
-            // resource_scope reinsertion would mark even unchanged snapshots changed.
-            let mut snapshots = world.resource_mut::<RouterSnapshots>();
-            if snapshots
-                .bypass_change_detection()
-                .publish(&mut navigation.entries)
-            {
-                snapshots.set_changed();
-            }
-        },
-    );
+    if snapshots
+        .bypass_change_detection()
+        .publish(&mut navigation.entries)
+    {
+        snapshots.set_changed();
+    }
 }
 
 #[cfg(test)]

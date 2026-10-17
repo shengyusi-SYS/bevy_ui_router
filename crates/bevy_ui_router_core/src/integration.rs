@@ -8732,6 +8732,12 @@ impl RouterEngine {
         self.inner.collect();
     }
 
+    /// Observes pending execution work without moving its lifecycle owner.
+    #[doc(hidden)]
+    pub fn has_action(&self) -> bool {
+        self.inner.has_action()
+    }
+
     pub fn action(&mut self) -> Option<EngineAction> {
         self.inner.action().map(|action| match action {
             CoreEngineAction::FrameTask(inner) => EngineAction::FrameTask(FrameTask { inner }),

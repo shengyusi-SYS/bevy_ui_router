@@ -591,7 +591,12 @@ mod tests {
             .resource_mut::<crate::RouterNavigation>()
             .push(router, RouteLocation::new("/items/2"))
             .unwrap();
-        crate::navigation::publish_snapshots_system(app.world_mut());
+        {
+            use bevy_ecs::system::RunSystemOnce;
+            app.world_mut()
+                .run_system_once(crate::navigation::publish_snapshots_system)
+                .unwrap();
+        }
         assert!(matches!(
             app.world().resource::<RouterSnapshots>().request(router, queued),
             RequestLookup::Found(snapshot) if snapshot.status() == &RequestStatus::Queued

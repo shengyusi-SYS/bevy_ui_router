@@ -255,12 +255,24 @@ fn containers<'a>(
     frames: impl Iterator<Item = &'a RealizedFrame>,
     eligible: &HashSet<Entity>,
 ) -> (Vec<Container>, DuplicateKeys) {
+    containers_from_membership(
+        world,
+        frames.map(|frame| (frame, frame.managed_content_entities(world))),
+        eligible,
+    )
+}
+
+fn containers_from_membership<'a, M: AsRef<[Entity]>>(
+    world: &World,
+    frames: impl Iterator<Item = (&'a RealizedFrame, M)>,
+    eligible: &HashSet<Entity>,
+) -> (Vec<Container>, DuplicateKeys) {
     let mut result = Vec::new();
     let mut duplicates = Vec::new();
-    for frame in frames {
-        let managed = frame.managed_content_entities(world);
+    for (frame, managed) in frames {
+        let managed = managed.as_ref();
         let mut keys = HashMap::<&str, usize>::new();
-        for entity in &managed {
+        for entity in managed {
             if let Some(marker) = world.get::<RouteScroll>(*entity) {
                 *keys.entry(&marker.key).or_default() += 1;
             }
@@ -277,7 +289,7 @@ fn containers<'a>(
                 .map(|key| (frame.frame().clone(), key)),
         );
         let mut frame_containers = Vec::new();
-        for entity in managed {
+        for entity in managed.iter().copied() {
             let Some(marker) = world.get::<RouteScroll>(entity) else {
                 continue;
             };
@@ -554,32 +566,41 @@ fn observe_active(
         .iter()
         .find(|entry| entry.handle == handle)
         .unwrap();
-    let active = entry.active.as_ref().filter(|active| {
-        entry.engine.availability() == &RouterAvailability::Ready
-            && entry.engine.active().kind() == ActivePresentationKind::Route
-            && entry
-                .host
-                .as_ref()
-                .is_some_and(|host| crate::navigation::current_host_binding_is_exact(world, host))
-            && crate::frame_local::validate_active_branch_with_entering(
+    let observation = entry
+        .active
+        .as_ref()
+        .filter(|_| {
+            entry.engine.availability() == &RouterAvailability::Ready
+                && entry.engine.active().kind() == ActivePresentationKind::Route
+                && entry.host.as_ref().is_some_and(|host| {
+                    crate::navigation::current_host_binding_is_exact(world, host)
+                })
+        })
+        .and_then(|active| {
+            crate::frame_local::observe_active_branch_with_entering(
                 world,
                 active,
                 entry.current_reconciliation_entering_branch(),
                 entry.current_mount_new_staging_allowance(),
             )
-            .is_ok()
-    });
-    let (containers, duplicates) = containers(
+            .ok()
+        });
+    let (containers, duplicates) = containers_from_membership(
         world,
-        active.iter().flat_map(|branch| branch.frames()),
+        observation
+            .iter()
+            .flat_map(|branch| branch.frames())
+            .map(|frame| (frame.frame(), frame.managed_content_entities())),
         eligible,
     );
     ActiveObservation {
-        entry: active.and_then(|_| entry.engine.canonical_history().current_entry()),
-        frames: active
+        entry: observation
+            .as_ref()
+            .and_then(|_| entry.engine.canonical_history().current_entry()),
+        frames: observation
             .iter()
             .flat_map(|branch| branch.frames())
-            .map(|frame| frame.frame().clone())
+            .map(|frame| frame.frame().frame().clone())
             .collect(),
         containers,
         duplicates,
@@ -664,7 +685,10 @@ pub(crate) fn prepare_scroll_system(world: &mut World) {
 
 /// Runs once after normal UI layout. Explicit intents remain waiting; attempted
 /// intents settle once or abandon missing geometry without chasing range growth.
-pub(crate) fn settle_scroll_system(world: &mut World) {
+pub(crate) fn settle_scroll_system(
+    world: &mut World,
+    layout: &mut SystemState<ScrollLayout<'static, 'static>>,
+) {
     let eligible = eligible_containers(world);
     if eligible.is_empty()
         && world
@@ -683,7 +707,7 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
         .collect::<Vec<_>>();
     for handle in handles {
         let mut observation = observe_active(world, handle, &eligible);
-        let laid_out = laid_out_containers(world, &observation.containers);
+        let laid_out = laid_out_containers(world, &observation.containers, layout);
         let missing_layout = observation
             .containers
             .iter()
@@ -763,29 +787,43 @@ pub(crate) fn settle_scroll_system(world: &mut World) {
     }
 }
 
-fn laid_out_containers(world: &mut World, containers: &[Container]) -> HashSet<Entity> {
+#[derive(SystemParam)]
+pub(crate) struct ScrollLayout<'w, 's> {
+    roots: UiRootNodes<'w, 's>,
+    children: UiChildren<'w, 's>,
+    nodes: Query<
+        'w,
+        's,
+        (
+            &'static ComputedNode,
+            &'static ComputedUiRenderTargetInfo,
+            &'static ComputedUiTargetCamera,
+        ),
+        (
+            With<Node>,
+            With<ContentSize>,
+            With<UiTransform>,
+            With<UiGlobalTransform>,
+        ),
+    >,
+    cameras: Query<'w, 's, &'static Camera>,
+}
+
+fn laid_out_containers(
+    world: &World,
+    containers: &[Container],
+    layout: &mut SystemState<ScrollLayout<'static, 'static>>,
+) -> HashSet<Entity> {
     if containers.is_empty() || !world.contains_resource::<UiSurface>() {
         return HashSet::new();
     }
-    let mut ui = SystemState::<(
-        UiRootNodes,
-        UiChildren,
-        Query<
-            (
-                &ComputedNode,
-                &ComputedUiRenderTargetInfo,
-                &ComputedUiTargetCamera,
-            ),
-            (
-                With<Node>,
-                With<ContentSize>,
-                With<UiTransform>,
-                With<UiGlobalTransform>,
-            ),
-        >,
-        Query<&Camera>,
-    )>::new(world);
-    let Ok((roots, children, layout_nodes, cameras)) = ui.get(world) else {
+    let Ok(ScrollLayout {
+        roots,
+        children,
+        nodes: layout_nodes,
+        cameras,
+    }) = layout.get(world)
+    else {
         return HashSet::new();
     };
     let roots = roots.iter().collect::<HashSet<_>>();

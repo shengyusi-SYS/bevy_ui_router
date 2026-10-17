@@ -140,7 +140,8 @@ flowchart TB
         Layout --> Scroll["归属复验与单次结算<br/>采样实际显示位置"]
     end
     Ready --> Observe
-    Publish --> Content
+    Publish --> FocusBoundary["BSN focus 队列观察<br/>安装核查：首次 / 调度变化"]
+    FocusBoundary --> Content
 ```
 
 `Update` 的前五个生命周期 set 是 crate-private；公开的本轮观察排序锚点只有
@@ -149,6 +150,10 @@ flowchart TB
 
 该 snapshot 观察点早于本轮 `PostUpdate`，不表示布局或滚动结算已经完成。
 
+生命周期阶段先读取现有 action、task 和 cleanup owner；没有对应工作时不进入资源移出与物理执行路径。空闲 host 的 registration 仍每轮观察，异步 task 仍持续轮询。host 确认保持在原 entry 的资源作用域结束后，避免改变 publication 与 hook 的先后关系。
+
+输入刷新与滚动观察各自在连续的只读 World 借用内复用已验证的逐 frame 内容归属；focus closure 保持独立。写入后或进入另一调度阶段重新观察。滚动保留查询元数据，每轮仍读取当前布局和位置；等值快照不标记变化，权限不变且无待处理撤权时不写输入 gate。
+
 `Refresh` 在 picking hover 前更新当前内容资格；hovermap 生成后、interaction 更新前
 过滤非活动目标。正常 publication 同次调用撤销离场目标的历史 hover、press、click、
 drag 与 focus，避免旧手势在下一轮继续命中。
@@ -156,3 +161,5 @@ drag 与 focus，避免旧手势在下一轮继续命中。
 应用的目标定向 keyboard/gamepad handler 在 `RouterInputSet::Ready` 之后读取
 `RouterInputGate`。它们仍由应用编写；安装 Router 不会自动让所有原生焦点导航或
 输入分发插件遵守 gate。具体接入见[集成指南](../guides/integration.md)。
+
+现有 BSN focus 桥只在首次使用或 `PostUpdate` 调度图变化、重建后核查官方 drain 的组合；稳定调度继续观察焦点队列，不再逐帧枚举系统。

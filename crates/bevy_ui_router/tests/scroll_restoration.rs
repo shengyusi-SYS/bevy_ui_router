@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use bevy_app::{App, PostUpdate};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
-use bevy_input_focus::InputFocusPlugin;
+use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
 use bevy_internal::{
     DefaultPlugins,
     camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo},
@@ -503,6 +503,83 @@ fn drive_availability(app: &mut App, router: RouterHandle, expected: RouterAvail
             .get(router)
             .unwrap()
     );
+}
+
+#[test]
+fn idle_retained_pages_preserve_focus_scroll_and_unchanged_public_resources() {
+    #[derive(Resource, Default)]
+    struct Observations(Vec<(bool, bool, usize)>);
+
+    let Fixture {
+        mut app, router, ..
+    } = fixture(FixtureOptions {
+        keep_alive_capacity: 2,
+        ..Default::default()
+    });
+    push(&mut app, router, "/a");
+    let a = page(&mut app, "a");
+    let a_position = Vec2::new(45.0, 70.0);
+    scroll(&mut app, a, a_position);
+    push(&mut app, router, "/b");
+    let b = page(&mut app, "b");
+    let b_position = Vec2::new(88.0, 150.0);
+    scroll(&mut app, b, b_position);
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(b, FocusCause::Pressed);
+    for _ in 0..3 {
+        app.world_mut().spawn(Node {
+            width: Val::Px(8.0),
+            height: Val::Px(8.0),
+            ..Default::default()
+        });
+    }
+    app.init_resource::<Observations>().add_systems(
+        PostUpdate,
+        (|gate: Res<RouterInputGate>,
+          snapshots: Res<RouterSnapshots>,
+          added_pages: Query<(), Added<Page>>,
+          mut observations: ResMut<Observations>| {
+            observations.0.push((
+                gate.is_changed(),
+                snapshots.is_changed(),
+                added_pages.iter().count(),
+            ));
+        })
+        .after(UiSystems::Layout),
+    );
+    // Let the observer establish its own system tick after the new focus and UI.
+    app.update();
+    app.world_mut().resource_mut::<Observations>().0.clear();
+    let before = history(&app, router);
+    for _ in 0..4 {
+        app.update();
+        assert_eq!(page(&mut app, "b"), b);
+        assert_eq!(app.world().get::<Page>(a).unwrap().0, "a");
+        assert_position(&app, b, b_position);
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(b));
+        let gate = app.world().resource::<RouterInputGate>();
+        assert!(gate.allows_pointer(b));
+        assert!(gate.allows_keyboard(b));
+        assert!(!gate.allows_pointer(a));
+        assert!(!gate.allows_keyboard(a));
+        assert!(!gate.allows_gamepad(a));
+    }
+    assert_eq!(
+        app.world().resource::<Observations>().0,
+        [(false, false, 0); 4]
+    );
+    assert_eq!(history(&app, router), before);
+
+    // Leaving after the idle samples still records B's displayed position.
+    push(&mut app, router, "/c");
+    app.world_mut().get_mut::<ScrollPosition>(b).unwrap().0 = Vec2::ZERO;
+    back(&mut app, router);
+    assert_eq!(page(&mut app, "b"), b);
+    assert_position(&app, b, b_position);
+    back(&mut app, router);
+    assert_eq!(page(&mut app, "a"), a);
+    assert_position(&app, a, a_position);
 }
 
 #[test]

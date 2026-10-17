@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
-    change_detection::Mut,
-    entity::Entity,
+    change_detection::{DetectChangesMut, Mut},
+    entity::{Entity, EntityHashSet},
     entity_disabling::DefaultQueryFilters,
     hierarchy::{ChildOf, Children},
     prelude::World,
@@ -19,7 +19,7 @@ use bevy_picking::{
 
 use crate::{
     components::{ChildSlotAuthority, ChildSlotLifecycle, RouteOwnershipSeal, RouterInputBarrier},
-    frame_local::validate_active_branch_with_entering,
+    frame_local::observe_active_branch_with_entering,
     presentation::FrameLifecycle,
     registry::{
         EntityLifecycle, EntityOwner, ExactRegistryClaim, ProvisionalOwner, QuarantineLeaseTable,
@@ -79,7 +79,16 @@ impl RouterInputGate {
         self.revoked = revoked;
     }
 
-    fn refresh_allowed(&mut self, allowed: &HashSet<Entity>, grants: &HashSet<Entity>) {
+    fn refresh_allowed(&mut self, allowed: &HashSet<Entity>, grants: &HashSet<Entity>) -> bool {
+        if self.allowed.iter().all(|entity| allowed.contains(entity))
+            && (self.allowed.len() == allowed.len()
+                || grants
+                    .iter()
+                    .all(|entity| !allowed.contains(entity) || self.allowed.contains(entity)))
+            && self.revoked.iter().all(|entity| !allowed.contains(entity))
+        {
+            return false;
+        }
         for entity in self.allowed.iter().copied() {
             if !allowed.contains(&entity) && !self.revoked.contains(&entity) {
                 self.revoked.push(entity);
@@ -95,6 +104,7 @@ impl RouterInputGate {
         self.allowed.sort_by_key(|entity| entity.to_bits());
         self.allowed.dedup();
         self.revoked.retain(|entity| !allowed.contains(entity));
+        true
     }
 }
 
@@ -391,24 +401,23 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
             .filter_map(|entry| entry.active.as_ref().map(|active| (entry, active)))
         {
             let (entry, active) = branch;
-            if validate_active_branch_with_entering(
+            if let Ok(observation) = observe_active_branch_with_entering(
                 world,
                 active,
                 entry.current_reconciliation_entering_branch(),
                 entry.current_mount_new_staging_allowance(),
-            )
-            .is_ok()
-            {
-                for frame in active.frames() {
-                    let (managed, eligible) = frame.content_input_facts(world, &[]);
+            ) {
+                for frame in observation.frames() {
+                    let (managed, eligible) = frame.content_input_facts();
                     let eligible = eligible.into_iter().collect::<HashSet<_>>();
                     ineligible_content.extend(
                         managed
-                            .into_iter()
+                            .iter()
+                            .copied()
                             .filter(|entity| !eligible.contains(entity)),
                     );
                     allowed.extend(eligible.iter().copied());
-                    if frame.native_root().is_some() {
+                    if frame.frame().native_root().is_some() {
                         grants.extend(eligible);
                     }
                 }
@@ -442,9 +451,13 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
         invalid_active.extend(native_residual_targets);
     }
     clear_inert_subtree_focus(world, &invalid_active);
-    world
-        .resource_mut::<RouterInputGate>()
-        .refresh_allowed(&allowed, &grants);
+    let mut gate = world.resource_mut::<RouterInputGate>();
+    if gate
+        .bypass_change_detection()
+        .refresh_allowed(&allowed, &grants)
+    {
+        gate.set_changed();
+    }
     // Lifecycle publication may have revoked a target after the preceding
     // picking pass. Clear its retained gesture state before the next backend
     // sample; the second scheduled pass also filters newly generated hits.
@@ -483,28 +496,22 @@ fn fail_closed_invalid_active_frames(
     world: &mut World,
     invalid_claims: Vec<Vec<ExactRegistryClaim>>,
 ) -> HashSet<Entity> {
-    let exact_branches = {
+    let entities = {
         let registry = world.resource::<RouteEntityRegistry>();
         invalid_claims
             .into_iter()
-            .filter_map(|claims| {
-                let current = claims
-                    .into_iter()
-                    .filter(|claim| {
-                        registry
-                            .record(claim.entity())
-                            .is_some_and(|record| record.claim() == *claim)
-                    })
-                    .collect::<Vec<_>>();
-                (!current.is_empty()).then_some(current)
+            .flatten()
+            .filter(|claim| {
+                registry
+                    .record(claim.entity())
+                    .is_some_and(|record| record.claim() == *claim)
             })
-            .collect::<Vec<_>>()
+            .map(|claim| claim.entity())
+            .collect::<EntityHashSet>()
     };
-    let entities = exact_branches
-        .iter()
-        .flatten()
-        .map(ExactRegistryClaim::entity)
-        .collect::<HashSet<_>>();
+    if entities.is_empty() {
+        return HashSet::new();
+    }
     let focus_closure = observed_descendant_closure(world, entities.iter().copied());
     prepare_physical_isolation(world, &entities).apply();
     focus_closure
@@ -512,7 +519,7 @@ fn fail_closed_invalid_active_frames(
 
 fn prepare_physical_isolation<'w>(
     world: &'w mut World,
-    targets: &HashSet<Entity>,
+    targets: &EntityHashSet,
 ) -> PreparedPhysicalIsolation<'w> {
     #[cfg(feature = "bsn")]
     let native_content = targets
@@ -534,10 +541,8 @@ fn prepare_physical_isolation<'w>(
         Option<&mut bevy_ui::Node>,
     )>();
     let mut entities = Vec::with_capacity(targets.len());
-    for (entity, visibility, pickable, barrier, node) in query.iter_mut(world) {
-        if !targets.contains(&entity) {
-            continue;
-        }
+    for (entity, visibility, pickable, barrier, node) in query.iter_many_unique_mut(world, targets)
+    {
         #[cfg(feature = "bsn")]
         if native_content.contains(&entity) {
             continue;
@@ -899,7 +904,10 @@ pub(crate) fn filter_inactive_router_pointer_state_system(world: &mut World) {
         !gate.allows_pointer(*target) && target_has_exact_router_boundary(world, *target)
     }));
     revoke_router_pointer_targets(world, &denied);
-    world.resource_mut::<RouterInputGate>().revoked.clear();
+    let mut gate = world.resource_mut::<RouterInputGate>();
+    if !gate.revoked.is_empty() {
+        gate.revoked.clear();
+    }
 }
 
 fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
@@ -2078,6 +2086,33 @@ pub(crate) mod tests {
 
         refresh_input_gate_system(app.world_mut());
 
+        assert!(
+            !app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+    }
+
+    #[test]
+    fn unchanged_refresh_does_not_mark_the_input_gate_changed() {
+        use bevy_ecs::change_detection::DetectChanges;
+
+        let (mut app, active) = active_atomic_app("refresh-stable");
+        app.world_mut().clear_trackers();
+
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(!app.world().resource_ref::<RouterInputGate>().is_changed());
+        assert!(
+            app.world()
+                .resource::<RouterInputGate>()
+                .allows_pointer(active)
+        );
+
+        *app.world_mut().get_mut::<Visibility>(active).unwrap() = Visibility::Hidden;
+        refresh_input_gate_system(app.world_mut());
+
+        assert!(app.world().resource_ref::<RouterInputGate>().is_changed());
         assert!(
             !app.world()
                 .resource::<RouterInputGate>()

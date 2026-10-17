@@ -1861,18 +1861,34 @@ impl RealizedFrame {
         #[cfg(feature = "bsn")]
         if self.native_root().is_some() {
             let managed = self.managed_content_entities(world);
+            let eligible = self.input_entities_for_observed_content(world, next, &managed);
+            return (managed, eligible);
+        }
+        let _ = (world, next);
+        (Vec::new(), self.interactive_entities())
+    }
+
+    /// Derive eligibility from membership observed in this same immutable World
+    /// borrow. Callers retain the membership proof and its observation lifetime.
+    pub(crate) fn input_entities_for_observed_content(
+        &self,
+        world: &World,
+        next: &[FrameMutationTarget],
+        managed: &[Entity],
+    ) -> Vec<Entity> {
+        #[cfg(feature = "bsn")]
+        if self.native_root().is_some() {
             let mut visibility = native_frame::AuthoredVisibilityObservation::new(world, next);
-            let eligible = managed
+            return managed
                 .iter()
                 .copied()
                 .filter(|entity| {
                     world.get::<Node>(*entity).is_some() && visibility.is_visible(*entity)
                 })
                 .collect();
-            return (managed, eligible);
         }
-        let _ = (world, next);
-        (Vec::new(), self.interactive_entities())
+        let _ = (world, next, managed);
+        self.interactive_entities()
     }
     pub(crate) const fn frame(&self) -> &RouteFrameVersion {
         &self.frame

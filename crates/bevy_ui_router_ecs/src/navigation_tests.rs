@@ -1,4 +1,12 @@
 use super::*;
+
+fn publish_snapshots_system(world: &mut World) {
+    use bevy_ecs::system::RunSystemOnce;
+    world
+        .run_system_once(super::publish_snapshots_system)
+        .unwrap();
+}
+
 #[cfg(test)]
 use crate::cleanup::BackCapacityRetireError;
 use crate::{

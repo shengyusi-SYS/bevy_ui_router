@@ -10863,6 +10863,10 @@ impl RouterEngine {
         self.action.take()
     }
 
+    pub(crate) fn has_action(&self) -> bool {
+        self.action.is_some()
+    }
+
     pub(crate) fn restore_action(&mut self, action: EngineAction) {
         debug_assert!(self.action.is_none());
         self.action = Some(action);

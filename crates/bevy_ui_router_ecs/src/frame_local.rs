@@ -57,6 +57,22 @@ fn collect_frame_local_entities_with_policy(
     registry: &RouteEntityRegistry,
     manifest_policy: ManifestPolicy,
 ) -> Result<Vec<Entity>, FrameLocalError> {
+    observe_frame_local_entities_with_policy(world, frame, root, registry, manifest_policy)
+        .map(|observation| observation.physical)
+}
+
+struct FrameLocalEntities {
+    physical: Vec<Entity>,
+    native_managed: Option<Vec<Entity>>,
+}
+
+fn observe_frame_local_entities_with_policy(
+    world: &World,
+    frame: &RouteFrameVersion,
+    root: Entity,
+    registry: &RouteEntityRegistry,
+    manifest_policy: ManifestPolicy,
+) -> Result<FrameLocalEntities, FrameLocalError> {
     if world.get_entity(root).is_err() || registry.record(root).is_none() {
         return Err(FrameLocalError::MissingRoot(root));
     }
@@ -78,9 +94,9 @@ fn collect_frame_local_entities_with_policy(
         let content =
             crate::presentation::native_frame::collect_content(world, frame, content_root)?;
         let mut structure = vec![root, content_root];
-        for entity in content {
+        for entity in &content {
             for child in world
-                .get::<Children>(entity)
+                .get::<Children>(*entity)
                 .into_iter()
                 .flat_map(|children| children.iter().copied())
             {
@@ -93,7 +109,10 @@ fn collect_frame_local_entities_with_policy(
                 }
             }
         }
-        return Ok(structure);
+        return Ok(FrameLocalEntities {
+            physical: structure,
+            native_managed: Some(content),
+        });
     }
 
     let mut visited = HashSet::new();
@@ -143,7 +162,10 @@ fn collect_frame_local_entities_with_policy(
             pending.push(child);
         }
     }
-    Ok(ordered)
+    Ok(FrameLocalEntities {
+        physical: ordered,
+        native_managed: None,
+    })
 }
 
 fn manifest_is_acceptable(
@@ -414,6 +436,72 @@ pub(crate) fn validate_active_branch_with_entering(
     )
 }
 
+/// Facts from the successful active proof, usable only while its World stays
+/// immutably borrowed. Managed content never substitutes for the focus closure.
+pub(crate) struct ActiveBranchObservation<'w> {
+    frames: Vec<ActiveFrameObservation<'w>>,
+}
+
+impl ActiveBranchObservation<'_> {
+    pub(crate) fn frames(&self) -> &[ActiveFrameObservation<'_>] {
+        &self.frames
+    }
+}
+
+pub(crate) struct ActiveFrameObservation<'w> {
+    world: &'w World,
+    frame: &'w crate::presentation::RealizedFrame,
+    managed: Vec<Entity>,
+}
+
+impl ActiveFrameObservation<'_> {
+    pub(crate) fn frame(&self) -> &crate::presentation::RealizedFrame {
+        self.frame
+    }
+
+    pub(crate) fn managed_content_entities(&self) -> &[Entity] {
+        &self.managed
+    }
+
+    pub(crate) fn content_input_facts(&self) -> (&[Entity], Vec<Entity>) {
+        let eligible =
+            self.frame
+                .input_entities_for_observed_content(self.world, &[], &self.managed);
+        let managed = if self.frame.native_root().is_some() {
+            self.managed.as_slice()
+        } else {
+            &[]
+        };
+        (managed, eligible)
+    }
+}
+
+pub(crate) fn observe_active_branch_with_entering<'w>(
+    world: &'w World,
+    branch: &'w RealizedBranch,
+    entering: Option<&RealizedBranch>,
+    staging_allowance: Option<&SealedMountNewStagingAllowance>,
+) -> Result<ActiveBranchObservation<'w>, FrameLocalError> {
+    let mut frames = Vec::with_capacity(branch.frames().len());
+    validate_committed_branch_with_entering_and_observe(
+        world,
+        branch,
+        false,
+        entering.map(Into::into),
+        staging_allowance,
+        None,
+        |frame, native_managed| {
+            frames.push(ActiveFrameObservation {
+                world,
+                frame,
+                managed: native_managed
+                    .unwrap_or_else(|| frame.claims().map(|claim| claim.entity()).collect()),
+            });
+        },
+    )?;
+    Ok(ActiveBranchObservation { frames })
+}
+
 pub(crate) fn validate_active_branch_for_splice<'payload>(
     world: &World,
     preserved: &RealizedBranch,
@@ -518,6 +606,26 @@ fn validate_committed_branch_with_entering(
     entering: Option<crate::instance::PayloadRef<'_>>,
     staging_allowance: Option<&SealedMountNewStagingAllowance>,
     sealed_slot_roles: Option<&[SealedReconciliationSlotRole]>,
+) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_committed_branch_with_entering_and_observe(
+        world,
+        branch,
+        leaving,
+        entering,
+        staging_allowance,
+        sealed_slot_roles,
+        |_, _| {},
+    )
+}
+
+fn validate_committed_branch_with_entering_and_observe<'w>(
+    world: &'w World,
+    branch: &'w RealizedBranch,
+    leaving: bool,
+    entering: Option<crate::instance::PayloadRef<'_>>,
+    staging_allowance: Option<&SealedMountNewStagingAllowance>,
+    sealed_slot_roles: Option<&[SealedReconciliationSlotRole]>,
+    mut observe_frame: impl FnMut(&'w crate::presentation::RealizedFrame, Option<Vec<Entity>>),
 ) -> Result<Vec<Entity>, FrameLocalError> {
     validate_branch_structure(branch)?;
     if let Some(allowance) = staging_allowance.filter(|allowance| {
@@ -691,7 +799,7 @@ fn validate_committed_branch_with_entering(
         if !valid {
             return Err(FrameLocalError::OwnershipDrift(frame.shell()));
         }
-        validate_frame_claim_set(
+        let native_managed = observe_frame_claim_set(
             world,
             frame.frame(),
             frame.shell(),
@@ -700,6 +808,7 @@ fn validate_committed_branch_with_entering(
             ManifestPolicy::Observed,
             &external_boundaries,
         )?;
+        observe_frame(frame, native_managed);
     }
     validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells, &[])
 }
@@ -958,6 +1067,27 @@ fn validate_frame_claim_set<'a, 'payload>(
     manifest_policy: ManifestPolicy,
     external_boundaries: &[Entity],
 ) -> Result<(), FrameLocalError> {
+    observe_frame_claim_set(
+        world,
+        frame,
+        root,
+        claims,
+        branch,
+        manifest_policy,
+        external_boundaries,
+    )
+    .map(|_| ())
+}
+
+fn observe_frame_claim_set<'a, 'payload>(
+    world: &World,
+    frame: &RouteFrameVersion,
+    root: Entity,
+    claims: impl Iterator<Item = &'a crate::registry::ExactRegistryClaim>,
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
+    manifest_policy: ManifestPolicy,
+    external_boundaries: &[Entity],
+) -> Result<Option<Vec<Entity>>, FrameLocalError> {
     let branch = branch.into();
     let registry = world
         .get_resource::<RouteEntityRegistry>()
@@ -971,7 +1101,7 @@ fn validate_frame_claim_set<'a, 'payload>(
         return Err(FrameLocalError::OwnershipDrift(stale.entity()));
     }
     let physical =
-        collect_frame_local_entities_with_policy(world, frame, root, registry, manifest_policy)?;
+        observe_frame_local_entities_with_policy(world, frame, root, registry, manifest_policy)?;
     let expected = claims
         .iter()
         .map(|claim| claim.entity())
@@ -987,14 +1117,14 @@ fn validate_frame_claim_set<'a, 'payload>(
             return Err(FrameLocalError::ForeignChildSlot(*boundary));
         }
     }
-    let actual = physical.into_iter().collect::<HashSet<_>>();
+    let actual = physical.physical.into_iter().collect::<HashSet<_>>();
     if actual.len() != expected.len() + boundaries.len()
         || !expected.is_subset(&actual)
         || !boundaries.is_subset(&actual)
     {
         return Err(FrameLocalError::OwnershipDrift(root));
     }
-    Ok(())
+    Ok(physical.native_managed)
 }
 
 pub(crate) fn validate_branch_descendants<'payload>(
@@ -1501,6 +1631,54 @@ mod tests {
         assert!(closure.contains(&foreign));
         assert!(closure.contains(&foreign_leaf));
         assert!(closure.contains(&child_slot));
+    }
+
+    #[test]
+    fn active_content_observation_keeps_focus_scope_separate_and_reobserves_drift() {
+        use crate::navigation::RouterNavigation;
+
+        let (mut app, target) =
+            crate::input::tests::active_atomic_app("active-content-observation");
+        let foreign = app.world_mut().spawn(ChildOf(target)).id();
+        {
+            let world = app.world();
+            let entry = &world.resource::<RouterNavigation>().entries[0];
+            let active = entry.active.as_ref().unwrap();
+            let observation =
+                observe_active_branch_with_entering(world, active, None, None).unwrap();
+            let focus = validate_active_branch_with_entering(world, active, None, None).unwrap();
+            assert!(focus.contains(&foreign));
+            assert!(
+                !observation
+                    .frames()
+                    .iter()
+                    .any(|frame| { frame.managed_content_entities().contains(&foreign) })
+            );
+            for frame in observation.frames() {
+                assert_eq!(
+                    frame.managed_content_entities(),
+                    frame.frame().managed_content_entities(world)
+                );
+                let (managed, eligible) = frame.content_input_facts();
+                assert!(
+                    managed.is_empty(),
+                    "legacy input membership stays unchanged"
+                );
+                assert_eq!(eligible, frame.frame().content_input_facts(world, &[]).1);
+            }
+        }
+
+        app.world_mut()
+            .entity_mut(target)
+            .remove::<RouteOwnershipSeal>();
+        let world = app.world();
+        let entry = &world.resource::<RouterNavigation>().entries[0];
+        let active = entry.active.as_ref().unwrap();
+        assert_eq!(
+            observe_active_branch_with_entering(world, active, None, None).err(),
+            validate_active_branch_with_entering(world, active, None, None).err()
+        );
+        assert!(observe_active_branch_with_entering(world, active, None, None).is_err());
     }
 
     #[test]

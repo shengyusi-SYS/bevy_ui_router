@@ -109,6 +109,25 @@ fn physically_idle(entry: &RouterEntry) -> bool {
         && entry.pending_back_target_permanent_cleanup.is_none()
 }
 
+pub(super) fn healthy_observation_is_noop(world: &World, entry: &RouterEntry) -> bool {
+    entry.idle_host_loss.is_none()
+        && physically_idle(entry)
+        && entry
+            .host
+            .as_ref()
+            .is_some_and(|host| host_registration_is_current(world, entry.handle, host))
+}
+
+fn host_registration_is_current(world: &World, router: RouterHandle, host: &HostBinding) -> bool {
+    world.get_entity(host.host).is_ok()
+        && world
+            .get::<RouterHostRegistration>(host.host)
+            .is_some_and(|registration| {
+                registration.router() == router
+                    && registration.incarnation() == host.registration_incarnation
+            })
+}
+
 pub(super) fn allows_candidate(
     world: &World,
     terminal: &IdleHostTerminal,
@@ -334,14 +353,7 @@ pub(super) fn observe(world: &mut World, entry: &mut RouterEntry) -> bool {
     let Some(host) = entry.host.as_ref() else {
         return false;
     };
-    if world.get_entity(host.host).is_ok()
-        && world
-            .get::<RouterHostRegistration>(host.host)
-            .is_some_and(|registration| {
-                registration.router() == entry.handle
-                    && registration.incarnation() == host.registration_incarnation
-            })
-    {
+    if host_registration_is_current(world, entry.handle, host) {
         return false;
     }
     let retained_plan = if entry.retained.is_empty() {
