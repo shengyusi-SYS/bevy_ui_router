@@ -106,9 +106,9 @@ python3 scripts/check-packaged-consumer.py
 
 ## 已有证据与未验证范围
 
-当前观察优化源码 `6a0ab58f704e878efd7494c5f66ba92ea3cf956f` 通过 workspace 全特性 1,422 项测试、ECS 无默认特性 652 项测试、workspace 全目标/全特性静态检查、格式检查和独立窗口 workspace 全目标/全特性编译；独立 consumer 在完整测试中实际运行。新增回归核对动态内容变化后的 native membership、完整 slot 边界，以及禁用且缺布局组件的重复 marker 对旧滚动记录的失效。`steady` 夹具的两层/三层初始动态页面通过 nested 行为 smoke。
+当前执行入口参数收窄后的树通过 workspace 全特性 1,423 项测试、ECS 无默认特性 653 项测试、workspace 全目标/全特性静态检查和格式检查；独立 consumer 在完整测试中实际运行。安装回归确认 Collect 与 Ready 均非独占系统；正常调度验证 Hover 的 Commands/observer 结果在 Ready 后可见，observer 发起的真实请求在 Collect 产生 action。
 
-已有稳态回归继续覆盖 retained/active 身份、focus、输入拒绝、公开资源 change detection 与后续访问滚动恢复；原生 focus 覆盖晚安装、外部初始化和原调度条件/顺序。稳定快照保持等值不写，终态后的诊断仍可更新。观察只在连续只读阶段复用，保留异步轮询、host 失效、正常滚动采样和写后复验。性能范围归[性能说明](../performance.md)，本轮未重跑窗口交互或打包。
+已有稳态回归继续覆盖动态 native membership、完整 slot 边界、禁用重复 marker、retained/active 身份、focus、输入拒绝、公开资源 change detection 与后续访问滚动恢复；原生 focus 覆盖晚安装、外部初始化和原调度条件/顺序。稳定快照保持等值不写，终态后的诊断仍可更新。观察只在连续只读阶段复用，保留异步轮询、host 失效、正常滚动采样和写后复验。独立窗口全目标/全特性编译及 `steady` nested smoke 的既有证据绑定观察优化源码 `6a0ab58f704e878efd7494c5f66ba92ea3cf956f`；本轮未重跑窗口或打包，也未测量两处参数收窄的独立收益。已有计时归[性能说明](../performance.md)。
 
 跨 search 复用源码 `a737b4d` 的公开回归覆盖 current/retained 命中及 Push/Replace/Back 与 fragment 的组合。扩展后的 nested 示例进一步验证应用任务安装内容、当前输入与显式滚动 ready，已实际运行并由独立 consumer 原样消费；对应变更通过全特性 ECS、公开保留/滚动/活动旅程、workspace 全目标/全特性静态检查和格式检查。窗口诊断字段通过独立 workspace 全目标/全特性编译与格式检查，未重跑窗口交互或打包。
 

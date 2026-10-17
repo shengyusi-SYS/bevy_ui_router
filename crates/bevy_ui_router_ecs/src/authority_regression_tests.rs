@@ -25,8 +25,9 @@ use crate::{
     driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
     input::RouterInputGate,
     navigation::{
-        RouterNavigation, collect_navigation_system, commit_presentation_system,
-        drive_navigation_system, observe_authority_system, settle_cleanup_system,
+        RouterNavigation, collect_navigation_for_test as collect_navigation_system,
+        commit_presentation_system, drive_navigation_system, observe_authority_system,
+        settle_cleanup_system,
     },
     presentation::FrameOutput,
     registry::{

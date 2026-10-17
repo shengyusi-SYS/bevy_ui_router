@@ -7552,8 +7552,19 @@ fn retain_host_admission_operation_failure(
     });
 }
 
-pub(crate) fn collect_navigation_system(world: &mut World) {
-    for entry in &mut world.resource_mut::<RouterNavigation>().entries {
+pub(crate) fn collect_navigation_system(
+    mut navigation: bevy_ecs::prelude::ResMut<RouterNavigation>,
+) {
+    collect_navigation(&mut navigation);
+}
+
+#[cfg(test)]
+pub(crate) fn collect_navigation_for_test(world: &mut World) {
+    collect_navigation(&mut world.resource_mut::<RouterNavigation>());
+}
+
+fn collect_navigation(navigation: &mut RouterNavigation) {
+    for entry in &mut navigation.entries {
         if entry.retained_miss_cleanup.is_none()
             && entry.pending_back_resolution_action.is_none()
             && entry.pending_bound_back_resolution.is_none()

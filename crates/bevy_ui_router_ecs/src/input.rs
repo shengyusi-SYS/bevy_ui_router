@@ -937,7 +937,7 @@ fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
     false
 }
 
-pub(crate) fn input_ready_system(_world: &mut World) {}
+pub(crate) fn input_ready_system() {}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -947,8 +947,8 @@ pub(crate) mod tests {
         content::{ContentColor, FrameContentWriter, SolidRect},
         driver::{EcsViewDriver, EcsViewReportSession, ViewBuildReport},
         navigation::{
-            RouterNavigation, collect_navigation_system, commit_presentation_system,
-            drive_navigation_system, settle_cleanup_system,
+            RouterNavigation, collect_navigation_for_test as collect_navigation_system,
+            commit_presentation_system, drive_navigation_system, settle_cleanup_system,
         },
         plugin::BevyUiRouterPlugin,
     };

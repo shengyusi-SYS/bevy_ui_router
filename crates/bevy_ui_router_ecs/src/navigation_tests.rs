@@ -1,3 +1,4 @@
+use super::collect_navigation_for_test as collect_navigation_system;
 use super::*;
 
 fn publish_snapshots_system(world: &mut World) {
@@ -2260,6 +2261,70 @@ impl EcsViewDriver for FailOnceDriver {
 
 fn install_atomic_router(app: &mut App, label: &str) -> RouterHandle {
     install_atomic_router_at_pattern(app, label, "/")
+}
+
+#[test]
+fn normal_collect_and_ready_preserve_deferred_observer_visibility() {
+    use bevy_ecs::prelude::{Commands, Event, Res, ResMut};
+
+    #[derive(Event)]
+    enum StageEvent {
+        Hover,
+        Navigate(RouterHandle),
+    }
+
+    #[derive(Resource, Default)]
+    struct Probe {
+        hover_observed: bool,
+        ready_observed: bool,
+        request_collected: bool,
+    }
+
+    let mut app = App::new();
+    let router = install_atomic_router(&mut app, "normal-stage-observation");
+    app.update();
+    app.init_resource::<Probe>()
+        .add_observer(
+            |event: On<StageEvent>,
+             mut probe: ResMut<Probe>,
+             mut navigation: ResMut<RouterNavigation>| {
+                match &*event {
+                    StageEvent::Hover => probe.hover_observed = true,
+                    StageEvent::Navigate(router) => {
+                        navigation.push(*router, RouteLocation::new("/")).unwrap();
+                    }
+                }
+            },
+        )
+        .add_systems(
+            PreUpdate,
+            (|mut commands: Commands| commands.trigger(StageEvent::Hover))
+                .in_set(bevy_picking::PickingSystems::Hover),
+        )
+        .add_systems(
+            PreUpdate,
+            (|mut probe: ResMut<Probe>| probe.ready_observed = probe.hover_observed)
+                .after(crate::plugin::RouterInputSet::Ready),
+        )
+        .add_systems(
+            Update,
+            (move |mut commands: Commands| commands.trigger(StageEvent::Navigate(router)))
+                .after(RouterLifecycleSet::ObserveAuthority)
+                .before(RouterLifecycleSet::CollectNavigation),
+        )
+        .add_systems(
+            Update,
+            (|navigation: Res<RouterNavigation>, mut probe: ResMut<Probe>| {
+                probe.request_collected = navigation.entries[0].engine.has_action();
+            })
+            .after(RouterLifecycleSet::CollectNavigation)
+            .before(RouterLifecycleSet::DriveNavigation),
+        );
+    app.update();
+
+    let probe = app.world().resource::<Probe>();
+    assert!(probe.ready_observed);
+    assert!(probe.request_collected);
 }
 
 fn install_atomic_router_at_pattern(app: &mut App, label: &str, pattern: &str) -> RouterHandle {

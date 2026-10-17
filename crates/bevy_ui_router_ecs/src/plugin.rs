@@ -157,6 +157,7 @@ mod tests {
     };
     use bevy_app::PreUpdate;
     use bevy_ecs::schedule::{ApplyDeferred, ScheduleLabel, Schedules};
+    use bevy_ecs::system::{IntoSystem, System};
     use std::any::TypeId;
 
     #[test]
@@ -213,6 +214,30 @@ mod tests {
         };
         assert_eq!(installed_systems.0.len(), 6);
         assert_eq!(installed_systems.1.len(), 3);
+        for (label, kind) in [
+            (
+                Update.intern(),
+                IntoSystem::into_system(collect_navigation_system).system_type(),
+            ),
+            (
+                PreUpdate.intern(),
+                IntoSystem::into_system(input_ready_system).system_type(),
+            ),
+        ] {
+            let schedules = app.world().resource::<Schedules>();
+            let (_, system) = schedules
+                .get(label)
+                .unwrap()
+                .systems()
+                .unwrap()
+                .find(|(_, system)| system.system_type() == kind)
+                .unwrap();
+            assert!(
+                !system.is_exclusive(),
+                "{} needs no exclusive World access",
+                system.name()
+            );
+        }
         let resource_addresses = (
             app.world().resource::<RouteFocusState>() as *const _,
             app.world().resource::<RouterInputGate>() as *const _,

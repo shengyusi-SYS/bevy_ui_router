@@ -1,3 +1,4 @@
+use super::collect_navigation_for_test as collect_navigation_system;
 use super::*;
 use crate::prelude::*;
 use bevy_app::{App, TaskPoolPlugin};
