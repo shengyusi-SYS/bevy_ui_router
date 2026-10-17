@@ -3,8 +3,11 @@
 //! ROUTER_BENCH_SHAPE=flat (default) or nested selects equal-sized content trees.
 //! ROUTER_BENCH_MODE=keep_alive selects the separate retention comparison CSV.
 //! ROUTER_BENCH_MODE=instances measures parent/child inventory coordination.
+//! ROUTER_BENCH_MODE=steady isolates initial dynamic content and ordinary scroll observation.
 #[path = "router_baseline/retained_instances.rs"]
 mod retained_instances;
+#[path = "router_baseline/steady.rs"]
+mod steady;
 use std::{
     sync::{
         Arc,
@@ -104,7 +107,14 @@ fn assert_content_shape(app: &mut App, page: Entity, count: usize, shape: Conten
         max_depth = max_depth.max(depth);
     }
     // Existing sizes: one leaf, or enough nodes to populate all four levels.
-    assert_eq!(max_depth, if count == 1 { 1 } else { shape.levels() });
+    assert_eq!(
+        max_depth,
+        match count {
+            0 => 0,
+            1 => 1,
+            _ => shape.levels(),
+        }
+    );
 }
 
 #[derive(Component, Clone, Default)]
@@ -752,6 +762,10 @@ fn main() {
         }
     );
     match std::env::var("ROUTER_BENCH_MODE") {
+        Ok(mode) if mode == "steady" => {
+            steady::run(shape, samples);
+            return;
+        }
         Ok(mode) if mode == "instances" => {
             retained_instances::run(shape, samples);
             return;
@@ -766,7 +780,9 @@ fn main() {
             return;
         }
         Err(std::env::VarError::NotPresent) => {}
-        mode => panic!("ROUTER_BENCH_MODE must be unset, keep_alive or instances, got {mode:?}"),
+        mode => {
+            panic!("ROUTER_BENCH_MODE must be unset, steady, keep_alive or instances, got {mode:?}")
+        }
     }
     println!(
         "scenario,content_children,batch,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,retained_requests"

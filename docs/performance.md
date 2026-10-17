@@ -25,6 +25,18 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 
 先比较相同工作下的绝对 p50/p95、update 数与波动，再决定 profile 或重构。CI 仅运行上述 smoke，不设置共享机器上的耗时阈值。
 
+## 初始动态页面对照
+
+现有夹具的 `steady` 模式只测首次导航后的空闲路径，避免以反复导航或大量请求记录解释初始页面成本：
+
+```sh
+ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > initial-steady.csv
+```
+
+每组 6 行：128/1024 个普通内容节点各测无 Router 控制、两层 native frame 的初始页，以及同页增加一个普通 `RouteScroll + ScrollPosition` 后的空闲更新。内容通过公开 World 在 publication 后动态创建；仅一条请求、一项 history，不使用 keep-alive。`nested` 沿用四层内容树；`flat` 可按需作形状对照。普通样本数和 32 update 批均值沿用现有方法。
+
+这个对照隔离路由归属和输入/滚动观察，不安装 UI layout、camera、picking 或 renderer；它不能测布局采样、视觉滚动或整应用开销。行为 smoke 将 `cargo bench` 换为 `cargo test` 并加 `-- --test`。
+
 ## Keep-alive 对照
 
 使用同一 benchmark 的独立模式；不改变默认模式的 48 行 CSV，也不把旧 `retained_requests` 列当作缓存实例数：
