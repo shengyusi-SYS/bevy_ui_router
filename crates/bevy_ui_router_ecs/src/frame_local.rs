@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
+    entity::EntityHashSet,
     hierarchy::{ChildOf, Children},
     prelude::{Entity, World},
 };
@@ -64,6 +65,7 @@ fn collect_frame_local_entities_with_policy(
 struct FrameLocalEntities {
     physical: Vec<Entity>,
     native_managed: Option<Vec<Entity>>,
+    native_membership: Option<EntityHashSet>,
 }
 
 fn observe_frame_local_entities_with_policy(
@@ -73,15 +75,7 @@ fn observe_frame_local_entities_with_policy(
     registry: &RouteEntityRegistry,
     manifest_policy: ManifestPolicy,
 ) -> Result<FrameLocalEntities, FrameLocalError> {
-    if world.get_entity(root).is_err() || registry.record(root).is_none() {
-        return Err(FrameLocalError::MissingRoot(root));
-    }
-    if !matches!(
-        registry.record(root).map(RouteEntityRecord::owner),
-        Some(RegistryOwner::Committed(EntityOwner::FrameShell(owner))) if owner == frame
-    ) {
-        return Err(FrameLocalError::OwnershipDrift(root));
-    }
+    validate_frame_local_root(world, frame, root, registry)?;
 
     #[cfg(feature = "bsn")]
     if let Some(content_root) = world.get::<Children>(root).and_then(|children| {
@@ -92,27 +86,8 @@ fn observe_frame_local_entities_with_policy(
         })
     }) {
         let content =
-            crate::presentation::native_frame::collect_content(world, frame, content_root)?;
-        let mut structure = vec![root, content_root];
-        for entity in &content {
-            for child in world
-                .get::<Children>(*entity)
-                .into_iter()
-                .flat_map(|children| children.iter().copied())
-            {
-                if let Some(record) = registry.record(child) {
-                    if !matches!(record.owner(), RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. }) if parent == frame)
-                    {
-                        return Err(FrameLocalError::OwnershipDrift(child));
-                    }
-                    structure.push(child);
-                }
-            }
-        }
-        return Ok(FrameLocalEntities {
-            physical: structure,
-            native_managed: Some(content),
-        });
+            crate::presentation::native_frame::observe_content(world, frame, content_root)?;
+        return frame_local_entities_from_native_content(frame, root, registry, content);
     }
 
     let mut visited = HashSet::new();
@@ -165,6 +140,50 @@ fn observe_frame_local_entities_with_policy(
     Ok(FrameLocalEntities {
         physical: ordered,
         native_managed: None,
+        native_membership: None,
+    })
+}
+
+fn validate_frame_local_root(
+    world: &World,
+    frame: &RouteFrameVersion,
+    root: Entity,
+    registry: &RouteEntityRegistry,
+) -> Result<(), FrameLocalError> {
+    if world.get_entity(root).is_err() || registry.record(root).is_none() {
+        return Err(FrameLocalError::MissingRoot(root));
+    }
+    if !matches!(
+        registry.record(root).map(RouteEntityRecord::owner),
+        Some(RegistryOwner::Committed(EntityOwner::FrameShell(owner))) if owner == frame
+    ) {
+        return Err(FrameLocalError::OwnershipDrift(root));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bsn")]
+fn frame_local_entities_from_native_content(
+    frame: &RouteFrameVersion,
+    root: Entity,
+    registry: &RouteEntityRegistry,
+    content: crate::presentation::native_frame::NativeContentObservation<'_>,
+) -> Result<FrameLocalEntities, FrameLocalError> {
+    let mut physical = Vec::with_capacity(2 + content.child_slots.len());
+    physical.extend([root, content.root]);
+    for child in content.child_slots {
+        if !matches!(
+            registry.record(child).map(RouteEntityRecord::owner),
+            Some(RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. })) if parent == frame
+        ) {
+            return Err(FrameLocalError::OwnershipDrift(child));
+        }
+        physical.push(child);
+    }
+    Ok(FrameLocalEntities {
+        physical,
+        native_managed: Some(content.managed),
+        native_membership: Some(content.membership),
     })
 }
 
@@ -437,7 +456,8 @@ pub(crate) fn validate_active_branch_with_entering(
 }
 
 /// Facts from the successful active proof, usable only while its World stays
-/// immutably borrowed. Managed content never substitutes for the focus closure.
+/// immutably borrowed. Native focus membership also includes the proved shell
+/// and committed cut slots; managed content alone is never the focus closure.
 pub(crate) struct ActiveBranchObservation<'w> {
     frames: Vec<ActiveFrameObservation<'w>>,
 }
@@ -452,6 +472,7 @@ pub(crate) struct ActiveFrameObservation<'w> {
     world: &'w World,
     frame: &'w crate::presentation::RealizedFrame,
     managed: Vec<Entity>,
+    native_membership: Option<EntityHashSet>,
 }
 
 impl ActiveFrameObservation<'_> {
@@ -461,6 +482,13 @@ impl ActiveFrameObservation<'_> {
 
     pub(crate) fn managed_content_entities(&self) -> &[Entity] {
         &self.managed
+    }
+
+    pub(crate) fn contains_managed_content(&self, entity: Entity) -> bool {
+        self.native_membership.as_ref().map_or_else(
+            || self.managed.contains(&entity),
+            |membership| membership.contains(&entity),
+        )
     }
 
     pub(crate) fn content_input_facts(&self) -> (&[Entity], Vec<Entity>) {
@@ -490,14 +518,18 @@ pub(crate) fn observe_active_branch_with_entering<'w>(
         entering.map(Into::into),
         staging_allowance,
         None,
-        |frame, native_managed| {
-            frames.push(ActiveFrameObservation {
-                world,
-                frame,
-                managed: native_managed
-                    .unwrap_or_else(|| frame.claims().map(|claim| claim.entity()).collect()),
-            });
-        },
+        Some(
+            |frame: &'w crate::presentation::RealizedFrame, local: FrameLocalEntities| {
+                frames.push(ActiveFrameObservation {
+                    world,
+                    frame,
+                    managed: local
+                        .native_managed
+                        .unwrap_or_else(|| frame.claims().map(|claim| claim.entity()).collect()),
+                    native_membership: local.native_membership,
+                });
+            },
+        ),
     )?;
     Ok(ActiveBranchObservation { frames })
 }
@@ -614,7 +646,7 @@ fn validate_committed_branch_with_entering(
         entering,
         staging_allowance,
         sealed_slot_roles,
-        |_, _| {},
+        None::<fn(&crate::presentation::RealizedFrame, FrameLocalEntities)>,
     )
 }
 
@@ -625,7 +657,9 @@ fn validate_committed_branch_with_entering_and_observe<'w>(
     entering: Option<crate::instance::PayloadRef<'_>>,
     staging_allowance: Option<&SealedMountNewStagingAllowance>,
     sealed_slot_roles: Option<&[SealedReconciliationSlotRole]>,
-    mut observe_frame: impl FnMut(&'w crate::presentation::RealizedFrame, Option<Vec<Entity>>),
+    mut active_observer: Option<
+        impl FnMut(&'w crate::presentation::RealizedFrame, FrameLocalEntities),
+    >,
 ) -> Result<Vec<Entity>, FrameLocalError> {
     validate_branch_structure(branch)?;
     if let Some(allowance) = staging_allowance.filter(|allowance| {
@@ -646,6 +680,9 @@ fn validate_committed_branch_with_entering_and_observe<'w>(
         }
     }
     let mut sealed_entering_shells = Vec::new();
+    // An active observer consumes membership only. Callers requesting a focus
+    // vector retain the canonical World traversal below.
+    let mut native_focus = active_observer.as_ref().map(|_| EntityHashSet::default());
     for slot in branch.child_slots() {
         let occupied = branch
             .frames()
@@ -766,8 +803,11 @@ fn validate_committed_branch_with_entering_and_observe<'w>(
                 allowance.expected_anchor_children().to_vec(),
             ));
         }
-        let valid = if leaving {
-            validate_leaving_frame_with_child_slots(world, frame, &child_slots)
+        let (valid, native_local) = if leaving {
+            (
+                validate_leaving_frame_with_child_slots(world, frame, &child_slots),
+                None,
+            )
         } else {
             let entering_shells = entering
                 .into_iter()
@@ -778,11 +818,46 @@ fn validate_committed_branch_with_entering_and_observe<'w>(
             if entering_shells.len() > 1 {
                 return Err(FrameLocalError::OwnershipDrift(frame.shell()));
             }
-            let valid = validate_active_frame_with_child_slots_and_entering_shells(
-                world,
-                frame,
-                &child_slots,
-                &entering_shells,
+            #[cfg(feature = "bsn")]
+            let (valid, native_local) = if native_focus.is_some() && frame.native_root().is_some() {
+                match crate::presentation::observe_active_native_frame(
+                    world,
+                    frame,
+                    &entering_shells,
+                ) {
+                    Some(content) => {
+                        let registry = world.resource::<RouteEntityRegistry>();
+                        validate_frame_local_root(world, frame.frame(), frame.shell(), registry)?;
+                        let local = frame_local_entities_from_native_content(
+                            frame.frame(),
+                            frame.shell(),
+                            registry,
+                            content,
+                        )?;
+                        (true, Some(local))
+                    }
+                    None => (false, None),
+                }
+            } else {
+                (
+                    validate_active_frame_with_child_slots_and_entering_shells(
+                        world,
+                        frame,
+                        &child_slots,
+                        &entering_shells,
+                    ),
+                    None,
+                )
+            };
+            #[cfg(not(feature = "bsn"))]
+            let (valid, native_local) = (
+                validate_active_frame_with_child_slots_and_entering_shells(
+                    world,
+                    frame,
+                    &child_slots,
+                    &entering_shells,
+                ),
+                None,
             );
             if valid {
                 sealed_entering_shells.extend(entering_shells);
@@ -794,23 +869,62 @@ fn validate_committed_branch_with_entering_and_observe<'w>(
                         .cloned(),
                 );
             }
-            valid
+            (valid, native_local)
         };
         if !valid {
             return Err(FrameLocalError::OwnershipDrift(frame.shell()));
         }
-        let native_managed = observe_frame_claim_set(
+        let local = observe_frame_claim_set_with_local(
             world,
             frame.frame(),
             frame.shell(),
             frame.claims(),
             branch,
-            ManifestPolicy::Observed,
             &external_boundaries,
+            |registry| match native_local {
+                Some(local) => Ok(local),
+                None => observe_frame_local_entities_with_policy(
+                    world,
+                    frame.frame(),
+                    frame.shell(),
+                    registry,
+                    ManifestPolicy::Observed,
+                ),
+            },
         )?;
-        observe_frame(frame, native_managed);
+        if let (Some(seen), Some(managed)) = (native_focus.as_mut(), local.native_managed.as_ref())
+            && frame.native_root().is_some()
+        {
+            // Values prove the shell has exactly this content root. The content
+            // walk proves every managed descendant and cut edge; the local and
+            // claim proofs above require every cut slot to be committed/exact.
+            for entity in local
+                .physical
+                .iter()
+                .copied()
+                .chain(managed.iter().copied().skip(1))
+            {
+                if !seen.insert(entity) {
+                    return Err(FrameLocalError::RelationshipCycle(entity));
+                }
+            }
+        }
+        if let Some(observe_frame) = active_observer.as_mut() {
+            observe_frame(frame, local);
+        }
     }
-    validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells, &[])
+    if let Some(native_focus) = native_focus {
+        validate_branch_descendants_with_native_membership(
+            world,
+            branch,
+            &sealed_entering_shells,
+            &[],
+            Some(native_focus),
+        )?;
+        Ok(Vec::new())
+    } else {
+        validate_branch_descendants_allowing_entering(world, branch, &sealed_entering_shells, &[])
+    }
 }
 
 fn validate_sealed_existing_slot_role(
@@ -1087,7 +1201,29 @@ fn observe_frame_claim_set<'a, 'payload>(
     branch: impl Into<crate::instance::PayloadRef<'payload>>,
     manifest_policy: ManifestPolicy,
     external_boundaries: &[Entity],
-) -> Result<Option<Vec<Entity>>, FrameLocalError> {
+) -> Result<FrameLocalEntities, FrameLocalError> {
+    observe_frame_claim_set_with_local(
+        world,
+        frame,
+        root,
+        claims,
+        branch,
+        external_boundaries,
+        |registry| {
+            observe_frame_local_entities_with_policy(world, frame, root, registry, manifest_policy)
+        },
+    )
+}
+
+fn observe_frame_claim_set_with_local<'a, 'payload>(
+    world: &World,
+    frame: &RouteFrameVersion,
+    root: Entity,
+    claims: impl Iterator<Item = &'a crate::registry::ExactRegistryClaim>,
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
+    external_boundaries: &[Entity],
+    observe_local: impl FnOnce(&RouteEntityRegistry) -> Result<FrameLocalEntities, FrameLocalError>,
+) -> Result<FrameLocalEntities, FrameLocalError> {
     let branch = branch.into();
     let registry = world
         .get_resource::<RouteEntityRegistry>()
@@ -1100,8 +1236,7 @@ fn observe_frame_claim_set<'a, 'payload>(
     }) {
         return Err(FrameLocalError::OwnershipDrift(stale.entity()));
     }
-    let physical =
-        observe_frame_local_entities_with_policy(world, frame, root, registry, manifest_policy)?;
+    let physical = observe_local(registry)?;
     let expected = claims
         .iter()
         .map(|claim| claim.entity())
@@ -1117,14 +1252,14 @@ fn observe_frame_claim_set<'a, 'payload>(
             return Err(FrameLocalError::ForeignChildSlot(*boundary));
         }
     }
-    let actual = physical.physical.into_iter().collect::<HashSet<_>>();
+    let actual = physical.physical.iter().copied().collect::<HashSet<_>>();
     if actual.len() != expected.len() + boundaries.len()
         || !expected.is_subset(&actual)
         || !boundaries.is_subset(&actual)
     {
         return Err(FrameLocalError::OwnershipDrift(root));
     }
-    Ok(physical.native_managed)
+    Ok(physical)
 }
 
 pub(crate) fn validate_branch_descendants<'payload>(
@@ -1149,6 +1284,24 @@ fn validate_branch_descendants_allowing_entering<'payload>(
     sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
     opaque_boundaries: &[Entity],
 ) -> Result<Vec<Entity>, FrameLocalError> {
+    validate_branch_descendants_with_native_membership(
+        world,
+        branch,
+        sealed_entering_shells,
+        opaque_boundaries,
+        None,
+    )
+}
+
+/// Only the active observation may supply native membership. Canonical callers
+/// always collect their original ordered focus projection from World.
+fn validate_branch_descendants_with_native_membership<'payload>(
+    world: &World,
+    branch: impl Into<crate::instance::PayloadRef<'payload>>,
+    sealed_entering_shells: &[crate::registry::ExactRegistryClaim],
+    opaque_boundaries: &[Entity],
+    native_membership: Option<EntityHashSet>,
+) -> Result<Vec<Entity>, FrameLocalError> {
     let branch = branch.into();
     if branch.frames().is_empty() {
         return Ok(Vec::new());
@@ -1157,8 +1310,12 @@ fn validate_branch_descendants_allowing_entering<'payload>(
         .get_resource::<RouteEntityRegistry>()
         .ok_or_else(|| FrameLocalError::MissingRoot(branch.frames()[0].shell()))?;
     let mut ordered = Vec::new();
-    let mut branch_seen = HashSet::new();
+    let observed_native = native_membership.is_some();
+    let mut branch_seen = native_membership.unwrap_or_default();
     for frame in branch.frames() {
+        if observed_native && frame.native_root().is_some() {
+            continue;
+        }
         let local = collect_frame_focus_unit(
             world,
             frame.frame(),
@@ -1322,7 +1479,7 @@ fn collect_child_slot_foreign_focus(
 
 fn extend_focus_closure(
     ordered: &mut Vec<Entity>,
-    seen: &mut HashSet<Entity>,
+    seen: &mut EntityHashSet,
     unit: Vec<Entity>,
 ) -> Result<(), FrameLocalError> {
     for entity in unit {

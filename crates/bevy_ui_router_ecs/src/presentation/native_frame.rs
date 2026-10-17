@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use bevy_asset::UntypedHandle;
 use bevy_ecs::{
-    entity::Entity,
+    entity::{Entity, EntityHashSet},
     hierarchy::{ChildOf, Children},
     world::World,
 };
@@ -368,13 +368,29 @@ impl NativeFrameFailure {
     }
 }
 
-/// Current frame-local content, excluding all child slots and their frames.
-/// The root's exact structural claim is the authority; returned entities are facts only.
+/// One immutable observation of managed content and its cut child-slot boundaries.
+/// The root's exact structural claim remains the authority; these are facts only.
+pub(crate) struct NativeContentObservation<'w> {
+    pub(crate) root: Entity,
+    pub(crate) managed: Vec<Entity>,
+    pub(crate) child_slots: Vec<Entity>,
+    pub(crate) membership: EntityHashSet,
+    _world: &'w World,
+}
+
 pub(crate) fn collect_content(
     world: &World,
     frame: &RouteFrameVersion,
     root: Entity,
 ) -> Result<Vec<Entity>, crate::frame_local::FrameLocalError> {
+    observe_content(world, frame, root).map(|observation| observation.managed)
+}
+
+pub(crate) fn observe_content<'w>(
+    world: &'w World,
+    frame: &RouteFrameVersion,
+    root: Entity,
+) -> Result<NativeContentObservation<'w>, crate::frame_local::FrameLocalError> {
     use crate::frame_local::FrameLocalError;
     let registry = world.resource::<RouteEntityRegistry>();
     let root_record = registry
@@ -388,9 +404,10 @@ pub(crate) fn collect_content(
     {
         return Err(FrameLocalError::OwnershipDrift(root));
     }
-    let mut seen = HashSet::new();
+    let mut seen = EntityHashSet::default();
     let mut pending = vec![root];
     let mut content = Vec::new();
+    let mut child_slots = Vec::new();
     while let Some(entity) = pending.pop() {
         if !seen.insert(entity) {
             return Err(FrameLocalError::RelationshipCycle(entity));
@@ -427,18 +444,30 @@ pub(crate) fn collect_content(
             return Err(FrameLocalError::OwnershipDrift(entity));
         }
         content.push(entity);
-        let children = world
-            .get::<Children>(entity)
-            .map(|children| children.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for child in &children {
-            if world.get::<ChildOf>(*child).map(ChildOf::parent) != Some(entity) {
-                return Err(FrameLocalError::OwnershipDrift(*child));
+        if let Some(children) = world.get::<Children>(entity) {
+            for child in children.iter().copied() {
+                if world.get::<ChildOf>(child).map(ChildOf::parent) != Some(entity) {
+                    return Err(FrameLocalError::OwnershipDrift(child));
+                }
+                // Preserve the physical enumeration order: managed parent order,
+                // then its authored children. The later visit proves each cut.
+                if registry.record(child).is_some() {
+                    child_slots.push(child);
+                }
             }
+            pending.extend(children.iter().rev().copied());
         }
-        pending.extend(children.into_iter().rev());
     }
-    Ok(content)
+    for slot in &child_slots {
+        seen.remove(slot);
+    }
+    Ok(NativeContentObservation {
+        root,
+        managed: content,
+        child_slots,
+        membership: seen,
+        _world: world,
+    })
 }
 
 pub(crate) fn realize_native_root(
@@ -866,9 +895,15 @@ pub(super) fn validate_native_values(
     frame: &RealizedFrame,
     lifecycle: EntityLifecycle,
 ) -> bool {
-    let Some(root) = frame.native_root() else {
-        return false;
-    };
+    observe_native_values(world, frame, lifecycle).is_some()
+}
+
+pub(super) fn observe_native_values<'w>(
+    world: &'w World,
+    frame: &RealizedFrame,
+    lifecycle: EntityLifecycle,
+) -> Option<NativeContentObservation<'w>> {
+    let root = frame.native_root()?;
     let active = lifecycle == EntityLifecycle::Active;
     let expected_node = Node {
         display: if active { Display::Flex } else { Display::None },
@@ -877,7 +912,7 @@ pub(super) fn validate_native_values(
         ..Node::default()
     };
     let registry = world.resource::<RouteEntityRegistry>();
-    frame.entities.iter().all(|entity| {
+    let valid = frame.entities.iter().all(|entity| {
         registry
             .record(entity.entity)
             .is_some_and(|record| record.claim() == entity.claim && record.lifecycle() == lifecycle)
@@ -899,8 +934,11 @@ pub(super) fn validate_native_values(
             .is_some_and(RouterInputBarrier::denies_all)
         && world
             .get::<Children>(frame.shell())
-            .is_some_and(|children| children.len() == 1 && children[0] == root)
-        && collect_content(world, frame.frame(), root).is_ok()
+            .is_some_and(|children| children.len() == 1 && children[0] == root);
+    if !valid {
+        return None;
+    }
+    observe_content(world, frame.frame(), root).ok()
 }
 
 #[cfg(test)]
@@ -914,7 +952,9 @@ mod tests {
     use bevy_ui_router_core::prelude::*;
     use bevy_ui_router_view::prelude::*;
 
-    fn active_native_frame() -> (App, Entity, RealizedFrame) {
+    fn active_native_branch(
+        nested: bool,
+    ) -> (App, Entity, crate::branch_transaction::RealizedBranch) {
         let mut app = App::new();
         app.add_plugins((
             TaskPoolPlugin::default(),
@@ -930,20 +970,43 @@ mod tests {
             })
             .unwrap();
         let view = RouteViewKey::new("native").unwrap();
-        let routes = RouteTree::builder()
-            .root_with_options(
-                RoutePattern::path("/").unwrap(),
-                RouteNodeOptions::new().with_view(view.clone()),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
         let mut views = RouteViewRegistry::new();
         views
             .insert(view.clone(), RouteViewDescriptor::new(driver))
             .unwrap();
+        let root_view = if nested {
+            let driver = app
+                .register_bsn_view(ViewDriverKey::new("observation-layout").unwrap(), |_| {
+                    Ok(bsn! { Node DefaultOutlet })
+                })
+                .unwrap();
+            let key = RouteViewKey::new("layout").unwrap();
+            views
+                .insert(key.clone(), RouteViewDescriptor::new(driver))
+                .unwrap();
+            key
+        } else {
+            view.clone()
+        };
+        let mut routes = RouteTree::builder()
+            .root_with_options(
+                RoutePattern::path("/").unwrap(),
+                RouteNodeOptions::new().with_view(root_view),
+            )
+            .unwrap();
+        if nested {
+            routes
+                .route_with_options(
+                    routes.root_id().unwrap(),
+                    RoutePattern::path("child").unwrap(),
+                    RouteNodeOptions::new()
+                        .with_view(view.clone())
+                        .with_slot(RouteSlotKey::default()),
+                )
+                .unwrap();
+        }
         let router = app
-            .add_ui_router(RouterConfig::new(routes, views, view))
+            .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, view))
             .unwrap();
         let host = app
             .world_mut()
@@ -953,7 +1016,10 @@ mod tests {
         let request = app
             .world_mut()
             .resource_mut::<RouterNavigation>()
-            .push(router, RouteLocation::new("/"))
+            .push(
+                router,
+                RouteLocation::new(if nested { "/child" } else { "/" }),
+            )
             .unwrap();
         for _ in 0..12 {
             app.update();
@@ -965,8 +1031,128 @@ mod tests {
             .active
             .take()
             .unwrap();
+        (app, host, branch)
+    }
+
+    fn active_native_frame() -> (App, Entity, RealizedFrame) {
+        let (app, host, branch) = active_native_branch(false);
         let frame = branch.into_single_frame().ok().flatten().unwrap();
         (app, host, frame)
+    }
+
+    #[test]
+    fn active_native_observation_preserves_boundaries_and_rechecks_dynamic_membership() {
+        let (mut app, _, branch) = active_native_branch(true);
+        assert_eq!(branch.frames().len(), 2);
+        let parent = &branch.frames()[0];
+        let child = &branch.frames()[1];
+        let slot = branch.child_slots()[0].slot();
+        let dynamic = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(child.native_root().unwrap())))
+            .id();
+        let application = app.world_mut().spawn_empty().id();
+
+        let focus = crate::frame_local::validate_active_branch_with_entering(
+            app.world(),
+            &branch,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(focus.contains(&parent.shell()));
+        assert!(focus.contains(&slot));
+        assert!(focus.contains(&child.shell()));
+        assert!(focus.contains(&dynamic));
+        let observed = crate::frame_local::observe_active_branch_with_entering(
+            app.world(),
+            &branch,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!observed.frames()[0].contains_managed_content(slot));
+        assert!(!observed.frames()[0].contains_managed_content(child.shell()));
+        assert!(!observed.frames()[0].contains_managed_content(dynamic));
+        assert!(observed.frames()[1].contains_managed_content(dynamic));
+        for (frame, observed) in branch.frames().iter().zip(observed.frames()) {
+            let expected =
+                collect_content(app.world(), frame.frame(), frame.native_root().unwrap()).unwrap();
+            assert_eq!(observed.managed_content_entities(), expected.as_slice());
+        }
+        drop(observed);
+
+        app.world_mut()
+            .entity_mut(dynamic)
+            .insert(ChildOf(application));
+        let observed = crate::frame_local::observe_active_branch_with_entering(
+            app.world(),
+            &branch,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!observed.frames()[1].contains_managed_content(dynamic));
+        drop(observed);
+
+        let slot_sibling = app.world_mut().spawn(ChildOf(slot)).id();
+        assert!(
+            crate::frame_local::validate_active_branch_with_entering(
+                app.world(),
+                &branch,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::frame_local::observe_active_branch_with_entering(
+                app.world(),
+                &branch,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(app.world_mut().despawn(slot_sibling));
+        assert!(
+            crate::frame_local::validate_active_branch_with_entering(
+                app.world(),
+                &branch,
+                None,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::frame_local::observe_active_branch_with_entering(
+                app.world(),
+                &branch,
+                None,
+                None,
+            )
+            .is_ok()
+        );
+
+        app.world_mut().spawn(ChildOf(parent.shell()));
+        assert!(
+            crate::frame_local::validate_active_branch_with_entering(
+                app.world(),
+                &branch,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::frame_local::observe_active_branch_with_entering(
+                app.world(),
+                &branch,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

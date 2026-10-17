@@ -250,6 +250,13 @@ pub(crate) fn eligible_containers(world: &mut World) -> HashSet<Entity> {
         .collect()
 }
 
+fn marked_containers(world: &mut World) -> Vec<Entity> {
+    // Disabled and incomplete markers still participate in duplicate-key
+    // detection, just as they do when observed through native containment.
+    let mut query = crate::input::query_including_disabled::<(Entity, &RouteScroll)>(world);
+    query.iter(world).map(|(entity, _)| entity).collect()
+}
+
 fn containers<'a>(
     world: &World,
     frames: impl Iterator<Item = &'a RealizedFrame>,
@@ -270,47 +277,63 @@ fn containers_from_membership<'a, M: AsRef<[Entity]>>(
     let mut result = Vec::new();
     let mut duplicates = Vec::new();
     for (frame, managed) in frames {
-        let managed = managed.as_ref();
-        let mut keys = HashMap::<&str, usize>::new();
-        for entity in managed {
-            if let Some(marker) = world.get::<RouteScroll>(*entity) {
-                *keys.entry(&marker.key).or_default() += 1;
-            }
-        }
-        let mut duplicate_keys = keys
-            .iter()
-            .filter(|(_, count)| **count != 1)
-            .map(|(key, _)| (*key).to_owned())
-            .collect::<Vec<_>>();
-        duplicate_keys.sort();
-        duplicates.extend(
-            duplicate_keys
-                .into_iter()
-                .map(|key| (frame.frame().clone(), key)),
+        let (containers, keys) = frame_containers(
+            world,
+            frame.frame(),
+            managed.as_ref().iter().copied(),
+            eligible,
         );
-        let mut frame_containers = Vec::new();
-        for entity in managed.iter().copied() {
-            let Some(marker) = world.get::<RouteScroll>(entity) else {
-                continue;
-            };
-            if keys.get(marker.key.as_str()) != Some(&1) || !eligible.contains(&entity) {
-                continue;
-            }
-            let Some(position) = world.get::<ScrollPosition>(entity) else {
-                continue;
-            };
-            frame_containers.push(Container {
-                frame: frame.frame().clone(),
-                entity,
-                key: marker.key.clone(),
-                policy: marker.policy,
-                position: position.clone(),
-            });
-        }
-        frame_containers.sort_by(|a, b| a.key.cmp(&b.key));
-        result.extend(frame_containers);
+        result.extend(containers);
+        duplicates.extend(keys);
     }
     (result, duplicates)
+}
+
+fn frame_containers(
+    world: &World,
+    frame: &RouteFrameVersion,
+    candidates: impl Iterator<Item = Entity>,
+    eligible: &HashSet<Entity>,
+) -> (Vec<Container>, DuplicateKeys) {
+    let marked = candidates
+        .filter_map(|entity| {
+            world
+                .get::<RouteScroll>(entity)
+                .map(|marker| (entity, marker))
+        })
+        .collect::<Vec<_>>();
+    let mut keys = HashMap::<&str, usize>::new();
+    for (_, marker) in &marked {
+        *keys.entry(&marker.key).or_default() += 1;
+    }
+    let mut duplicate_keys = keys
+        .iter()
+        .filter(|(_, count)| **count != 1)
+        .map(|(key, _)| (*key).to_owned())
+        .collect::<Vec<_>>();
+    duplicate_keys.sort();
+    let duplicates = duplicate_keys
+        .into_iter()
+        .map(|key| (frame.clone(), key))
+        .collect();
+    let mut frame_containers = Vec::new();
+    for (entity, marker) in marked {
+        if keys.get(marker.key.as_str()) != Some(&1) || !eligible.contains(&entity) {
+            continue;
+        }
+        let Some(position) = world.get::<ScrollPosition>(entity) else {
+            continue;
+        };
+        frame_containers.push(Container {
+            frame: frame.clone(),
+            entity,
+            key: marker.key.clone(),
+            policy: marker.policy,
+            position: position.clone(),
+        });
+    }
+    frame_containers.sort_by(|a, b| a.key.cmp(&b.key));
+    (frame_containers, duplicates)
 }
 
 fn reuse_key<'a>(
@@ -559,6 +582,7 @@ fn observe_active(
     world: &World,
     handle: crate::RouterHandle,
     eligible: &HashSet<Entity>,
+    marked: &[Entity],
 ) -> ActiveObservation {
     let navigation = world.resource::<RouterNavigation>();
     let entry = navigation
@@ -585,14 +609,17 @@ fn observe_active(
             )
             .ok()
         });
-    let (containers, duplicates) = containers_from_membership(
-        world,
-        observation
+    let mut containers = Vec::new();
+    let mut duplicates = Vec::new();
+    for frame in observation.iter().flat_map(|branch| branch.frames()) {
+        let candidates = marked
             .iter()
-            .flat_map(|branch| branch.frames())
-            .map(|frame| (frame.frame(), frame.managed_content_entities())),
-        eligible,
-    );
+            .copied()
+            .filter(|entity| frame.contains_managed_content(*entity));
+        let (local, keys) = frame_containers(world, frame.frame().frame(), candidates, eligible);
+        containers.extend(local);
+        duplicates.extend(keys);
+    }
     ActiveObservation {
         entry: observation
             .as_ref()
@@ -621,8 +648,9 @@ pub(crate) fn prepare_scroll_system(world: &mut World) {
         return;
     }
     let eligible = eligible_containers(world);
+    let marked = marked_containers(world);
     for handle in handles {
-        let observation = observe_active(world, handle, &eligible);
+        let observation = observe_active(world, handle, &eligible, &marked);
         let pending = {
             let mut navigation = world.resource_mut::<RouterNavigation>();
             std::mem::take(
@@ -705,8 +733,9 @@ pub(crate) fn settle_scroll_system(
         .iter()
         .map(|entry| entry.handle)
         .collect::<Vec<_>>();
+    let marked = marked_containers(world);
     for handle in handles {
-        let mut observation = observe_active(world, handle, &eligible);
+        let mut observation = observe_active(world, handle, &eligible, &marked);
         let laid_out = laid_out_containers(world, &observation.containers, layout);
         let missing_layout = observation
             .containers

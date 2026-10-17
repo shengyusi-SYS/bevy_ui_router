@@ -32,8 +32,8 @@ use crate::{
         observe_validated_host_candidate, validated_host_candidate_is_current,
     },
     input::{
-        PointerStateResources, PreparedPointerMutation, RouteFocusState, pointer_query,
-        pointer_resource_entity,
+        PointerStateResources, PreparedPointerMutation, RouteFocusState, pointer_resource_entity,
+        query_including_disabled,
     },
     mount::MountedChildSlot,
     registry::{
@@ -3661,7 +3661,7 @@ fn prepare_presentation_access<'w>(
     let gate_entity = pointer_resource_entity::<crate::input::RouterInputGate>(world);
     let input_focus_entity = pointer_resource_entity::<InputFocus>(world);
     let route_focus_entity = pointer_resource_entity::<RouteFocusState>(world);
-    let mut query = pointer_query::<(
+    let mut query = query_including_disabled::<(
         Entity,
         Option<(
             &mut Visibility,
@@ -3951,13 +3951,12 @@ enum CommittedFramePreflight {
     ReadyWithQuarantine,
 }
 
-fn classify_committed_frame(
+fn committed_frame_boundary_is_valid(
     world: &World,
     frame: &RealizedFrame,
     role: CommittedFrameRole,
-    child_slots: &[(Entity, Vec<Entity>)],
     entering_shells: &[ExactRegistryClaim],
-) -> CommittedFramePreflight {
+) -> bool {
     let leaving_child_boundary = matches!(role, CommittedFrameRole::Leaving)
         && matches!(frame.mount.kind, FrameMountBindingKind::ChildOutlet { .. });
     let binding_valid = validate_committed_mount_binding(
@@ -3976,9 +3975,35 @@ fn classify_committed_frame(
         entering_shells,
         &[],
     );
-    if binding_valid && mount_children_valid {
-        // Continue with the role-sensitive closure checks below.
-    } else {
+    binding_valid && mount_children_valid
+}
+
+/// Reuse the native values/content proof only within the active read observation.
+#[cfg(feature = "bsn")]
+pub(crate) fn observe_active_native_frame<'w>(
+    world: &'w World,
+    frame: &RealizedFrame,
+    entering_shells: &[ExactRegistryClaim],
+) -> Option<native_frame::NativeContentObservation<'w>> {
+    if !committed_frame_boundary_is_valid(
+        world,
+        frame,
+        CommittedFrameRole::Preserved,
+        entering_shells,
+    ) {
+        return None;
+    }
+    native_frame::observe_native_values(world, frame, EntityLifecycle::Active)
+}
+
+fn classify_committed_frame(
+    world: &World,
+    frame: &RealizedFrame,
+    role: CommittedFrameRole,
+    child_slots: &[(Entity, Vec<Entity>)],
+    entering_shells: &[ExactRegistryClaim],
+) -> CommittedFramePreflight {
+    if !committed_frame_boundary_is_valid(world, frame, role, entering_shells) {
         return CommittedFramePreflight::Invalid;
     }
 

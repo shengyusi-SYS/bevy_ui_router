@@ -583,6 +583,29 @@ fn idle_retained_pages_preserve_focus_scroll_and_unchanged_public_resources() {
 }
 
 #[test]
+fn disabled_duplicate_marker_invalidates_the_last_display_witness() {
+    use bevy_ecs::entity_disabling::Disabled;
+
+    let (mut app, router) = app();
+    push(&mut app, router, "/a");
+    let a = page(&mut app, "a");
+    scroll(&mut app, a, Vec2::new(70.0, 140.0));
+    let duplicate = app
+        .world_mut()
+        .spawn((RouteScroll::new("body"), Disabled, ChildOf(a)))
+        .id();
+    app.update();
+    // Remove the invalid marker immediately before leaving. Publication must
+    // not revive a display witness invalidated by the preceding normal sample.
+    app.world_mut().despawn(duplicate);
+    push(&mut app, router, "/b");
+    back(&mut app, router);
+    let restored = page(&mut app, "a");
+    assert_ne!(restored, a);
+    assert_position(&app, restored, Vec2::ZERO);
+}
+
+#[test]
 fn repeated_entries_restore_distinct_positions_on_cache_hits_misses_and_eviction() {
     for capacity in [0, 1, 2] {
         let Fixture {

@@ -152,7 +152,9 @@ flowchart TB
 
 生命周期阶段先读取现有 action、task 和 cleanup owner；没有对应工作时不进入资源移出与物理执行路径。空闲 host 的 registration 仍每轮观察，异步 task 仍持续轮询。host 确认保持在原 entry 的资源作用域结束后，避免改变 publication 与 hook 的先后关系。
 
-输入刷新与滚动观察各自在连续的只读 World 借用内复用已验证的逐 frame 内容归属；focus closure 保持独立。写入后或进入另一调度阶段重新观察。滚动保留查询元数据，每轮仍读取当前布局和位置；等值快照不标记变化，权限不变且无待处理撤权时不写输入 gate。
+输入刷新与滚动观察各自在连续的只读 World 借用内复用逐 frame 事实。native 活动观察一次遍历得到受管内容、membership 与 child-slot 切口，再分别验证值、claims 和完整 focus 范围；focus 还包括 shell、已验证的 committed 切口与 slot 外侧闭包，不能只用 managed 内容代替。需要有序 focus 投影的通用调用保持原遍历与排序。
+
+写入后或进入另一调度阶段重新观察。普通滚动采样只用当前全部 `RouteScroll` marker 与已证明的内容 membership 相交，先判重复 key 再筛布局资格；disabled 或缺组件的 marker 也参与判重。publication 仍完整观察原内容边界。滚动保留查询元数据，每轮读取当前布局和位置；等值快照不标记变化，权限不变且无待处理撤权时不写输入 gate。
 
 `Refresh` 在 picking hover 前更新当前内容资格；hovermap 生成后、interaction 更新前
 过滤非活动目标。正常 publication 同次调用撤销离场目标的历史 hover、press、click、

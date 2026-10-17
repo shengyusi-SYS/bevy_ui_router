@@ -79,7 +79,7 @@ impl RouterInputGate {
         self.revoked = revoked;
     }
 
-    fn refresh_allowed(&mut self, allowed: &HashSet<Entity>, grants: &HashSet<Entity>) -> bool {
+    fn refresh_allowed(&mut self, allowed: &EntityHashSet, grants: &EntityHashSet) -> bool {
         if self.allowed.iter().all(|entity| allowed.contains(entity))
             && (self.allowed.len() == allowed.len()
                 || grants
@@ -260,10 +260,9 @@ pub(crate) fn pointer_resource_entity<R: Resource>(world: &World) -> Option<Enti
         .and_then(|id| world.resource_entities().get(id))
 }
 
-/// Native history must remain reachable after a target or resource entity is
-/// disabled. This is the dynamic equivalent of Allow<T> for the currently
-/// registered disabling components; it never changes the World's filters.
-pub(crate) fn pointer_query<D: QueryData>(world: &mut World) -> QueryState<D> {
+/// Include currently registered disabling components without changing World's
+/// filters, so native input history and route metadata remain observable.
+pub(crate) fn query_including_disabled<D: QueryData>(world: &mut World) -> QueryState<D> {
     let mut access = FilteredAccess::default();
     if let Some(filters) = world.get_resource::<DefaultQueryFilters>() {
         for component in filters.disabling_ids() {
@@ -391,10 +390,10 @@ fn try_prepare_pointer_revocations(
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
     let (allowed, grants, invalid_claims, ineligible_content) = {
         let navigation = world.resource::<crate::navigation::RouterNavigation>();
-        let mut allowed = HashSet::new();
-        let mut grants = HashSet::new();
+        let mut allowed = EntityHashSet::default();
+        let mut grants = EntityHashSet::default();
         let mut invalid_claims = Vec::new();
-        let mut ineligible_content = HashSet::new();
+        let mut ineligible_content = EntityHashSet::default();
         for branch in navigation
             .entries
             .iter()
@@ -409,7 +408,7 @@ pub(crate) fn refresh_input_gate_system(world: &mut World) {
             ) {
                 for frame in observation.frames() {
                     let (managed, eligible) = frame.content_input_facts();
-                    let eligible = eligible.into_iter().collect::<HashSet<_>>();
+                    let eligible = eligible.into_iter().collect::<EntityHashSet>();
                     ineligible_content.extend(
                         managed
                             .iter()
@@ -827,7 +826,7 @@ fn prepare_pointer_mutation<'w>(
     let hover_entity = pointer_resource_entity::<HoverMap>(world);
     let previous_hover_entity = pointer_resource_entity::<PreviousHoverMap>(world);
     let state_entity = pointer_resource_entity::<PointerState>(world);
-    let mut query = pointer_query::<(
+    let mut query = query_including_disabled::<(
         Entity,
         Option<&mut HoverMap>,
         Option<&mut PreviousHoverMap>,
