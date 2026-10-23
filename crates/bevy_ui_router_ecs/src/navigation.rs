@@ -5795,7 +5795,7 @@ impl RouterNavigation {
                         NavigationEnqueueErrorKind::HostUnavailable,
                     ));
                 }
-                match entry.engine.snapshot().availability() {
+                match entry.engine.availability() {
                     RouterAvailability::Ready => {}
                     RouterAvailability::RecoveringAuthority => {
                         return Err(NavigationEnqueueError::new(
@@ -6238,7 +6238,7 @@ pub(crate) fn observe_authority_system(world: &mut World) {
                         classify_host_candidate(world, entry.handle, &mut revisions);
                     let candidate = match classification {
                         HostCandidateClassification::None(source) => {
-                            if entry.engine.snapshot().availability()
+                            if entry.engine.availability()
                                 != &RouterAvailability::AwaitingHost
                             {
                                 drive_observed_candidate_rejection(
@@ -6632,7 +6632,7 @@ fn drive_r3_unique_host_candidate(
         r3_core::HostAdmissionSourcePermitOutcome::Issued(permit) => permit,
         r3_core::HostAdmissionSourcePermitOutcome::Ineligible { source, .. } => {
             let observation = candidate.observation_source();
-            let evidence = match entry.engine.snapshot().availability() {
+            let evidence = match entry.engine.availability() {
                 RouterAvailability::Unavailable(
                     bevy_ui_router_core::prelude::RouterUnavailableReason::HostConflict,
                 ) => R3HostAdmissionUnavailableEvidence::Conflict(observation),
