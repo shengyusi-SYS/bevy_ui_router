@@ -1,0 +1,129 @@
+{
+  "baseline_commit": "822eed4f0feca25a4d6a97fd4282b248dd6bbb6a",
+  "fixture_patch": "matcher-fixture-2026-10-24.patch",
+  "fixture_sha256": "cad754502c2667099ba0cd70026d08f43c6f1901e141020d862054d9c487f7ad",
+  "candidate_patch": "matcher-borrow-candidate-2026-10-24.patch",
+  "candidate_sha256": "fb6ba690ed1c260f52251037a462acb5f40ffc9dfef94f86b43038cbc3face47",
+  "files_sha256": {
+    "crates/bevy_ui_router_core/Cargo.toml": "05ff0fd104f1e3650aa11da042dcd527e46ea24a56a50a98360fe9a58bfc55a9",
+    "crates/bevy_ui_router_core/src/matcher.rs": "7e7b9b6ef297b83d0d464de3d4dd7c7da0335a46e5df59ed9c7470590463570f",
+    "crates/bevy_ui_router_core/benches/matcher_baseline.rs": "1511d74f52129d0ee54ee337a53e7fff45699f4546849aea47fa5539e726e1c1"
+  },
+  "data": "performance-matcher-borrow-2026-10-24.csv",
+  "data_sha256": "f037acd89ccc3ff4ade22a308d8af62e94b4a86a74ad2c1600fba2f35629c804",
+  "rows": 24,
+  "binaries": {
+    "baseline": {
+      "binary_sha256": "87a17ea0bacbb0c01981320488c7e56662990bf2565598c434b4025853983138",
+      "matcher_sha256": "40e237cb0c5d01cf2be8bb9f42a15a20d29aab33a6b119919cd6fe21e30a7311",
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-matcher-candidate-20261024/crates/bevy_ui_router_core#0.1.0",
+        "manifest_path": "/tmp/router-matcher-candidate-20261024/crates/bevy_ui_router_core/Cargo.toml",
+        "target": {
+          "kind": [
+            "bench"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "matcher_baseline",
+          "src_path": "/tmp/router-matcher-candidate-20261024/crates/bevy_ui_router_core/benches/matcher_baseline.rs",
+          "edition": "2024",
+          "doc": false,
+          "doctest": false,
+          "test": false
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [],
+        "filenames": [
+          "/tmp/router-matcher-target-20261024/release/build/bevy_ui_router_core/02d1d62375f2562a/out/matcher_baseline-02d1d62375f2562a"
+        ],
+        "executable": "/tmp/router-matcher-target-20261024/release/build/bevy_ui_router_core/02d1d62375f2562a/out/matcher_baseline-02d1d62375f2562a",
+        "fresh": false
+      }
+    },
+    "candidate": {
+      "binary_sha256": "fe39be3dba92a0f979940bd5192a66e7f664c2c6644efa745a96b0b2f5755b40",
+      "matcher_sha256": "7e7b9b6ef297b83d0d464de3d4dd7c7da0335a46e5df59ed9c7470590463570f",
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-matcher-candidate-20261024/crates/bevy_ui_router_core#0.1.0",
+        "manifest_path": "/tmp/router-matcher-candidate-20261024/crates/bevy_ui_router_core/Cargo.toml",
+        "target": {
+          "kind": [
+            "bench"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "matcher_baseline",
+          "src_path": "/tmp/router-matcher-candidate-20261024/crates/bevy_ui_router_core/benches/matcher_baseline.rs",
+          "edition": "2024",
+          "doc": false,
+          "doctest": false,
+          "test": false
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [],
+        "filenames": [
+          "/tmp/router-matcher-target-20261024/release/build/bevy_ui_router_core/02d1d62375f2562a/out/matcher_baseline-02d1d62375f2562a"
+        ],
+        "executable": "/tmp/router-matcher-target-20261024/release/build/bevy_ui_router_core/02d1d62375f2562a/out/matcher_baseline-02d1d62375f2562a",
+        "fresh": false
+      }
+    }
+  },
+  "runs": [
+    {
+      "variant": "baseline",
+      "round": 1,
+      "file": "matcher-baseline-1.csv",
+      "start_unix": 1792777764.1057067,
+      "end_unix": 1792777765.3507404,
+      "sha256": "bc6fdeb5de0466ddc4bbbcd7037c1ff7e11e0fb6b0a7949ddbf0f51c396ef699"
+    },
+    {
+      "variant": "candidate",
+      "round": 1,
+      "file": "matcher-candidate-1.csv",
+      "start_unix": 1792777765.351267,
+      "end_unix": 1792777765.5578296,
+      "sha256": "a5e5ef20abdf24da259ff9f8e5898f7769aa048c7455ea3cbcd04323c464112a"
+    },
+    {
+      "variant": "candidate",
+      "round": 2,
+      "file": "matcher-candidate-2.csv",
+      "start_unix": 1792777765.558054,
+      "end_unix": 1792777765.7571268,
+      "sha256": "fca99cc71583302a24ec6854753e13d5d81325ad04a730fbed21884140ec28a7"
+    },
+    {
+      "variant": "baseline",
+      "round": 2,
+      "file": "matcher-baseline-2.csv",
+      "start_unix": 1792777765.7573776,
+      "end_unix": 1792777766.9651523,
+      "sha256": "5b550bfd8e3f0456f11d609f3e8ea52f41ecfc6a3bdc339eb5a495028826450c"
+    }
+  ],
+  "build_command": "CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/router-matcher-target-20261024 cargo bench -p bevy_ui_router_core --bench matcher_baseline --locked --no-run --message-format=json",
+  "rustc": "rustc 1.99.0-nightly (ba28ff76f 2026-08-13)\nbinary: rustc\ncommit-hash: ba28ff76f353a722f31c4f3dd2ac4e437d36411b\ncommit-date: 2026-08-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0\n",
+  "lock_sha256": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+  "environment": "Linux WSL2 / Ryzen 9 9950X / 24 visible CPUs; no affinity/frequency/full host-load control",
+  "measurement": "Uninstrumented public match_location only; 16 warmup batches; 128 measured batches x 128 calls; result drop timed, setup/assertions/output outside; p50/p95/max are batch means per match, not per-call tail; no allocator counter/dependency, World, history, or full navigation.",
+  "validation": "Exact routes, parameter ownership, query fingerprint, fragment and not-found assertions passed in every run; patch replay exact; all 24 rows retained."
+}

@@ -293,6 +293,12 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 
 外层update/completion时间在A/B两行重复，统计按phase/sample去重；inclusive scope不可与外层求和。探针只适用于实际非MT构建，并验证必经A scope被捕获；没有UI layout、窗口或滚动恢复计时。单次运行支持成本定位，不作为正式版本收益对照；环境和工具链沿用本日headless诊断。[结论](../../performance.md#多-router-的观察与快照)区分临时索引、真实快照重建和滚动观察。
 
+## Matcher 分支借用 2026-10-24
+
+[24行](performance-matcher-borrow-2026-10-24.csv)、[临时公共API夹具](matcher-fixture-2026-10-24.patch)、[生产差异](matcher-borrow-candidate-2026-10-24.patch)与[身份](matcher-borrow-identity-2026-10-24.json)绑定 `822eed4`。先应用fixture得到baseline，再应用candidate；三文件重放与实测源码逐字节相同。临时bench注册和夹具不进入生产Cargo，无新增依赖或allocator。
+
+构建 `cargo bench -p bevy_ui_router_core --bench matcher_baseline --locked --no-run --message-format=json`，保存两个compiler-artifact executable，按before1→candidate1→candidate2→before2串行运行。每次6行：16/64/256siblings的成功/NotFound；固定三层、16预热批、128测量批×128调用，black_box输入/结果，drop在计时内。p50/p95/max表示每批均值的分布；exact route、params/query/fragment/error断言在计时外，全部通过。没有并行构建，未控制宿主全部负载；环境沿用本日WSL2与优化工具链。结果只归因于匹配函数的局部工作，取舍见[性能说明](../../performance.md#匹配器的分支借用)。
+
 ## History 分配 2026-10-24
 
 [全部288行](history-allocations-2026-10-24.csv)、[探针与临时 lock 差异](history-allocation-probe-2026-10-24.patch)、[生产候选差异](history-borrow-candidate-2026-10-24.patch)及[身份](history-allocations-identity-2026-10-24.json)绑定 `c63a1c5`。先应用探针得到 before，再应用候选得到 after；顺序重放与实测四个文件逐字节相同。只在独立副本的 Core dev-dependency 加入固定 `allocation-counter = "=0.8.1"`，生产 Cargo/lock 未改变。
