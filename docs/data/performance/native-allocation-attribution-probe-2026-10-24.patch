@@ -1,0 +1,154 @@
+diff --git a/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs b/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs
+--- a/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs
++++ b/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs
+@@ -7,6 +7,8 @@
+     Freeze,
+     Compare,
+     Navigation,
++    NativeCreate,
++    CleanupSettle,
+ }
+
+ #[derive(Clone, Copy, Debug, Default)]
+@@ -39,8 +41,10 @@
+             Ok(value) if value == "freeze" => Some(Purpose::Freeze),
+             Ok(value) if value == "compare" => Some(Purpose::Compare),
+             Ok(value) if value == "total" => Some(Purpose::Navigation),
++            Ok(value) if value == "native_create" => Some(Purpose::NativeCreate),
++            Ok(value) if value == "cleanup_settle" => Some(Purpose::CleanupSettle),
+             other => panic!(
+-                "ROUTER_BENCH_PUBLICATION_ALLOCATIONS must be unset, freeze, compare or total: {other:?}"
++                "ROUTER_BENCH_PUBLICATION_ALLOCATIONS must be unset, freeze, compare, total, native_create or cleanup_settle: {other:?}"
+             ),
+         },
+     )
+@@ -51,6 +55,8 @@
+         Purpose::Freeze => "owned_freeze",
+         Purpose::Compare => "immediate_compare",
+         Purpose::Navigation => "navigation_total",
++        Purpose::NativeCreate => "native_create",
++        Purpose::CleanupSettle => "cleanup_settle",
+     })
+ }
+
+@@ -73,8 +79,12 @@
+         let completed = state.replace(State::default());
+         assert!(completed.active && !completed.measuring);
+         assert!(
+-            completed.counts.calls > 0,
+-            "no observation calls on this navigation thread"
++            completed.counts.calls > 0
++                || matches!(
++                    selected(),
++                    Some(Purpose::NativeCreate | Purpose::CleanupSettle)
++                ),
++            "no selected scope calls on this navigation thread"
+         );
+         completed.counts
+     })
+@@ -84,6 +94,14 @@
+ // execute directly; in other modes, this wrapper executes directly.
+ pub fn navigation<T>(run: impl FnOnce() -> T) -> T {
+     observe(Purpose::Navigation, run)
++}
++
++pub fn native_create<T>(run: impl FnOnce() -> T) -> T {
++    observe(Purpose::NativeCreate, run)
++}
++
++pub fn cleanup_settle<T>(run: impl FnOnce() -> T) -> T {
++    observe(Purpose::CleanupSettle, run)
+ }
+
+ pub(crate) fn observe<T>(purpose: Purpose, make_observation: impl FnOnce() -> T) -> T {
+diff --git a/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs b/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
+--- a/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
++++ b/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
+@@ -356,6 +356,16 @@
+ }
+
+ pub(crate) fn create_native_scene(
++    world: &mut World,
++    frame: RouteFrameVersion,
++    prepared: PreparedBsnScene,
++) -> Result<NativeSceneAdoption, NativeSceneCreationFailure> {
++    bevy_ui_router_core::publication_allocation_diagnostic::native_create(|| {
++        create_native_scene_unprofiled(world, frame, prepared)
++    })
++}
++
++fn create_native_scene_unprofiled(
+     world: &mut World,
+     frame: RouteFrameVersion,
+     prepared: PreparedBsnScene,
+diff --git a/crates/bevy_ui_router_ecs/src/cleanup.rs b/crates/bevy_ui_router_ecs/src/cleanup.rs
+--- a/crates/bevy_ui_router_ecs/src/cleanup.rs
++++ b/crates/bevy_ui_router_ecs/src/cleanup.rs
+@@ -11535,6 +11535,16 @@
+         world: &mut World,
+         step: PreparedRetainedInvalidationRemovalStep,
+     ) -> bool {
++        bevy_ui_router_core::publication_allocation_diagnostic::cleanup_settle(|| {
++            self.settle_prepared_retained_invalidation_unprofiled(world, step)
++        })
++    }
++
++    fn settle_prepared_retained_invalidation_unprofiled(
++        &mut self,
++        world: &mut World,
++        step: PreparedRetainedInvalidationRemovalStep,
++    ) -> bool {
+         let PreparedRetainedInvalidationRemovalStep {
+             attempt,
+             removal,
+@@ -11694,6 +11704,23 @@
+     }
+
+     fn settle_with_failure_source(
++        &mut self,
++        world: &mut World,
++        attempt: CleanupAttempt,
++        failure_source: Option<&FailureCleanupSourceProjection>,
++        inherited_quarantine: Option<CleanupDisposition>,
++    ) -> bool {
++        bevy_ui_router_core::publication_allocation_diagnostic::cleanup_settle(|| {
++            self.settle_with_failure_source_unprofiled(
++                world,
++                attempt,
++                failure_source,
++                inherited_quarantine,
++            )
++        })
++    }
++
++    fn settle_with_failure_source_unprofiled(
+         &mut self,
+         world: &mut World,
+         attempt: CleanupAttempt,
+diff --git a/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs b/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs
+--- a/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs
++++ b/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs
+@@ -271,6 +271,13 @@
+ }
+
+ pub(super) fn run(shape: ContentShape, samples: usize) {
++    let only_dependency_eviction = match std::env::var("ROUTER_BENCH_INSTANCE_CASE") {
++        Err(std::env::VarError::NotPresent) => false,
++        Ok(value) if value == "dependency_eviction" => true,
++        other => {
++            panic!("ROUTER_BENCH_INSTANCE_CASE must be unset or dependency_eviction: {other:?}")
++        }
++    };
+     println!(
+         "scenario,parent_content_children,child_content_children,capacity,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,inactive_parents,inactive_children,parent_factory_builds,child_factory_builds"
+     );
+@@ -296,6 +303,9 @@
+                 &[("q", "a"), ("r", "a"), ("p", "a")][..],
+             ),
+         ] {
++            if only_dependency_eviction && name != "dependency_eviction" {
++                continue;
++            }
+             let mut instances = Instances::new(content, shape, mode);
+             let mut values = Vec::with_capacity(samples);
+             let mut allocations = PublicationAllocations::default();

@@ -338,3 +338,13 @@ freeze/compare 仅在测量导航内启用，计数结束后统一输出；befor
 [384行普通计时](performance-native-scratch-2026-10-24.csv)、[32行完整导航分配](native-scratch-allocations-2026-10-24.csv)、[64行计数夹具输出](native-scratch-allocation-fixtures-2026-10-24.csv)及[身份](native-scratch-identity-2026-10-24.json)以 `e21dca3 + Children 借用` 为基线，再应用[scratch 增量](native-scratch-candidate-2026-10-24.patch)。它只复用单次 realization 内 containment/stack/visited 的容量，每轮先清空再完整读取 World，最终只移出最后一次 containment；没有跨写事实缓存。所有源码版本重放 hash 一致。
 
 普通 allocator 的两个版本按上一节同样的模式、shape、样本数和正反序重新配对，baseline 使用已保存的 Children-only executable，逐次验证其 hash。计数 baseline 复用该同一 binary 已完成的32导航计数，candidate 运行相同边界；身份明确标注复用记录及原时间，未复用普通耗时数据。全部原断言、非计时列、慢值和尾部保留。计数依赖及探针只存在于独立副本，不能从分配总量推导驻留或峰值 heap。
+
+## 剩余分配归属 2026-10-24
+
+[3行计数](native-allocation-attribution-2026-10-24.csv)、[6行夹具输出](native-allocation-attribution-fixtures-2026-10-24.csv)、[增量探针](native-allocation-attribution-probe-2026-10-24.patch)与[完整身份](native-allocation-attribution-identity-2026-10-24.json)对应最终生产 `abfd438`。独立检出该提交，按 publication 候选方法应用已有 allocation probe（排除两个 engine 旧调用文件）、borrow scopes、navigation total 三份补丁，再应用本增量；十个源码文件与实际编译版本的 hash 已逐项重放核对。
+
+优化构建/保存实际 compiler-artifact executable 的方法不变。设置 `ROUTER_BENCH_MODE=instances ROUTER_BENCH_INSTANCE_CASE=dependency_eviction ROUTER_BENCH_SHAPE=flat ROUTER_BENCH_SAMPLES=32`，依次以 `ROUTER_BENCH_PUBLICATION_ALLOCATIONS=native_create`、`cleanup_settle`、`total` 运行。精确 case 筛选只跳过其它独立夹具，本场景原64次预热、导航完成边界、断言、idle和退出均保留；128是父、子各自的内容预算。
+
+native 包住完整创建入口；cleanup 聚合普通 `settle_with_failure_source` 与已准备的 `settle_prepared_retained_invalidation` 两个完整入口，二者不互相调用，共享 removal 不重复插桩。前置准备/reservation 和后来调用方工作在范围外，不能把它称为全部 SettleCleanup。scope 选择互斥，total 内其它 scope 直接执行；无嵌套，真实调用数单独记录。当前线程的 count_total/bytes_total 不测净驻留或峰值，不比较替换 allocator 后的耗时。
+
+三次运行全部非计时字段一致，并与上一节最终 counter 的相同场景一致；total 的调用数、分配次数、字节与原记录精确相同。全部断言通过，环境及非 MT/headless 边界不变。按每行 navigations=32 相除得到每导航成本；余项仅为同一成功夹具总量减两范围，不作进一步职责归因。

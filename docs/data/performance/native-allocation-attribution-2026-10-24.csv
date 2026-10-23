@@ -1,0 +1,4 @@
+kind,mode,scenario,content_children,shape,scope,navigations,calls,allocations,bytes
+publication_allocation,instances,dependency_eviction,128,Flat,native_create,32,64,70624,20039232
+publication_allocation,instances,dependency_eviction,128,Flat,cleanup_settle,32,32,577632,154744448
+publication_allocation,instances,dependency_eviction,128,Flat,navigation_total,32,32,1055520,320034592
