@@ -1,0 +1,78 @@
+{
+  "baseline_commit": "11e89350b1abeb82eb82b1a0aea6d50ac0151ae6",
+  "changed_files_sha256": {
+    "crates/bevy_ui_router/benches/router_baseline.rs": "8314d3519bd88c53bcfb56ad517a9a457e9626860eadd610570e791ead2e98bf",
+    "crates/bevy_ui_router/benches/router_baseline/retained_instances.rs": "414f86b27090e1270acd464ddad6d9f7cd1afa43ad97c20dbe43202a8c146ac0",
+    "crates/bevy_ui_router_ecs/src/bsn.rs": "b883d38e01c0bd32784f3d9c5bfde84713bb588e586b769092afe4062ac069d1",
+    "crates/bevy_ui_router_ecs/src/cleanup.rs": "20b399694774b4a52a28af1c81bcee5fe9d21ac818e9bd8da83e6fb2fd283da0",
+    "crates/bevy_ui_router_ecs/src/input.rs": "784a02b58665c88274cea8fdc67ec9cdc1b5fb85102046d4ba0609fb77cdab76",
+    "crates/bevy_ui_router_ecs/src/lib.rs": "ab89c809eab879a860102f226dfb560c1a8b5c318084b76ff66f5ef810bd1f8c",
+    "crates/bevy_ui_router_ecs/src/navigation.rs": "0c07230d62e7ed9b60c8589ad3118ae6796bc1618d9007f42cab520292a37924",
+    "crates/bevy_ui_router_ecs/src/presentation.rs": "c9cc14409bc87a4822a0cc5f9b9f9554b504e17709c0421e655af6272bbdf235",
+    "crates/bevy_ui_router_ecs/src/presentation/native_scene.rs": "9c135c1166c521d8dd46497b2c3236044bcf05c505fdeb1dd1eb081bc75d9d4c",
+    "crates/bevy_ui_router_ecs/src/scroll.rs": "1d9a3e7080daa0d470cdb25f33f46b7ee41e95dd4c0835ede15c684114f64e3c",
+    "crates/bevy_ui_router_ecs/src/temporary_profile.rs": "4b21f336572ba1f071fc4255a53936234378a0f28ec5347ca2bfc1eec3e57108"
+  },
+  "patch_sha256": "76c6257bc761eefdda5b6d1d07251570f347e1c1c8e3fe92f977d4b35a209595",
+  "data_sha256": "857cb41441c38c6df18c5f6d14e29312222f5ec1774da917fd5457a744210fb6",
+  "binary_sha256": "ec5e05272aaa2b06ac6e3907d917c81ee621ffdb2682138b0e9388af673fd711",
+  "rows": 7944,
+  "build": "CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<isolated-target> cargo bench -p bevy_ui_router --bench router_baseline --features bsn --no-run --locked --message-format=json",
+  "run": "ROUTER_BENCH_PROFILE_SCOPES=1 ROUTER_BENCH_SAMPLES=32 ROUTER_BENCH_MODE={keep_alive,instances} ROUTER_BENCH_SHAPE={flat,nested} <executable>",
+  "scope_semantics": "10 distinct system stages; other 15 nested inclusive scopes overlap; parent loop includes expected construction and actual Children read/compare. Buffered rows are output after navigation terminal. Diagnostic overhead included. Non-MT only.",
+  "runtime_order": [
+    "keep_alive flat",
+    "keep_alive nested",
+    "instances flat",
+    "instances nested"
+  ],
+  "artifact": {
+    "reason": "compiler-artifact",
+    "package_id": "path+file:///tmp/router-wide-profile-20261024/crates/bevy_ui_router#0.1.0",
+    "manifest_path": "/tmp/router-wide-profile-20261024/crates/bevy_ui_router/Cargo.toml",
+    "target": {
+      "kind": [
+        "bench"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "name": "router_baseline",
+      "src_path": "/tmp/router-wide-profile-20261024/crates/bevy_ui_router/benches/router_baseline.rs",
+      "edition": "2024",
+      "required-features": [
+        "bsn"
+      ],
+      "doc": false,
+      "doctest": false,
+      "test": false
+    },
+    "profile": {
+      "opt_level": "3",
+      "debuginfo": 0,
+      "debug_assertions": false,
+      "overflow_checks": false,
+      "test": true
+    },
+    "features": [
+      "bsn",
+      "default",
+      "ecs",
+      "view"
+    ],
+    "filenames": [
+      "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a2c604a87869facf/out/router_baseline-a2c604a87869facf"
+    ],
+    "executable": "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a2c604a87869facf/out/router_baseline-a2c604a87869facf",
+    "fresh": false
+  },
+  "rustc": "rustc 1.99.0-nightly (ba28ff76f 2026-08-13)\nbinary: rustc\ncommit-hash: ba28ff76f353a722f31c4f3dd2ac4e437d36411b\ncommit-date: 2026-08-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0\n",
+  "lock_sha256": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+  "bevy_ecs_features": [
+    "async_executor",
+    "backtrace",
+    "bevy_reflect",
+    "default",
+    "std"
+  ]
+}

@@ -238,3 +238,25 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 为解释热点而保留的[追加诊断 3,144 行](publication-profile-2026-10-24.csv)分 baseline 与完整集合候选，各 1,572 行，保留全部阶段；两者都基于 `b3672c6`，与正式对照的源码基线不同。先在独立检出应用[九 scope 补丁](publication-profile-2026-10-24.patch)获得 baseline；完整集合诊断再应用[输入差异](publication-profile-input-2026-10-24.patch)。两个补丁顺序重放与实测源码逐字节一致，[身份](publication-profile-identity-2026-10-24.json)绑定数据、差异和二进制。构建与运行方法沿用上一节的独立 target / 32 样本诊断命令。
 
 追加 scope 包括 `prepare_presentation_access`；诊断确认局部输入准备变快，但其它 scope 的变化没有建立因果解释，不能代替无插桩的完整路径对照。共同环境及不含 MT/layout/picking/GPU/I/O 的边界沿用上一节。最终取舍见[性能说明](../../performance.md#清理与输入准备热点)。
+
+## 完整导航阶段 2026-10-24
+
+[全部 7,944 行](navigation-stages-2026-10-24.csv)、[独立探针补丁](navigation-stages-probe-2026-10-24.patch)与[身份](navigation-stages-identity-2026-10-24.json)绑定完整基线 `11e89350b1abeb82eb82b1a0aea6d50ac0151ae6`。补丁在该基线重放后，11 个变化文件逐字节与实测副本相同；生产库不含探针。顺序为 keep_alive flat、keep_alive nested、instances flat、instances nested，每场景 32 个计时样本，保留所有阶段及离群值，measure 共 2,304 行。
+
+独立 target 构建 `cargo bench -p bevy_ui_router --bench router_baseline --features bsn --no-run --locked --message-format=json`，以 compiler-artifact 定位并保存 executable；用 `ROUTER_BENCH_PROFILE_SCOPES=1 ROUTER_BENCH_SAMPLES=32 ROUTER_BENCH_MODE=<mode> ROUTER_BENCH_SHAPE=<shape>` 直接运行。身份记录包含准确构建参数、源码/数据/二进制 hash、lock、Rust 和实际 ECS features。
+
+十个系统阶段分别为 ObserveAuthority、Collect、Drive、Commit、SettleCleanup、PublishSnapshots、InputRefresh、InputFilter、ScrollPrepare、ScrollSettle；另十五个细分 scope 与阶段嵌套，inclusive 时间不能相加。父 children 循环同时包含不可变期望的构造、实际读取与比较，不代表纯构造时间。仅非 MT 构建使用 thread-local 聚合。
+
+每个导航记录 enqueue、逐 update、从原起点计算的累计时间与原 completion 边界，数据在请求终态后统一输出。completion 在同一导航的多行中重复，汇总时按 nav_id 去重。标准 benchmark 的断言、CSV 和计时边界保留；探针有额外成本，不能拿插桩总时间替代无插桩对照。idle 沿用原批均值，没有新增逐帧记录。
+
+环境沿用本日 Linux WSL2 / Ryzen 9 9950X / Rust 1.99.0-nightly / Bevy 0.19.1，24 可见逻辑 CPU；采样串行且无本任务的并行构建，未固定 affinity、频率或控制宿主全部负载。不含 MT、UI layout、picking、renderer 或 I/O；结果解读见[完整阶段说明](../../performance.md#完整导航阶段与-scene-声明拓扑)。
+
+## Scene 声明拓扑对照 2026-10-24
+
+[完整 384 行](performance-native-topology-2026-10-24.csv)、[候选完整差异](native-topology-candidate-2026-10-24.patch)和[构建身份](native-topology-identity-2026-10-24.json)对应基线 `11e8935`。candidate 仅修改 native Scene 的操作内声明拓扑准备及复用，保留全部 World 实时复验，并增加一个真实 marker hook 重排 siblings 的回归；没有改 benchmark。
+
+先 keep_alive、再 instances，每个模式先 flat 后 nested；每种组合均按 before 1→candidate 1→candidate 2→before 2 运行，每场景 128 样本，每次完整 24 行。CSV 合并两种模式的原始列，不适用列留空，所有较慢组和最大值保留。各配对非计时列逐项相同，无选择性删除或合并分位数。
+
+使用无插桩优化构建及独立保存的两个 executable，实际路径来自 compiler-artifact。导出基线与主工作区复用 target 时，显式清理 ECS/facade 的 release 产物后重新构建 candidate，避免跨源码目录复用旧产物；记录确认 ECS 源码重新编译，两份 binary hash 不同。采样期间没有本任务的并行构建。
+
+环境、工具链、features 与本日完整阶段诊断一致，实际 ECS 未开启 `multi_threaded`。headless wall-clock 不含 layout、原生输入、renderer 或异步 I/O。结果包含命中路径的小幅回退，取舍见[性能说明](../../performance.md#完整导航阶段与-scene-声明拓扑)。
