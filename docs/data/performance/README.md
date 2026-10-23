@@ -228,3 +228,13 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 首轮 before 的导航及未受修改影响的 idle 广泛变慢，原因未证实，整对标为 `unstable_pair`。其余配对和全部较慢值均保留，未按单行筛选；没有本任务的并行编译、窗口或其它采样，也未控制宿主全部负载。补充两轮用于判断这种整组变化是否掩盖候选收益，最终候选已撤回，结论见[性能说明](../../performance.md#清理与输入准备热点)。
 
 共同环境为 Linux WSL2、Ryzen 9 9950X、24 可见逻辑 CPU、Rust 1.99.0-nightly、Bevy 0.19.1，bench opt-level 3、无 debug assertions，未固定 affinity/频率。实际 ECS features 不含 `multi_threaded`；这些夹具不含 UI layout、picking、窗口、GPU 或 I/O。CSV 为墙钟而非线程 CPU 时间；idle 仍是 32 update 批均值的分布。
+
+## 输入准备候选 2026-10-24
+
+[完整 384 行](performance-input-preparation-2026-10-24.csv)记录 `full_set` 与 `narrow_set` 两个候选，每个候选均先 flat、再 nested，各自按 before 1→after 1→after 2→before 2 顺序执行。每次完整 24 行、每场景 128 样本；没有本任务的并行编译。每对样本数、update 数、实体、活动/非活动页和 factory 次数一致。`narrow_set` 的 nested 第 2 轮两侧出现整体变慢，整对标为 `unstable_pair`，原因未证实；所有输出和较慢结果保留。
+
+[身份记录](input-preparation-identity-2026-10-24.json)保存实际二进制、完整差异、lock、features 与 profile。before 为 `a0679dd8086ef20baaae7fd868adc3fa34d12369` 保存的无插桩产物；两个 candidate 均为 `3fe3c9f` 加[完整集合差异](input-candidate-2026-10-24.patch)或[收窄差异](input-narrow-candidate-2026-10-24.patch)。这两个基线提交之间仅增加诊断文档，生产源码相同；三处 availability 窄读取没有混入候选。两个输入候选均未采用，源码与专用新增测试已撤回。
+
+为解释热点而保留的[追加诊断 3,144 行](publication-profile-2026-10-24.csv)分 baseline 与完整集合候选，各 1,572 行，保留全部阶段；两者都基于 `b3672c6`，与正式对照的源码基线不同。先在独立检出应用[九 scope 补丁](publication-profile-2026-10-24.patch)获得 baseline；完整集合诊断再应用[输入差异](publication-profile-input-2026-10-24.patch)。两个补丁顺序重放与实测源码逐字节一致，[身份](publication-profile-identity-2026-10-24.json)绑定数据、差异和二进制。构建与运行方法沿用上一节的独立 target / 32 样本诊断命令。
+
+追加 scope 包括 `prepare_presentation_access`；诊断确认局部输入准备变快，但其它 scope 的变化没有建立因果解释，不能代替无插桩的完整路径对照。共同环境及不含 MT/layout/picking/GPU/I/O 的边界沿用上一节。最终取舍见[性能说明](../../performance.md#清理与输入准备热点)。

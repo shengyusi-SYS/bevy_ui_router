@@ -1,0 +1,173 @@
+--- a/crates/bevy_ui_router_ecs/src/input.rs
++++ b/crates/bevy_ui_router_ecs/src/input.rs
+@@ -132,7 +132,10 @@
+     next.try_reserve_exact(gate.allowed.len()).map_err(|_| ())?;
+     next.extend(gate.allowed.iter().copied());
+     next.retain(|entity| !targets.contains(entity));
+-    let revoked = try_prepare_pointer_revocations(gate, &next)?;
++    let mut next_members = EntityHashSet::new();
++    next_members.try_reserve(next.len()).map_err(|_| ())?;
++    next_members.extend(next.iter().copied());
++    let revoked = try_prepare_pointer_revocations(gate, &next_members)?;
+     Ok(PreparedInputGateIsolation { next, revoked })
+ }
+
+@@ -336,29 +339,35 @@
+     remove: &[Entity],
+     add: Vec<Entity>,
+ ) -> Option<PreparedInputGateMutation<'w>> {
+-    let _profile_scope =
+-        crate::temporary_profile::enter(crate::temporary_profile::Scope::PrepareInputGateMutation);
+-    if remove.iter().any(|entity| !gate.allowed.contains(entity))
+-        || remove
++    let _profile_scope = crate::temporary_profile::enter(crate::temporary_profile::Scope::PrepareInputGateMutation);
++    let capacity = gate.allowed.len().checked_add(add.len())?;
++    let mut next_members = EntityHashSet::new();
++    next_members.try_reserve(capacity).ok()?;
++    next_members.extend(gate.allowed.iter().copied());
++    let additions_were_allowed = add.iter().all(|entity| next_members.contains(entity));
++    for entity in remove {
++        if !next_members.remove(entity) {
++            return None;
++        }
++    }
++    let mut next = Vec::new();
++    next.try_reserve_exact(capacity).ok()?;
++    next.extend(
++        gate.allowed
+             .iter()
+-            .enumerate()
+-            .any(|(index, entity)| remove[index + 1..].contains(entity))
+-        || add
+-            .iter()
+-            .enumerate()
+-            .any(|(index, entity)| add[index + 1..].contains(entity))
+-        || add
+-            .iter()
+-            .any(|entity| gate.allowed.contains(entity) && !remove.contains(entity))
+-    {
+-        return None;
+-    }
+-    let mut next = gate.allowed.clone();
+-    next.retain(|entity| !remove.contains(entity));
+-    next.extend(add);
+-    let revoked = try_prepare_pointer_revocations(&gate, &next).ok()?;
+-    let same_permissions =
+-        gate.allowed.len() == next.len() && next.iter().all(|entity| gate.allowed.contains(entity));
++            .copied()
++            .filter(|entity| next_members.contains(entity)),
++    );
++    for entity in add {
++        if !next_members.insert(entity) {
++            return None;
++        }
++        next.push(entity);
++    }
++    let revoked = try_prepare_pointer_revocations(&gate, &next_members).ok()?;
++    // Every survivor already belonged to the old gate. Only additions can
++    // change membership; an equivalent delta must preserve its order and tick.
++    let same_permissions = gate.allowed.len() == next.len() && additions_were_allowed;
+     let changed = !same_permissions || gate.revoked != revoked;
+     Some(PreparedInputGateMutation {
+         gate,
+@@ -370,11 +379,9 @@
+
+ fn try_prepare_pointer_revocations(
+     gate: &RouterInputGate,
+-    next: &[Entity],
++    next: &EntityHashSet,
+ ) -> Result<Vec<Entity>, ()> {
+-    let _profile_scope = crate::temporary_profile::enter(
+-        crate::temporary_profile::Scope::TryPreparePointerRevocations,
+-    );
++    let _profile_scope = crate::temporary_profile::enter(crate::temporary_profile::Scope::TryPreparePointerRevocations);
+     let capacity = gate
+         .revoked
+         .len()
+@@ -383,8 +390,11 @@
+     let mut revoked = Vec::new();
+     revoked.try_reserve_exact(capacity).map_err(|_| ())?;
+     revoked.extend(gate.revoked.iter().copied());
++    let mut seen = EntityHashSet::new();
++    seen.try_reserve(capacity).map_err(|_| ())?;
++    seen.extend(gate.revoked.iter().copied());
+     for entity in gate.allowed.iter().copied() {
+-        if !next.contains(&entity) && !revoked.contains(&entity) {
++        if !next.contains(&entity) && seen.insert(entity) {
+             revoked.push(entity);
+         }
+     }
+@@ -2038,6 +2048,73 @@
+     }
+
+     #[test]
++    fn gate_delta_rejects_duplicates_and_preserves_revocation_order_on_reauthorization() {
++        let mut world = World::new();
++        let first = world.spawn_empty().id();
++        let second = world.spawn_empty().id();
++        let preserved = world.spawn_empty().id();
++        let still_revoked = world.spawn_empty().id();
++        let entering = world.spawn_empty().id();
++        world.insert_resource(RouterInputGate::new());
++        prepare_input_gate_mutation(
++            world.resource_mut::<RouterInputGate>(),
++            &[],
++            vec![first, second, preserved, still_revoked],
++        )
++        .unwrap()
++        .apply();
++        prepare_input_gate_mutation(
++            world.resource_mut::<RouterInputGate>(),
++            &[still_revoked, first],
++            vec![],
++        )
++        .unwrap()
++        .apply();
++        assert_eq!(
++            world.resource::<RouterInputGate>().revoked,
++            vec![first, still_revoked]
++        );
++        let tick = world
++            .get_resource_change_ticks::<RouterInputGate>()
++            .unwrap()
++            .changed;
++        world.increment_change_tick();
++
++        for (remove, add) in [
++            (vec![entering], vec![]),
++            (vec![second, second], vec![]),
++            (vec![], vec![entering, entering]),
++            (vec![], vec![second]),
++        ] {
++            assert!(
++                prepare_input_gate_mutation(world.resource_mut::<RouterInputGate>(), &remove, add)
++                    .is_none()
++            );
++        }
++        let gate = world.resource::<RouterInputGate>();
++        assert_eq!(gate.allowed, vec![second, preserved]);
++        assert_eq!(gate.revoked, vec![first, still_revoked]);
++        assert_eq!(
++            world
++                .get_resource_change_ticks::<RouterInputGate>()
++                .unwrap()
++                .changed,
++            tick
++        );
++
++        prepare_input_gate_mutation(
++            world.resource_mut::<RouterInputGate>(),
++            &[second],
++            vec![first, entering],
++        )
++        .unwrap()
++        .apply();
++        let gate = world.resource::<RouterInputGate>();
++        assert_eq!(gate.allowed, vec![preserved, first, entering]);
++        assert_eq!(gate.revoked, vec![still_revoked, second]);
++    }
++
++    #[test]
+     fn focus_mutation_clears_both_focus_sources_for_a_leaving_target() {
+         let mut world = World::new();
+         let leaving = world.spawn_empty().id();
