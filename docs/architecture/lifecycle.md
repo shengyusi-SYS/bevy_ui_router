@@ -50,6 +50,6 @@ history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router
 | [native_frame.rs](../../crates/bevy_ui_router_ecs/src/presentation/native_frame.rs) | adoption 后 containment、native cleanup preparation 和依赖保活 |
 | [native_failure.rs](../../crates/bevy_ui_router_ecs/src/presentation/native_failure.rs) | Scene preparation/creation 失败的来源、依赖与物理 residual owner |
 | [authority_isolation.rs](../../crates/bevy_ui_router_ecs/src/navigation/authority_isolation.rs) | current authority loss 的隔离写集与后续 settlement |
-| [cleanup.rs](../../crates/bevy_ui_router_ecs/src/cleanup.rs) | target/protected evidence、operation-local removal plan、逐写复验及 receipt/ledger completion；[capacity.rs](../../crates/bevy_ui_router_ecs/src/cleanup/capacity.rs) 负责容量预留与持有 |
+| [cleanup.rs](../../crates/bevy_ui_router_ecs/src/cleanup.rs) | operation-local removal plan、物理执行及 receipt/ledger completion；[failure_partition.rs](../../crates/bevy_ui_router_ecs/src/cleanup/failure_partition.rs) 集中失败清理的 source、target/protected、allowed write set 与逐写复验；[capacity.rs](../../crates/bevy_ui_router_ecs/src/cleanup/capacity.rs) 负责容量预留与持有 |
 
 跨层改动先核对 action 接收端、当前 holder 和失败返回值，再修改实现。验证入口包括 [ECS native 回归](../../crates/bevy_ui_router_ecs/src/navigation/native_tests.rs)、相关模块内部回归，以及[公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs)和[独立 BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs)；按[验证指南](../development/verification.md)选择完整 gate。
