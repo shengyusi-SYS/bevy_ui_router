@@ -21,7 +21,7 @@ Core 的 [engine](../../crates/bevy_ui_router_core/src/engine.rs) 决定下一�
 
 依赖 forest 清理停止后若仍有存活目标且 host binding 真实失效，使用原 installed owner 与 lease 的专用 terminal：原 token、receipts、stop、物理 payload 和原库存 owners 全部进入已有 authority residual。它只结束前台 continuation，不生成物理 completion；拒绝返还完整原 owner/lease，残留存在时阻止 readmission。
 
-history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)。publication 后的 compound settlement 在 Core [post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs) 与 ECS navigation 中，保留已发布结果。已退役缓存继续由原 normal token/ledger 持有，Live 缓存进入 authority 第二批；完整库存随原 receiver 冻结，联合完成分别结算两个 token。延迟删除非权威 preservation proof 时只移除原选定项，保留其他 Router 的合法变化。无运行请求的 host loss 则由 Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) 和 ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs) 持有独立 settlement owner，不重开 terminal 请求。
+history 的签发与配对在 [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs)。publication 后的 compound settlement 由 Core [post_commit.rs](../../crates/bevy_ui_router_core/src/engine/post_commit.rs) 持有逻辑协议与完成判定，ECS [navigation/post_commit.rs](../../crates/bevy_ui_router_ecs/src/navigation/post_commit.rs) 推进原 owner，[cleanup/post_commit.rs](../../crates/bevy_ui_router_ecs/src/cleanup/post_commit.rs) 冻结并结算物理证据，保留已发布结果。已退役缓存继续由原 normal token/ledger 持有，Live 缓存进入 authority 第二批；完整库存随原 receiver 冻结，联合完成分别结算两个 token。延迟删除非权威 preservation proof 时只移除原选定项，保留其他 Router 的合法变化。无运行请求的 host loss 则由 Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) 和 ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs) 持有独立 settlement owner，不重开 terminal 请求。
 
 ## 准备结果与失败分流
 

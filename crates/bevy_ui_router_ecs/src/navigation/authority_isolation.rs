@@ -1,5 +1,5 @@
 use bevy_camera::visibility::Visibility;
-use bevy_ecs::prelude::World;
+use bevy_ecs::prelude::{Entity, World};
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
 use bevy_ui_router_core::{
@@ -29,13 +29,31 @@ use crate::{
 
 use super::{
     AuthorityProtocolResidualKind, AuthorityProtocolResidualOwner,
-    FailureCleanupCompletionInertOwner, FrozenPostCommitInputIsolation,
-    FrozenTargetPreparationPermanentPhysicalManifest, HostBinding, PendingBackTargetExecution,
-    PendingFailedBranch, PendingFailedBranchTerminal, PostCommitInputIsolationFailure,
-    PreparedPostCommitInputIsolation, RetiredHostBinding, RouterEntry,
-    authority_settlement_logical_roots, precommit_authority_cause,
+    FailureCleanupCompletionInertOwner, FrozenTargetPreparationPermanentPhysicalManifest,
+    HostBinding, PendingBackTargetExecution, PendingFailedBranch, PendingFailedBranchTerminal,
+    RetiredHostBinding, RouterEntry, authority_settlement_logical_roots, precommit_authority_cause,
     projectionless_fail_close_capacity_probe,
 };
+
+pub(super) struct PreparedPostCommitInputIsolation {
+    mutation: PreparedAuthorityIsolation,
+    frozen: FrozenPostCommitInputIsolation,
+    contradiction: Option<AuthorityIsolationContradiction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FrozenPostCommitInputIsolation {
+    focus: Vec<Entity>,
+    gate_targets: Vec<Entity>,
+    gate_required: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PostCommitInputIsolationFailure {
+    RetryableCapacity,
+    Permanent(AuthorityIsolationContradiction),
+    RefreezeRejected,
+}
 
 #[cfg(test)]
 mod tests {
@@ -656,7 +674,7 @@ pub(super) struct PreparedAuthorityEntityIsolation {
 
 pub(super) struct PreparedAuthorityIsolation {
     pub(super) entities: Vec<PreparedAuthorityEntityIsolation>,
-    pub(super) focus: Vec<bevy_ecs::entity::Entity>,
+    pub(super) focus: Vec<Entity>,
     pub(super) gate: Option<PreparedInputGateIsolation>,
     pointer_targets: std::collections::HashSet<bevy_ecs::entity::Entity>,
 }
@@ -840,7 +858,7 @@ pub(super) fn try_push<T>(values: &mut Vec<T>, value: T) -> Result<(), ()> {
 pub(super) fn prepare_idle_host_isolation<'a>(
     world: &World,
     claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
-    targets: Vec<bevy_ecs::entity::Entity>,
+    targets: Vec<Entity>,
 ) -> AuthorityIsolationPreparation {
     prepare_frozen_authority_isolation(world, claims, targets, 0)
 }
@@ -848,7 +866,7 @@ pub(super) fn prepare_idle_host_isolation<'a>(
 fn prepare_frozen_authority_isolation<'a>(
     world: &World,
     claims: impl IntoIterator<Item = &'a ExactRegistryClaim>,
-    targets: Vec<bevy_ecs::entity::Entity>,
+    targets: Vec<Entity>,
     capacity_probe: usize,
 ) -> AuthorityIsolationPreparation {
     let mut preparation =
@@ -1263,7 +1281,7 @@ pub(super) fn prepare_failed_manifest_authority_isolation_with_retained(
     failed: &PendingFailedBranch,
     host: Option<&HostBinding>,
     retained: &[&crate::instance::InstancePayload],
-    targets: Vec<bevy_ecs::entity::Entity>,
+    targets: Vec<Entity>,
 ) -> AuthorityIsolationPreparation {
     prepare_failed_branch_authority_isolation_with_retained(
         world,
@@ -1281,7 +1299,7 @@ fn prepare_failed_branch_authority_isolation_with_retained(
     branch: &FailedPreparedBranch,
     host: Option<&HostBinding>,
     retained: &[&crate::instance::InstancePayload],
-    frozen_targets: Option<Vec<bevy_ecs::entity::Entity>>,
+    frozen_targets: Option<Vec<Entity>>,
 ) -> AuthorityIsolationPreparation {
     #[cfg(feature = "bsn")]
     let frozen_targets = if let Some(mut targets) = frozen_targets {

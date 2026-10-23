@@ -79,6 +79,7 @@ Core 拥有 history 与保留决策，ECS 按 opaque entry key 保存滚动位�
 | host、slot、frame 与内容执行 | [host.rs](../../crates/bevy_ui_router_ecs/src/host.rs)、[mount.rs](../../crates/bevy_ui_router_ecs/src/mount.rs)、[presentation.rs](../../crates/bevy_ui_router_ecs/src/presentation.rs)、[native_scene.rs](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs) |
 | ownership 与清理 | [registry.rs](../../crates/bevy_ui_router_ecs/src/registry.rs)、[cleanup.rs](../../crates/bevy_ui_router_ecs/src/cleanup.rs)、[cleanup/](../../crates/bevy_ui_router_ecs/src/cleanup) |
 | publication 准备 | [normal_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs)、[projectionless_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs)、[branch_transaction.rs](../../crates/bevy_ui_router_ecs/src/branch_transaction.rs) |
+| publication 后的清理推进与物理结算 | ECS [navigation/post_commit.rs](../../crates/bevy_ui_router_ecs/src/navigation/post_commit.rs)、[cleanup/post_commit.rs](../../crates/bevy_ui_router_ecs/src/cleanup/post_commit.rs)；逻辑 owner 与完成判定归 Core `engine/post_commit.rs` |
 | reconciliation、frame-local、native failure 与 authority settlement | [生命周期执行协议的模块地图](lifecycle.md#修改时定位哪些模块) |
 | 输入与焦点 | [input.rs](../../crates/bevy_ui_router_ecs/src/input.rs)、[native_focus.rs](../../crates/bevy_ui_router_ecs/src/native_focus.rs) |
 | BSN 合同与 bridge | [BSN lib.rs](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bsn.rs](../../crates/bevy_ui_router_ecs/src/bsn.rs) |
