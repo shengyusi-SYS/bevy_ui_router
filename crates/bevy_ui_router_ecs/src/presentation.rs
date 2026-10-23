@@ -6,6 +6,7 @@ use bevy_color::Color;
 use bevy_ecs::{
     change_detection::Mut,
     component::{Component, ComponentId},
+    entity::EntityHashMap,
     hierarchy::{ChildOf, Children},
     prelude::{Entity, World},
 };
@@ -3652,6 +3653,13 @@ fn prepare_presentation_access<'w>(
         return None;
     }
     let pointer_targets = pointer_targets.iter().copied().collect::<HashSet<_>>();
+    let mut access_entities =
+        EntityHashMap::with_capacity(targets.len() + pointer_targets.len() + 8);
+    for (index, target) in targets.iter().enumerate() {
+        if access_entities.insert(target.entity, Some(index)).is_some() {
+            return None;
+        }
+    }
     let hover_entity = pointer_resource_entity::<HoverMap>(world);
     let previous_hover_entity = pointer_resource_entity::<PreviousHoverMap>(world);
     let state_entity = pointer_resource_entity::<PointerState>(world);
@@ -3660,6 +3668,24 @@ fn prepare_presentation_access<'w>(
     let gate_entity = pointer_resource_entity::<crate::input::RouterInputGate>(world);
     let input_focus_entity = pointer_resource_entity::<InputFocus>(world);
     let route_focus_entity = pointer_resource_entity::<RouteFocusState>(world);
+    // Borrow only authorized targets and the exact native/publication receivers.
+    // The union provides Bevy's uniqueness guarantee even when roles overlap.
+    for entity in pointer_targets.iter().copied().chain(
+        [
+            hover_entity,
+            previous_hover_entity,
+            state_entity,
+            navigation_entity,
+            registry_entity,
+            gate_entity,
+            input_focus_entity,
+            route_focus_entity,
+        ]
+        .into_iter()
+        .flatten(),
+    ) {
+        access_entities.entry(entity).or_insert(None);
+    }
     let mut query = query_including_disabled::<(
         Entity,
         Option<(
@@ -3699,7 +3725,7 @@ fn prepare_presentation_access<'w>(
         previous_hover,
         state,
         resources,
-    ) in query.iter_mut(world)
+    ) in query.iter_many_unique_mut(world, access_entities.keys())
     {
         let (nav, reg, input_gate, focus, route) = resources;
         if publication {
@@ -3734,13 +3760,10 @@ fn prepare_presentation_access<'w>(
         {
             pointer_interactions.push(interaction);
         }
-        let Some((index, target)) = targets
-            .iter()
-            .enumerate()
-            .find(|(_, target)| target.entity == entity)
-        else {
+        let Some(&Some(index)) = access_entities.get(&entity) else {
             continue;
         };
+        let target = &targets[index];
         if matches!(target.kind, PresentationTargetKind::NativeContent) {
             let lifecycle = frame_lifecycle?;
             if lifecycle.0 != target.current || slot_lifecycle.is_some() || found[index] {

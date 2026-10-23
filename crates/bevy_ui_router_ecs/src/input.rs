@@ -826,6 +826,14 @@ fn prepare_pointer_mutation<'w>(
     let hover_entity = pointer_resource_entity::<HoverMap>(world);
     let previous_hover_entity = pointer_resource_entity::<PreviousHoverMap>(world);
     let state_entity = pointer_resource_entity::<PointerState>(world);
+    // Borrow only authorized targets and the exact native pointer resources.
+    let mut access_entities = EntityHashSet::with_capacity(targets.len() + 3);
+    access_entities.extend(targets.iter().copied());
+    access_entities.extend(
+        [hover_entity, previous_hover_entity, state_entity]
+            .into_iter()
+            .flatten(),
+    );
     let mut query = query_including_disabled::<(
         Entity,
         Option<&mut HoverMap>,
@@ -835,7 +843,9 @@ fn prepare_pointer_mutation<'w>(
     )>(world);
     let mut resources = PointerStateResources::default();
     let mut interactions = Vec::with_capacity(targets.len());
-    for (entity, hover, previous_hover, state, interaction) in query.iter_mut(world) {
+    for (entity, hover, previous_hover, state, interaction) in
+        query.iter_many_unique_mut(world, access_entities)
+    {
         if Some(entity) == hover_entity {
             resources.hover = hover;
         }
@@ -1845,44 +1855,50 @@ pub(crate) mod tests {
 
     #[test]
     fn pointer_preparation_is_read_only_and_handles_targets_outside_presentation() {
-        #[derive(bevy_ecs::component::Component)]
-        struct AppDisabled;
-        let mut world = World::new();
-        world.register_disabling_component::<AppDisabled>();
-        let removed = world.spawn_empty().id();
-        let preserved = world.spawn_empty().id();
-        seed_pointer_history(&mut world, &[removed, preserved]);
-        world
-            .entity_mut(removed)
-            .insert((bevy_ecs::entity_disabling::Disabled, AppDisabled));
-        for resource in [
-            pointer_resource_entity::<HoverMap>(&world),
-            pointer_resource_entity::<PreviousHoverMap>(&world),
-            pointer_resource_entity::<PointerState>(&world),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for apply_presentation in [false, true] {
+            #[derive(bevy_ecs::component::Component)]
+            struct AppDisabled;
+            let mut world = World::new();
+            world.register_disabling_component::<AppDisabled>();
+            let removed = world.spawn_empty().id();
+            let preserved = world.spawn_empty().id();
+            seed_pointer_history(&mut world, &[removed, preserved]);
             world
-                .entity_mut(resource)
-                .insert(bevy_ecs::entity_disabling::Disabled);
+                .entity_mut(removed)
+                .insert((bevy_ecs::entity_disabling::Disabled, AppDisabled));
+            for resource in [
+                pointer_resource_entity::<HoverMap>(&world),
+                pointer_resource_entity::<PreviousHoverMap>(&world),
+                pointer_resource_entity::<PointerState>(&world),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                world
+                    .entity_mut(resource)
+                    .insert(bevy_ecs::entity_disabling::Disabled);
+            }
+            let before = world.resource::<PointerState>().clone();
+            drop(prepare_pointer_mutation(
+                &mut world,
+                [removed].into_iter().collect(),
+            ));
+            assert_pointer_target_preserved(&world, removed, &before);
+            assert_pointer_target_preserved(&world, preserved, &before);
+            if apply_presentation {
+                crate::presentation::prepare_presentation_with_pointer_revocation(
+                    &mut world,
+                    &[],
+                    &[removed],
+                )
+                .unwrap()
+                .apply();
+            } else {
+                prepare_pointer_mutation(&mut world, [removed].into_iter().collect()).apply();
+            }
+            assert_pointer_target_revoked(&world, removed);
+            assert_pointer_target_preserved(&world, preserved, &before);
         }
-        let before = world.resource::<PointerState>().clone();
-        drop(prepare_pointer_mutation(
-            &mut world,
-            [removed].into_iter().collect(),
-        ));
-        assert_pointer_target_preserved(&world, removed, &before);
-        assert_pointer_target_preserved(&world, preserved, &before);
-        let presentation = crate::presentation::prepare_presentation_with_pointer_revocation(
-            &mut world,
-            &[],
-            &[removed],
-        )
-        .unwrap();
-        presentation.apply();
-        assert_pointer_target_revoked(&world, removed);
-        assert_pointer_target_preserved(&world, preserved, &before);
     }
 
     #[test]
@@ -1907,34 +1923,40 @@ pub(crate) mod tests {
         });
         let unrelated = world.spawn_empty().id();
         world.clear_trackers();
-        for targets in [vec![], vec![unrelated]] {
-            let presentation = crate::presentation::prepare_presentation_with_pointer_revocation(
-                &mut world,
-                &[],
-                &targets,
-            )
-            .unwrap();
-            presentation.apply();
-            assert!(!world.get_resource_ref::<HoverMap>().unwrap().is_changed());
-            assert!(
-                !world
-                    .get_resource_ref::<PreviousHoverMap>()
+        for apply_presentation in [false, true] {
+            for targets in [vec![], vec![unrelated]] {
+                if apply_presentation {
+                    crate::presentation::prepare_presentation_with_pointer_revocation(
+                        &mut world,
+                        &[],
+                        &targets,
+                    )
                     .unwrap()
-                    .is_changed()
-            );
-            assert!(
-                !world
-                    .get_resource_ref::<PointerState>()
-                    .unwrap()
-                    .is_changed()
-            );
-            assert!(
-                !world
-                    .entity(target)
-                    .get_ref::<PickingInteraction>()
-                    .unwrap()
-                    .is_changed()
-            );
+                    .apply();
+                } else {
+                    prepare_pointer_mutation(&mut world, targets.into_iter().collect()).apply();
+                }
+                assert!(!world.get_resource_ref::<HoverMap>().unwrap().is_changed());
+                assert!(
+                    !world
+                        .get_resource_ref::<PreviousHoverMap>()
+                        .unwrap()
+                        .is_changed()
+                );
+                assert!(
+                    !world
+                        .get_resource_ref::<PointerState>()
+                        .unwrap()
+                        .is_changed()
+                );
+                assert!(
+                    !world
+                        .entity(target)
+                        .get_ref::<PickingInteraction>()
+                        .unwrap()
+                        .is_changed()
+                );
+            }
         }
         prepare_pointer_mutation(&mut world, [target].into_iter().collect()).apply();
         assert_eq!(

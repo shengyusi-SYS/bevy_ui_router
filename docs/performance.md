@@ -284,7 +284,7 @@ scope 是含子调用的 wall-clock，不能相加；探针也有开销。这是
 | 方向与最小边界 | 工作量、风险与决策 |
 | --- | --- |
 | 输入准备使用操作内实体集合 | 两版均已测并撤回；命中改善，但 LRU 稳定回退。保留原实现，暂不继续更换容器 |
-| presentation 改用 Bevy 定向实体查询及 target 索引 | 0.5–1 人日，中风险；小 World 中占比低，后续[规模诊断](#无关-world-实体与清理准备)已确认线性成本，值得比较最小候选 |
+| presentation 与 pointer 改用 Bevy 定向实体查询 | 已按[规模对照](#按目标读取-presentation-与-pointer)采用；保留原权限判定与实时观察，消除无关 World 实体的扫描成本 |
 | Registered target 借用组件 ID，避免临时排序 manifest | 0.5–1 人日，中风险；target 全部复验仅约 5–6%，其中普通内容不走该分支。收益上限有限，暂缓 |
 | 完整 ledger 的 receipt 索引 | 0.5–1 人日，中风险；现有 plan 不覆盖已结算项，另建索引引入维护负担，而对应成本仅约 2%，不采用 |
 | focus 临时容量、一次比较内 EntityRef 合并 | 低成本；前者占比低，后者对照无稳定收益，不继续 |
@@ -348,6 +348,21 @@ Core matcher 的分支克隆与最大深度重算需要更大真实路由表的�
 清理方面，128 父子依赖淘汰的 removal plan 准备约 1.21 ms，其中 receipt batch 约 0.66 ms；leaf LRU 对应约 0.46 / 0.24 ms。源码确认同一只读准备区间为每个 target 重复比较完整 issued attempt，再创建单项 receipt 去重集合。一次准备整批 receipt、再分别线性消费，是可核验的局部方向；它与已撤回的 EntityRef 读取合并不同，也不能据此省去删除后的完整 World 复验。该补充诊断只有一个父子运行，不把所有 SettleCleanup 剩余成本归到 receipt。
 
 背景实验只改变实体数量，未覆盖 archetype 多样性、应用系统或 MT 竞争；不因此引入新的运行框架或全局索引。
+
+## 按目标读取 presentation 与 pointer
+
+两处准备使用现有 Bevy `iter_many_unique_mut`，只借用已授权 targets、pointer targets 与 exact resource Entity。presentation 同时用操作内 Entity 索引替代逐实体线性查找；缺失/重复 target 仍拒绝，返回顺序仍按原 target 顺序，disabled pointer、只读准备与 publication tail 的边界不变。没有跨帧缓存，也没有更换原 pointer membership 集合。
+
+在 `6b20ed9` 上分别比较 presentation、pointer 和组合，背景数0/8192、flat、每场景128样本，各两轮反序运行。[完整384行与重放来源](data/performance/README.md#定向查询-2026-10-24)保留全部结果。8192个无关实体、128内容节点时，组合结果为：
+
+| 路径 | before p50 | 组合 p50 | 配对变化 |
+| --- | --- | --- | --- |
+| fresh | 6.054 / 6.065 ms | 5.744 / 5.804 ms | −5.1% / −4.3% |
+| 首次 miss | 2.727 / 2.714 ms | 2.429 / 2.491 ms | −10.9% / −8.2% |
+| 缓存命中 | 739 / 722 µs | 387 / 375 µs | −47.6% / −48.1% |
+| 满容量 LRU | 8.608 / 8.519 ms | 8.207 / 8.250 ms | −4.7% / −3.2% |
+
+两项单独修改也减少该规模下的导航成本；组合使命中接近无背景的水平。背景为0时，128节点命中变化−3.3% / +2.0%，LRU约持平；1节点第二轮命中与LRU分别增加8.0% / 14.4%，部分idle增加约1–6%，不能宣称小场景没有开销。小World的128节点命中第二轮p95也从461增至564µs，全部记录保留。采用依据是消除不相关World规模造成的稳定线性成本，改动限于局部访问准备；未据此增加阈值分支或归因未解释的波动。
 
 ## History 源校验的分配减法
 

@@ -752,6 +752,74 @@ fn pointer_preparation_keeps_disabled_presentation_rejected() {
 }
 
 #[test]
+fn duplicate_or_missing_presentation_targets_are_rejected_without_writes() {
+    for missing_target in [false, true] {
+        let mut world = World::new();
+        let (leaving, entering, child_slot, mut targets) = presentation_commit_fixture(&mut world);
+        crate::input::tests::seed_pointer_history(&mut world, &[leaving, entering]);
+        if missing_target {
+            let missing = world
+                .spawn(FrameLifecycle(EntityLifecycle::PreparedInert))
+                .id();
+            world.despawn(missing);
+            // Native content bypasses visual eligibility, so this exercises the
+            // final completeness check when a targeted iteration skips it.
+            targets.push(FrameMutationTarget {
+                entity: missing,
+                kind: PresentationTargetKind::NativeContent,
+                interactive: false,
+                ..targets[1]
+            });
+        } else {
+            targets.push(targets[0]);
+        }
+        let snapshot = |world: &World| {
+            macro_rules! component {
+                ($entity:expr, $ty:ty) => {
+                    (
+                        world.get::<$ty>($entity).copied(),
+                        world
+                            .entity($entity)
+                            .get_change_ticks::<$ty>()
+                            .map(|ticks| (ticks.added, ticks.changed)),
+                    )
+                };
+            }
+            (
+                [leaving, entering, child_slot].map(|entity| {
+                    (
+                        component!(entity, Visibility),
+                        component!(entity, Pickable),
+                        component!(entity, RouterInputBarrier),
+                        component!(entity, FrameLifecycle),
+                        component!(entity, ChildSlotLifecycle),
+                        component!(entity, PickingInteraction),
+                    )
+                }),
+                [
+                    world.get_resource_change_ticks::<HoverMap>(),
+                    world.get_resource_change_ticks::<PreviousHoverMap>(),
+                    world.get_resource_change_ticks::<PointerState>(),
+                ]
+                .map(|ticks| ticks.map(|ticks| (ticks.added, ticks.changed))),
+            )
+        };
+        let before = snapshot(&world);
+        let pointer_before = world.resource::<PointerState>().clone();
+        world.increment_change_tick();
+
+        assert!(
+            prepare_presentation_with_pointer_revocation(&mut world, &targets, &[leaving])
+                .is_none()
+        );
+
+        assert_eq!(snapshot(&world), before);
+        crate::input::tests::assert_pointer_target_preserved(&world, leaving, &pointer_before);
+        crate::input::tests::assert_pointer_target_preserved(&world, entering, &pointer_before);
+    }
+}
+
+#[test]
 fn commit_split_is_rejected_before_any_mutation() {
     let mut world = World::new();
     let (leaving, entering, child_slot, targets) = presentation_commit_fixture(&mut world);

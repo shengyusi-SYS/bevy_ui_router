@@ -271,6 +271,14 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 
 环境与非MT、headless、wall-clock边界沿用本日完整阶段诊断。固定内容预算下的背景规模对照不代表任意 archetype 或应用负载；[结果及最小优化边界](../../performance.md#无关-world-实体与清理准备)分别讨论 presentation、输入撤权和 receipt，未把全部增量归于单一scope。
 
+## 定向查询 2026-10-24
+
+[全部384行](performance-bounded-query-2026-10-24.csv)、[背景夹具差异](bounded-query-fixture-2026-10-24.patch)、[组合候选差异](bounded-query-candidate-2026-10-24.patch)与[构建身份](bounded-query-identity-2026-10-24.json)绑定 `6b20ed9`。先应用夹具，再按身份中的 `candidate_include` 用 `git apply --include=<path>` 选取 presentation 两个文件、pointer 文件或全部文件；四个版本均已逐字节重放核验。合入主源码前仅另作 rustfmt 格式化。
+
+无插桩，原导航终态边界、idle批次、CSV与行为断言不变；背景实体的精确数量及无归属检查位于初始化/退出，不在采样内。使用实际 compiler-artifact 保存四个 executable，确认每个候选的ECS重新编译。各背景数按 baseline1→presentation1→pointer1→combined1→combined2→pointer2→presentation2→baseline2 串行运行，先0后8192；每次flat keep_alive、128样本、完整24行。
+
+组内全部非计时列一致，`live_entities`继续包含背景实体；所有尾部和较慢结果保留。环境沿用本日WSL2、非MT优化构建与headless边界，没有本任务的并行构建，不含layout/picking/GPU/I/O，也未控制宿主全部负载。采用理由及小场景代价见[性能说明](../../performance.md#按目标读取-presentation-与-pointer)。
+
 ## History 分配 2026-10-24
 
 [全部288行](history-allocations-2026-10-24.csv)、[探针与临时 lock 差异](history-allocation-probe-2026-10-24.patch)、[生产候选差异](history-borrow-candidate-2026-10-24.patch)及[身份](history-allocations-identity-2026-10-24.json)绑定 `c63a1c5`。先应用探针得到 before，再应用候选得到 after；顺序重放与实测四个文件逐字节相同。只在独立副本的 Core dev-dependency 加入固定 `allocation-counter = "=0.8.1"`，生产 Cargo/lock 未改变。

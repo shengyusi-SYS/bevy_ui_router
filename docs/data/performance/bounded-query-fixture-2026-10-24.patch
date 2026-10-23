@@ -1,0 +1,91 @@
+--- a/crates/bevy_ui_router/benches/router_baseline.rs
++++ b/crates/bevy_ui_router/benches/router_baseline.rs
+@@ -3,8 +3,9 @@
+ //! ROUTER_BENCH_SHAPE=flat (default) or nested selects equal-sized content trees.
+ //! ROUTER_BENCH_MODE=keep_alive selects the separate retention comparison CSV.
+ //! ROUTER_BENCH_MODE=instances measures parent/child inventory coordination.
+ //! ROUTER_BENCH_MODE=steady isolates initial dynamic content and ordinary scroll observation.
++//! ROUTER_BENCH_UNRELATED_ENTITIES (default 0) adds app-owned Node entities only in keep_alive.
+ #[path = "router_baseline/retained_instances.rs"]
+ mod retained_instances;
+ #[path = "router_baseline/steady.rs"]
+ mod steady;
+@@ -127,15 +128,68 @@
+ struct Content;
+ #[derive(Component, Clone, Default)]
+ struct ErrorPage;
+
++// Ordinary application entities deliberately outside all Router content/hosts.
++#[derive(Component)]
++struct UnrelatedWorldEntity;
++
++fn unrelated_entity_count() -> u32 {
++    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    *COUNT.get_or_init(|| {
++        if !matches!(
++            std::env::var("ROUTER_BENCH_MODE").as_deref(),
++            Ok("keep_alive")
++        ) {
++            return 0;
++        }
++        match std::env::var("ROUTER_BENCH_UNRELATED_ENTITIES") {
++            Err(std::env::VarError::NotPresent) => 0,
++            Ok(value) => value
++                .parse()
++                .expect("ROUTER_BENCH_UNRELATED_ENTITIES must be a nonnegative u32"),
++            value => panic!("cannot read ROUTER_BENCH_UNRELATED_ENTITIES: {value:?}"),
++        }
++    })
++}
++
++// Called only at fixture setup/teardown, outside timed navigation. Do not scan
++// this extra World before every sample and artificially warm its cache lines.
++fn assert_unrelated_entities(app: &mut App) {
++    let count = unrelated_entity_count();
++    if count == 0 {
++        return;
++    }
++    let mut query = app
++        .world_mut()
++        .query_filtered::<(Entity, &Node), With<UnrelatedWorldEntity>>();
++    let entities = query.iter(app.world()).collect::<Vec<_>>();
++    assert_eq!(entities.len(), count as usize);
++    for (entity, node) in entities {
++        assert_eq!(*node, Node::default());
++        assert!(app.world().get::<ChildOf>(entity).is_none());
++        assert!(app.world().get::<Content>(entity).is_none());
++        assert!(app.world().get::<RouterHostRegistration>(entity).is_none());
++    }
++}
++
+ fn base_app() -> App {
+     let mut app = App::new();
+     app.add_plugins((
+         TaskPoolPlugin::default(),
+         AssetPlugin::default(),
+         ScenePlugin,
+     ));
++    let unrelated = unrelated_entity_count();
++    if unrelated != 0 {
++        let before = app.world().entities().count_spawned();
++        for _ in 0..unrelated {
++            app.world_mut()
++                .spawn((Node::default(), UnrelatedWorldEntity));
++        }
++        assert_eq!(app.world().entities().count_spawned() - before, unrelated);
++        assert_unrelated_entities(&mut app);
++    }
+     app
+ }
+
+ fn only<T: Component>(app: &mut App) -> Entity {
+@@ -757,8 +811,9 @@
+             &after,
+             0,
+         );
+         fixture.release_parent_scope();
++        assert_unrelated_entities(&mut fixture.app);
+     }
+ }
+
+ fn main() {
