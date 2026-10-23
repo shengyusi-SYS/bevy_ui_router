@@ -10867,6 +10867,12 @@ impl RouterEngine {
         self.inner.canonical_history()
     }
 
+    /// Reads the current canonical key without projecting all history entries.
+    /// The key cannot authorize history mutation.
+    pub fn current_history_entry(&self) -> Option<HistoryEntryKey> {
+        self.inner.current_history_entry()
+    }
+
     pub fn history(&self) -> &MemoryHistory {
         self.inner.history()
     }

@@ -1990,7 +1990,7 @@ impl CanonicalHistory {
             .collect()
     }
 
-    fn current_entry_key(&self) -> Option<HistoryEntryKey> {
+    pub(crate) fn current_entry_key(&self) -> Option<HistoryEntryKey> {
         self.projection
             .cursor()
             .and_then(|cursor| self.entry_ids.get(cursor).copied())

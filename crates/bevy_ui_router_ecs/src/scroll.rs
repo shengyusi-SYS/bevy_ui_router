@@ -119,7 +119,7 @@ pub struct RouteScrollRestorations<'w, 's> {
 impl RouteScrollRestorations<'_, '_> {
     pub fn pending(&self, scope_entity: Entity, key: &str) -> Option<RouteScrollRestoration> {
         let (entry, frame) = self.scope.resolve(scope_entity)?;
-        let current = entry.engine.canonical_history().current_entry()?;
+        let current = entry.engine.current_history_entry()?;
         let intent = entry.scroll.pending.iter().find(|intent| {
             intent.entry == current && intent.frame == *frame.frame() && intent.key == key
         })?;
@@ -623,7 +623,7 @@ fn observe_active(
     ActiveObservation {
         entry: observation
             .as_ref()
-            .and_then(|_| entry.engine.canonical_history().current_entry()),
+            .and_then(|_| entry.engine.current_history_entry()),
         frames: observation
             .iter()
             .flat_map(|branch| branch.frames())
@@ -809,7 +809,7 @@ pub(crate) fn settle_scroll_system(
             .scroll
             .warn_layout(missing_layout.map(|index| &observation.containers[index]));
         entry.scroll.sample_displayed(
-            entry.engine.canonical_history().current_entry(),
+            entry.engine.current_history_entry(),
             observation.containers,
             &laid_out,
         );

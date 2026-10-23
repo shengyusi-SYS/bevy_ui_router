@@ -179,6 +179,14 @@ Bevy 0.19.1 的 Multi executor 先 `can_run` 再 `should_run`；exclusive 系统
 
 优化复用当前 World 借用内已经证明的内容和切口事实，仍分别检查值、claims 与完整 focus 范围；滚动候选先判重复 key，再筛布局资格。动态内容在下一次观察重新读取，正常采样和 publication 边界保持。这组结果只支持库内 CPU 侧观察成本下降：夹具没有 UI layout、原生 picking、窗口或 GPU，也没有持续视觉滚动，不能解释设备 FPS 或承诺相同比例的帧率改善。
 
+## 当前 history entry 读取
+
+滚动观察与恢复查询现在直接读取 Core 的当前 entry key。此前为取得一个 key，先构造包含全部 history keys 的投影；新入口仍从同一个 canonical history cursor 读取，不引入缓存或第二个状态来源，将这一步从 O(H) 复制与分配降为 O(1)。完整 history 投影继续服务需要全部 keys 的调用方。
+
+采用现有 `steady`、nested、每场景 128 样本，按 before→after→after→before 完成两轮串行优化对照，完整 40 行及构建身份见[数据说明](data/performance/README.md#当前-history-entry-读取)。夹具只有一项 history，因此不用于宣称长 history 的实际收益。带 marker 的 128 内容节点场景，两轮 idle 批均值 p50 分别降低约 0.6–1.8%；1024 节点中，两层 frame 第二轮由 177.769 增至 178.560 µs，其余配对下降。小幅变化可能混有运行波动，不能认领稳定的整帧加速。
+
+保留依据是读取接口与调用需求一致、确定消除了完整投影分配，改动局部且无新状态。既有滚动、history、生命周期与独立 consumer 回归仍验证实际行为；此对照不含 UI layout、picking、窗口或连续滚动输入，不代表 FPS。
+
 ## 稳态执行实测
 
 2026-10-17 继续对空目标隔离、空工作资源作用域、内容观察复用和 focus 安装核查做两轮交替 before/after 对照。完整 192 行、源码和二进制身份见[数据说明](data/performance/README.md#稳态执行-2026-10-17)。沿用同一 flat 夹具、1/32/128 内容预算和每普通场景 128 样本；下表为 128 内容节点时 idle 批均值 p50 的两轮范围，单位 µs。

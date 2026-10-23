@@ -208,3 +208,11 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 已确认采样期间存在外部并行 Cargo 编译，区间为 2026-10-17 UTC 20:25:35–20:25:43、20:25:49–20:26:13。文件时间确认与 `retained` 第 2 轮重叠：after CSV 从创建至末写为 20:25:10.515–20:25:46.323，before 为 20:25:46.343–20:26:22.095。整个配对 48 行均标为 `contended_pair`，不用于收益估算；没有按单行猜测或裁剪受影响样本，也没有重跑追加矩阵。其余组未与该已知区间重叠，标为 `uncontended_pair`，不表示控制了宿主全部负载。
 
 每次完整输出 24 行，全部 288 行保留，含受干扰轮次、较慢导航、尾部和最大值；不删除候选或挑选较快轮次。三组各轮的样本数、min/max update、实体、活动/非活动页面和 factory 次数逐项一致。结果是 CPU wall-clock 汇总，不含 UI layout、picking、窗口、GPU 或持续视觉滚动；没有合并不同运行的分位数。采用结论与未确定归因见[性能说明](../../performance.md#retained-权限读取对照)。
+
+## 当前 history entry 读取
+
+[完整 40 行](performance-current-history-2026-10-23.csv)使用既有 `steady` 模式、nested、每场景 128 样本，包含无 Router、两层/三层 frame、有/无普通滚动 marker 的所有组。固定顺序为 before 1→after 1→after 2→before 2；没有删去较慢组或离群值。两侧均只有一条请求、一项 history，实体和 update 数相同，idle 分位数是每 32 次 update 均值的分布。
+
+[构建身份](current-history-identity-2026-10-23.json)记录基线提交 `b3672c6`、候选完整源码 hash、lock、工具链、实际 binary 和 compiler-artifact features/profile，以及每组输出 hash 和时间。候选仅增加受控的当前 key 读取并替换滚动三处完整投影调用，未改基准。使用两个单独保存的无插桩 executable 运行，采样期间没有本任务的并行构建。
+
+环境为 Linux WSL2、AMD Ryzen 9 9950X、24 可见逻辑 CPU，Rust 1.99.0-nightly、官方 Bevy 0.19.1，opt-level 3、无 debug assertions。实际 `bevy_ecs` artifact 未启用 `multi_threaded`；没有 UI layout、picking、GPU、窗口或持续滚动。未固定 CPU affinity/频率，也未控制宿主全部负载。此结果只约束该小 history 夹具，不证明长 history、MT 调度或整应用帧率收益。

@@ -39,7 +39,9 @@ use crate::history_authority::{
     PrepareBackAdmissionErrorKind, PreparedHistoryPublication, PreparedPresentationBinding,
     VerifiedBackNoTargetCandidate, VerifiedBackTargetExecutionOwner,
 };
-use crate::history_authority::{CanonicalHistoryView, HistoryFrameFact, HistoryPublicationFacts};
+use crate::history_authority::{
+    CanonicalHistoryView, HistoryEntryKey, HistoryFrameFact, HistoryPublicationFacts,
+};
 #[cfg(test)]
 use crate::history_authority::{
     HistoryAuthoritySnapshot, HistoryCapabilitySnapshot, HistoryDriftEvidenceSnapshot,
@@ -12840,6 +12842,10 @@ impl RouterEngine {
 
     pub(crate) fn canonical_history(&self) -> CanonicalHistoryView {
         self.history.entry_key_projection()
+    }
+
+    pub(crate) fn current_history_entry(&self) -> Option<HistoryEntryKey> {
+        self.history.current_entry_key()
     }
 
     pub(crate) const fn history(&self) -> &MemoryHistory {

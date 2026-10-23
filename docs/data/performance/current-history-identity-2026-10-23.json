@@ -1,0 +1,309 @@
+{
+  "base": "b3672c6bc9185430cdde436e54c8ee58147ab850",
+  "toolchain": "rustc 1.99.0-nightly (ba28ff76f 2026-08-13)\nbinary: rustc\ncommit-hash: ba28ff76f353a722f31c4f3dd2ac4e437d36411b\ncommit-date: 2026-08-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0\n",
+  "command": "ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_SAMPLES=128 <saved-binary>",
+  "source_sha256": {
+    "Cargo.lock": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+    "crates/bevy_ui_router_core/src/history_authority.rs": "0109f882feb03c6477ebaffdb0ebc83324c6eec8de15d3f44aee50cde2ab40fd",
+    "crates/bevy_ui_router_core/src/engine.rs": "95d75821332b4856ff776510c77c74d4d18e10ca2005fc28ac4d870845cf4435",
+    "crates/bevy_ui_router_core/src/integration.rs": "47434c5fbf9b56b562fb4b701c4c6f4b7a3a42d93534f7a4b310806541f3623f",
+    "crates/bevy_ui_router_ecs/src/scroll.rs": "885fae97172a854145be0aa80ddc2b995f939fbeedf341ace530ace809c46d52",
+    "crates/bevy_ui_router/benches/router_baseline.rs": "0e2a774ea24e6f3c22d3388be8fef24b06cce6c5b3705e8b0f60cf582c06cfea",
+    "crates/bevy_ui_router/benches/router_baseline/steady.rs": "898acb52ba9c5c692bc50f4d1169bd18799d7f4b07487a45bb994be1b54d56f9"
+  },
+  "runs": [
+    {
+      "run_order": 1,
+      "variant": "before",
+      "round": 1,
+      "result_sha256": "d40e972bf2c942ae8b449335cd646b3aa2d9acb64c435ab0afcccbce6871295f",
+      "finished_at_utc": "2026-10-23T07:01:20.556530+00:00"
+    },
+    {
+      "run_order": 2,
+      "variant": "after",
+      "round": 1,
+      "result_sha256": "a5b4b1e2dcbff2e8248f9305fdbacf36abb9891d1dbfa2dd497066ed2613d9b3",
+      "finished_at_utc": "2026-10-23T07:03:43.108502+00:00"
+    },
+    {
+      "run_order": 3,
+      "variant": "after",
+      "round": 2,
+      "result_sha256": "3c4a958b37687d8d7e1417b48d997539782d00e7dc398464d20f7e1a5213e67c",
+      "finished_at_utc": "2026-10-23T07:03:46.512501+00:00"
+    },
+    {
+      "run_order": 4,
+      "variant": "before",
+      "round": 2,
+      "result_sha256": "b81997633b1b773f8db044061c42515479a6b1f375920af5e5dbba8725bda176",
+      "finished_at_utc": "2026-10-23T07:03:49.916501+00:00"
+    }
+  ],
+  "builds": {
+    "before": {
+      "base": "b3672c6bc9185430cdde436e54c8ee58147ab850",
+      "binary_sha256": "de237354ad661be94176cdda7b3a8e8e825b7c1b2f4f27d95541ac70a200261f",
+      "features": [
+        "bsn",
+        "default",
+        "ecs",
+        "view"
+      ],
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "dependency_artifacts": [
+        {
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_tasks@0.19.1",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_tasks",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_tasks-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [
+            "async_executor",
+            "futures-lite"
+          ],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        },
+        {
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ecs",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [
+            "async_executor",
+            "backtrace",
+            "bevy_reflect",
+            "default",
+            "std"
+          ],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        },
+        {
+          "package_id": "path+file:///workspace/projects/bevy_ui_router/crates/bevy_ui_router_core#0.1.0",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_core",
+            "src_path": "/workspace/projects/bevy_ui_router/crates/bevy_ui_router_core/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        },
+        {
+          "package_id": "path+file:///workspace/projects/bevy_ui_router/crates/bevy_ui_router_ecs#0.1.0",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_ecs",
+            "src_path": "/workspace/projects/bevy_ui_router/crates/bevy_ui_router_ecs/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [
+            "bsn",
+            "default"
+          ],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    "scroll": {
+      "base": "b3672c6bc9185430cdde436e54c8ee58147ab850",
+      "binary_sha256": "a40738fdcf09fc25d2be9da063970dac4683daa0fe186a95c9981cb0bb55e921",
+      "features": [
+        "bsn",
+        "default",
+        "ecs",
+        "view"
+      ],
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "dependency_artifacts": [
+        {
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_tasks@0.19.1",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_tasks",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_tasks-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [
+            "async_executor",
+            "futures-lite"
+          ],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        },
+        {
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ecs",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [
+            "async_executor",
+            "backtrace",
+            "bevy_reflect",
+            "default",
+            "std"
+          ],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        },
+        {
+          "package_id": "path+file:///workspace/projects/bevy_ui_router/crates/bevy_ui_router_core#0.1.0",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_core",
+            "src_path": "/workspace/projects/bevy_ui_router/crates/bevy_ui_router_core/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        },
+        {
+          "package_id": "path+file:///workspace/projects/bevy_ui_router/crates/bevy_ui_router_ecs#0.1.0",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_ecs",
+            "src_path": "/workspace/projects/bevy_ui_router/crates/bevy_ui_router_ecs/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "features": [
+            "bsn",
+            "default"
+          ],
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          }
+        }
+      ]
+    }
+  },
+  "data_sha256": "e68dfcd87298b7150486b7c59c86ab396468cbbc44c55531a410a313b8c45824"
+}
