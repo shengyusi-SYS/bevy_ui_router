@@ -1,0 +1,28 @@
+{
+  "base": "b3672c6",
+  "command": "ROUTER_BENCH_PROFILE_SCOPES=1 ROUTER_BENCH_MODE=keep_alive ROUTER_BENCH_SAMPLES=32 <saved-binary>",
+  "binary_sha256": "aa2003de1ed0903d6642d9ae8a7fe1e5f38a7f72b4d86b44bda804d307743b41",
+  "patch_sha256": "ab2eebee1b28fa8d46024c6ce911cba1e77decaf27503894e3009223c0f88fb7",
+  "data_sha256": "b2225573bd0464c24909514ef4fe78ce34aa5be6588692ea94081336d743aebf",
+  "features": [
+    "bsn",
+    "default",
+    "ecs",
+    "view"
+  ],
+  "profile": {
+    "opt_level": "3",
+    "debuginfo": 0,
+    "debug_assertions": false,
+    "overflow_checks": false,
+    "test": true
+  },
+  "bevy_ecs_features": [
+    "async_executor",
+    "backtrace",
+    "bevy_reflect",
+    "default",
+    "std"
+  ],
+  "instrumentation": "Inclusive wall-time scopes; nested scope times must not be summed. Diagnostic only, separate target. App update rows buffered and printed only after request terminal."
+}

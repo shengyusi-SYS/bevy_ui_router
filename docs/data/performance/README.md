@@ -216,3 +216,15 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 [构建身份](current-history-identity-2026-10-23.json)记录基线提交 `b3672c6`、候选完整源码 hash、lock、工具链、实际 binary 和 compiler-artifact features/profile，以及每组输出 hash 和时间。候选仅增加受控的当前 key 读取并替换滚动三处完整投影调用，未改基准。使用两个单独保存的无插桩 executable 运行，采样期间没有本任务的并行构建。
 
 环境为 Linux WSL2、AMD Ryzen 9 9950X、24 可见逻辑 CPU，Rust 1.99.0-nightly、官方 Bevy 0.19.1，opt-level 3、无 debug assertions。实际 `bevy_ecs` artifact 未启用 `multi_threaded`；没有 UI layout、picking、GPU、窗口或持续滚动。未固定 CPU affinity/频率，也未控制宿主全部负载。此结果只约束该小 history 夹具，不证明长 history、MT 调度或整应用帧率收益。
+
+## 清理与输入准备 2026-10-24
+
+诊断基线为 `b3672c6`，临时插桩只存在于独立源码副本与 target，未进入生产模块。第一次的[逐 update 记录](cleanup-profile-2026-10-24.csv)、[完整补丁](cleanup-profile-2026-10-24.patch)、[身份](cleanup-profile-identity-2026-10-24.json)覆盖六个 scope；第二次的[细分记录](cleanup-profile-detail-2026-10-24.csv)、[完整补丁](cleanup-profile-detail-2026-10-24.patch)、[身份](cleanup-profile-detail-identity-2026-10-24.json)另分离 removed receipt 集合与 protected 字段比较。每次各 1,572 行，保留 setup、warmup、measure、reset、teardown 全部阶段，其中 measure 各 384 行。第二份补丁独立应用于相同基线，不叠加第一份。
+
+从基线的独立检出应用对应补丁后，以独立 `CARGO_TARGET_DIR` 优化构建 `cargo bench -p bevy_ui_router --bench router_baseline --features bsn --no-run --locked`；由 compiler-artifact 找到 executable，再运行 `ROUTER_BENCH_PROFILE_SCOPES=1 ROUTER_BENCH_MODE=keep_alive ROUTER_BENCH_SAMPLES=32 <executable>`。数据在请求终态后统一输出；scope 为同步调用的 inclusive wall-clock，嵌套项不能求和，插桩成本仍在总耗时内，两组总时间不作回归比较。
+
+后续 EntityRef 合并候选的[全部 192 行](performance-cleanup-entity-read-2026-10-24.csv)、[未采用差异](cleanup-entity-read-candidate-2026-10-24.patch)和[构建身份](cleanup-entity-read-identity-2026-10-24.json)绑定 `a0679dd8086ef20baaae7fd868adc3fa34d12369`；不含探针。两个保存的 executable 按 before 1→after 1→after 2→before 2，再 before 3→after 3→after 4→before 4 串行运行。每组 flat、128 样本、完整 24 行；样本数、update、活实体、活动/非活动页及 factory 次数逐项一致。
+
+首轮 before 的导航及未受修改影响的 idle 广泛变慢，原因未证实，整对标为 `unstable_pair`。其余配对和全部较慢值均保留，未按单行筛选；没有本任务的并行编译、窗口或其它采样，也未控制宿主全部负载。补充两轮用于判断这种整组变化是否掩盖候选收益，最终候选已撤回，结论见[性能说明](../../performance.md#清理与输入准备热点)。
+
+共同环境为 Linux WSL2、Ryzen 9 9950X、24 可见逻辑 CPU、Rust 1.99.0-nightly、Bevy 0.19.1，bench opt-level 3、无 debug assertions，未固定 affinity/频率。实际 ECS features 不含 `multi_threaded`；这些夹具不含 UI layout、picking、窗口、GPU 或 I/O。CSV 为墙钟而非线程 CPU 时间；idle 仍是 32 update 批均值的分布。
