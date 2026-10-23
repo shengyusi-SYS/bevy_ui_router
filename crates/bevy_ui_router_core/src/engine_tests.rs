@@ -1031,7 +1031,7 @@ fn back_target_permanent_begin_rejects_owned_noncanonical_relations_losslessly()
 
     let integration_and_tests = include_str!("../../bevy_ui_router_core/src/integration.rs");
     let integration = &integration_and_tests[..integration_and_tests
-        .find("mod tests {")
+        .find("mod tests;")
         .unwrap_or(integration_and_tests.len())];
     for guarded_item in [
         braced_item(
