@@ -63,6 +63,10 @@ impl MemoryHistory {
         self.cursor
     }
 
+    pub(crate) fn entries(&self) -> &[RouteLocation] {
+        &self.entries
+    }
+
     pub(crate) fn can_back(&self) -> bool {
         self.cursor.is_some_and(|cursor| cursor > 0)
     }

@@ -1,0 +1,164 @@
+--- a/crates/bevy_ui_router_core/Cargo.toml
++++ b/crates/bevy_ui_router_core/Cargo.toml
+@@ -10,3 +10,6 @@
+ test-support = []
+
+ [dependencies]
++
++[dev-dependencies]
++allocation-counter = "=0.8.1"
+--- a/crates/bevy_ui_router_core/src/history_authority.rs
++++ b/crates/bevy_ui_router_core/src/history_authority.rs
+@@ -2362,6 +2362,127 @@
+         history.publish(prepared);
+     }
+
++    // Temporary diagnostic in an isolated benchmark copy, not a regression threshold.
++    #[test]
++    #[ignore = "current-thread allocation diagnostic; run explicitly with --nocapture"]
++    fn history_allocation_diagnostic() {
++        use allocation_counter::{AllocationInfo, measure};
++        use std::hint::black_box;
++
++        const WARMUP: usize = 4;
++        const SAMPLES: usize = 16;
++
++        fn report(phase: &str, entries: usize, samples: &[AllocationInfo; SAMPLES]) {
++            for (sample, info) in samples.iter().enumerate() {
++                println!(
++                    "{phase},{entries},{sample},{},{},{},{},{},{}",
++                    info.count_total,
++                    info.count_current,
++                    info.count_max,
++                    info.bytes_total,
++                    info.bytes_current,
++                    info.bytes_max,
++                );
++            }
++        }
++
++        println!(
++            "# allocation-counter=0.8.1; current thread only; non-nested scopes; warmup={WARMUP}; samples={SAMPLES}"
++        );
++        println!(
++            "# current is interval allocation minus deallocation; Replace also releases inputs/old state allocated before the interval; these are not whole-heap or navigation-time measurements"
++        );
++        println!(
++            "phase,history_entries,sample,count_total,count_current,count_max,bytes_total,bytes_current,bytes_max"
++        );
++
++        for entries in [1, 64, 256] {
++            let mut fixture = HistoryAuthorityFixture::new();
++            let mut history = CanonicalHistory::new(fixture.router_identity());
++            for index in 0..entries {
++                publish(
++                    &mut history,
++                    &mut fixture,
++                    HistoryEffect::Push(RouteLocation::new(format!("/entries/{index:06}"))),
++                );
++            }
++            // Keep all entries while making the NoTarget source a real cursor-zero case.
++            // Setup uses normal Back capabilities and stays outside all measurements.
++            for _ in 1..entries {
++                let BackPreview::Target(destination) = history.preview_back() else {
++                    panic!("seeded history has a Back target until cursor zero");
++                };
++                let (execution, presentation) = fixture.next_history_binding();
++                let capability = match history.freeze_back(execution, destination) {
++                    Ok(capability) => capability,
++                    Err(_) => panic!("setup Back keeps the exact source"),
++                };
++                let prepared = match history.prepare(capability, presentation) {
++                    Ok(prepared) => prepared,
++                    Err(_) => panic!("setup Back has the exact execution binding"),
++                };
++                assert!(prepared.matches_canonical_source(&history));
++                history.publish(prepared);
++            }
++            assert_eq!(history.projection.cursor(), Some(0));
++            assert_eq!(history.entry_ids.len(), entries);
++
++            let mut samples = [AllocationInfo::default(); SAMPLES];
++            for iteration in 0..WARMUP + SAMPLES {
++                // Retain the owned result until after measure so current includes it.
++                let mut frozen = None;
++                let info = measure(|| {
++                    frozen = Some(black_box(history.freeze_source()));
++                });
++                assert_eq!(frozen.as_ref().unwrap().entry_ids.len(), entries);
++                drop(black_box(frozen));
++                if iteration >= WARMUP {
++                    samples[iteration - WARMUP] = info;
++                }
++            }
++            report("freeze_source_owned", entries, &samples);
++
++            let BackPreview::NoTarget(expected) = history.preview_back() else {
++                panic!("cursor zero produces a NoTarget source");
++            };
++            for iteration in 0..WARMUP + SAMPLES {
++                let mut accepted = false;
++                let info = measure(|| {
++                    accepted = black_box(history.refreeze_back_no_target_source(&expected)).is_ok();
++                });
++                assert!(accepted, "unchanged source validates successfully");
++                if iteration >= WARMUP {
++                    samples[iteration - WARMUP] = info;
++                }
++            }
++            report("refreeze_no_target_success", entries, &samples);
++            drop(expected);
++
++            for iteration in 0..WARMUP + SAMPLES {
++                // Exclude fixture reservation, target construction and reporting. The real
++                // capability is produced, checked and consumed within this one flat scope.
++                let (execution, presentation) = fixture.next_history_binding();
++                let effect = HistoryEffect::Replace(RouteLocation::new("/entries/replacement"));
++                let info = measure(|| {
++                    let capability = history.freeze(execution, effect);
++                    let prepared = match history.prepare(capability, presentation) {
++                        Ok(prepared) => prepared,
++                        Err(_) => panic!("measured Replace has an exact source and binding"),
++                    };
++                    assert!(black_box(prepared.matches_canonical_source(&history)));
++                    history.publish(prepared);
++                    black_box(&history);
++                });
++                assert_eq!(history.entry_ids.len(), entries);
++                assert_eq!(history.projection.cursor(), Some(0));
++                if iteration >= WARMUP {
++                    samples[iteration - WARMUP] = info;
++                }
++            }
++            report("replace_freeze_prepare_match_publish", entries, &samples);
++        }
++    }
++
+     #[test]
+     fn back_between_duplicate_locations_uses_entry_identity() {
+         let mut fixture = HistoryAuthorityFixture::new();
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -19,6 +19,12 @@
+ dependencies = [
+  "memchr",
+ ]
++
++[[package]]
++name = "allocation-counter"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+ [[package]]
+ name = "allocator-api2"
+@@ -1179,6 +1185,9 @@
+ [[package]]
+ name = "bevy_ui_router_core"
+ version = "0.1.0"
++dependencies = [
++ "allocation-counter",
++]
+
+ [[package]]
+ name = "bevy_ui_router_ecs"

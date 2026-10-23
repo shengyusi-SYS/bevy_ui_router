@@ -1,0 +1,101 @@
+{
+  "baseline_commit": "c63a1c5b950a769a7a6ba81a0b1550bac9cde7ca",
+  "probe_patch_sha256": "cde14e914f3ca6e048947887eaaa8643bf7bfd5e998d87811f06e4d0d92b3f42",
+  "candidate_patch_sha256": "88f232d31ed172c6fee46f4fadc3e96a6b721826aa7299deeb5441c2a5859b67",
+  "data_sha256": "e11050e833db28bcc20112ba1bd8edb5c326e3c31f71650129556ce21efc356b",
+  "rows": 288,
+  "probe_lock_sha256": "cbd67aef57f61d648b74ca4b97a6f1a8bcb885f2069b1309c49cff9d454fb91f",
+  "production_lock_sha256": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+  "binaries": {
+    "before": {
+      "sha256": "0d189d385dc0a8f8883ff65a52d163da86a9707b3d3984e828d9b7a0d1b0bc07",
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-history-allocation-profile-20261024/crates/bevy_ui_router_core#0.1.0",
+        "manifest_path": "/tmp/router-history-allocation-profile-20261024/crates/bevy_ui_router_core/Cargo.toml",
+        "target": {
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "name": "bevy_ui_router_core",
+          "src_path": "/tmp/router-history-allocation-profile-20261024/crates/bevy_ui_router_core/src/lib.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": true,
+          "test": true
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [],
+        "filenames": [
+          "/tmp/router-history-allocation-target-20261024/release/build/bevy_ui_router_core/d487ebc9b660ccf5/out/bevy_ui_router_core-d487ebc9b660ccf5"
+        ],
+        "executable": "/tmp/router-history-allocation-target-20261024/release/build/bevy_ui_router_core/d487ebc9b660ccf5/out/bevy_ui_router_core-d487ebc9b660ccf5",
+        "fresh": false
+      }
+    },
+    "after": {
+      "sha256": "10f26481fea1204282cfbc9ba2db4e66d39c63d2af6f55eb367c15fc0c799891",
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-history-allocation-profile-20261024/crates/bevy_ui_router_core#0.1.0",
+        "manifest_path": "/tmp/router-history-allocation-profile-20261024/crates/bevy_ui_router_core/Cargo.toml",
+        "target": {
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "name": "bevy_ui_router_core",
+          "src_path": "/tmp/router-history-allocation-profile-20261024/crates/bevy_ui_router_core/src/lib.rs",
+          "edition": "2024",
+          "doc": true,
+          "doctest": true,
+          "test": true
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [],
+        "filenames": [
+          "/tmp/router-history-allocation-target-20261024/release/build/bevy_ui_router_core/d487ebc9b660ccf5/out/bevy_ui_router_core-d487ebc9b660ccf5"
+        ],
+        "executable": "/tmp/router-history-allocation-target-20261024/release/build/bevy_ui_router_core/d487ebc9b660ccf5/out/bevy_ui_router_core-d487ebc9b660ccf5",
+        "fresh": false
+      }
+    }
+  },
+  "production_candidate_source_sha256": {
+    "crates/bevy_ui_router_core/src/history.rs": "9e9bcabbbfac66f54f99fc92766acfd59bba92b57382999c4b895519cd57ed90",
+    "crates/bevy_ui_router_core/src/history_authority.rs": "a543c08bec39f41e8669089c58e594c861b3e2925402d54f2292c2e45e45c856"
+  },
+  "probe_candidate_source_sha256": {
+    "crates/bevy_ui_router_core/Cargo.toml": "b15cc67a58288a78630557122c89266beaa9e16c3a72c308ed61ba72ac2a2ab8",
+    "crates/bevy_ui_router_core/src/history.rs": "9e9bcabbbfac66f54f99fc92766acfd59bba92b57382999c4b895519cd57ed90",
+    "crates/bevy_ui_router_core/src/history_authority.rs": "39ef740a1bd9d33e22a6ae9b5bb7ae0ce02a5d51c6880a6eefcf7f5f6deb945b",
+    "Cargo.lock": "cbd67aef57f61d648b74ca4b97a6f1a8bcb885f2069b1309c49cff9d454fb91f"
+  },
+  "build": "CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<isolated target> cargo test -p bevy_ui_router_core --release --no-run --locked --message-format=json",
+  "run": "<saved executable> history_authority::tests::history_allocation_diagnostic --ignored --exact --nocapture --test-threads=1",
+  "dependency": {
+    "name": "allocation-counter",
+    "version": "0.8.1",
+    "scope": "temporary diagnostic dev-dependency only",
+    "upstream": "https://docs.rs/allocation-counter/0.8.1/allocation_counter/fn.measure.html"
+  },
+  "measurement": "1/64/256 entries; 4 warmup +16 samples per phase; current-thread, non-nested; no timing claims. Owned freeze result dropped after measure. Replace includes release of old state and inputs allocated outside measure; current can be negative and is not whole-process heap or leak evidence.",
+  "rustc": "rustc 1.99.0-nightly (ba28ff76f 2026-08-13)\nbinary: rustc\ncommit-hash: ba28ff76f353a722f31c4f3dd2ac4e437d36411b\ncommit-date: 2026-08-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0\n"
+}

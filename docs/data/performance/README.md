@@ -270,3 +270,13 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 背景实体只带普通 Node 与独立 marker，不含 ChildOf、Router host 或 Content。初始化断言精确增加N个，退出再次验证数量、Node和无归属状态；这些附加检查不在计时循环内。跨规模配对的非计时列完全一致，`live_entities` 精确相差N，原CSV继续报告真实总数。数据新增 run 与 unrelated_entities；按 run/mode/背景数/nav_id 对 completion 去重。
 
 环境与非MT、headless、wall-clock边界沿用本日完整阶段诊断。固定内容预算下的背景规模对照不代表任意 archetype 或应用负载；[结果及最小优化边界](../../performance.md#无关-world-实体与清理准备)分别讨论 presentation、输入撤权和 receipt，未把全部增量归于单一scope。
+
+## History 分配 2026-10-24
+
+[全部288行](history-allocations-2026-10-24.csv)、[探针与临时 lock 差异](history-allocation-probe-2026-10-24.patch)、[生产候选差异](history-borrow-candidate-2026-10-24.patch)及[身份](history-allocations-identity-2026-10-24.json)绑定 `c63a1c5`。先应用探针得到 before，再应用候选得到 after；顺序重放与实测四个文件逐字节相同。只在独立副本的 Core dev-dependency 加入固定 `allocation-counter = "=0.8.1"`，生产 Cargo/lock 未改变。
+
+优化构建 `cargo test -p bevy_ui_router_core --release --no-run --locked --message-format=json`，独立 target、构建并发2、关闭 incremental；取 compiler-artifact 的 test executable 保存后运行 `history_authority::tests::history_allocation_diagnostic --ignored --exact --nocapture --test-threads=1`。两个 binary、完整源码、lock 和 Rust 身份均记录。
+
+使用现有 HistoryAuthorityFixture，经正常 Push/Back capability 构建1/64/256条 history，在真实 cursor 0 下分别测 owned freeze、成功 NoTarget 源校验及完整 Replace 链，每项4次预热、16次样本。Replace 的 binding/target 构造与打印在区间外；真实 capability 的创建、prepare、source match、publish 在同一区间。owned freeze 返回值在区间外 drop，便于同时观察临时总分配与最终 owned 输出。
+
+依照[计数库官方说明](https://docs.rs/allocation-counter/0.8.1/allocation_counter/fn.measure.html)，仅当前线程计数；全部区间不嵌套。`current` 是区间分配减释放，Replace 包含对旧 history/外部输入的释放，因此为负不代表错误，也不能据此宣称进程 heap 或长期释放正常。本次比较分配次数与字节，不比较工具替换 allocator 后的 wall-clock。原始每次记录均保留，不设置 CI 分配阈值；[结论](../../performance.md#history-源校验的分配减法)限于这三条 Core 路径。

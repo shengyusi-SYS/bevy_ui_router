@@ -1070,7 +1070,7 @@ impl BackTargetPermanentOwner {
 
     pub(crate) fn observed_source_is_current(&self, history: &CanonicalHistory) -> bool {
         self.source_facts()
-            .is_some_and(|(_, observed, _)| observed == &history.freeze_source())
+            .is_some_and(|(_, observed, _)| history.source_matches(observed))
     }
 
     pub(crate) fn observed_baseline_is_current(
@@ -1343,9 +1343,7 @@ impl BackNoTargetSourceDriftOwner {
     }
 
     pub(crate) fn observed_source_is_current(&self, history: &CanonicalHistory) -> bool {
-        history
-            .refreeze_back_no_target_source(&self.inner.observed)
-            .is_ok()
+        history.source_matches(&self.inner.observed)
     }
 
     pub(crate) fn into_terminal_evidence(self) -> BackNoTargetSourceDriftTerminalEvidence {
@@ -1737,7 +1735,7 @@ impl PreparedHistoryPublication {
     }
 
     pub(crate) fn matches_canonical_source(&self, history: &CanonicalHistory) -> bool {
-        self.source == history.freeze_source()
+        history.source_matches(&self.source)
     }
 
     pub(crate) fn execution_projection(&self) -> HistoryExecutionBindingProjection {
@@ -2064,11 +2062,10 @@ impl CanonicalHistory {
         &self,
         destination: &BackDestination,
     ) -> Result<(), FrozenHistorySource> {
-        let observed = self.freeze_source();
-        if destination.source == observed {
+        if self.source_matches(&destination.source) {
             Ok(())
         } else {
-            Err(observed)
+            Err(self.freeze_source())
         }
     }
 
@@ -2076,11 +2073,10 @@ impl CanonicalHistory {
         &self,
         expected: &FrozenHistorySource,
     ) -> Result<(), FrozenHistorySource> {
-        let observed = self.freeze_source();
-        if expected == &observed {
+        if self.source_matches(expected) {
             Ok(())
         } else {
-            Err(observed)
+            Err(self.freeze_source())
         }
     }
 
@@ -2089,12 +2085,12 @@ impl CanonicalHistory {
         execution: HistoryExecutionBinding,
         effect: HistoryEffect,
     ) -> HistoryCommitCapability {
-        let snapshot = self.snapshot();
         let destination = match effect {
             HistoryEffect::Push(target) => FrozenHistoryDestination::Push { target },
             HistoryEffect::Replace(target) => FrozenHistoryDestination::Replace {
                 target,
-                replaced: snapshot
+                replaced: self
+                    .projection
                     .cursor()
                     .and_then(|cursor| self.entry_ids.get(cursor).copied()),
             },
@@ -2128,11 +2124,10 @@ impl CanonicalHistory {
             source: destination.source,
             destination: frozen,
         };
-        let observed = self.freeze_source();
-        if capability.source != observed {
+        if !self.source_matches(&capability.source) {
             return Err(HistorySourceDrift {
                 capability,
-                observed,
+                observed: self.freeze_source(),
             });
         }
         Ok(capability)
@@ -2143,11 +2138,10 @@ impl CanonicalHistory {
         capability: HistoryCommitCapability,
         presentation: PreparedPresentationBinding,
     ) -> Result<PreparedHistoryPublication, HistoryPreparationError> {
-        let observed_source = self.freeze_source();
-        if observed_source != capability.source {
+        if !self.source_matches(&capability.source) {
             return Err(HistoryPreparationError::Source(HistorySourceDrift {
                 capability,
-                observed: observed_source,
+                observed: self.freeze_source(),
             }));
         }
 
@@ -2258,14 +2252,21 @@ impl CanonicalHistory {
         *self = next;
     }
 
+    fn source_matches(&self, expected: &FrozenHistorySource) -> bool {
+        expected.incarnation == self.incarnation
+            && expected.revision == self.revision
+            && expected.cursor == self.projection.cursor()
+            && expected.entry_ids == self.entry_ids
+            && expected.locations.as_slice() == self.projection.entries()
+    }
+
     fn freeze_source(&self) -> FrozenHistorySource {
-        let snapshot = self.snapshot();
         FrozenHistorySource {
             incarnation: self.incarnation,
             revision: self.revision,
-            cursor: snapshot.cursor(),
+            cursor: self.projection.cursor(),
             entry_ids: self.entry_ids.clone(),
-            locations: snapshot.entries().to_vec(),
+            locations: self.projection.entries().to_vec(),
         }
     }
 

@@ -349,6 +349,22 @@ Core matcher 的分支克隆与最大深度重算需要更大真实路由表的�
 
 背景实验只改变实体数量，未覆盖 archetype 多样性、应用系统或 MT 竞争；不因此引入新的运行框架或全局索引。
 
+## History 源校验的分配减法
+
+Core 的 canonical history 源比较原来先构造 owned snapshot，再复制 locations；成功校验后立即丢弃。现在直接借用既有 cursor/entries，完整比较 incarnation、revision、cursor、entry IDs 和 locations；只有需要保存源或返回失败证据时才构造 owned 值。capability source 与 prepared next 继续独立持有，比较仍逐项核对，不增加 revision 缓存或更改 history 行为。
+
+在独立 Core 副本以固定版本分配计数库测量 1/64/256 条 history，每项预热4次、记录16次，完整 [288 行与可重放来源](data/performance/README.md#history-分配-2026-10-24)保留。下表为每次操作的分配次数，组内16次结果一致；不是完整 ECS 导航计时。
+
+| 操作 | 1 entry：before→after | 64 entries：before→after | 256 entries：before→after |
+| --- | --- | --- | --- |
+| 冻结完整 owned source | 5→3 | 131→66 | 515→258 |
+| 成功重新校验 NoTarget source | 5→0 | 131→0 | 515→0 |
+| Replace 的 freeze→prepare→source match→publish | 21→7 | 525→133 | 2061→517 |
+
+256 entries 的 Replace 链累计分配字节从219,196降至65,054；最终区间净分配保持相同。owned source 的最终持有字节仍为32,512，减少的是临时副本；失败仍返回原 capability 和完整 observed evidence。该局部优化不声称整导航耗时按相同比例下降。
+
+计数仅覆盖当前线程、使用非嵌套区间。Replace 会释放区间外创建的输入及旧状态，因此净值可为负，不能解释为进程驻留内存或泄漏。计数依赖与 ignored probe 只保留为诊断补丁，不进入生产 Cargo 配置。
+
 ## 窗口诊断的边界
 
 [窗口 CSV](data/performance/performance-window-2026-09-27.csv)来自简单交互示例、两轮优化构建的临时诊断副本：暖机后 BRP 发送真实 WindowEvent/KeyboardInput，交替导航，采样期间不截图或轮询。每次在输入帧观察成功、正确路径、正尺寸布局与相同 layout Entity；最终截图只验证最终页面。
