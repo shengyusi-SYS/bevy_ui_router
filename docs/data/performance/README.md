@@ -279,6 +279,20 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 
 组内全部非计时列一致，`live_entities`继续包含背景实体；所有尾部和较慢结果保留。环境沿用本日WSL2、非MT优化构建与headless边界，没有本任务的并行构建，不含layout/picking/GPU/I/O，也未控制宿主全部负载。采用理由及小场景代价见[性能说明](../../performance.md#按目标读取-presentation-与-pointer)。
 
+## Receipt 批量准备 2026-10-24
+
+[完整192行](performance-receipt-batch-2026-10-24.csv)、[未采用差异](receipt-batch-candidate-2026-10-24.patch)与[构建身份](receipt-batch-identity-2026-10-24.json)绑定 `822eed4`，只改 cleanup 的操作内 receipt 准备，未进入主源码。补丁重放与实测候选逐字节相同；源码基线已含定向查询优化，没有改 benchmark。
+
+先flat keep_alive，再flat instances，各按before1→candidate1→candidate2→before2运行，每场景128样本，每次完整24行；非计时列逐项一致，行为断言通过。两份无插桩executable来自重新编译的实际artifact，全部慢值与尾部保留。构建参数、环境及非MT/headless边界沿用本日定向查询对照；没有本任务的并行构建。静态复核不代替crate回归，本候选未运行完整crate测试；[未采用原因](../../performance.md#无关-world-实体与清理准备)基于完整路径收益不足。
+
+## 多 Router 2026-10-24
+
+[192行](multi-router-2026-10-24.csv)、[六文件独立探针](multi-router-probe-2026-10-24.patch)和[身份](multi-router-identity-2026-10-24.json)绑定 `6b20ed9`，早于定向查询优化。patch重放逐字节一致，Cargo配置未改。构建原router_baseline后，以 `ROUTER_BENCH_MODE=multi_router ROUTER_BENCH_SAMPLES=32 <executable> --bench` 运行；已确认构建及运行退出0，全部边界保护断言通过。
+
+固定A/B两个Router，均两层native frame、每页128节点；A有两个预热页面，B有64条终态请求与一项history。三个阶段各预热64update再采32次：无marker空闲、仅A有普通marker空闲、A命中导航/B静止。计数使用固定TLS双槽，没有探针HashMap分配；只测Settle归属观察、借用请求索引构建，并分别计数两类公开快照重建。A保留原完成边界与行为断言，B状态检查在阶段结束及A退出后进行。
+
+外层update/completion时间在A/B两行重复，统计按phase/sample去重；inclusive scope不可与外层求和。探针只适用于实际非MT构建，并验证必经A scope被捕获；没有UI layout、窗口或滚动恢复计时。单次运行支持成本定位，不作为正式版本收益对照；环境和工具链沿用本日headless诊断。[结论](../../performance.md#多-router-的观察与快照)区分临时索引、真实快照重建和滚动观察。
+
 ## History 分配 2026-10-24
 
 [全部288行](history-allocations-2026-10-24.csv)、[探针与临时 lock 差异](history-allocation-probe-2026-10-24.patch)、[生产候选差异](history-borrow-candidate-2026-10-24.patch)及[身份](history-allocations-identity-2026-10-24.json)绑定 `c63a1c5`。先应用探针得到 before，再应用候选得到 after；顺序重放与实测四个文件逐字节相同。只在独立副本的 Core dev-dependency 加入固定 `allocation-counter = "=0.8.1"`，生产 Cargo/lock 未改变。

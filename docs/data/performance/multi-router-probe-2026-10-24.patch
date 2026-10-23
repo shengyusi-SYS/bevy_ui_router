@@ -1,0 +1,556 @@
+--- a/crates/bevy_ui_router/benches/router_baseline.rs
++++ b/crates/bevy_ui_router/benches/router_baseline.rs
+@@ -4,6 +4,8 @@
+ //! ROUTER_BENCH_MODE=keep_alive selects the separate retention comparison CSV.
+ //! ROUTER_BENCH_MODE=instances measures parent/child inventory coordination.
+ //! ROUTER_BENCH_MODE=steady isolates initial dynamic content and ordinary scroll observation.
++#[path = "router_baseline/multi_router_profile.rs"]
++mod multi_router_profile;
+ #[path = "router_baseline/retained_instances.rs"]
+ mod retained_instances;
+ #[path = "router_baseline/steady.rs"]
+@@ -331,7 +333,9 @@
+         }
+         .unwrap();
+         for updates in 1..=32 {
++            let update_started = bevy_ui_router_ecs::temporary_multi_router_profile::begin_update();
+             self.app.update();
++            bevy_ui_router_ecs::temporary_multi_router_profile::end_update(update_started);
+             let snapshots = self.app.world().resource::<RouterSnapshots>();
+             let RequestLookup::Found(result) = snapshots.request(self.router, request) else {
+                 continue;
+@@ -794,6 +798,10 @@
+         }
+     );
+     match std::env::var("ROUTER_BENCH_MODE") {
++        Ok(mode) if mode == "multi_router" => {
++            multi_router_profile::run(samples);
++            return;
++        }
+         Ok(mode) if mode == "steady" => {
+             steady::run(shape, samples);
+             return;
+--- /dev/null
++++ b/crates/bevy_ui_router/benches/router_baseline/multi_router_profile.rs
+@@ -0,0 +1,318 @@
++//! Temporary two-Router observation diagnostic, not a production benchmark mode.
++use super::*;
++use bevy_ui::ScrollPosition;
++use bevy_ui_router_ecs::{NavigationRequestSnapshot, temporary_multi_router_profile as profile};
++
++#[derive(Component, Clone, Default)]
++struct BackgroundLayout;
++#[derive(Component, Clone, Default)]
++struct BackgroundPage;
++#[derive(Component, Clone, Default)]
++struct BackgroundContent;
++
++struct Background {
++    router: RouterHandle,
++    host: Entity,
++    layout: Entity,
++    page: Entity,
++    content: Vec<Entity>,
++    snapshot: RouterSnapshot,
++    requests: Vec<(NavigationRequestId, NavigationRequestSnapshot, usize)>,
++    history_storage: usize,
++}
++
++fn install_background(app: &mut App) -> Background {
++    let layout = app
++        .register_bsn_view(ViewDriverKey::new("multi-b-layout").unwrap(), |_| {
++            Ok(bsn! { Node BackgroundLayout Children [(Node DefaultOutlet)] })
++        })
++        .unwrap();
++    let page = app
++        .register_bsn_view(ViewDriverKey::new("multi-b-page").unwrap(), |_| {
++            Ok(SceneFunction(|_, root: &mut ResolvedScene| {
++                root.push_template(Node::default());
++                root.push_template(BackgroundPage);
++                for _ in 0..128 {
++                    let mut child = ResolvedScene::default();
++                    child.push_template(Node::default());
++                    child.push_template(BackgroundContent);
++                    root.get_or_insert_related_resolved_scenes::<ChildOf>()
++                        .scenes
++                        .push(child);
++                }
++            }))
++        })
++        .unwrap();
++    let layout_key = RouteViewKey::new("multi-b-layout").unwrap();
++    let page_key = RouteViewKey::new("multi-b-page").unwrap();
++    let mut views = RouteViewRegistry::new();
++    views
++        .insert(layout_key.clone(), RouteViewDescriptor::new(layout))
++        .unwrap();
++    views
++        .insert(page_key.clone(), RouteViewDescriptor::new(page))
++        .unwrap();
++    let mut routes = RouteTree::builder()
++        .root_with_options(
++            RoutePattern::path("/").unwrap(),
++            RouteNodeOptions::new().with_view(layout_key),
++        )
++        .unwrap();
++    routes
++        .route_with_options(
++            routes.root_id().unwrap(),
++            RoutePattern::path("background").unwrap(),
++            RouteNodeOptions::new().with_view(page_key.clone()),
++        )
++        .unwrap();
++    let router = app
++        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, page_key))
++        .unwrap();
++    let host = app
++        .world_mut()
++        .spawn((Node::default(), RouterHostRegistration::new(router)))
++        .id();
++    app.update();
++    let mut issued = Vec::with_capacity(64);
++    for _ in 0..64 {
++        let request = app
++            .world_mut()
++            .resource_mut::<RouterNavigation>()
++            .replace(router, RouteLocation::new("/background"))
++            .unwrap();
++        let mut complete = false;
++        for _ in 0..32 {
++            app.update();
++            let snapshots = app.world().resource::<RouterSnapshots>();
++            let RequestLookup::Found(result) = snapshots.request(router, request) else {
++                continue;
++            };
++            assert!(!matches!(result.status(), RequestStatus::Failed(_)));
++            let snapshot = snapshots.get(router).unwrap();
++            if result.status() == &RequestStatus::Succeeded
++                && snapshot.running_request().is_none()
++                && !snapshot.cleanup().foreground_pending()
++            {
++                assert_eq!(snapshot.cleanup().quarantine_count(), 0);
++                complete = true;
++                break;
++            }
++        }
++        assert!(
++            complete,
++            "B navigation reaches its public completion boundary"
++        );
++        issued.push(request);
++    }
++    let layout = only::<BackgroundLayout>(app);
++    let page = only::<BackgroundPage>(app);
++    let content = app
++        .world_mut()
++        .query_filtered::<Entity, With<BackgroundContent>>()
++        .iter(app.world())
++        .collect::<Vec<_>>();
++    let snapshots = app.world().resource::<RouterSnapshots>();
++    let snapshot = snapshots.get(router).unwrap().clone();
++    let history_storage = snapshots.get(router).unwrap().history().entries().as_ptr() as usize;
++    let requests = issued
++        .into_iter()
++        .map(|request| {
++            let RequestLookup::Found(value) = snapshots.request(router, request) else {
++                panic!("all 64 B terminal requests are retained");
++            };
++            (request, value.clone(), value.trace().as_ptr() as usize)
++        })
++        .collect();
++    Background {
++        router,
++        host,
++        layout,
++        page,
++        content,
++        snapshot,
++        requests,
++        history_storage,
++    }
++}
++
++impl Background {
++    // Boundary-only guard: do not warm B's content and records before every sample.
++    fn assert_unchanged(&self, app: &mut App) {
++        assert_eq!(only::<BackgroundLayout>(app), self.layout);
++        assert_eq!(only::<BackgroundPage>(app), self.page);
++        assert_eq!(self.content.len(), 128);
++        assert_eq!(
++            app.world_mut()
++                .query_filtered::<Entity, With<BackgroundContent>>()
++                .iter(app.world())
++                .count(),
++            128
++        );
++        let world = app.world();
++        assert!(world.get::<RouterHostRegistration>(self.host).is_some());
++        let gate = world.resource::<RouterInputGate>();
++        for entity in [self.layout, self.page]
++            .into_iter()
++            .chain(self.content.iter().copied())
++        {
++            assert_eq!(world.get::<Node>(entity), Some(&Node::default()));
++            assert!(world.get::<RouteScroll>(entity).is_none());
++            assert!(gate.allows_keyboard(entity));
++        }
++        for entity in &self.content {
++            assert!(world.get::<BackgroundContent>(*entity).is_some());
++            assert_eq!(world.get::<ChildOf>(*entity).unwrap().parent(), self.page);
++        }
++        let snapshots = world.resource::<RouterSnapshots>();
++        let current = snapshots.get(self.router).unwrap();
++        assert_eq!(current, &self.snapshot);
++        assert_eq!(current.history().entries().len(), 1);
++        assert_eq!(current.history().cursor(), Some(0));
++        assert_eq!(current.active().frames().len(), 2);
++        assert_eq!(
++            current.history().entries().as_ptr() as usize,
++            self.history_storage
++        );
++        assert_eq!(self.requests.len(), 64);
++        for (id, expected, trace_storage) in &self.requests {
++            let RequestLookup::Found(current) = snapshots.request(self.router, *id) else {
++                panic!("B request retention must remain unchanged");
++            };
++            assert_eq!(current, expected);
++            assert_eq!(current.status(), &RequestStatus::Succeeded);
++            assert_eq!(current.trace().as_ptr() as usize, *trace_storage);
++        }
++    }
++}
++
++fn update(app: &mut App) {
++    let started = profile::begin_update();
++    app.update();
++    profile::end_update(started);
++}
++
++pub(super) fn run(samples: usize) {
++    let mut fixture = Fixture::configured(128, ContentShape::Flat, Some(2));
++    let background = install_background(&mut fixture.app);
++    for index in 0..64 {
++        fixture.navigate(
++            Action::Replace,
++            if index % 2 == 0 {
++                "/items/b"
++            } else {
++                "/items/a"
++            },
++            false,
++        );
++    }
++    let layout = only::<Layout>(&mut fixture.app);
++    let toolbar = only::<Toolbar>(&mut fixture.app);
++    let baseline = fixture.census("a", 1);
++    let pages = baseline
++        .pages
++        .iter()
++        .map(|(entity, _)| {
++            (
++                fixture.app.world().get::<Page>(*entity).unwrap().0.clone(),
++                *entity,
++            )
++        })
++        .collect::<Vec<_>>();
++    let factory_calls = fixture.factory_count();
++    background.assert_unchanged(&mut fixture.app);
++    assert_eq!(
++        fixture
++            .app
++            .world_mut()
++            .query::<&RouteScroll>()
++            .iter(fixture.app.world())
++            .count(),
++        0
++    );
++    profile::bind(fixture.router, background.router);
++    eprintln!(
++        "# temporary two-Router diagnostic: A={:?}, B={:?}; same-thread headless build only; each has two native frames and 128 content nodes per page; B has 64 terminal requests and one history entry",
++        fixture.router, background.router
++    );
++    eprintln!(
++        "# inclusive scope times overlap outer update/navigation time; outer values repeat on A/B rows, so do not sum them; no layout/window/scroll-restoration timing"
++    );
++    println!(
++        "phase,sample,router,updates,update_total_ns,completion_ns,scroll_observe_calls,scroll_observe_ns,request_index_calls,request_index_ns,router_snapshot_rebuilds,request_snapshot_rebuilds"
++    );
++    for phase in ["idle_no_marker", "idle_a_marker", "a_hit_b_idle"] {
++        if phase == "idle_a_marker" {
++            fixture
++                .app
++                .world_mut()
++                .entity_mut(layout)
++                .insert((RouteScroll::new("body"), ScrollPosition::default()));
++        }
++        // Same warmup as the existing idle helper; all setup is outside samples.
++        for _ in 0..64 {
++            fixture.app.update();
++        }
++        let mut rows = Vec::with_capacity(samples);
++        let mut current = "a";
++        for sample in 0..samples {
++            profile::start();
++            let elapsed = if phase == "a_hit_b_idle" {
++                current = if sample % 2 == 0 { "b" } else { "a" };
++                let sample = fixture.navigate(Action::Replace, &format!("/items/{current}"), false);
++                let counters = profile::finish();
++                assert_eq!(counters.updates, sample.updates as u64);
++                rows.push((sample.elapsed, counters));
++                let census = fixture.census(current, 1);
++                assert_eq!(
++                    census.active_page(),
++                    pages.iter().find(|(id, _)| id == current).unwrap().1
++                );
++                assert_eq!(census.live, baseline.live);
++                assert_eq!(fixture.factory_count(), factory_calls);
++                assert_eq!(only::<Layout>(&mut fixture.app), layout);
++                assert_eq!(only::<Toolbar>(&mut fixture.app), toolbar);
++                assert_eq!(fixture.app.world().get::<Toolbar>(toolbar).unwrap().0, 73);
++                continue;
++            } else {
++                let started = Instant::now();
++                update(&mut fixture.app);
++                started.elapsed()
++            };
++            let counters = profile::finish();
++            assert_eq!(counters.updates, 1);
++            rows.push((elapsed, counters));
++        }
++        let after = fixture.census(current, 1);
++        assert_eq!(after.live, baseline.live);
++        assert_eq!(fixture.factory_count(), factory_calls);
++        background.assert_unchanged(&mut fixture.app);
++        for (sample, (elapsed, counters)) in rows.iter().enumerate() {
++            // Detect an unsupported execution-thread setup instead of reporting
++            // silently missing scope data from a worker-local counter.
++            if phase != "idle_no_marker" {
++                assert_eq!(counters.routers[0].scroll_observe_calls, counters.updates);
++            }
++            if phase == "a_hit_b_idle" {
++                assert!(counters.routers[0].request_index_calls > 0);
++            }
++            assert_eq!(counters.routers[1].router_snapshot_rebuilds, 0);
++            assert_eq!(counters.routers[1].request_snapshot_rebuilds, 0);
++            for (router, row) in ["A", "B"].into_iter().zip(counters.routers) {
++                println!(
++                    "{phase},{sample},{router},{},{},{},{},{},{},{},{},{}",
++                    counters.updates,
++                    counters.update_elapsed.as_nanos(),
++                    elapsed.as_nanos(),
++                    row.scroll_observe_calls,
++                    row.scroll_observe_elapsed.as_nanos(),
++                    row.request_index_calls,
++                    row.request_index_elapsed.as_nanos(),
++                    row.router_snapshot_rebuilds,
++                    row.request_snapshot_rebuilds
++                );
++            }
++        }
++    }
++    fixture.release_parent_scope();
++    background.assert_unchanged(&mut fixture.app);
++}
+--- a/crates/bevy_ui_router_ecs/src/lib.rs
++++ b/crates/bevy_ui_router_ecs/src/lib.rs
+@@ -30,6 +30,8 @@
+ mod snapshots;
+ #[cfg(test)]
+ mod task10_regression_tests;
++#[doc(hidden)]
++pub mod temporary_multi_router_profile;
+ #[cfg(test)]
+ mod test_support;
+
+--- a/crates/bevy_ui_router_ecs/src/scroll.rs
++++ b/crates/bevy_ui_router_ecs/src/scroll.rs
+@@ -735,7 +735,13 @@
+         .collect::<Vec<_>>();
+     let marked = marked_containers(world);
+     for handle in handles {
+-        let mut observation = observe_active(world, handle, &eligible, &marked);
++        let mut observation = {
++            let _profile = crate::temporary_multi_router_profile::enter(
++                handle,
++                crate::temporary_multi_router_profile::Scope::ScrollObserve,
++            );
++            observe_active(world, handle, &eligible, &marked)
++        };
+         let laid_out = laid_out_containers(world, &observation.containers, layout);
+         let missing_layout = observation
+             .containers
+--- a/crates/bevy_ui_router_ecs/src/snapshots.rs
++++ b/crates/bevy_ui_router_ecs/src/snapshots.rs
+@@ -236,11 +236,17 @@
+         for entry in entries {
+             // A shallow borrowed index replaces two scans of all Core records
+             // for each request. It is only needed when published values differ.
+-            let views = entry
+-                .engine
+-                .requests()
+-                .map(|view| (view.id(), view))
+-                .collect::<HashMap<_, _>>();
++            let views = {
++                let _profile = crate::temporary_multi_router_profile::enter(
++                    entry.handle,
++                    crate::temporary_multi_router_profile::Scope::RequestIndex,
++                );
++                entry
++                    .engine
++                    .requests()
++                    .map(|view| (view.id(), view))
++                    .collect::<HashMap<_, _>>()
++            };
+             entry.requests.retain(|request| views.contains_key(request));
+             let cleanup = entry.cleanup_summary();
+             if let Some((_, snapshot)) = self
+@@ -251,10 +257,12 @@
+                 if cleanup != snapshot.cleanup
+                     || !entry.engine.snapshot_matches(&snapshot.projection)
+                 {
++                    crate::temporary_multi_router_profile::router_snapshot_rebuilt(entry.handle);
+                     *snapshot = RouterSnapshot::project(entry.engine.snapshot(), cleanup);
+                     changed = true;
+                 }
+             } else {
++                crate::temporary_multi_router_profile::router_snapshot_rebuilt(entry.handle);
+                 self.routers.push((
+                     entry.handle,
+                     RouterSnapshot::project(entry.engine.snapshot(), cleanup),
+@@ -272,6 +280,7 @@
+                 {
+                     continue;
+                 }
++                crate::temporary_multi_router_profile::request_snapshot_rebuilt(entry.handle);
+                 self.requests.insert(
+                     key,
+                     NavigationRequestSnapshot::new(
+--- /dev/null
++++ b/crates/bevy_ui_router_ecs/src/temporary_multi_router_profile.rs
+@@ -0,0 +1,126 @@
++//! Temporary same-thread diagnostics for one fixed pair of Routers.
++//! This module exists only in the isolated benchmark copy. No counter allocates.
++use crate::RouterHandle;
++use std::{
++    cell::RefCell,
++    time::{Duration, Instant},
++};
++
++#[derive(Clone, Copy, Default)]
++pub struct RouterCounters {
++    pub scroll_observe_calls: u64,
++    pub scroll_observe_elapsed: Duration,
++    pub request_index_calls: u64,
++    pub request_index_elapsed: Duration,
++    pub router_snapshot_rebuilds: u64,
++    pub request_snapshot_rebuilds: u64,
++}
++
++#[derive(Clone, Copy, Default)]
++pub struct SampleCounters {
++    pub routers: [RouterCounters; 2],
++    pub updates: u64,
++    pub update_elapsed: Duration,
++}
++
++#[derive(Default)]
++struct State {
++    handles: Option<[RouterHandle; 2]>,
++    enabled: bool,
++    sample: SampleCounters,
++}
++thread_local! {
++    static STATE: RefCell<State> = RefCell::new(State::default());
++}
++
++pub fn bind(a: RouterHandle, b: RouterHandle) {
++    assert_ne!(a, b);
++    STATE.with(|state| state.borrow_mut().handles = Some([a, b]));
++}
++pub fn start() {
++    STATE.with(|state| {
++        let mut state = state.borrow_mut();
++        assert!(state.handles.is_some() && !state.enabled);
++        state.sample = SampleCounters::default();
++        state.enabled = true;
++    });
++}
++pub fn finish() -> SampleCounters {
++    STATE.with(|state| {
++        let mut state = state.borrow_mut();
++        assert!(state.enabled);
++        state.enabled = false;
++        std::mem::take(&mut state.sample)
++    })
++}
++pub fn begin_update() -> Option<Instant> {
++    STATE.with(|state| state.borrow().enabled.then(Instant::now))
++}
++pub fn end_update(started: Option<Instant>) {
++    if let Some(started) = started {
++        let elapsed = started.elapsed();
++        STATE.with(|state| {
++            let mut state = state.borrow_mut();
++            state.sample.updates += 1;
++            state.sample.update_elapsed += elapsed;
++        });
++    }
++}
++fn index(handle: RouterHandle) -> Option<usize> {
++    STATE.with(|state| {
++        let state = state.borrow();
++        state
++            .enabled
++            .then(|| state.handles.unwrap().iter().position(|h| *h == handle))
++            .flatten()
++    })
++}
++#[derive(Clone, Copy)]
++pub(crate) enum Scope {
++    ScrollObserve,
++    RequestIndex,
++}
++pub(crate) struct ScopeTimer {
++    index: Option<usize>,
++    scope: Scope,
++    started: Option<Instant>,
++}
++pub(crate) fn enter(handle: RouterHandle, scope: Scope) -> ScopeTimer {
++    let index = index(handle);
++    ScopeTimer {
++        index,
++        scope,
++        started: index.map(|_| Instant::now()),
++    }
++}
++impl Drop for ScopeTimer {
++    fn drop(&mut self) {
++        if let (Some(index), Some(started)) = (self.index, self.started) {
++            let elapsed = started.elapsed();
++            STATE.with(|state| {
++                let mut state = state.borrow_mut();
++                let counter = &mut state.sample.routers[index];
++                match self.scope {
++                    Scope::ScrollObserve => {
++                        counter.scroll_observe_calls += 1;
++                        counter.scroll_observe_elapsed += elapsed;
++                    }
++                    Scope::RequestIndex => {
++                        counter.request_index_calls += 1;
++                        counter.request_index_elapsed += elapsed;
++                    }
++                }
++            });
++        }
++    }
++}
++pub(crate) fn router_snapshot_rebuilt(handle: RouterHandle) {
++    if let Some(index) = index(handle) {
++        STATE.with(|state| state.borrow_mut().sample.routers[index].router_snapshot_rebuilds += 1);
++    }
++}
++pub(crate) fn request_snapshot_rebuilt(handle: RouterHandle) {
++    if let Some(index) = index(handle) {
++        STATE.with(|state| state.borrow_mut().sample.routers[index].request_snapshot_rebuilds += 1);
++    }
++}
