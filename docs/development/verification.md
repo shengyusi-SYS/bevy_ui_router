@@ -52,7 +52,7 @@ cargo test -p bevy_ui_router_ecs --no-default-features --locked
 
 私有测试可以覆盖内部写入窗口、stale owner 和故障注入；公开旅程证明推荐入口与普通调度能够兑现行为。二者互补，不能以一个 snapshot 或私有 probe 替代完整用户路径。
 
-独立 consumer 直接编译并执行推荐示例的原样源码，使用显式依赖，避免借用仓库 dev-dependency 的 feature 合并。编译拒绝逐 case 断言错误类别、目标符号及 consumer source，防止无关错误掩盖权限边界失效。LF/CRLF 覆盖文本输入，不代表 Windows 原生验证。
+独立 consumer 按不同 feature 配置编译运行，并直接消费推荐示例的原样源码，使用显式依赖，避免借用仓库 dev-dependency 的 feature 合并。编译拒绝逐 case 断言错误类别、目标符号及 consumer source，防止无关错误掩盖权限边界失效。依赖规则的 LF/CRLF 输入由解析单测覆盖，不重复运行整套 consumer，也不代表 Windows 原生验证。
 
 ## 示例与窗口
 

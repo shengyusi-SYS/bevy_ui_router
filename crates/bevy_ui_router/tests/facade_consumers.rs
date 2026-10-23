@@ -31,7 +31,6 @@ impl Consumer {
         features: &[&str],
         ecs: bool,
         source: &str,
-        crlf: bool,
         native_ui: bool,
     ) -> Self {
         let facade = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -79,12 +78,8 @@ impl Consumer {
         }
         assert!(manifest_violations(&toml::from_str(&manifest).unwrap()).is_empty());
         fs::create_dir_all(directory.join("src")).unwrap();
-        let line_endings = |text: &str| {
-            let lf = text.replace("\r\n", "\n");
-            if crlf { lf.replace('\n', "\r\n") } else { lf }
-        };
-        fs::write(directory.join("Cargo.toml"), line_endings(&manifest)).unwrap();
-        fs::write(directory.join("src/main.rs"), line_endings(source)).unwrap();
+        fs::write(directory.join("Cargo.toml"), manifest).unwrap();
+        fs::write(directory.join("src/main.rs"), source).unwrap();
         Self {
             directory,
             target: base.join("cargo-target"),
@@ -206,32 +201,21 @@ impl Consumer {
 
 #[test]
 fn independent_facade_consumers_run_and_cannot_forge_authority() {
-    // Each positive consumer uses real production paths. The default consumer runs
-    // unchanged with both line endings, including its manifest and Rust source.
-    for (name, defaults, features, ecs, source, crlf) in [
+    // Each feature configuration exercises real production paths in an independent workspace.
+    for (name, defaults, features, ecs, source) in [
         (
             "core",
             false,
             &[][..],
             false,
             include_str!("consumers/core.rs"),
-            false,
         ),
         (
-            "default-lf",
+            "default",
             true,
             &[][..],
             false,
             include_str!("consumers/view.rs"),
-            false,
-        ),
-        (
-            "default-crlf",
-            true,
-            &[][..],
-            false,
-            include_str!("consumers/view.rs"),
-            true,
         ),
         (
             "view",
@@ -239,7 +223,6 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             &["view"][..],
             false,
             include_str!("consumers/view.rs"),
-            false,
         ),
         (
             "ecs",
@@ -247,26 +230,16 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             &["ecs"][..],
             true,
             include_str!("consumers/ecs.rs"),
-            false,
         ),
         (
-            "bsn-native-lf",
+            "bsn-native",
             false,
             &["bsn"][..],
             true,
             include_str!("consumers/bsn.rs"),
-            false,
-        ),
-        (
-            "bsn-native-crlf",
-            false,
-            &["bsn"][..],
-            true,
-            include_str!("consumers/bsn.rs"),
-            true,
         ),
     ] {
-        Consumer::new(name, defaults, features, ecs, source, crlf, false).run(!ecs);
+        Consumer::new(name, defaults, features, ecs, source, false).run(!ecs);
     }
 
     // Compile and execute the actual recommended examples, outside the workspace
@@ -279,7 +252,7 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
         ),
         ("nested", include_str!("../examples/bsn_nested.rs"), true),
     ] {
-        Consumer::new(name, false, &["bsn"], true, source, false, native_ui).run(false);
+        Consumer::new(name, false, &["bsn"], true, source, native_ui).run(false);
     }
 
     // One rejection per consumer: another compiler error cannot mask a removed boundary.
@@ -315,7 +288,7 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             "publish",
         ),
     ] {
-        Consumer::new(name, false, &["ecs"], false, source, false, false).rejects(code, symbol);
+        Consumer::new(name, false, &["ecs"], false, source, false).rejects(code, symbol);
     }
 
     // Disabled modules are compiler-enforced boundaries, not just absent Cargo targets.
@@ -357,7 +330,6 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             "RouteEntityRegistry",
         ),
     ] {
-        Consumer::new(name, defaults, features, false, source, false, false)
-            .rejects("E0432", symbol);
+        Consumer::new(name, defaults, features, false, source, false).rejects("E0432", symbol);
     }
 }

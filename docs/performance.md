@@ -251,7 +251,18 @@ Bevy 0.19.1 的 Multi executor 先 `can_run` 再 `should_run`；exclusive 系统
 
 后续 flat/nested [形状对照](data/performance/performance-shape-2026-09-27.csv)只有第一轮配对无干扰：128 节点 normal p50 为 flat 8.552–9.170 ms、nested 8.129–8.924 ms。它没有出现数量级恶化，但不足以证明稳定形状差异或任意深树。第二/三轮 `contended_pair` 不用于收益估算。该文件的读取合并 candidate 未显示值得保留的收益，**未采用**。
 
-最近定位的主要剩余工作是每次真实写后对完整 target/protected 事实的扫描。此前清理分类、普通内容临时登记和历史 seal 列表造成的重复工作已减去；逐写复验仍保留。性能增长不能仅靠几个点推导全库复杂度，后续应先测代表页面的真实切换帧及 cleanup 占比，再判断局部重构是否值得做。
+当前代码中，正常清理在每次真实删除后重新检查完整 target/protected 事实，见 [removal plan 与执行](../crates/bevy_ui_router_ecs/src/cleanup.rs)。此前清理分类、普通内容临时登记和历史 seal 列表造成的重复工作已减去；逐写复验仍保留。历史耗时支持优先定位清理，但不能证明当前版本各步骤的占比，也不能仅靠几个数据点推导全库复杂度。
+
+后续先用现有 fresh/LRU 夹具的代表预算定位最慢单次 update 和 cleanup 占比，约 0.5 人日，不扩展场景矩阵。以下是静态审查确认的候选，尚未实施或测得收益；工作量含局部实现、回归及配对测量，按熟悉代码的开发者估算。
+
+| 顺序 | 候选与最小改动 | 工作量、风险与收益依据 |
+| --- | --- | --- |
+| 1 | `current_focus_targets` 的容量 2 临时 Vec 改为按需分配；`targets_are_current` 借用现有组件 ID 观察，避免为 Registered target 反复构造排序 manifest | 0.5–1 人日；低至中风险。重复分配明确存在，CPU 收益待测；必须保留现有组件排除规则、两种 focus 与完整写后检查 |
+| 2 | `related_protected_is_current` 在正常 removal plan 内建立覆盖完整 ledger 的实体到 receipt 索引，包含此前已结算项，避免每次重建已删除集合 | 0.5–1 人日；中风险。现有 plan 索引只覆盖本次未结算项，不能直接替代；receipt 仍读当前值，protected 实体仍逐次观察，先看其实际占比 |
+| 暂缓 | [滚动 publication](../crates/bevy_ui_router_ecs/src/scroll.rs) 的全部记录克隆、surviving entries 与 displayed/container 线性匹配 | 0.5–2 人日；扩大到 prepared delta 时风险增加。现有基线只有少量 history/容器，尚无足够收益证据 |
+| 暂缓 | 滚动 Prepare/Settle 的窄 Query/Res 迁移 | 2–4 人日；中风险。沿用[已有调度取舍](#窄读取方案的取舍)，先证实 MT 等待影响整体更新 |
+
+这些候选均可使用现有标准库和 Bevy 能力，不需增加依赖。源码中重复工作减少不等于整帧或 FPS 改善，采用与否仍以相同语义下的测量决定。
 
 当前没有真实页面预算支持新增全局缓存、分帧销毁、第二套 runtime、全平台 benchmark 或更多容器微优化。60 Hz 的 16.7 ms 是整个帧的参考预算，不是 Router 可独占的预算。
 

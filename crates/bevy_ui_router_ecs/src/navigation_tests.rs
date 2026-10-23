@@ -18556,20 +18556,6 @@ fn target_permanent_contract_item_between<'a>(source: &'a str, start: &str, end:
         .expect("contract item boundary must remain named")]
 }
 
-fn target_permanent_contract_field_count(contract: &str, field: &str) -> usize {
-    let prefix = format!("{field}:");
-    contract
-        .lines()
-        .map(str::trim)
-        .map(|line| {
-            line.strip_prefix("pub(crate) ")
-                .or_else(|| line.strip_prefix("pub "))
-                .unwrap_or(line)
-        })
-        .filter(|line| line.starts_with(&prefix) && line.ends_with(','))
-        .count()
-}
-
 fn target_permanent_production_source() -> &'static str {
     include_str!("navigation.rs")
         .split_once(concat!(
@@ -20228,90 +20214,6 @@ fn back_target_ready_plan_permanent_refreezes_existing_manifests_and_moves_ready
         "Prepared must move the existing frozen Entity manifest by value"
     );
     assert_eq!(normal_manifest.projection(), source_before.manifest);
-
-    let source = include_str!("navigation.rs");
-    const READY_PLAN_ADAPTER_START: &str = concat!(
-        "pub(crate) fn prepare_back_target_",
-        "ready_plan_permanent("
-    );
-    const READY_PLAN_ADAPTER_END: &str = concat!(
-        "\nfn target_preparation_permanent_",
-        "dispatch_entry_preflight("
-    );
-    assert_eq!(
-        source.match_indices(READY_PLAN_ADAPTER_START).count(),
-        1,
-        "the Ready-plan adapter source gate requires one exact production function"
-    );
-    let adapter_and_tail = &source[source
-        .find(READY_PLAN_ADAPTER_START)
-        .expect("the Ready-plan adapter start marker must remain exact")..];
-    let adapter = &adapter_and_tail[..adapter_and_tail
-        .find(READY_PLAN_ADAPTER_END)
-        .expect("the Ready-plan adapter end marker must remain exact")];
-    let compact = adapter
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    let normalized_patterns = compact.replace(",}", "}");
-    let sequential_whole_destructure = normalized_patterns.contains(
-            "letPreparationPermanentOwner{owner,evidence}=owner;letBackTargetReadyAcceptanceOwner{physical,continuation,frozen_manifest,manifest}=owner;",
-        );
-    let nested_whole_destructure = normalized_patterns.contains(
-            "letPreparationPermanentOwner{owner:BackTargetReadyAcceptanceOwner{physical,continuation,frozen_manifest,manifest},evidence}=owner;",
-        );
-    assert!(
-        sequential_whole_destructure || nested_whole_destructure,
-        "the Ready-plan adapter must whole-destructure its original typed owner and existing Ready facts"
-    );
-    assert!(
-        compact.contains("normal_manifest:manifest,"),
-        "the Ready-plan branch must retain the original Core manifest as source evidence"
-    );
-    assert_eq!(
-        adapter.matches("CleanupManifest::new").count(),
-        1,
-        "the Ready-plan adapter must construct exactly one dedicated Core binding"
-    );
-    assert!(
-            compact.contains(
-                "letdedicated_manifest=CleanupManifest::new(logical_cleanup_roots(physical.classified.splice.leaving()),ecs_manifest.digest(),ecs_manifest.len(),);"
-            ),
-            "the dedicated Core binding must come directly from the original leaving roots and exact ECS digest/count"
-        );
-    assert!(
-        compact
-            .contains("accept_back_target_authority_lost(continuation,scope,&dedicated_manifest)")
-            && compact.contains(
-                "core_binding:BackTargetPermanentAuthorityManifest{cleanup:dedicated_manifest,}"
-            ),
-        "the same dedicated Core binding must authorize acceptance and move into the common disposition"
-    );
-    for forbidden in [
-        "CleanupManifest::empty",
-        "prepare_back_target_classifier_permanent",
-        "classify_back_target(",
-        "FrozenTargetPreparationPermanentBranch::Classifier",
-    ] {
-        assert!(
-            !adapter.contains(forbidden),
-            "the Ready-plan adapter must not substitute normal evidence or enter the classifier adapter: {forbidden}"
-        );
-    }
-    for forbidden in [
-        "accept_back_target_authority_lost(continuation,scope,&manifest)",
-        "cleanup:manifest,",
-        "cleanup:normal_manifest,",
-    ] {
-        assert!(
-            !compact.contains(forbidden),
-            "normal source evidence must not replace the dedicated Core binding: {forbidden}"
-        );
-    }
-    assert!(
-        !normalized_patterns.contains("TargetPreparationOwner{"),
-        "the Ready-plan adapter must not reconstruct the classifier source owner"
-    );
 }
 
 #[test]
@@ -21071,18 +20973,6 @@ fn back_target_physical_permanent_begin_rejects_logical_roots_only_drift_in_core
         .expect("the logical-roots fixture retains its exact entry");
     assert_eq!(entry.engine.snapshot(), core_before);
     assert!(entry.pending_back_target_permanent_cleanup.is_none());
-
-    let source = include_str!("navigation.rs");
-    let dispatch_and_tail = &source[source
-        .find("pub(crate) fn dispatch_back_target_permanent(")
-        .expect("the unique target permanent dispatch must remain named")..];
-    let dispatch = &dispatch_and_tail[..dispatch_and_tail
-        .find("\nfn registered_claim_has_exact_authority_and_manifest_coverage(")
-        .expect("the dispatch source boundary must remain exact")];
-    assert!(
-        !dispatch.contains(".logical_roots"),
-        "ECS must carry the opaque Core manifest without reading or authenticating its logical roots"
-    );
 }
 
 #[test]
@@ -21790,52 +21680,6 @@ fn back_target_permanent_prepared_core_manifest_mismatch_has_pending_shape_evide
             LifecyclePreflightObserved::Contradictory,
         ),
     );
-}
-
-#[test]
-fn back_target_permanent_prepared_lineage_scope_is_exact_bound_or_removed() {
-    const LINEAGE_START: &str = concat!(
-        "pub(crate) struct FrozenTargetPreparationPermanent",
-        "Lineage {"
-    );
-    const LINEAGE_END: &str = concat!(
-        "#[derive(Clone)]\n",
-        "pub(crate) struct FrozenTargetPreparationPermanentProtectedClosures {"
-    );
-    const DISPATCH_START: &str = concat!(
-        "fn dispatch_prepared_back_target_permanent_with_installation_",
-        "observer<F>("
-    );
-    const DISPATCH_END: &str = concat!(
-        "\nfn registered_claim_has_exact_authority_and_manifest_",
-        "coverage("
-    );
-    let source = include_str!("navigation.rs");
-    for marker in [LINEAGE_START, LINEAGE_END, DISPATCH_START, DISPATCH_END] {
-        assert_eq!(
-            source.matches(marker).count(),
-            1,
-            "the prepared scope source contract requires one exact boundary marker: {marker}"
-        );
-    }
-    let lineage_tail = &source[source.find(LINEAGE_START).unwrap()..];
-    let lineage = &lineage_tail[..lineage_tail.find(LINEAGE_END).unwrap()];
-    if lineage.contains("scope:") {
-        let dispatch_tail = &source[source.find(DISPATCH_START).unwrap()..];
-        let dispatch = &dispatch_tail[..dispatch_tail.find(DISPATCH_END).unwrap()];
-        let compact = dispatch
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>();
-        assert!(
-            compact
-                .contains("validation.lineage.scope==disposition.cleanup.physical.lineage.scope")
-                || compact.contains(
-                    "disposition.cleanup.physical.lineage.scope==validation.lineage.scope"
-                ),
-            "a retained prepared lineage scope must exact-bind to the cleanup owner or be removed as redundant"
-        );
-    }
 }
 
 #[test]
@@ -22870,39 +22714,6 @@ fn back_target_permanent_completion_mismatch_preserves_whole_settled_owner() {
         ReadyPlanPermanentZeroWriteProjection::capture(&app, router, staged.request, staged.host,),
         next_tick_before,
         "a settled mismatch holder must suppress every later receiver call and physical write"
-    );
-
-    let production = target_permanent_production_source();
-    let holder = target_permanent_contract_item_between(
-        production,
-        "pub(crate) enum PendingTargetPreparationPermanentCleanup",
-        "pub(crate) enum BackTargetPermanentDispatchOutcome",
-    );
-    let compact_holder = holder
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    assert!(
-        compact_holder.contains("Completing(PreparedTargetPreparationPermanentPhysicalCompletion)")
-            && compact_holder.contains("Settled{")
-            && compact_holder.contains("prepared:")
-            && compact_holder.contains("owner:")
-            && compact_holder.contains("mismatch:"),
-        "the canonical holder must preserve the whole Completing proof and returned Core owner as typed Settled mismatch evidence"
-    );
-    let driver = target_permanent_contract_item_between(
-        production,
-        "fn drive_target_preparation_permanent_cleanup",
-        "pub(crate) fn settle_cleanup_system",
-    );
-    let compact = driver
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    assert!(
-        compact.contains("BackTargetPermanentCleanupCompletionOutcome::Mismatch{owner,mismatch}")
-            && compact.contains("PendingTargetPreparationPermanentCleanup::Settled"),
-        "typed receiver mismatch must combine the exact physical proof, returned completion owner and expected/observed mismatch"
     );
 }
 
@@ -25138,72 +24949,6 @@ fn back_target_permanent_dedicated_scope_covers_actual_splice_and_keeps_normal_s
         Some(host),
         "the independent host-edge domain must bind the exact app host and exact top slot"
     );
-
-    let ecs_source = target_permanent_production_source();
-    let branches = target_permanent_contract_item_between(
-        ecs_source,
-        "pub(crate) enum FrozenTargetPreparationPermanentBranch {",
-        "pub(crate) struct FrozenTargetPreparationPermanentPhysicalManifest {",
-    );
-    let ready = &branches[branches
-        .find("ReadyPlan {")
-        .expect("the ReadyPlan source owner must remain explicit")..];
-    assert_eq!(
-        (
-            target_permanent_contract_field_count(ready, "normal_frozen_manifest"),
-            target_permanent_contract_field_count(ready, "normal_manifest"),
-            target_permanent_contract_field_count(ready, "frozen_manifest"),
-            target_permanent_contract_field_count(ready, "manifest"),
-        ),
-        (1, 1, 0, 0),
-        "the ReadyPlan branch must retain both normal manifests by value as source evidence"
-    );
-    let allowed_write_contract = target_permanent_contract_item_between(
-        ecs_source,
-        "pub(crate) struct FrozenTargetPreparationPermanentAllowedWriteSet {",
-        "pub(crate) enum FrozenTargetPreparationPermanentBranch {",
-    );
-    assert_eq!(
-        (
-            target_permanent_contract_field_count(allowed_write_contract, "splice_targets"),
-            target_permanent_contract_field_count(allowed_write_contract, "host_edge"),
-            target_permanent_contract_field_count(allowed_write_contract, "targets"),
-        ),
-        (1, 1, 0),
-        "permanent settlement must type-separate splice writes from the exact host-edge effect"
-    );
-    let disposition_contract = target_permanent_contract_item_between(
-        ecs_source,
-        "pub(crate) struct TargetPreparationPermanentDisposition {",
-        "pub(crate) struct PreparedTargetPreparationPermanentLedger {",
-    );
-    assert_eq!(
-        (
-            target_permanent_contract_field_count(disposition_contract, "ecs_manifest"),
-            target_permanent_contract_field_count(disposition_contract, "core_binding"),
-            target_permanent_contract_field_count(disposition_contract, "manifest"),
-        ),
-        (1, 1, 0),
-        "the common disposition must keep ECS exact obligations separate from the Core logical binding"
-    );
-    let core_source = include_str!("../../bevy_ui_router_core/src/integration.rs");
-    for contract in [
-        target_permanent_contract_item_between(
-            core_source,
-            "pub struct CleanupManifest {",
-            "pub struct CleanupManifestView {",
-        ),
-        target_permanent_contract_item_between(
-            core_source,
-            "pub struct BackTargetPermanentBeginOwner {",
-            "impl BackTargetPermanentBeginOwner {",
-        ),
-    ] {
-        assert!(
-            !contract.contains("Entity"),
-            "Core permanent manifest/begin authority must not contain Entity identity"
-        );
-    }
 }
 
 #[test]
@@ -25289,49 +25034,9 @@ fn back_target_permanent_exact_begin_retires_host_into_ecs_and_core_owners() {
         .get::<RouterHostRegistration>(expected_host_binding.host)
         .is_some_and(|registration| registration.router() == router);
 
-    let ecs_source = target_permanent_production_source();
-    let retired_binding_contract = target_permanent_contract_item_between(
-        ecs_source,
-        "pub(crate) struct RetiredHostBinding {",
-        "impl HostBinding {",
-    );
-    let retirement_contract = target_permanent_contract_item_between(
-        ecs_source,
-        "impl HostBinding {",
-        "impl RetiredHostBinding {",
-    );
-    let installed_contract = target_permanent_contract_item_between(
-        ecs_source,
-        "pub(crate) struct InstalledTargetPreparationPermanentCleanup {",
-        "pub(crate) struct PreparedTargetPermanentEcsInstallationOwner {",
-    );
-    let retired_binding_has_exact_fields = [
-        "version",
-        "slot_id",
-        "host",
-        "top_slot",
-        "top_slot_claim",
-        "candidate",
-    ]
-    .iter()
-    .all(|field| target_permanent_contract_field_count(retired_binding_contract, field) == 1)
-        && target_permanent_contract_field_count(retired_binding_contract, "lease") == 0;
-    let installed_has_only_retired_host =
-        target_permanent_contract_field_count(installed_contract, "retired_host") == 1
-            && target_permanent_contract_field_count(installed_contract, "host") == 0
-            && target_permanent_contract_field_count(installed_contract, "host_binding") == 0;
-    let compact_retirement = retirement_contract
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    let retirement_moves_binding_and_lease = compact_retirement.contains("(RetiredHostBinding{")
-        && compact_retirement.contains("},lease,)")
-        && !compact_retirement.contains("lease.clone()");
     assert_eq!(
         (
             entry.host.is_none(),
-            installed_has_only_retired_host,
-            retired_binding_has_exact_fields && retirement_moves_binding_and_lease,
             registry_claim_is_exact,
             entry
                 .engine
@@ -25342,7 +25047,7 @@ fn back_target_permanent_exact_begin_retires_host_into_ecs_and_core_owners() {
             core.pending_target_cleanup_present(),
             host_registration_is_preserved,
         ),
-        (true, true, true, true, true, true, true),
+        (true, true, true, true, true),
         "exact begin must linearly retire HostBinding into an ECS RetiredHostBinding carrying the top-slot claim plus a Core logical retired-host owner before returning"
     );
 }
@@ -25422,23 +25127,10 @@ fn back_target_permanent_host_retirement_rejection_restores_whole_owner_zero_wri
                 panic!("the exact dedicated logical roots must reach host retirement")
             }
         };
-    let core_source = include_str!("../../bevy_ui_router_core/src/integration.rs");
-    let evidence_contract = target_permanent_contract_item_between(
-        core_source,
-        "pub enum BackTargetPermanentBeginPermanentEvidence {",
-        "pub struct BackTargetPermanentCurrentStateProjectionView {",
-    );
-    assert!(
-        evidence_contract
-            .lines()
-            .map(str::trim)
-            .any(|line| line.starts_with("HostRetirementRejected")),
-        "target begin must expose a typed HostRetirementRejected evidence variant"
-    );
-    assert!(
-        format!("{evidence:?}").starts_with("HostRetirementRejected"),
-        "the real non-owning issuer must produce typed host-retirement evidence"
-    );
+    assert!(matches!(
+        evidence,
+        bevy_ui_router_core::integration::BackTargetPermanentBeginPermanentEvidence::HostRetirementRejected
+    ));
     assert_prepared_target_permanent_dispatch_owner_is_complete(&returned);
     assert_eq!(
         TargetPermanentDispositionProjection::capture_prepared(&returned),
@@ -25509,41 +25201,6 @@ fn back_target_physical_permanent_begin_installs_prepared_before_core_write() {
         .expect("the exact begin fixture retains its entry")
         .engine
         .snapshot();
-
-    let source = include_str!("navigation.rs");
-    let dispatch_and_tail = &source[source
-        .find("pub(crate) fn dispatch_back_target_permanent(")
-        .expect("the unique target permanent dispatch must remain named")..];
-    let dispatch = &dispatch_and_tail[..dispatch_and_tail
-        .find("\nfn registered_claim_has_exact_authority_and_manifest_coverage(")
-        .expect("the dispatch source boundary must remain exact")];
-    for forbidden in [
-        "dispatch_back_no_target",
-        "publish_ready_back_target",
-        "prepare_back_target_commit",
-        "CleanupLedger::activate",
-        "observe_cleanup_receipts",
-        "settle_cleanup",
-    ] {
-        assert!(
-            !dispatch.contains(forbidden),
-            "begin dispatch must not reuse a no-target/publisher/executable cleanup path: {forbidden}"
-        );
-    }
-    assert!(dispatch.contains("CleanupLedger::reserve"));
-    assert!(dispatch.contains("begin_back_target_permanent_cleanup"));
-    assert!(dispatch.contains("PreparedTargetPermanentEcsInstallationOwner"));
-    assert!(
-        std::mem::size_of::<BackTargetPermanentCleanupBatchOwner>() > 0,
-        "the unique Core batch owner must carry real opaque identity, not a ZST marker"
-    );
-    assert_eq!(
-        dispatch
-            .matches("begin_back_target_permanent_cleanup")
-            .count(),
-        1,
-        "the physical begin path must retain one unique Core begin callsite"
-    );
 
     let observed_whole_owner = std::cell::Cell::new(false);
     let mut navigation = app

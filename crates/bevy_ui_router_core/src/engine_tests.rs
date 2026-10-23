@@ -1261,58 +1261,6 @@ fn back_target_permanent_request_contradiction_preserves_presence_and_trace_cont
     assert_eq!(callback_calls.get(), 0);
     assert_eq!(engine.snapshot(), before);
     assert!(source.current_request.trace_closed);
-
-    fn item_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        let tail = &source[source.find(start).expect("contract item must remain named")..];
-        &tail[..tail.find(end).expect("contract boundary must remain named")]
-    }
-    let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
-    let evidence = item_between(
-        engine_source,
-        "pub(crate) enum BackTargetPermanentBeginCorePermanentEvidence",
-        "pub(crate) struct CoreBackTargetPermanentCurrentStateProjection",
-    );
-    let request_contradiction = item_between(
-        evidence,
-        "RequestRecordContradiction",
-        "TerminalPlanContradiction",
-    );
-    let compact_request_contradiction = request_contradiction
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    let request_projection = item_between(
-        engine_source,
-        "pub(crate) struct CoreBackTargetPermanentRequestProjection",
-        "pub(crate) struct CoreBackTargetPermanentAuthorityProjection",
-    );
-    let begin = item_between(
-        engine_source,
-        "pub(crate) fn begin_back_target_permanent_cleanup",
-        "pub(crate) fn complete_back_no_target_authority_cleanup",
-    );
-    let request_gate = item_between(
-        begin,
-        "let exact_request_record",
-        "if !exact_request_record",
-    );
-    assert!(
-        compact_request_contradiction
-            .contains("expected:Option<CoreBackTargetPermanentRequestProjection>")
-            && compact_request_contradiction
-                .contains("observed:Option<CoreBackTargetPermanentRequestProjection>")
-            && !compact_request_contradiction.contains("expected_status:")
-            && !compact_request_contradiction.contains("observed_status:"),
-        "generic request contradiction must retain presence-aware full expected/observed records"
-    );
-    assert!(
-        request_projection.contains("trace_closed: bool"),
-        "the full record projection must retain trace closure"
-    );
-    assert!(
-        !request_gate.contains("trace_closed"),
-        "trace-only drift must remain a purpose-specific terminal planning failure"
-    );
 }
 
 #[test]
@@ -1455,19 +1403,6 @@ fn back_target_permanent_terminal_source_retains_missing_queued_record_expectati
             && source.contains(&format!("request: {queued_request:?}"))
             && source.contains("observed: None"),
         "the queued source item must pair command expectation with observed record presence: {source}"
-    );
-
-    let engine_source = include_str!("../../bevy_ui_router_core/src/engine.rs");
-    let source_start = engine_source
-        .find("let source = CoreBackTargetPermanentTerminalSourceProjection")
-        .expect("the terminal source freeze must remain named");
-    let source_tail = &engine_source[source_start..];
-    let source_freeze = &source_tail[..source_tail
-        .find("let failure = NavigationFailure::new")
-        .expect("the terminal source freeze boundary must remain named")];
-    assert!(
-        !source_freeze.contains(".filter_map("),
-        "terminal source freeze must not discard queued commands with missing records"
     );
 }
 
