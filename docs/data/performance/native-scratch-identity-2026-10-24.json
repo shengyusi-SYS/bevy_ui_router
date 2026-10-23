@@ -1,0 +1,920 @@
+{
+  "baseline_commit": "e21dca3c060780c9eaf8fcbadaf06244713e874b",
+  "baseline_patch": "native-children-candidate-2026-10-24.patch",
+  "baseline_patch_sha256": "f5cd86a1cb90de022d0a4c0ea27406f672f5077778266d13ee06c9b415aab122",
+  "candidate_patch": "native-scratch-candidate-2026-10-24.patch",
+  "candidate_sha256": "fa7da0a8976b46e8c106b7849fabb6b9438a8010b281712a29573c4ed0d07952",
+  "allocation_probe_patches": {
+    "publication-allocation-probe-2026-10-24.patch": "4145b49797489d3b2662dc15d78f298d1431a83432233c79117666748d1f1785",
+    "publication-borrow-scopes-2026-10-24.patch": "9bad85e6371ef98ff5fc4a1f7aefb3f9a773de8e45577444cad74591410ee5ee",
+    "publication-navigation-allocation-2026-10-24.patch": "b2f9c4c7cf8ce4290cb3f074b1fcb8ef848788886964e42bb6f3e20e1f07d46c"
+  },
+  "variants": {
+    "timing-baseline": {
+      "binary_sha256": "ecacaadae341a906325b713ad37ef64c1c56f16e7c2449ffc9181aebda622b7c",
+      "files_sha256": {
+        "Cargo.lock": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+        "crates/bevy_ui_router_ecs/src/presentation/native_scene.rs": "b341796b623f3d1827044c22a0b3de82aa6134d01a0d11a3d7e40f4c1a3c5e9f",
+        "crates/bevy_ui_router_core/Cargo.toml": "5aa157097233062b35cb248a6fc5bd67daa92b86072886307bfa3244dc480f1a",
+        "crates/bevy_ui_router_core/src/lib.rs": "81d653d03d8f35e78bb707bfab25324e61f6e93915a4de686afce0b84cc16d13",
+        "crates/bevy_ui_router_core/src/engine.rs": "f8587a39ebdb3cfff6963ca094c11f3affe41e4469bb9e60acd8d5a56e0789a9",
+        "crates/bevy_ui_router_core/src/engine/retained.rs": "cee32502adac8b4dd58035c7aefde0a36795cc8f2c7aecca79f3a23834a63a2a",
+        "crates/bevy_ui_router/benches/router_baseline.rs": "0e2a774ea24e6f3c22d3388be8fef24b06cce6c5b3705e8b0f60cf582c06cfea",
+        "crates/bevy_ui_router/benches/router_baseline/retained_instances.rs": "5aedfb0649570a6bdc8b4313e409e0e1688df8361706f4f7589c03539fed830c"
+      },
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-native-children-bench-20261024/crates/bevy_ui_router#0.1.0",
+        "manifest_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router/Cargo.toml",
+        "target": {
+          "kind": [
+            "bench"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "router_baseline",
+          "src_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router/benches/router_baseline.rs",
+          "edition": "2024",
+          "required-features": [
+            "bsn"
+          ],
+          "doc": false,
+          "doctest": false,
+          "test": false
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [
+          "bsn",
+          "default",
+          "ecs",
+          "view"
+        ],
+        "filenames": [
+          "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a2c604a87869facf/out/router_baseline-a2c604a87869facf"
+        ],
+        "executable": "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a2c604a87869facf/out/router_baseline-a2c604a87869facf",
+        "fresh": false
+      },
+      "dependencies": [
+        {
+          "reason": "compiler-artifact",
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+          "manifest_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ecs",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "async_executor",
+            "backtrace",
+            "bevy_reflect",
+            "default",
+            "std"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rmeta"
+          ],
+          "executable": null,
+          "fresh": true
+        },
+        {
+          "reason": "compiler-artifact",
+          "package_id": "path+file:///tmp/router-native-children-bench-20261024/crates/bevy_ui_router_ecs#0.1.0",
+          "manifest_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router_ecs/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_ecs",
+            "src_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router_ecs/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "bsn",
+            "default"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/28d56810b274a1f2/out/libbevy_ui_router_ecs-28d56810b274a1f2.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/28d56810b274a1f2/out/libbevy_ui_router_ecs-28d56810b274a1f2.rmeta"
+          ],
+          "executable": null,
+          "fresh": false
+        }
+      ]
+    },
+    "allocation-baseline": {
+      "binary_sha256": "e6030b0e8c0bc65e0d4cd91694b51e109bde843ef06d1625ee99d462ddbcf580",
+      "files_sha256": {
+        "Cargo.lock": "cbd67aef57f61d648b74ca4b97a6f1a8bcb885f2069b1309c49cff9d454fb91f",
+        "crates/bevy_ui_router_ecs/src/presentation/native_scene.rs": "b341796b623f3d1827044c22a0b3de82aa6134d01a0d11a3d7e40f4c1a3c5e9f",
+        "crates/bevy_ui_router_core/Cargo.toml": "be98d238f2c86524c6f389fc2a538a6e93f96d58887983bd1e4d3964fcff6a7c",
+        "crates/bevy_ui_router_core/src/lib.rs": "fceea93c78644e46a8f24d090f21395bd736d52e4cc55456df581c6e40bc975b",
+        "crates/bevy_ui_router_core/src/engine.rs": "82a81a2db043c0f7d59a650a94ad728de27af43df670aae2cbafaceb06679214",
+        "crates/bevy_ui_router_core/src/engine/retained.rs": "cee32502adac8b4dd58035c7aefde0a36795cc8f2c7aecca79f3a23834a63a2a",
+        "crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs": "9120ae1620a4d7635729efd1ee135445ad0159e3e598f24ac6bf50aa0c78cc51",
+        "crates/bevy_ui_router/benches/router_baseline.rs": "aa71a65c2c6dfdb241c5fb439c9f044e31219072ba8571bbb8797cdd49cbf18a",
+        "crates/bevy_ui_router/benches/router_baseline/retained_instances.rs": "53d1dfadf875c67ae10a56b5ea90b0a01051ca9548af7beda68b6cbf2abb755f"
+      },
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-native-children-bench-20261024/crates/bevy_ui_router#0.1.0",
+        "manifest_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router/Cargo.toml",
+        "target": {
+          "kind": [
+            "bench"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "router_baseline",
+          "src_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router/benches/router_baseline.rs",
+          "edition": "2024",
+          "required-features": [
+            "bsn"
+          ],
+          "doc": false,
+          "doctest": false,
+          "test": false
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [
+          "bsn",
+          "default",
+          "ecs",
+          "view"
+        ],
+        "filenames": [
+          "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a0cc53d680307971/out/router_baseline-a0cc53d680307971"
+        ],
+        "executable": "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a0cc53d680307971/out/router_baseline-a0cc53d680307971",
+        "fresh": false
+      },
+      "dependencies": [
+        {
+          "reason": "compiler-artifact",
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+          "manifest_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ecs",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "async_executor",
+            "backtrace",
+            "bevy_reflect",
+            "default",
+            "std"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rmeta"
+          ],
+          "executable": null,
+          "fresh": true
+        },
+        {
+          "reason": "compiler-artifact",
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#allocation-counter@0.8.1",
+          "manifest_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/allocation-counter-0.8.1/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "allocation_counter",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/allocation-counter-0.8.1/src/lib.rs",
+            "edition": "2021",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/allocation-counter/a18be71127842f2e/out/liballocation_counter-a18be71127842f2e.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/allocation-counter/a18be71127842f2e/out/liballocation_counter-a18be71127842f2e.rmeta"
+          ],
+          "executable": null,
+          "fresh": true
+        },
+        {
+          "reason": "compiler-artifact",
+          "package_id": "path+file:///tmp/router-native-children-bench-20261024/crates/bevy_ui_router_ecs#0.1.0",
+          "manifest_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router_ecs/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_ecs",
+            "src_path": "/tmp/router-native-children-bench-20261024/crates/bevy_ui_router_ecs/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "bsn",
+            "default"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/318742e2d0db2953/out/libbevy_ui_router_ecs-318742e2d0db2953.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/318742e2d0db2953/out/libbevy_ui_router_ecs-318742e2d0db2953.rmeta"
+          ],
+          "executable": null,
+          "fresh": false
+        }
+      ]
+    },
+    "timing-candidate": {
+      "binary_sha256": "b44685f7d927945f8e678d41389f51c7d385d757a30eaed88eb0d222d76563f4",
+      "files_sha256": {
+        "Cargo.lock": "1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8",
+        "crates/bevy_ui_router_ecs/src/presentation/native_scene.rs": "4cb4f8a68d05525ab593c2a6e7fa8fc476ccefb6d6b42df8d2a49f3308a26354",
+        "crates/bevy_ui_router_core/Cargo.toml": "5aa157097233062b35cb248a6fc5bd67daa92b86072886307bfa3244dc480f1a",
+        "crates/bevy_ui_router_core/src/lib.rs": "81d653d03d8f35e78bb707bfab25324e61f6e93915a4de686afce0b84cc16d13",
+        "crates/bevy_ui_router_core/src/engine.rs": "f8587a39ebdb3cfff6963ca094c11f3affe41e4469bb9e60acd8d5a56e0789a9",
+        "crates/bevy_ui_router_core/src/engine/retained.rs": "cee32502adac8b4dd58035c7aefde0a36795cc8f2c7aecca79f3a23834a63a2a",
+        "crates/bevy_ui_router/benches/router_baseline.rs": "0e2a774ea24e6f3c22d3388be8fef24b06cce6c5b3705e8b0f60cf582c06cfea",
+        "crates/bevy_ui_router/benches/router_baseline/retained_instances.rs": "5aedfb0649570a6bdc8b4313e409e0e1688df8361706f4f7589c03539fed830c"
+      },
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router#0.1.0",
+        "manifest_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router/Cargo.toml",
+        "target": {
+          "kind": [
+            "bench"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "router_baseline",
+          "src_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router/benches/router_baseline.rs",
+          "edition": "2024",
+          "required-features": [
+            "bsn"
+          ],
+          "doc": false,
+          "doctest": false,
+          "test": false
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [
+          "bsn",
+          "default",
+          "ecs",
+          "view"
+        ],
+        "filenames": [
+          "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a2c604a87869facf/out/router_baseline-a2c604a87869facf"
+        ],
+        "executable": "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a2c604a87869facf/out/router_baseline-a2c604a87869facf",
+        "fresh": false
+      },
+      "dependencies": [
+        {
+          "reason": "compiler-artifact",
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+          "manifest_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ecs",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "async_executor",
+            "backtrace",
+            "bevy_reflect",
+            "default",
+            "std"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rmeta"
+          ],
+          "executable": null,
+          "fresh": true
+        },
+        {
+          "reason": "compiler-artifact",
+          "package_id": "path+file:///tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router_ecs#0.1.0",
+          "manifest_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router_ecs/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_ecs",
+            "src_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router_ecs/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "bsn",
+            "default"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/28d56810b274a1f2/out/libbevy_ui_router_ecs-28d56810b274a1f2.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/28d56810b274a1f2/out/libbevy_ui_router_ecs-28d56810b274a1f2.rmeta"
+          ],
+          "executable": null,
+          "fresh": false
+        }
+      ]
+    },
+    "allocation-candidate": {
+      "binary_sha256": "ba52b100f83e6849a66a23c47c539daaa47c5d099439adbabdf730daff68940c",
+      "files_sha256": {
+        "Cargo.lock": "cbd67aef57f61d648b74ca4b97a6f1a8bcb885f2069b1309c49cff9d454fb91f",
+        "crates/bevy_ui_router_ecs/src/presentation/native_scene.rs": "4cb4f8a68d05525ab593c2a6e7fa8fc476ccefb6d6b42df8d2a49f3308a26354",
+        "crates/bevy_ui_router_core/Cargo.toml": "be98d238f2c86524c6f389fc2a538a6e93f96d58887983bd1e4d3964fcff6a7c",
+        "crates/bevy_ui_router_core/src/lib.rs": "fceea93c78644e46a8f24d090f21395bd736d52e4cc55456df581c6e40bc975b",
+        "crates/bevy_ui_router_core/src/engine.rs": "82a81a2db043c0f7d59a650a94ad728de27af43df670aae2cbafaceb06679214",
+        "crates/bevy_ui_router_core/src/engine/retained.rs": "cee32502adac8b4dd58035c7aefde0a36795cc8f2c7aecca79f3a23834a63a2a",
+        "crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs": "9120ae1620a4d7635729efd1ee135445ad0159e3e598f24ac6bf50aa0c78cc51",
+        "crates/bevy_ui_router/benches/router_baseline.rs": "aa71a65c2c6dfdb241c5fb439c9f044e31219072ba8571bbb8797cdd49cbf18a",
+        "crates/bevy_ui_router/benches/router_baseline/retained_instances.rs": "53d1dfadf875c67ae10a56b5ea90b0a01051ca9548af7beda68b6cbf2abb755f"
+      },
+      "artifact": {
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router#0.1.0",
+        "manifest_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router/Cargo.toml",
+        "target": {
+          "kind": [
+            "bench"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "name": "router_baseline",
+          "src_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router/benches/router_baseline.rs",
+          "edition": "2024",
+          "required-features": [
+            "bsn"
+          ],
+          "doc": false,
+          "doctest": false,
+          "test": false
+        },
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 0,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": true
+        },
+        "features": [
+          "bsn",
+          "default",
+          "ecs",
+          "view"
+        ],
+        "filenames": [
+          "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a0cc53d680307971/out/router_baseline-a0cc53d680307971"
+        ],
+        "executable": "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router/a0cc53d680307971/out/router_baseline-a0cc53d680307971",
+        "fresh": false
+      },
+      "dependencies": [
+        {
+          "reason": "compiler-artifact",
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#bevy_ecs@0.19.1",
+          "manifest_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ecs",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bevy_ecs-0.19.1/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "async_executor",
+            "backtrace",
+            "bevy_reflect",
+            "default",
+            "std"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ecs/eaf6c148fae3cf5d/out/libbevy_ecs-eaf6c148fae3cf5d.rmeta"
+          ],
+          "executable": null,
+          "fresh": true
+        },
+        {
+          "reason": "compiler-artifact",
+          "package_id": "registry+https://github.com/rust-lang/crates.io-index#allocation-counter@0.8.1",
+          "manifest_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/allocation-counter-0.8.1/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "allocation_counter",
+            "src_path": "/workspace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/allocation-counter-0.8.1/src/lib.rs",
+            "edition": "2021",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/allocation-counter/a18be71127842f2e/out/liballocation_counter-a18be71127842f2e.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/allocation-counter/a18be71127842f2e/out/liballocation_counter-a18be71127842f2e.rmeta"
+          ],
+          "executable": null,
+          "fresh": true
+        },
+        {
+          "reason": "compiler-artifact",
+          "package_id": "path+file:///tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router_ecs#0.1.0",
+          "manifest_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router_ecs/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "bevy_ui_router_ecs",
+            "src_path": "/tmp/router-native-scratch-bench-20261024/crates/bevy_ui_router_ecs/src/lib.rs",
+            "edition": "2024",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "3",
+            "debuginfo": 0,
+            "debug_assertions": false,
+            "overflow_checks": false,
+            "test": false
+          },
+          "features": [
+            "bsn",
+            "default"
+          ],
+          "filenames": [
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/318742e2d0db2953/out/libbevy_ui_router_ecs-318742e2d0db2953.rlib",
+            "/tmp/router-perf-profile-target-20261023/release/build/bevy_ui_router_ecs/318742e2d0db2953/out/libbevy_ui_router_ecs-318742e2d0db2953.rmeta"
+          ],
+          "executable": null,
+          "fresh": false
+        }
+      ]
+    }
+  },
+  "runs": [
+    {
+      "kind": "allocation",
+      "mode": "keep_alive",
+      "shape": "flat",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-children-allocation-keep_alive-flat-candidate-1",
+      "start_unix": 1792780423.6865876,
+      "end_unix": 1792780425.742188,
+      "csv_sha256": "1b4b5f3c4d6d688726476bf7e08537428ef5c4590f79b2969610e1af9bd3bc38",
+      "log_sha256": "659191a69c248d934bf1389629caefbf942e0bc83e9336e75afe01dc2d952abd",
+      "reused_from": "native-children allocation candidate"
+    },
+    {
+      "kind": "allocation",
+      "mode": "keep_alive",
+      "shape": "nested",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-children-allocation-keep_alive-nested-candidate-1",
+      "start_unix": 1792780427.8736808,
+      "end_unix": 1792780430.0064194,
+      "csv_sha256": "f77c2ccefaafae7a9060fd8a1116bac427235ee7e4ccfe25ef2548401b8fbf0c",
+      "log_sha256": "b28110b6ef16bb1424f65a57fafb4d692f3c15a92a2f3cce9dfcd2d141dfc5c0",
+      "reused_from": "native-children allocation candidate"
+    },
+    {
+      "kind": "allocation",
+      "mode": "instances",
+      "shape": "flat",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-children-allocation-instances-flat-candidate-1",
+      "start_unix": 1792780435.3795795,
+      "end_unix": 1792780440.6569142,
+      "csv_sha256": "b0656a45eb7658050c29eae6bc192a7d108078297bd87541fa35be7adc4f4da7",
+      "log_sha256": "cb3a99b44a7e38e5e59588aa954ae2c6b9a12d1ccedafc700925d236a4ad1f6b",
+      "reused_from": "native-children allocation candidate"
+    },
+    {
+      "kind": "allocation",
+      "mode": "instances",
+      "shape": "nested",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-children-allocation-instances-nested-candidate-1",
+      "start_unix": 1792780446.1310315,
+      "end_unix": 1792780451.5704832,
+      "csv_sha256": "26a2d186994150310a6108cb4edc580f29b7e8d60c5e48aec8d4f66ffa5aa845",
+      "log_sha256": "ef7624c9b7a1f23dc883679f9a3c8fc000fea3a049b8e6387ca2771ee201d82b",
+      "reused_from": "native-children allocation candidate"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "flat",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-scratch-timing-keep_alive-flat-baseline-1",
+      "start_unix": 1792780552.6988947,
+      "end_unix": 1792780560.2655742,
+      "csv_sha256": "3d2f7047edf6af98af4fb2263ae750bbd0d1b8ac3cf7d14ebd80ad6bf4ad4d0f",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "flat",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-timing-keep_alive-flat-candidate-1",
+      "start_unix": 1792780560.3264804,
+      "end_unix": 1792780567.719763,
+      "csv_sha256": "fed1fbd00afa1fdbcf79d41a2b1e457e389ac16441f8361a82d399aed2991f56",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "flat",
+      "variant": "candidate",
+      "round": 2,
+      "file": "native-scratch-timing-keep_alive-flat-candidate-2",
+      "start_unix": 1792780567.7811487,
+      "end_unix": 1792780575.090799,
+      "csv_sha256": "fbc966294922590a27e83fb09570da78e80850f88d207df243e821f7f6d8ac86",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "flat",
+      "variant": "baseline",
+      "round": 2,
+      "file": "native-scratch-timing-keep_alive-flat-baseline-2",
+      "start_unix": 1792780575.150497,
+      "end_unix": 1792780582.5168502,
+      "csv_sha256": "6561393022e62d7c39de60ae62119431f9a056de10dfd22512c988ba058b9952",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "nested",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-scratch-timing-keep_alive-nested-baseline-1",
+      "start_unix": 1792780582.5778127,
+      "end_unix": 1792780590.3239956,
+      "csv_sha256": "6e53291ba79f10956fe7d82fa3511a44b78656fedb9cbb2430af3a5a5a7d3d40",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "nested",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-timing-keep_alive-nested-candidate-1",
+      "start_unix": 1792780590.3850503,
+      "end_unix": 1792780597.9737847,
+      "csv_sha256": "6572ae55839d393ff5eabe90fe681996019fad37522529faa732da345ad76af1",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "nested",
+      "variant": "candidate",
+      "round": 2,
+      "file": "native-scratch-timing-keep_alive-nested-candidate-2",
+      "start_unix": 1792780598.043975,
+      "end_unix": 1792780605.5348716,
+      "csv_sha256": "36d161e79b27178343898f21aee1b62f31b610cc32ff6f3befb25625b9f72311",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "keep_alive",
+      "shape": "nested",
+      "variant": "baseline",
+      "round": 2,
+      "file": "native-scratch-timing-keep_alive-nested-baseline-2",
+      "start_unix": 1792780605.5982573,
+      "end_unix": 1792780613.3302054,
+      "csv_sha256": "918af43e9eb1852319cce7a3f69c85223fa03183463bd8a87333c881ef0b4bdf",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "flat",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-scratch-timing-instances-flat-baseline-1",
+      "start_unix": 1792780613.3929756,
+      "end_unix": 1792780628.399243,
+      "csv_sha256": "c7decf326076c69e6e848d30e3060ba76a5c300345be045945640602b42d52fa",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "flat",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-timing-instances-flat-candidate-1",
+      "start_unix": 1792780628.4583287,
+      "end_unix": 1792780643.1028273,
+      "csv_sha256": "1b0348257f784688c76655378e4a1926bad72dbf34f7e6efce71bee1326571f1",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "flat",
+      "variant": "candidate",
+      "round": 2,
+      "file": "native-scratch-timing-instances-flat-candidate-2",
+      "start_unix": 1792780643.1620138,
+      "end_unix": 1792780657.7235816,
+      "csv_sha256": "a70b76eeaed6f6c8683de5669d28b205d9c6eecb8ec563890c074cd2777d6e8b",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "flat",
+      "variant": "baseline",
+      "round": 2,
+      "file": "native-scratch-timing-instances-flat-baseline-2",
+      "start_unix": 1792780657.7831888,
+      "end_unix": 1792780672.6047006,
+      "csv_sha256": "53ccc7df896ffd4194012d5c3f094c7f4ae6af3b4faceadb4021ab30ebefbfa4",
+      "log_sha256": "5d9e568926612b64aa0adbab03b14faf2ec28b4b9cd035f6077d87fe2e9dc720"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "nested",
+      "variant": "baseline",
+      "round": 1,
+      "file": "native-scratch-timing-instances-nested-baseline-1",
+      "start_unix": 1792780672.6658063,
+      "end_unix": 1792780688.122875,
+      "csv_sha256": "a64d06adecfbe4fb4c1f1343b8a1a09ead0ee859cbb157377424f06b2b436a1e",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "nested",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-timing-instances-nested-candidate-1",
+      "start_unix": 1792780688.181729,
+      "end_unix": 1792780703.431035,
+      "csv_sha256": "dfa37a1035c07c97a415922788b659eca5cc438f554def6b69397fd33c8e2964",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "nested",
+      "variant": "candidate",
+      "round": 2,
+      "file": "native-scratch-timing-instances-nested-candidate-2",
+      "start_unix": 1792780703.4929512,
+      "end_unix": 1792780718.9914534,
+      "csv_sha256": "3926f70c57104b0caa7b2303ae15919dd103eae21661dbd3a13975ca06fd5f6b",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "timing",
+      "mode": "instances",
+      "shape": "nested",
+      "variant": "baseline",
+      "round": 2,
+      "file": "native-scratch-timing-instances-nested-baseline-2",
+      "start_unix": 1792780719.056457,
+      "end_unix": 1792780734.478893,
+      "csv_sha256": "6117c4bd2a926512086455a14a5689dc3d2839d3dc9693f3e66675e49943e1ae",
+      "log_sha256": "2e63fa3faa404dbc8d3b940cfffe117fc77157a992a390fa6c03464256a63187"
+    },
+    {
+      "kind": "allocation",
+      "mode": "keep_alive",
+      "shape": "flat",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-allocation-keep_alive-flat-candidate-1",
+      "start_unix": 1792780734.5434682,
+      "end_unix": 1792780736.4735937,
+      "csv_sha256": "753aec94609a92bbaf4e342b250b0c27113a7349c41a87a04c6b92e9069bfe27",
+      "log_sha256": "0c03f1c63a4b4928bde5379b50e9db2ee429bcac3396fc0c9d39b273f955a90c"
+    },
+    {
+      "kind": "allocation",
+      "mode": "keep_alive",
+      "shape": "nested",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-allocation-keep_alive-nested-candidate-1",
+      "start_unix": 1792780736.5350485,
+      "end_unix": 1792780738.5918746,
+      "csv_sha256": "93531a8ddd3d338e4e434a0966a00cfe68143044d377a0a83f849b41120cb3a5",
+      "log_sha256": "26b7b48deff3560726c7c8b47f123172d96a460e301a5b9a9f230bf64479c5a1"
+    },
+    {
+      "kind": "allocation",
+      "mode": "instances",
+      "shape": "flat",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-allocation-instances-flat-candidate-1",
+      "start_unix": 1792780738.6497378,
+      "end_unix": 1792780743.6462636,
+      "csv_sha256": "a4762caa9c0b0194300021b95be895fc47b5f86e17f7af0180dd80467e2418ff",
+      "log_sha256": "397bb08a1ffdc141d60e80446a7b5835a6a7a2aecc61cdc298d1695097e6c638"
+    },
+    {
+      "kind": "allocation",
+      "mode": "instances",
+      "shape": "nested",
+      "variant": "candidate",
+      "round": 1,
+      "file": "native-scratch-allocation-instances-nested-candidate-1",
+      "start_unix": 1792780743.7085865,
+      "end_unix": 1792780748.9973238,
+      "csv_sha256": "858cdc45808ebe49696ad4962f59c909d598f09a877c4b9d061517641ef1a441",
+      "log_sha256": "2db14fb557ac6b9f04bdad45aaacc1e11979c12551174e3c1da03c3c6ee39051"
+    }
+  ],
+  "data": [
+    {
+      "file": "performance-native-scratch-2026-10-24.csv",
+      "sha256": "53d94cb33fdec726a2210fc8b8f45283a971842d650c3dd4e4cb76ceb4de5b8c",
+      "rows": 384
+    },
+    {
+      "file": "native-scratch-allocations-2026-10-24.csv",
+      "sha256": "d45a860e57d21fb22bb09fe355eca2d80869077cbf8f8a9d56cb6659f5dbc64a",
+      "rows": 32
+    },
+    {
+      "file": "native-scratch-allocation-fixtures-2026-10-24.csv",
+      "sha256": "f564027696b709b5309865b237c0c7e1f0100fb8d822527060ffb14e64197fae",
+      "rows": 64
+    }
+  ],
+  "rustc": "rustc 1.99.0-nightly (ba28ff76f 2026-08-13)\nbinary: rustc\ncommit-hash: ba28ff76f353a722f31c4f3dd2ac4e437d36411b\ncommit-date: 2026-08-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 23.1.0\n",
+  "build_command": "CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<separate-target> cargo bench -p bevy_ui_router --bench router_baseline --features bsn --offline --locked --no-run --message-format=json",
+  "timing_run": "ROUTER_BENCH_MODE=<keep_alive|instances> ROUTER_BENCH_SHAPE=<flat|nested> ROUTER_BENCH_SAMPLES=128 <saved-executable>; no allocation environment variable",
+  "allocation_run": "same modes/shapes, ROUTER_BENCH_SAMPLES=32 ROUTER_BENCH_PUBLICATION_ALLOCATIONS=total",
+  "environment": "Linux WSL2 / Ryzen 9 9950X / 24 visible CPUs; no affinity/frequency/full host-load control; non-MT, no layout/picking/GPU/I/O; all new builds completed before sequential samples; allocation baseline reuses the identical saved prior total counter records from the Children-only binary; timing baseline rerun in each fresh pair",
+  "validation": "All four source variants replayed exactly; actual ECS rebuilt for each new variant, baseline identity reused exactly from Children-only evidence; paired non-timing fields identical and all benchmark assertions passed; all outputs retained.",
+  "measurement_limits": "Allocation is current-thread churn in unchanged Fixture::navigate, including same completion/issued bookkeeping, not resident or peak heap. Allocation probe wall times are not CPU evidence. Timing is uninstrumented wall-clock; idle percentiles are batch means."
+}

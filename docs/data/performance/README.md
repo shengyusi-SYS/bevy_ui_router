@@ -324,3 +324,17 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 freeze/compare 仅在测量导航内启用，计数结束后统一输出；before 的 compare 包住旧 owned construction，after 包住整个新借用比较 helper。total 包住未改的 `Fixture::navigate`，包括 enqueue 到终态/公开完成检查及相同 `issued.push`，此时内部两个 scope 直接执行、不嵌套计数；setup/reset/idle/teardown 均在区间外。当前线程的累计分配次数/字节不表示净驻留、峰值或泄漏；owned freeze 不变，total 的8个前后差值精确等于对应 compare 的减少量。
 
 普通 allocator 计时只在独立 `0db8593` 检出应用生产差异，不应用任何探针或依赖；相同 bench 构建，运行时不设置计数环境变量，样本128。两类实验各自全部非计时列逐项相同，所有断言通过。环境沿用本日 WSL2、非 MT、headless 优化构建；无本任务并行构建，未固定 affinity/频率或控制宿主全部负载。不含 layout、picking、GPU 或 I/O。采用理由和维护成本见[性能说明](../../performance.md#publication-源比较的分配减法)，不把分配下降换算为 CPU 提速。
+
+## Native 实时 Children 借用 2026-10-24
+
+[384行普通计时](performance-native-children-2026-10-24.csv)、[32行完整导航分配](native-children-allocations-2026-10-24.csv)、[64行计数夹具输出](native-children-allocation-fixtures-2026-10-24.csv)及[身份](native-children-identity-2026-10-24.json)绑定 `e21dca3`。[候选](native-children-candidate-2026-10-24.patch)仅将 native adoption validator 的三处即时 Children Vec 改成借用 slice，未改变 owned 冻结或每次 marker 写后复验。四个源码版本重放 hash 一致，全部配对非计时列及断言相同。
+
+普通 allocator 对照先 keep_alive、后 instances，每种模式先 flat 后 nested，各按 before1→candidate1→candidate2→before2；每场景128样本，每次24行。全部慢值和尾部保留，结果混合，不宣称普遍 CPU 加速。计数对照同样四种组合，各 before→candidate、32样本、仅128内容预算，每次4条聚合计数及8行原夹具输出；idle 的探针耗时不作 CPU 证据。
+
+独立检出 `e21dca3` 后，baseline 不应用生产差异，candidate 应用本候选；计数版本均再按上一节候选方法应用已有 allocation probe（排除两个 engine 旧调用文件）、borrow scopes、navigation total 三份补丁，不重复应用 publication 生产差异。构建/运行命令、依赖和非嵌套区间沿用上一节，实际 ECS 重新编译，四个 executable 均独立保存。所有构建结束后才串行采样，环境及 headless/非 MT/current-thread 边界不变。
+
+## Native 校验容量复用 2026-10-24
+
+[384行普通计时](performance-native-scratch-2026-10-24.csv)、[32行完整导航分配](native-scratch-allocations-2026-10-24.csv)、[64行计数夹具输出](native-scratch-allocation-fixtures-2026-10-24.csv)及[身份](native-scratch-identity-2026-10-24.json)以 `e21dca3 + Children 借用` 为基线，再应用[scratch 增量](native-scratch-candidate-2026-10-24.patch)。它只复用单次 realization 内 containment/stack/visited 的容量，每轮先清空再完整读取 World，最终只移出最后一次 containment；没有跨写事实缓存。所有源码版本重放 hash 一致。
+
+普通 allocator 的两个版本按上一节同样的模式、shape、样本数和正反序重新配对，baseline 使用已保存的 Children-only executable，逐次验证其 hash。计数 baseline 复用该同一 binary 已完成的32导航计数，candidate 运行相同边界；身份明确标注复用记录及原时间，未复用普通耗时数据。全部原断言、非计时列、慢值和尾部保留。计数依赖及探针只存在于独立副本，不能从分配总量推导驻留或峰值 heap。

@@ -1,0 +1,38 @@
+diff --git a/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs b/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
+--- a/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
++++ b/crates/bevy_ui_router_ecs/src/presentation/native_scene.rs
+@@ -902,7 +902,9 @@
+         }
+     }
+     let expected_shell_children = [allocations[1].entity()];
+-    let actual_shell_children = current_children(world, shell);
++    let actual_shell_children = world
++        .get::<Children>(shell)
++        .map_or(&[][..], |children| &children[..]);
+     if actual_shell_children != expected_shell_children {
+         if let Some(child) = actual_shell_children
+             .iter()
+@@ -919,7 +921,9 @@
+     for parent in 0..declarations.len() {
+         let entity = allocations[parent + 1].entity();
+         let expected = &topology.children[parent];
+-        let actual = current_children(world, entity);
++        let actual = world
++            .get::<Children>(entity)
++            .map_or(&[][..], |children| &children[..]);
+         let declared_in_actual = actual.iter().copied().filter(|child| {
+             topology
+                 .declaration_indices
+@@ -957,8 +961,10 @@
+             });
+         }
+         containment.push(entity);
+-        let children = current_children(world, entity);
+-        stack.extend(children.into_iter().rev().map(|child| (child, entity)));
++        let children = world
++            .get::<Children>(entity)
++            .map_or(&[][..], |children| &children[..]);
++        stack.extend(children.iter().copied().rev().map(|child| (child, entity)));
+     }
+     if topology
+         .declaration_indices

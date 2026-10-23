@@ -528,18 +528,17 @@ pub(crate) fn create_native_scene(
             dependencies,
         ));
     }
-    let mut current_containment =
-        match validate_adoption(world, &allocations, &declarations, &topology) {
-            Ok(containment) => containment,
-            Err(error) => {
-                return Err(fail_and_settle(
-                    world,
-                    NativeSceneCreationError::Adoption(error),
-                    allocations,
-                    dependencies,
-                ));
-            }
-        };
+    let mut scratch = NativeSceneValidationScratch::default();
+    if let Err(error) =
+        validate_adoption(world, &allocations, &declarations, &topology, &mut scratch)
+    {
+        return Err(fail_and_settle(
+            world,
+            NativeSceneCreationError::Adoption(error),
+            allocations,
+            dependencies,
+        ));
+    }
 
     let descendant_claims = allocations[2..]
         .iter()
@@ -566,16 +565,13 @@ pub(crate) fn create_native_scene(
             .entity_mut(allocations[index].entity())
             .remove::<(RouteOwnershipSeal, FrameLifecycle)>();
         world.flush();
-        match validate_adoption(world, &allocations, &declarations, &topology) {
-            Ok(containment) => current_containment = containment,
-            Err(_) => {
-                return Err(fail_and_settle(
-                    world,
-                    NativeSceneCreationError::Adoption(NativeSceneAdoptionError::RetirementDrift),
-                    allocations,
-                    dependencies,
-                ));
-            }
+        if validate_adoption(world, &allocations, &declarations, &topology, &mut scratch).is_err() {
+            return Err(fail_and_settle(
+                world,
+                NativeSceneCreationError::Adoption(NativeSceneAdoptionError::RetirementDrift),
+                allocations,
+                dependencies,
+            ));
         }
     }
     // Marker hooks may add ordinary content/components. Keep the surviving
@@ -610,7 +606,7 @@ pub(crate) fn create_native_scene(
         frame,
         shell: allocations[0].claim.clone(),
         root: allocations[1].claim.clone(),
-        current_containment,
+        current_containment: scratch.containment,
         dependencies,
     })
 }
@@ -860,12 +856,24 @@ impl PreparedNativeSceneTopology {
     }
 }
 
+// Capacity is reused only within one realization; each validation clears all facts.
+#[derive(Default)]
+struct NativeSceneValidationScratch {
+    containment: Vec<Entity>,
+    stack: Vec<(Entity, Entity)>,
+    visited: HashSet<Entity>,
+}
+
 fn validate_adoption(
     world: &World,
     allocations: &[NativeSceneAllocation],
     declarations: &[crate::bsn::BsnSceneDeclaration],
     topology: &PreparedNativeSceneTopology,
-) -> Result<Vec<Entity>, NativeSceneAdoptionError> {
+    scratch: &mut NativeSceneValidationScratch,
+) -> Result<(), NativeSceneAdoptionError> {
+    scratch.containment.clear();
+    scratch.stack.clear();
+    scratch.visited.clear();
     for allocation in allocations {
         if !allocation_has_exact_private_identity(world, allocation) {
             return Err(NativeSceneAdoptionError::AllocationDrift {
@@ -876,7 +884,7 @@ fn validate_adoption(
             });
         }
     }
-    validate_adoption_relationships(world, allocations, declarations, topology)
+    validate_adoption_relationships(world, allocations, declarations, topology, scratch)
 }
 
 fn validate_adoption_relationships(
@@ -884,7 +892,8 @@ fn validate_adoption_relationships(
     allocations: &[NativeSceneAllocation],
     declarations: &[crate::bsn::BsnSceneDeclaration],
     topology: &PreparedNativeSceneTopology,
-) -> Result<Vec<Entity>, NativeSceneAdoptionError> {
+    scratch: &mut NativeSceneValidationScratch,
+) -> Result<(), NativeSceneAdoptionError> {
     if allocations.len() != declarations.len() + 1 {
         return Err(NativeSceneAdoptionError::RelationshipDrift { declaration: None });
     }
@@ -902,7 +911,9 @@ fn validate_adoption_relationships(
         }
     }
     let expected_shell_children = [allocations[1].entity()];
-    let actual_shell_children = current_children(world, shell);
+    let actual_shell_children = world
+        .get::<Children>(shell)
+        .map_or(&[][..], |children| &children[..]);
     if actual_shell_children != expected_shell_children {
         if let Some(child) = actual_shell_children
             .iter()
@@ -919,7 +930,9 @@ fn validate_adoption_relationships(
     for parent in 0..declarations.len() {
         let entity = allocations[parent + 1].entity();
         let expected = &topology.children[parent];
-        let actual = current_children(world, entity);
+        let actual = world
+            .get::<Children>(entity)
+            .map_or(&[][..], |children| &children[..]);
         let declared_in_actual = actual.iter().copied().filter(|child| {
             topology
                 .declaration_indices
@@ -934,9 +947,12 @@ fn validate_adoption_relationships(
     }
 
     let root = allocations[1].entity();
-    let mut containment = Vec::new();
-    let mut stack = vec![(root, shell)];
-    let mut visited = HashSet::new();
+    let NativeSceneValidationScratch {
+        containment,
+        stack,
+        visited,
+    } = scratch;
+    stack.push((root, shell));
     while let Some((entity, parent)) = stack.pop() {
         if !visited.insert(entity) || current_parent(world, entity) != Some(parent) {
             return Err(NativeSceneAdoptionError::RelationshipDrift {
@@ -957,8 +973,10 @@ fn validate_adoption_relationships(
             });
         }
         containment.push(entity);
-        let children = current_children(world, entity);
-        stack.extend(children.into_iter().rev().map(|child| (child, entity)));
+        let children = world
+            .get::<Children>(entity)
+            .map_or(&[][..], |children| &children[..]);
+        stack.extend(children.iter().copied().rev().map(|child| (child, entity)));
     }
     if topology
         .declaration_indices
@@ -967,7 +985,7 @@ fn validate_adoption_relationships(
     {
         return Err(NativeSceneAdoptionError::RelationshipDrift { declaration: None });
     }
-    Ok(containment)
+    Ok(())
 }
 
 fn entity_has_current_router_owner(world: &World, entity: Entity) -> bool {

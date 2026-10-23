@@ -6,7 +6,7 @@
 
 | 角度 | 已核验的成本与处理 | 证据边界 |
 | --- | --- | --- |
-| 完整导航与 Scene 接管 | 系统阶段、逐 update、fresh/miss/hit/淘汰；一次准备不可变声明拓扑 | headless CPU，不代表屏幕首帧 |
+| 完整导航与 Scene 接管 | 系统阶段、逐 update、fresh/miss/hit/淘汰；一次准备不可变声明拓扑，借用即时 children，复用单次校验容量 | headless CPU，不代表屏幕首帧 |
 | 清理与库存 | 父子依赖、保护复验、receipt 准备及退出释放；不采用无稳定收益的容器/批量候选 | 实体释放不等于 heap 证明 |
 | 输入、滚动与调度 | 空工作退出、只读事实复用、focus 私有调度；保留实时观察 | 窗口证据限 WSLg；窄参数改造未证明稳定整帧收益 |
 | World 与多 Router 规模 | 定向查询消除无关实体扫描；区分快照比较、索引和重建 | 固定背景类型、双 Router；不建立全局索引 |
@@ -441,6 +441,25 @@ Core 的 canonical history 源比较原来先构造 owned snapshot，再复制 l
 另以普通 allocator 完成两轮 keep-alive/父子库存对照，每场景128样本，完整192行保留。第二轮两种模式均出现导航和未改动 idle 的整组漂移，原因未证实，整对标记不稳定；第一轮也有改善与回退，不能确认稳定 CPU 收益。采用依据是常用命中路径的完整导航分配减少，代价限于一个显式比较 helper；不增加缓存、公共 API 或生产依赖。
 
 计数仅涵盖当前线程的分配总次数/字节，不是驻留或峰值 heap。完整区间包住原 `Fixture::navigate`，包含公开完成检查及相同的 `issued.push`，排除初始化、reset、idle 和 teardown；替换 allocator 的探针耗时不作性能结论。没有新增机械镜像测试，继续由既有 source drift、原 owner 返回、retained continuation 与 facade journey 保护行为。
+
+## Scene 实时读取与校验容量
+
+完成拓扑准备后，再分别核验两项局部减法。第一项只把 `validate_adoption_relationships` 三处即时 Children 副本改为借用 slice；需要跨写入保存的 owned 观察不变。第二项用单次 `create_native_scene` 内的私有 scratch 复用 containment、stack、visited 的容量，每轮先清空，再按原顺序完整重读 World；最后才移出成功 containment。首次错误、写后 RetirementDrift、失败清理及原 owner 均不变。
+
+两项各自完成两轮 flat/nested、leaf/父子库存普通 allocator 配对，各384行；同一完整导航计数边界也分别核验。[Children 来源](data/performance/README.md#native-实时-children-借用-2026-10-24)与[scratch 来源](data/performance/README.md#native-校验容量复用-2026-10-24)保留全部数据和补丁。以下是128内容预算每导航分配次数的分步结果，后一步使用前一步完全相同的 counter binary 记录作基线。
+
+| 场景 | 两项改动前 | Children 借用后 | 再复用容量后 |
+| --- | ---: | ---: | ---: |
+| leaf flat 首次 miss | 5,936 | 5,549 | 3,501 |
+| leaf nested 首次 miss | 9,796 | 5,797 | 3,620 |
+| 父子 flat 均 fresh | 35,881 | 35,104 | 30,992 |
+| 父子 nested 均 fresh | 46,818.53 | 38,789.53 | 34,289.53 |
+
+Children 借用每个128节点页减少265,224累计分配字节；嵌套父节点较多，减少3,999次分配，flat减少387次。scratch 在此基础上每页再减少约2,048–2,177次、1.17–1.38 MB。两项合计使 leaf 首次 miss 的累计字节从约2.37–2.60 MB降至0.93–0.95 MB；缓存命中的次数和字节不变。这是当前线程的分配流量，不能解释为最终驻留或峰值改善。
+
+Children 单独的普通耗时结果混合：nested fresh p50下降4.4% / 1.0%，但nested miss增加2.6% / 1.2%，flat fresh增加1.2% / 8.6%；采用依据是无新状态的分配减法，不宣称 CPU 普遍加速。scratch 相对 Children-only 的四组128节点 leaf miss p50从2.39–2.52 ms降至2.15–2.18 ms，配对下降10.1%–14.4%，p95均下降；原父、新子四组p50下降3.0%–7.2%。这些区间来自各组分位数，未合并为一个分位数，也不与更早基线串乘百分比。
+
+代价仍保留：scratch 的 nested 父子依赖淘汰第二轮 p50增加2.8%，p95从22.64增至32.78 ms；flat fresh第一轮p95也从6.18增至6.55 ms。未改的命中与idle同样有波动，原因未证实，不能归因于 scratch 或反向当作它的收益。没有以此扩展阈值分支、缓存或测试矩阵；采用依据是首次构建路径的稳定减法及局部范围，未称所有场景更快。
 
 ## 窗口诊断的边界
 
