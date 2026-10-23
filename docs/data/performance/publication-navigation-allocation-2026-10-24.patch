@@ -1,0 +1,80 @@
+diff --git a/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs b/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs
+--- a/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs
++++ b/crates/bevy_ui_router_core/src/publication_allocation_diagnostic.rs
+@@ -1,4 +1,4 @@
+-//! Temporary diagnostic only: allocation counts during observation construction.
++//! Temporary diagnostic: allocation counts for observation or whole-navigation scopes.
+ //! Linking allocation-counter replaces the allocator even with the env unset.
+ use std::{cell::Cell, sync::OnceLock};
+
+@@ -6,6 +6,7 @@
+ pub(crate) enum Purpose {
+     Freeze,
+     Compare,
++    Navigation,
+ }
+
+ #[derive(Clone, Copy, Debug, Default)]
+@@ -37,8 +38,9 @@
+             Err(std::env::VarError::NotPresent) => None,
+             Ok(value) if value == "freeze" => Some(Purpose::Freeze),
+             Ok(value) if value == "compare" => Some(Purpose::Compare),
++            Ok(value) if value == "total" => Some(Purpose::Navigation),
+             other => panic!(
+-                "ROUTER_BENCH_PUBLICATION_ALLOCATIONS must be unset, freeze or compare: {other:?}"
++                "ROUTER_BENCH_PUBLICATION_ALLOCATIONS must be unset, freeze, compare or total: {other:?}"
+             ),
+         },
+     )
+@@ -48,6 +50,7 @@
+     selected().map(|scope| match scope {
+         Purpose::Freeze => "owned_freeze",
+         Purpose::Compare => "immediate_compare",
++        Purpose::Navigation => "navigation_total",
+     })
+ }
+
+@@ -77,6 +80,12 @@
+     })
+ }
+
++// The selected scope is exclusive: in total mode, inner freeze/compare calls
++// execute directly; in other modes, this wrapper executes directly.
++pub fn navigation<T>(run: impl FnOnce() -> T) -> T {
++    observe(Purpose::Navigation, run)
++}
++
+ pub(crate) fn observe<T>(purpose: Purpose, make_observation: impl FnOnce() -> T) -> T {
+     if selected() != Some(purpose) || !STATE.with(|state| state.get().active) {
+         return make_observation();
+diff --git a/crates/bevy_ui_router/benches/router_baseline.rs b/crates/bevy_ui_router/benches/router_baseline.rs
+--- a/crates/bevy_ui_router/benches/router_baseline.rs
++++ b/crates/bevy_ui_router/benches/router_baseline.rs
+@@ -717,7 +717,9 @@
+             let toolbar = only::<Toolbar>(&mut fixture.app);
+             let before_builds = fixture.factory_count();
+             allocations.begin(index >= WARMUP_CYCLES);
+-            let sample = fixture.navigate(Action::Replace, &format!("/items/{id}"), false);
++            let sample = publication_alloc::navigation(|| {
++                fixture.navigate(Action::Replace, &format!("/items/{id}"), false)
++            });
+             allocations.finish(index >= WARMUP_CYCLES);
+             let built = fixture.factory_count() - before_builds;
+             let census = fixture.census(id, inactive.min(index + 1));
+diff --git a/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs b/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs
+--- a/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs
++++ b/crates/bevy_ui_router/benches/router_baseline/retained_instances.rs
+@@ -328,10 +328,11 @@
+                 let before_parents = instances.parent_builds.load(Ordering::Relaxed);
+                 let before_pages = instances.fixture.factory_count();
+                 allocations.begin(index >= INSTANCE_WARMUP);
+-                let sample =
++                let sample = publication_alloc::navigation(|| {
+                     instances
+                         .fixture
+-                        .navigate(Action::Replace, &format!("/{section}/{id}"), false);
++                        .navigate(Action::Replace, &format!("/{section}/{id}"), false)
++                });
+                 allocations.finish(index >= INSTANCE_WARMUP);
+                 let built_parents =
+                     instances.parent_builds.load(Ordering::Relaxed) - before_parents;

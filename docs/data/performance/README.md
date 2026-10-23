@@ -308,3 +308,19 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 使用现有 HistoryAuthorityFixture，经正常 Push/Back capability 构建1/64/256条 history，在真实 cursor 0 下分别测 owned freeze、成功 NoTarget 源校验及完整 Replace 链，每项4次预热、16次样本。Replace 的 binding/target 构造与打印在区间外；真实 capability 的创建、prepare、source match、publish 在同一区间。owned freeze 返回值在区间外 drop，便于同时观察临时总分配与最终 owned 输出。
 
 依照[计数库官方说明](https://docs.rs/allocation-counter/0.8.1/allocation_counter/fn.measure.html)，仅当前线程计数；全部区间不嵌套。`current` 是区间分配减释放，Replace 包含对旧 history/外部输入的释放，因此为负不代表错误，也不能据此宣称进程 heap 或长期释放正常。本次比较分配次数与字节，不比较工具替换 allocator 后的 wall-clock。原始每次记录均保留，不设置 CI 分配阈值；[结论](../../performance.md#history-源校验的分配减法)限于这三条 Core 路径。
+
+## Publication 源比较 2026-10-24
+
+分配实验基线为 `7f667c3`，普通 allocator 计时基线为 `0db8593`；两者之间仅 matcher 和文档变化，publication 源码相同。两种实验各自的前后始终使用同一基线，不跨实验相减。[完整身份](publication-borrow-identity-2026-10-24.json)绑定六个实际 executable、源码/lock/patch/data hash、compiler-artifact features/profile、运行参数与顺序；所有来源均已重放并逐文件核对 hash。
+
+- [48行分配计数](publication-allocations-2026-10-24.csv)：owned freeze、即时比较和完整导航，各含两个版本、两种模式、四个场景；每行聚合32次导航，除以 navigations 得到每导航均值。
+- [96行原夹具输出](publication-allocation-fixtures-2026-10-24.csv)：保留上述12次运行的原断言结果与数量列；其 allocator 已替换，耗时不能作 CPU 基线。
+- [192行普通 allocator 计时](performance-publication-borrow-2026-10-24.csv)：flat keep_alive、再 instances，每种模式按 before1→candidate1→candidate2→before2，每场景128样本。第二轮两种模式均整对标为 `unstable_pair`；第一轮结果混合，标为 `no_stable_cpu_gain`。保留全部较慢组、idle、尾部及最大值。
+
+重建分配基线时，在独立 `7f667c3` 检出应用[探针补丁](publication-allocation-probe-2026-10-24.patch)。重建候选时，先应用[生产差异](publication-borrow-candidate-2026-10-24.patch)，再应用探针但用 `git apply --exclude=crates/bevy_ui_router_core/src/engine.rs --exclude=crates/bevy_ui_router_core/src/engine/retained.rs` 排除旧调用点，最后应用[候选 scope 补丁](publication-borrow-scopes-2026-10-24.patch)。两侧完整导航计数均在对应 scoped 副本上追加[total 区间补丁](publication-navigation-allocation-2026-10-24.patch)。生产 Cargo/lock 不加入计数依赖。
+
+使用独立 target、`CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked --no-run --message-format=json` 构建，记录 Core 实际重新编译并保存 compiler-artifact executable。分配副本临时固定 `allocation-counter = "=0.8.1"`，使用缓存依赖加 `--offline`。运行设置 `ROUTER_BENCH_MODE=<keep_alive|instances> ROUTER_BENCH_SHAPE=flat ROUTER_BENCH_SAMPLES=32 ROUTER_BENCH_PUBLICATION_ALLOCATIONS=<freeze|compare|total>`；只运行128内容预算，原预热、完成边界、idle批次和行为断言不变。
+
+freeze/compare 仅在测量导航内启用，计数结束后统一输出；before 的 compare 包住旧 owned construction，after 包住整个新借用比较 helper。total 包住未改的 `Fixture::navigate`，包括 enqueue 到终态/公开完成检查及相同 `issued.push`，此时内部两个 scope 直接执行、不嵌套计数；setup/reset/idle/teardown 均在区间外。当前线程的累计分配次数/字节不表示净驻留、峰值或泄漏；owned freeze 不变，total 的8个前后差值精确等于对应 compare 的减少量。
+
+普通 allocator 计时只在独立 `0db8593` 检出应用生产差异，不应用任何探针或依赖；相同 bench 构建，运行时不设置计数环境变量，样本128。两类实验各自全部非计时列逐项相同，所有断言通过。环境沿用本日 WSL2、非 MT、headless 优化构建；无本任务并行构建，未固定 affinity/频率或控制宿主全部负载。不含 layout、picking、GPU 或 I/O。采用理由和维护成本见[性能说明](../../performance.md#publication-源比较的分配减法)，不把分配下降换算为 CPU 提速。

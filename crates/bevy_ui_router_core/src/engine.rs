@@ -11795,8 +11795,9 @@ impl RouterEngine {
         sealed: &SealedCommit,
     ) -> Result<(), CommitError> {
         self.validate_sealed_commit_evidence(&sealed.evidence)?;
-        let observed = self.observe_prepared_publication_source(sealed.publication.record_index);
-        if !observed.same_source(&sealed.source) {
+        if !self
+            .prepared_publication_source_matches(sealed.publication.record_index, &sealed.source)
+        {
             return Err(CommitError::Stale);
         }
         let valid = self.current.as_ref().is_some_and(|current| {
@@ -11855,6 +11856,78 @@ impl RouterEngine {
             return Err(CommitError::Stale);
         }
         Ok(())
+    }
+
+    // Match the owned observation contract without cloning an observation that
+    // this read-only check would immediately discard. Frozen evidence stays owned.
+    fn prepared_publication_source_matches(
+        &self,
+        record_index: usize,
+        expected: &PreparedPublicationObservation,
+    ) -> bool {
+        // Exhaustive destructuring makes new observation fields require review.
+        let PreparedPublicationObservation {
+            identity,
+            stage,
+            record,
+            history_revision,
+            history_execution,
+            current_location,
+            current_branch,
+            current_attempt,
+            current_target_frames,
+            current_selected_retained_frames,
+            current_applied_frames,
+            current_reconciliation,
+            state,
+            host,
+            top_slot,
+            active,
+            active_branch,
+            active_child_slots,
+            retained_leaves,
+            pending_retained_miss_cleanup,
+            keep_alive_capacity,
+        } = expected;
+        let current = self.current.as_ref();
+        // These projections have no borrowed equivalent; preserve their existing
+        // construction even when an earlier field would reject the source.
+        let observed_stage = current.map(|current| current.stage.projection());
+        let observed_history_execution = current.and_then(|current| match &current.attempt {
+            AttemptKind::Normal(_) => Some(self.current_history_execution_projection(current)),
+            AttemptKind::Fallback { .. } => None,
+        });
+        let observed_attempt: Option<FailureCleanupZeroTerminalAttemptProjection> =
+            current.map(|current| (&current.attempt).into());
+        current.map(|current| &current.identity) == identity.as_ref()
+            && observed_stage.as_ref() == stage.as_ref()
+            && self.records.get(record_index) == record.as_ref()
+            && self.history.revision() == *history_revision
+            && observed_history_execution.as_ref() == history_execution.as_ref()
+            && current.map(|current| &current.location) == current_location.as_ref()
+            && PreparedPublicationObservation::branch_fingerprint(
+                current.and_then(|current| current.branch.as_ref()),
+            ) == PreparedPublicationObservation::branch_fingerprint(current_branch.as_ref())
+            && observed_attempt.as_ref() == current_attempt.as_ref()
+            && current.map_or(&[][..], |current| current.target_frames.as_slice())
+                == current_target_frames.as_slice()
+            && current.map_or(&[][..], |current| {
+                current.selected_retained_frames.as_slice()
+            }) == current_selected_retained_frames.as_slice()
+            && current.map_or(&[][..], |current| current.applied_frames.as_slice())
+                == current_applied_frames.as_slice()
+            && current.and_then(|current| current.reconciliation.as_ref())
+                == current_reconciliation.as_ref()
+            && &self.state == state
+            && self.state.host() == host.as_ref()
+            && self.state.top_slot() == *top_slot
+            && self.state.active() == active
+            && PreparedPublicationObservation::branch_fingerprint(self.active_branch.as_ref())
+                == PreparedPublicationObservation::branch_fingerprint(active_branch.as_ref())
+            && self.active_child_slots.as_slice() == active_child_slots.as_slice()
+            && self.retained_leaves.as_slice() == retained_leaves.as_slice()
+            && self.pending_retained_miss_cleanup.as_ref() == pending_retained_miss_cleanup.as_ref()
+            && self.keep_alive_capacity == *keep_alive_capacity
     }
 
     fn observe_prepared_publication_source(

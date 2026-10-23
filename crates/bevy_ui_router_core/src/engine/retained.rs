@@ -507,9 +507,7 @@ impl RouterEngine {
             return false;
         };
         retained.plan.normal == *normal
-            && self
-                .observe_prepared_publication_source(index)
-                .same_source(&retained.plan.source)
+            && self.prepared_publication_source_matches(index, &retained.plan.source)
             && owner_projections_match(retained.owners.iter(), retained.plan.retiring.iter())
             && self
                 .retained_leaves
@@ -760,11 +758,8 @@ impl RouterEngine {
             plan.failed_base_roots.is_none() && self.retained_authority_settlement_eligible()
         };
         if !eligible
-            || record_index.is_none_or(|index| {
-                !self
-                    .observe_prepared_publication_source(index)
-                    .same_source(&plan.source)
-            })
+            || record_index
+                .is_none_or(|index| !self.prepared_publication_source_matches(index, &plan.source))
             || self.observed_unavailable_owner_inventory() != plan.inventory
         {
             return Err((lease, owners, BeginAuthoritySettlementErrorKind::Stale));
@@ -1307,9 +1302,7 @@ impl RouterEngine {
         };
         if !self.instance_selection_eligible(&task)
             || self.inspect_view_report_identity(task.identity()).is_err()
-            || !self
-                .observe_prepared_publication_source(index)
-                .same_source(&plan.source)
+            || !self.prepared_publication_source_matches(index, &plan.source)
             || self.select_retained_prefix(&task).ok().as_ref() != Some(&plan.selected)
         {
             return Err((task, CommitError::Stale));
@@ -1566,10 +1559,7 @@ impl RouterEngine {
                 .records
                 .iter()
                 .position(|record| record.id() == owner.identity.request)
-                .is_some_and(|index| {
-                    self.observe_prepared_publication_source(index)
-                        .same_source(&owner.source)
-                })
+                .is_some_and(|index| self.prepared_publication_source_matches(index, &owner.source))
             && self.current.as_ref().is_some_and(|current| {
                 current.applied_frames.is_empty()
                     && current.reconciliation.as_ref().is_some_and(|projection| {
@@ -1851,9 +1841,7 @@ impl RouterEngine {
             || self.prepared_publication_authority.is_some()
             || self.live_failed_authority_trigger_revision.is_some()
             || !self.retained_invalidation_receiver_is_current(receiver.as_ref())
-            || !self
-                .observe_prepared_publication_source(index)
-                .same_source(&plan.source)
+            || !self.prepared_publication_source_matches(index, &plan.source)
         {
             return Err((receiver, owners, CommitError::Stale));
         }
@@ -1929,9 +1917,7 @@ impl RouterEngine {
             .ok_or(CleanupError::Stale)?;
         if self.pending_retained_miss_cleanup.as_ref() != Some(&owner.cleanup)
             || !self.retained_invalidation_receiver_is_current(owner.receiver.as_ref())
-            || !self
-                .observe_prepared_publication_source(index)
-                .same_source(&owner.source)
+            || !self.prepared_publication_source_matches(index, &owner.source)
         {
             return Err(CleanupError::Stale);
         }
@@ -2143,9 +2129,7 @@ impl RouterEngine {
             Some(index) => index,
             None => return Err((retiring, CommitError::Stale)),
         };
-        if !self
-            .observe_prepared_publication_source(record_index)
-            .same_source(&plan.source)
+        if !self.prepared_publication_source_matches(record_index, &plan.source)
             || !self.retained_plan_partition_is_current(plan)
         {
             return Err((retiring, CommitError::Stale));
