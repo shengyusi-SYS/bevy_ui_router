@@ -205,6 +205,6 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 
 四份产物的完整 compiler-artifact features/profile 投影相同，`bevy_ecs` 均含 `multi_threaded`；bench 为 opt-level 3、debuginfo 0、debug assertions 与 overflow checks 关闭。crate/benchmark/lock 在各自构建和计时期间没有未提交修改；本任务自身没有并行 Cargo/rustc、renderer 或窗口。未固定 CPU affinity/频率，也未控制宿主全部负载。
 
-另一个工作区事后反馈 Cargo 编译区间为 2026-10-17 UTC 20:25:35–20:25:43、20:25:49–20:26:13。文件时间确认与 `retained` 第 2 轮重叠：after CSV 从创建至末写为 20:25:10.515–20:25:46.323，before 为 20:25:46.343–20:26:22.095。整个配对 48 行均标为 `contended_pair`，不用于收益估算；没有按单行猜测或裁剪受影响样本，也没有重跑追加矩阵。其余组未与该已知区间重叠，标为 `uncontended_pair`，不表示控制了宿主全部负载。
+已确认采样期间存在外部并行 Cargo 编译，区间为 2026-10-17 UTC 20:25:35–20:25:43、20:25:49–20:26:13。文件时间确认与 `retained` 第 2 轮重叠：after CSV 从创建至末写为 20:25:10.515–20:25:46.323，before 为 20:25:46.343–20:26:22.095。整个配对 48 行均标为 `contended_pair`，不用于收益估算；没有按单行猜测或裁剪受影响样本，也没有重跑追加矩阵。其余组未与该已知区间重叠，标为 `uncontended_pair`，不表示控制了宿主全部负载。
 
 每次完整输出 24 行，全部 288 行保留，含受干扰轮次、较慢导航、尾部和最大值；不删除候选或挑选较快轮次。三组各轮的样本数、min/max update、实体、活动/非活动页面和 factory 次数逐项一致。结果是 CPU wall-clock 汇总，不含 UI layout、picking、窗口、GPU 或持续视觉滚动；没有合并不同运行的分位数。采用结论与未确定归因见[性能说明](../../performance.md#retained-权限读取对照)。

@@ -152,7 +152,7 @@ Bevy 0.19.1 的 Multi executor 先 `can_run` 再 `should_run`；exclusive 系统
 
 查询缓存组合的两轮 `disabled_replace`（128 内容节点）p50 分别增加 356.076 / 301.647 µs；改为首次 Settle 初始化后仍增加 364.138 / 986.490 µs。预热早于计时，不能用初始化时机直接解释稳态差异；具体原因未确认，也不能据此推导 QueryState 普遍较慢。本轮撤下整个 eligible/marker 缓存及其额外过滤器元数据维护，保留既有滚动布局 SystemState。
 
-仅权限相交的第 2 轮与另一工作区的 Cargo 编译重叠，整对 48 行标为 `contended_pair`，不作收益估算。未重叠该已知干扰区间的第 1 轮同样有利有弊：下表为 LRU idle 的批均值分位数，单位 µs，不能解释为单帧尾延迟。
+仅权限相交的第 2 轮采样期间存在外部并行 Cargo 编译，整对 48 行标为 `contended_pair`，不作收益估算。未重叠该已知干扰区间的第 1 轮同样有利有弊：下表为 LRU idle 的批均值分位数，单位 µs，不能解释为单帧尾延迟。
 
 | 内容节点 | before p50 | after p50 | before p95 | after p95 |
 | --- | --- | --- | --- | --- |
