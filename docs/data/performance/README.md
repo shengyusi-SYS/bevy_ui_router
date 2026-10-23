@@ -260,3 +260,13 @@ CARGO_BUILD_JOBS=4 cargo bench --offline --locked -p bevy_ui_router --bench rout
 使用无插桩优化构建及独立保存的两个 executable，实际路径来自 compiler-artifact。导出基线与主工作区复用 target 时，显式清理 ECS/facade 的 release 产物后重新构建 candidate，避免跨源码目录复用旧产物；记录确认 ECS 源码重新编译，两份 binary hash 不同。采样期间没有本任务的并行构建。
 
 环境、工具链、features 与本日完整阶段诊断一致，实际 ECS 未开启 `multi_threaded`。headless wall-clock 不含 layout、原生输入、renderer 或异步 I/O。结果包含命中路径的小幅回退，取舍见[性能说明](../../performance.md#完整导航阶段与-scene-声明拓扑)。
+
+## World 规模与清理准备 2026-10-24
+
+[全部 11,832 行](world-scaling-2026-10-24.csv)、[完整独立补丁](world-scaling-probe-2026-10-24.patch)和[身份](world-scaling-identity-2026-10-24.json)仍绑定 `11e8935`，不包含后来采用的 Scene 拓扑优化。补丁独立重放后11个变化文件与实测副本逐字节一致，不叠加前述探针。共有27个 inclusive scope，新增 removal plan 准备与 receipt batch 准备；后者嵌套于前者。
+
+先运行 flat instances、背景数0的一次清理诊断，再用同一 executable 运行 flat keep_alive：0→2048→8192、8192→2048→0，每场景32样本，标准CSV的每组24行及全部行为断言保留。背景开关为 `ROUTER_BENCH_UNRELATED_ENTITIES`，默认0；其余构建和 profile 环境变量与完整阶段诊断相同。采样串行且无本任务的并行构建。
+
+背景实体只带普通 Node 与独立 marker，不含 ChildOf、Router host 或 Content。初始化断言精确增加N个，退出再次验证数量、Node和无归属状态；这些附加检查不在计时循环内。跨规模配对的非计时列完全一致，`live_entities` 精确相差N，原CSV继续报告真实总数。数据新增 run 与 unrelated_entities；按 run/mode/背景数/nav_id 对 completion 去重。
+
+环境与非MT、headless、wall-clock边界沿用本日完整阶段诊断。固定内容预算下的背景规模对照不代表任意 archetype 或应用负载；[结果及最小优化边界](../../performance.md#无关-world-实体与清理准备)分别讨论 presentation、输入撤权和 receipt，未把全部增量归于单一scope。
