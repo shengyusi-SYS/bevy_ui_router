@@ -16,7 +16,9 @@ use bevy_picking::{
     events::PointerState,
     hover::{HoverMap, PickingInteraction, PreviousHoverMap},
 };
-use bevy_ui::{BackgroundColor, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
+use bevy_ui::{
+    BackgroundColor, ComputedNode, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val,
+};
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     integration::{
@@ -1883,7 +1885,9 @@ impl RealizedFrame {
                 .iter()
                 .copied()
                 .filter(|entity| {
-                    world.get::<Node>(*entity).is_some() && visibility.is_visible(*entity)
+                    // Native widgets such as ScrollbarThumb have computed UI
+                    // geometry without participating in Node/taffy layout.
+                    world.get::<ComputedNode>(*entity).is_some() && visibility.is_visible(*entity)
                 })
                 .collect();
         }

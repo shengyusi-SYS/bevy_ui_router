@@ -8,6 +8,8 @@
 
 Refresh 根据 active roots 的当前 frame-local Children closure 计算权限，下一 Ready 边界接纳新增内容、撤销移出内容。无 World 的 gate 是该边界快照，不是任意时刻实时 ancestry 查询。
 
+原生 UI 输入资格以 `ComputedNode` 和 authored visibility 识别可交互内容，不要求 `Node`；例如 `ScrollbarThumb` 的几何由控件计算，不参与普通布局。所属 scope、发布和非活动撤权规则相同。
+
 Router 生命周期切换在同次 publication/隔离内撤权，包括 active→retained，不能等下一帧。hidden、pending、leaving、failed、retained/residual 内容不保留集成输入或 active focus；其它有效目标不被无理由清除。
 
 原生 pointer 撤权同时清除目标的当前/前次 hover、press/click/drag 和祖先缓存，保留其它目标状态。在真实 hover 生成后、dispatch 前过滤非活动 owned scope；不能只依赖 Display、最新命中或修改 Pickable，也不能全局清空 pointer 状态。

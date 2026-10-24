@@ -179,6 +179,14 @@ enum Departure {
 }
 
 fn native_input_journey(departure: Departure, focus_on_application: bool) {
+    native_input_journey_with_target(departure, focus_on_application, false);
+}
+
+fn native_input_journey_with_target(
+    departure: Departure,
+    focus_on_application: bool,
+    computed_only: bool,
+) {
     let mut app = App::new();
     // These Cargo-selected default plugins provide headless window, camera,
     // layout and picking. No Winit event loop or GPU renderer is required.
@@ -332,6 +340,27 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
         .query_filtered::<Entity, With<NativeInputPage>>()
         .single(app.world())
         .unwrap();
+    let router_target = if computed_only {
+        let child = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(24.0),
+                    height: Val::Px(24.0),
+                    ..Node::default()
+                },
+                ChildOf(router_target),
+            ))
+            .id();
+        app.update();
+        // Keep ordinary computed layout facts, then exercise the same native
+        // input boundary as widgets whose geometry is supplied without Node.
+        app.world_mut().entity_mut(child).remove::<Node>();
+        app.update();
+        child
+    } else {
+        router_target
+    };
     assert!(
         app.world()
             .resource::<RouterInputGate>()
@@ -747,6 +776,11 @@ fn native_input_journey(departure: Departure, focus_on_application: bool) {
             before_new_gesture[&application_target]
         );
     }
+}
+
+#[test]
+fn computed_only_native_widget_receives_drag_and_loses_it_on_departure() {
+    native_input_journey_with_target(Departure::Replace, false, true);
 }
 
 #[test]
