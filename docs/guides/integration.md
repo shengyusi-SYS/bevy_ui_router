@@ -245,7 +245,7 @@ headless 成功不等于窗口、原生平台或硬件设备验收；当前证�
 
 ```rust
 app.add_plugins(DesktopBackInputPlugin)
-    .add_systems(PreUpdate, desktop_back.after(DesktopBackInputSet));
+    .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet));
 ```
 
 由应用在窗口 Entity 上保存安装得到的 Router handle；下面的 `WindowRouter` 是应用自己的组件：
@@ -254,8 +254,8 @@ app.add_plugins(DesktopBackInputPlugin)
 #[derive(Component)]
 struct WindowRouter(RouterHandle);
 
-fn desktop_back(
-    mut requests: MessageReader<DesktopBackRequested>,
+fn platform_back(
+    mut requests: MessageReader<PlatformBackRequested>,
     windows: Query<&WindowRouter>,
     mut navigation: ResMut<RouterNavigation>,
 ) {
@@ -272,6 +272,29 @@ fn desktop_back(
 
 窗口由应用创建，例如 `commands.entity(window).insert(WindowRouter(router))`；host 不是窗口，adapter 不推断或选择当前 Router。`NoBackEntry` 是正常的入队结果，由应用决定是否显示反馈或交给宿主，不默认退出。返回一旦入队就沿现有 history、保留、滚动恢复和 cleanup 流程执行。
 
-同一意图只安排一个应用处理器；两个 `MessageReader` 不会互相消费，不能用“另一个 reader 先读过”阻止返回。完整可运行接线见[窗口示例](../../examples/windowed/src/main.rs)的 `WindowRouter`、`desktop_back` 和 `navigate`；[公开旅程](../../crates/bevy_ui_router/tests/desktop_back.rs)另示范本地弹层先处理与两个窗口分别导航。
+同一意图只安排一个应用处理器；两个 `MessageReader` 不会互相消费，不能用“另一个 reader 先读过”阻止返回。完整可运行接线见[窗口示例](../../examples/windowed/src/main.rs)的 `WindowRouter`、`platform_back` 和 `navigate`；[公开旅程](../../crates/bevy_ui_router/tests/platform_back.rs)另示范本地弹层先处理与两个窗口分别导航。旧 `DesktopBackRequested` / `DesktopBackInputSet` 名称仍导出同一类型。
 
 `desktop-back` 单独启用只需要 Bevy app/ECS/input，不带 Router ECS、Scene、UI renderer 或 Winit；生产应用沿用已有输入/窗口插件。`platform` 本身与默认 facade 仍不引入 Bevy。消息来源和范围归[输入合同](../contracts/input-focus.md#窗口级返回输入)，设备与平台证据归[验证指南](../development/verification.md)。
+
+## Android 传统返回
+
+在已有 Android Bevy 应用中启用 `android-back`，例如 facade `features = ["bsn", "android-back"]`，安装传统按键源并复用上面的唯一应用处理器：
+
+```rust
+app.add_plugins(AndroidBackInputPlugin)
+    .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet));
+```
+
+现有 Winit 将 Android `KEYCODE_BACK` 映射为逻辑键 `BrowserBack`。adapter 接受 `BrowserBack` / `GoBack` 的首次按下，跳过重复和释放；它不把 Escape 或任意物理键当作返回。不需要 patch Bevy/Winit，也不引入 JNI 或额外 Activity glue。Android 窗口后端与打包仍由应用负责；`android-back` 单独启用仅需 Bevy app/ECS/input 的 std、keyboard 功能，不带 mouse 或 Router ECS。
+
+在 Android 16 及以上运行且 `targetSdk >= 36` 时，系统默认不再派发旧 Back 键。当前选择传统兼容路径，在应用现有 `AndroidManifest.xml` 的 `<application>` 或对应 `<activity>` 上增加：
+
+```xml
+<application android:enableOnBackInvokedCallback="false">
+    <!-- 保留现有应用配置与 activity。 -->
+</application>
+```
+
+这是官方提供的临时兼容开关，会退出系统预测返回动画；不需要为此降低 targetSdk。条件与用法见 [Android 16 返回迁移说明](https://developer.android.com/about/versions/16/behavior-changes-16#predictive-back)。`<activity>` 自己的设置会覆盖 `<application>` 默认值，应确保目标 Activity 最终为 `false`，见[按 Activity 配置](https://developer.android.com/guide/navigation/custom-back/predictive-back-gesture#opt-out-at-an-activity-level)。本插件不注册现代返回回调，也不处理预测进度、取消和动画。
+
+Bevy `KeyboardInput` 不携带 Android 的 [取消标志](https://developer.android.com/reference/android/view/KeyEvent#FLAG_CANCELED)，因此这里只承诺按下意图，不能等同于 Activity 已确认的返回动作。应用忽略消息或收到 `NoBackEntry` 不会自动回到系统退出路径；应在同一个处理器中明确选择宿主行为。可运行的最小依赖接线见 [Android-only consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs)，路由组合复用 [公开旅程](../../crates/bevy_ui_router/tests/platform_back.rs)。这些是普通 Bevy 消息与调度验证，未提供 APK 或设备实测。

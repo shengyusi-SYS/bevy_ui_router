@@ -238,7 +238,7 @@ fn main() {
         PreUpdate,
         (keyboard, restore_keyboard).after(RouterInputSet::Ready),
     )
-    .add_systems(PreUpdate, desktop_back.after(DesktopBackInputSet))
+    .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet))
     .add_systems(
         Update,
         (start_initial_navigation, update_status)
@@ -369,8 +369,8 @@ fn navigate(action: Action, demo: &mut Demo, navigation: &mut RouterNavigation) 
     }
 }
 
-fn desktop_back(
-    mut requests: MessageReader<DesktopBackRequested>,
+fn platform_back(
+    mut requests: MessageReader<PlatformBackRequested>,
     windows: Query<&WindowRouter>,
     mut demo: ResMut<Demo>,
     mut navigation: ResMut<RouterNavigation>,

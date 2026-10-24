@@ -48,6 +48,7 @@ impl Consumer {
         let path = Value::String(facade.to_str().expect("UTF-8 workspace path").to_owned());
         let bsn = features.contains(&"bsn");
         let desktop_back = features.contains(&"desktop-back");
+        let android_back = features.contains(&"android-back");
         let features = Value::Array(
             features
                 .iter()
@@ -71,7 +72,7 @@ impl Consumer {
                 ));
             }
         }
-        if desktop_back {
+        if desktop_back || android_back {
             if !ecs {
                 for dependency in ["bevy_app", "bevy_ecs"] {
                     manifest.push_str(&format!(
@@ -79,9 +80,15 @@ impl Consumer {
                     ));
                 }
             }
-            manifest.push_str(
-                "bevy_input = { version = '=0.19.1', default-features = false, features = ['mouse'] }\n",
-            );
+            let input_features = match (desktop_back, android_back) {
+                (true, true) => "['mouse', 'keyboard']",
+                (true, false) => "['mouse']",
+                (false, true) => "['keyboard']",
+                (false, false) => unreachable!(),
+            };
+            manifest.push_str(&format!(
+                "bevy_input = {{ version = '=0.19.1', default-features = false, features = {input_features} }}\n",
+            ));
         }
         if native_ui {
             manifest.push_str(
@@ -262,15 +269,12 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
         Consumer::new(name, defaults, features, ecs, source, false).run(!ecs);
     }
 
-    Consumer::new(
-        "desktop-back",
-        false,
-        &["desktop-back"],
-        false,
-        include_str!("consumers/desktop_back.rs"),
-        false,
-    )
-    .run(false);
+    for (feature, source) in [
+        ("desktop-back", include_str!("consumers/desktop_back.rs")),
+        ("android-back", include_str!("consumers/android_back.rs")),
+    ] {
+        Consumer::new(feature, false, &[feature], false, source, false).run(false);
+    }
 
     // Compile and execute the actual recommended examples, outside the workspace
     // dev-feature graph. Keep explicit dependencies aligned with the README.

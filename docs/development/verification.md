@@ -34,14 +34,15 @@ cargo test --workspace --all-features --locked
 cargo test -p bevy_ui_router_ecs --no-default-features --locked
 ```
 
-桌面返回 adapter 另可独立运行最小 feature：
+返回 adapter 另可独立运行各自最小 feature：
 
 ```sh
 cargo test -p bevy_ui_router_platform --features desktop-back --locked
-cargo test -p bevy_ui_router --features bsn,desktop-back --test desktop_back --locked
+cargo test -p bevy_ui_router_platform --features android-back --locked
+cargo test -p bevy_ui_router --features bsn,desktop-back,android-back --test platform_back --locked
 ```
 
-全特性检查不能代替最小 feature 检查。独立 consumer 和依赖合同负责验证默认、无默认、`view`、`ecs`、`bsn`、`platform` 与 `desktop-back` 的真实依赖与可见 API；无需另抄一份 Markdown export allowlist。
+全特性检查不能代替最小 feature 检查。独立 consumer 和依赖合同负责验证默认、无默认、`view`、`ecs`、`bsn`、`platform`、`desktop-back` 与 `android-back` 的真实依赖与可见 API；无需另抄一份 Markdown export allowlist。
 
 ## 从模块验证到用户行为
 
@@ -51,7 +52,7 @@ cargo test -p bevy_ui_router --features bsn,desktop-back --test desktop_back --l
 | View：renderer-neutral 输入与 binding | [View public API](../../crates/bevy_ui_router_view/tests/public_api.rs) | [view consumer](../../crates/bevy_ui_router/tests/consumers/view.rs) 的独立使用 |
 | ECS：host、identity、staging、publication、cleanup | [ECS public API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、`src/navigation_tests.rs`、`src/cleanup_tests.rs` | 公开导航旅程的旧内容清理、布局保留、失效缓存部分清理后的 host loss/readmission 与后续请求 |
 | BSN：factory、resolve/apply、outlet、containment | [BSN facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs) | [BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) 及两个原样示例 |
-| 桌面鼠标返回 | Platform 消息转换回归、[facade 公开返回旅程](../../crates/bevy_ui_router/tests/desktop_back.rs) | InputPlugin 共存、窗口/事件顺序、唯一应用处理器、双 Router 定向返回、原页状态复用与无 history；最小独立 consumer 不借其它 feature 的依赖 |
+| 桌面鼠标 / Android 传统返回 | Platform 消息转换回归、[facade 公开返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs) | InputPlugin 共存、每来源窗口/事件顺序、重复过滤、双源共用通道、唯一应用处理器、双 Router 定向返回、原页状态复用与无 history；最小独立 consumer 不借其它 feature 的依赖 |
 | 输入与焦点 | [原生 pointer 测试](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus 测试](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 窗口中的点击/Space、跨页手势与独立目标保护 |
 | 保留页与普通页交接 | [公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立 opt-in、原父/新子、内部库存与 LRU 依赖淘汰；OwnInvalid、fresh 失败、部分清理 host loss 后原请求终结与残留责任 |
 | entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的早晚绑定、显式 ready、二维裁剪、取消与应用优先、未完成记录及旧 ID 失效；保留既有失败、host 重接纳、原父/fresh 子 Back 与当前输入组合 |
@@ -87,7 +88,7 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml
 
 Linux 示例选择 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev`。窗口交互验证 push/replace/back、布局计数保留、页面点击与 Space、旧焦点释放、跨页按住/释放、Build failure/fallback 和恢复。应用内 BRP 自动化见 [调试指南](../guides/debugging.md)。
 
-原生 `TabNavigationPlugin` / `InputDispatchPlugin` 不在示例接线中；键盘通过 Ready 后显式消费 gate。桌面 Back 在默认 lock 的 Bevy 0.19.1 下通过标准 `MouseButtonInput` 消息注入验证，窗口示例包含侧键接线；这不代表物理侧键或 Win32 系统指令实测。引擎消息注入、OS 事件与物理设备输入是不同证据，不能混写。
+原生 `TabNavigationPlugin` / `InputDispatchPlugin` 不在示例接线中；键盘通过 Ready 后显式消费 gate。返回 adapter 在默认 lock 的 Bevy 0.19.1 下通过标准 `MouseButtonInput` / `KeyboardInput` 消息注入验证，窗口示例包含侧键接线。最小 Platform `android-back` 已通过 `aarch64-linux-android` 的 `cargo check`，未包含 Android 窗口后端。这些不代表物理侧键、Win32 系统指令或 Android APK/设备实测。Android manifest 兼容开关有官方文档依据，现代 callback / 预测手势不在范围内。引擎消息注入、目标编译、OS 事件与物理设备输入是不同证据，不能混写。
 
 ## 性能夹具与发布产物
 

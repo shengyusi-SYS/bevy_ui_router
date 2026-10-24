@@ -2,31 +2,18 @@
 
 use bevy_app::{App, Plugin, PreUpdate};
 use bevy_ecs::{
-    entity::Entity,
-    message::{Message, MessageReader, MessageWriter},
-    schedule::{IntoScheduleConfigs, SystemSet},
+    message::{MessageReader, MessageWriter},
+    schedule::IntoScheduleConfigs,
 };
 use bevy_input::{
-    ButtonState, InputSystems,
+    ButtonState,
     mouse::{MouseButton, MouseButtonInput},
 };
 
-/// A mouse Back press delivered to a window, without a routing decision.
-///
-/// Use one application handler to choose the window's Router and call its public
-/// `back` command, or handle local UI first. Reading this message does not consume
-/// it for other readers. No Router is selected and no window is closed by this plugin.
-#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DesktopBackRequested {
-    pub window: Entity,
-}
-
-/// Produces [`DesktopBackRequested`] in `PreUpdate`, after Bevy's input systems.
-///
-/// Run the application's return handler after this set in the same schedule to
-/// enqueue navigation before the Router's ordinary `Update` processing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SystemSet)]
-pub struct DesktopBackInputSet;
+/// Compatibility names for the shared message and set, not separate channels.
+pub use crate::back_input::{
+    PlatformBackInputSet as DesktopBackInputSet, PlatformBackRequested as DesktopBackRequested,
+};
 
 /// Translates mouse Back presses into window-level return requests.
 ///
@@ -38,14 +25,9 @@ pub struct DesktopBackInputPlugin;
 
 impl Plugin for DesktopBackInputPlugin {
     fn build(&self, app: &mut App) {
+        crate::back_input::install(app);
         app.add_message::<MouseButtonInput>()
-            .add_message::<DesktopBackRequested>()
-            .add_systems(
-                PreUpdate,
-                mouse_back_requests
-                    .in_set(DesktopBackInputSet)
-                    .after(InputSystems),
-            );
+            .add_systems(PreUpdate, mouse_back_requests.in_set(DesktopBackInputSet));
     }
 }
 
@@ -65,7 +47,7 @@ fn mouse_back_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_ecs::{resource::Resource, system::ResMut};
+    use bevy_ecs::{entity::Entity, resource::Resource, system::ResMut};
     use bevy_input::{ButtonInput, InputPlugin};
 
     #[derive(Resource, Default)]

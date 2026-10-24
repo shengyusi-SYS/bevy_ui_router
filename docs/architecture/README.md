@@ -12,7 +12,7 @@ flowchart TD
     Facade -->|"view：默认"| View["View<br/>renderer-neutral 合同"]
     Facade -->|ecs| ECS["ECS<br/>物理执行与隔离"]
     Facade -->|bsn| BSN["BSN<br/>Scene factory 与声明"]
-    Facade -->|platform| Platform["Platform<br/>中立合同与可选桌面返回"]
+    Facade -->|platform| Platform["Platform<br/>中立合同与可选返回输入"]
     View --> Core
     ECS --> Core
     ECS --> View
@@ -20,7 +20,7 @@ flowchart TD
     BSN --> Core
     BSN --> View
     Platform --> Core
-    Platform -->|"desktop-back：可选"| BevyInput["Bevy app / ECS / input<br/>窗口级返回消息"]
+    Platform -->|"desktop-back / android-back：可选"| BevyInput["Bevy app / ECS / input<br/>共用窗口级返回消息"]
 ```
 
 | Crate | 拥有的职责 | 边界 |
@@ -29,11 +29,11 @@ flowchart TD
 | View | view key、driver key、registry、descriptor、只读 effect/input | 仅依赖 Core，不拥有 World 或 lifecycle 权限 |
 | ECS | host/slot/frame binding、执行编排、staging、publication、cleanup、retained 物理内容、滚动、输入与活动资格 | 消费 Core 的受控合同，不维护第二套路由/history |
 | BSN | fresh Scene factory、build error、default outlet 声明 | 不依赖 ECS，不签发 mount、frame 或 commit 权限 |
-| Platform | 中立 Back 类型与可选鼠标 Back 消息转换 | 应用选择 Router 和本地 UI 返回策略；不维护 history、不安装窗口后端 |
+| Platform | 中立 Back 类型、可选鼠标与 Android 传统 Back 消息转换 | 应用唯一处理器选择 Router 和本地 UI 返回策略；不维护 history、不安装窗口后端 |
 | Facade | 常用 API 与 opt-in feature 组合 | 不导出内部 owner、registry writer 或可伪造的完成凭据 |
 
 `default = ["view"]` 不引入 Bevy。`ecs` 包含 `view`，`bsn` 包含 `ecs`；
-`platform` 独立开启且不引入 Bevy。`desktop-back` 包含 `platform`，为窗口返回消息启用 Bevy app/ECS/input，不隐式开启 Router 的 `ecs` / `bsn` 或窗口后端；`devtools` 当前为空 feature。
+`platform` 独立开启且不引入 Bevy。`desktop-back` / `android-back` 包含 `platform`，分别启用 Bevy app/ECS/input 的 mouse / keyboard 与 std，共用返回消息和调度 set，不隐式开启 Router 的 `ecs` / `bsn` 或窗口后端；`devtools` 当前为空 feature。
 BSN 的 `AppBsnExt` 实现在 ECS 的可选 bridge 中，再由 facade 导出。
 这样 Scene 声明层无需反向依赖完整 ECS runtime。
 
@@ -82,7 +82,7 @@ Core 拥有 history 与保留决策，ECS 按 opaque entry key 保存滚动位�
 | publication 准备 | [normal_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/normal_publication.rs)、[projectionless_publication.rs](../../crates/bevy_ui_router_ecs/src/navigation/projectionless_publication.rs)、[branch_transaction.rs](../../crates/bevy_ui_router_ecs/src/branch_transaction.rs) |
 | publication 后的清理推进与物理结算 | ECS [navigation/post_commit.rs](../../crates/bevy_ui_router_ecs/src/navigation/post_commit.rs)、[cleanup/post_commit.rs](../../crates/bevy_ui_router_ecs/src/cleanup/post_commit.rs)；逻辑 owner 与完成判定归 Core `engine/post_commit.rs` |
 | reconciliation、frame-local、native failure 与 authority settlement | [生命周期执行协议的模块地图](lifecycle.md#修改时定位哪些模块) |
-| 桌面返回输入 | Platform [desktop_back.rs](../../crates/bevy_ui_router_platform/src/desktop_back.rs)，应用唯一处理器通过公开 `RouterNavigation::back` 决定导航 |
+| 窗口返回输入 | Platform [back_input.rs](../../crates/bevy_ui_router_platform/src/back_input.rs) 共用消息，desktop / android 源只转换输入；应用唯一处理器通过公开 `RouterNavigation::back` 决定导航 |
 | 输入与焦点 | [input.rs](../../crates/bevy_ui_router_ecs/src/input.rs)、[native_focus.rs](../../crates/bevy_ui_router_ecs/src/native_focus.rs) |
 | BSN 合同与 bridge | [BSN lib.rs](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bsn.rs](../../crates/bevy_ui_router_ecs/src/bsn.rs) |
 

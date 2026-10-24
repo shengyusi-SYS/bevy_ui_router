@@ -14,6 +14,7 @@ ecs = ["view", "dep:bevy_ui_router_ecs"]
 bsn = ["ecs", "dep:bevy_ui_router_bsn", "bevy_ui_router_ecs/bsn"]
 platform = ["dep:bevy_ui_router_platform"]
 desktop-back = ["platform", "bevy_ui_router_platform/desktop-back"]
+android-back = ["platform", "bevy_ui_router_platform/android-back"]
 devtools = []
 
 [dependencies]
@@ -29,7 +30,7 @@ bevy_asset = { version = "0.19", default-features = false }
 bevy_camera = { version = "0.19", default-features = false }
 bevy_ecs = { version = "0.19", default-features = false }
 bevy_input_focus = { version = "0.19", default-features = false }
-bevy_input = { version = "0.19", default-features = false, features = ["mouse"] }
+bevy_input = { version = "0.19", default-features = false, features = ["mouse", "keyboard"] }
 bevy_window = { version = "0.19", default-features = false }
 bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
 bevy_picking = { version = "0.19", default-features = false }
@@ -71,9 +72,9 @@ path = "tests/retained_navigation.rs"
 required-features = ["bsn"]
 
 [[test]]
-name = "desktop_back"
-path = "tests/desktop_back.rs"
-required-features = ["bsn", "desktop-back"]
+name = "platform_back"
+path = "tests/platform_back.rs"
+required-features = ["bsn"]
 
 [[test]]
 name = "scroll_restoration"

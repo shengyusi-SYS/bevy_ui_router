@@ -1,11 +1,14 @@
-//! Desktop input through the facade, an application return policy and normal navigation.
+//! Platform input through one application policy and normal navigation.
+#![cfg(any(feature = "desktop-back", feature = "android-back"))]
+
 use bevy_app::{App, PreUpdate, TaskPoolPlugin};
 use bevy_asset::AssetPlugin;
 use bevy_ecs::{prelude::*, system::RunSystemOnce, template::FromTemplate};
-use bevy_input::{
-    ButtonState, InputPlugin,
-    mouse::{MouseButton, MouseButtonInput},
-};
+#[cfg(feature = "android-back")]
+use bevy_input::keyboard::{Key, KeyCode, KeyboardInput, NativeKeyCode};
+#[cfg(feature = "desktop-back")]
+use bevy_input::mouse::{MouseButton, MouseButtonInput};
+use bevy_input::{ButtonState, InputPlugin};
 use bevy_scene::{ResolvedScene, SceneFunction, ScenePlugin};
 use bevy_ui::Node;
 use bevy_ui_router::prelude::*;
@@ -33,7 +36,7 @@ struct DispatchLog(
 );
 
 fn return_policy(
-    mut requests: MessageReader<DesktopBackRequested>,
+    mut requests: MessageReader<PlatformBackRequested>,
     mut windows: Query<&mut WindowNavigation>,
     mut navigation: ResMut<RouterNavigation>,
     mut log: ResMut<DispatchLog>,
@@ -145,15 +148,58 @@ fn push(app: &mut App, router: RouterHandle, path: &str) {
     settle(app, router, request);
 }
 
-fn press(app: &mut App, window: Entity, button: MouseButton) {
-    for state in [ButtonState::Pressed, ButtonState::Released] {
-        app.world_mut().write_message(MouseButtonInput {
-            window,
-            button,
-            state,
-        });
+#[derive(Clone, Copy)]
+enum Source {
+    #[cfg(feature = "desktop-back")]
+    Mouse,
+    #[cfg(feature = "android-back")]
+    Android,
+}
+
+impl Source {
+    fn install(self, app: &mut App) {
+        match self {
+            #[cfg(feature = "desktop-back")]
+            Self::Mouse => {
+                app.add_plugins(DesktopBackInputPlugin);
+            }
+            #[cfg(feature = "android-back")]
+            Self::Android => {
+                app.add_plugins(AndroidBackInputPlugin);
+            }
+        }
     }
-    app.update();
+
+    fn press(self, app: &mut App, window: Entity, back: bool) {
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            match self {
+                #[cfg(feature = "desktop-back")]
+                Self::Mouse => {
+                    app.world_mut().write_message(MouseButtonInput {
+                        window,
+                        button: if back {
+                            MouseButton::Back
+                        } else {
+                            MouseButton::Forward
+                        },
+                        state,
+                    });
+                }
+                #[cfg(feature = "android-back")]
+                Self::Android => {
+                    app.world_mut().write_message(KeyboardInput {
+                        window,
+                        key_code: KeyCode::Unidentified(NativeKeyCode::Unidentified),
+                        logical_key: if back { Key::BrowserBack } else { Key::Escape },
+                        state,
+                        repeat: false,
+                        text: None,
+                    });
+                }
+            }
+        }
+        app.update();
+    }
 }
 
 fn snapshot(app: &App, router: RouterHandle) -> RouterSnapshot {
@@ -165,7 +211,18 @@ fn snapshot(app: &App, router: RouterHandle) -> RouterSnapshot {
 }
 
 #[test]
-fn application_policy_targets_one_window_and_back_reuses_the_original_page() {
+#[cfg(feature = "desktop-back")]
+fn mouse_back_uses_application_policy_and_reuses_the_original_page() {
+    application_policy_targets_one_window(Source::Mouse);
+}
+
+#[test]
+#[cfg(feature = "android-back")]
+fn android_back_uses_application_policy_and_reuses_the_original_page() {
+    application_policy_targets_one_window(Source::Android);
+}
+
+fn application_policy_targets_one_window(source: Source) {
     let mut app = App::new();
     app.add_plugins((
         TaskPoolPlugin::default(),
@@ -173,10 +230,10 @@ fn application_policy_targets_one_window_and_back_reuses_the_original_page() {
         ScenePlugin,
         InputPlugin,
         BevyUiRouterPlugin::default(),
-        DesktopBackInputPlugin,
     ))
     .init_resource::<DispatchLog>()
-    .add_systems(PreUpdate, return_policy.after(DesktopBackInputSet));
+    .add_systems(PreUpdate, return_policy.after(PlatformBackInputSet));
+    source.install(&mut app);
     let (first, first_window) = install(&mut app, "first");
     let (second, second_window) = install(&mut app, "second");
     let unbound_window = app.world_mut().spawn(Window::default()).id();
@@ -196,12 +253,12 @@ fn application_policy_targets_one_window_and_back_reuses_the_original_page() {
     let first_before = snapshot(&app, first);
     let second_before = snapshot(&app, second);
 
-    press(&mut app, first_window, MouseButton::Forward);
+    source.press(&mut app, first_window, false);
     app.world_mut()
         .get_mut::<WindowNavigation>(first_window)
         .unwrap()
         .modal_open = true;
-    press(&mut app, first_window, MouseButton::Back);
+    source.press(&mut app, first_window, true);
     assert_eq!(
         app.world()
             .get::<WindowNavigation>(first_window)
@@ -209,12 +266,12 @@ fn application_policy_targets_one_window_and_back_reuses_the_original_page() {
             .closed_modals,
         1
     );
-    press(&mut app, unbound_window, MouseButton::Back);
+    source.press(&mut app, unbound_window, true);
     assert!(app.world().resource::<DispatchLog>().0.is_empty());
     assert_eq!(snapshot(&app, first), first_before);
     assert_eq!(snapshot(&app, second), second_before);
 
-    press(&mut app, first_window, MouseButton::Back);
+    source.press(&mut app, first_window, true);
     let log = &app.world().resource::<DispatchLog>().0;
     assert_eq!(log.len(), 1, "release must not enqueue a second Back");
     assert_eq!(log[0].0, first_window);
@@ -234,14 +291,14 @@ fn application_policy_targets_one_window_and_back_reuses_the_original_page() {
     assert_eq!(snapshot(&app, second), second_before);
 
     let first_after = snapshot(&app, first);
-    press(&mut app, first_window, MouseButton::Back);
+    source.press(&mut app, first_window, true);
     assert_eq!(
         app.world().resource::<DispatchLog>().0[1],
         (first_window, Err(NavigationEnqueueErrorKind::NoBackEntry))
     );
     assert_eq!(snapshot(&app, first), first_after);
     assert!(app.world().get::<Window>(first_window).is_some());
-    press(&mut app, second_window, MouseButton::Back);
+    source.press(&mut app, second_window, true);
     let log = &app.world().resource::<DispatchLog>().0;
     assert_eq!(log.len(), 3);
     assert_eq!(log[2].0, second_window);

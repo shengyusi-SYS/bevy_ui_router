@@ -27,7 +27,7 @@ keep-alive 和滚动恢复是按需启用的体验增强：前者让布局与子
 - 当前已发布路由输入可只读查询，公共布局复用后仍可取得新 location 和自身 route-local params。
 - 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。
 - route-bound error view、router fallback、host loss/re-registration、stale 拒绝、局部 cleanup、输入与 focus 隔离。
-- 可选桌面鼠标 Back adapter，产生带窗口的返回意图；应用统一选择 Router 或优先处理本地 UI，再进入既有返回管线。
+- 可选桌面鼠标与 Android 传统 Back adapter，共用带窗口的返回意图；应用统一选择 Router 或优先处理本地 UI，再进入既有返回管线。Android 兼容条件见[集成指南](guides/integration.md#android-传统返回)。
 - facade、可运行示例、独立 consumer 和相称的跨层验证。
 
 依赖采用官方 crates.io Bevy `0.19`，允许 `>=0.19.0, <0.20.0`；已验证的版本和环境归[验证说明](development/verification.md)。Core/View 与 facade 默认功能不依赖 Bevy。

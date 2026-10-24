@@ -174,6 +174,14 @@ fn bsn_dependency_direction_and_optional_bridge_resolve_as_declared() {
             false,
         ),
         ("bevy_ui_router", Some("desktop-back"), false, false, false),
+        (
+            "bevy_ui_router_platform",
+            Some("android-back"),
+            false,
+            false,
+            false,
+        ),
+        ("bevy_ui_router", Some("android-back"), false, false, false),
     ] {
         let mut command = Command::new(env!("CARGO"));
         command.current_dir(workspace()).args([
@@ -185,7 +193,7 @@ fn bsn_dependency_direction_and_optional_bridge_resolve_as_declared() {
             "--prefix",
             "none",
             "--format",
-            "{p}",
+            "{p}|{f}",
             "--no-default-features",
             "--package",
             package,
@@ -218,6 +226,24 @@ fn bsn_dependency_direction_and_optional_bridge_resolve_as_declared() {
                 expected,
                 "{package} ({features:?}): {dependency}"
             );
+        }
+        if let Some(feature @ ("desktop-back" | "android-back")) = features {
+            for dependency in ["bevy_window", "bevy_winit", "winit", "android-activity"] {
+                assert!(
+                    !packages.contains(dependency),
+                    "{feature} pulled in {dependency}"
+                );
+            }
+            let (_, input_features) = tree
+                .lines()
+                .find(|line| line.starts_with("bevy_input "))
+                .expect("Back adapters use Bevy input")
+                .split_once('|')
+                .unwrap();
+            let enabled = input_features.split(',').collect::<BTreeSet<_>>();
+            assert!(enabled.contains("std"));
+            assert_eq!(enabled.contains("keyboard"), feature == "android-back");
+            assert_eq!(enabled.contains("mouse"), feature == "desktop-back");
         }
     }
 }

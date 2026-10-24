@@ -36,10 +36,12 @@ activity 独立于 authored visibility 和输入资格，也不是完整 frame-l
 
 ## 窗口级返回输入
 
-facade 或 Platform 的 `desktop-back` feature 提供 `DesktopBackInputPlugin`、`DesktopBackRequested` 和 `DesktopBackInputSet`。插件在 `PreUpdate` 的该 set 中、Bevy `InputSystems` 之后读取 `MouseButtonInput`；每个 `Back + Pressed` 产生一个带原 `window` Entity 的返回消息，保留事件顺序。Released、Forward 与其它按键不产生返回消息，原始输入及其它 reader 不被清空或消费。
+facade 或 Platform 的 `desktop-back` / `android-back` feature 分别提供 `DesktopBackInputPlugin` / `AndroidBackInputPlugin`。两者在 `PreUpdate` 的 `PlatformBackInputSet` 中、Bevy `InputSystems` 之后产生同一 `PlatformBackRequested { window }` 消息。桌面源读取 `MouseButtonInput` 的 `Back + Pressed`；Android 传统源读取 `KeyboardInput` 的逻辑键 `BrowserBack` / `GoBack`，仅接受 `Pressed` 且 `repeat == false`。各来源保留原窗口与顺序，不承诺不同来源之间的先后；Released、其它键和 Android 重复按键不产生返回消息，原始输入及其它 reader 不被清空或消费。
 
 这是应用窗口级意图，不要求鼠标命中某个页面控件，也不经 picking。应用用一个处理器明确决定 window→RouterHandle、本地 UI 优先级及无 history 的行为，再调用公开 `RouterNavigation::back(router)` 并处理入队结果。`BackPolicy` 等中立类型不会自动安装这套决策；没有默认 Router、自动弹层处理或窗口退出行为。
 
-推荐应用处理器在同一 `PreUpdate` 中 `.after(DesktopBackInputSet)`，使获准的返回进入既有 `Update` 导航管线。多个 `MessageReader` 各自有游标，先读取不能阻止另一个处理器再次派发；本地处理和 Router 派发应在同一决策路径内完成。窗口与 host 是不同对象，应用保存安装得到的 handle 并显式映射。
+推荐应用处理器在同一 `PreUpdate` 中 `.after(PlatformBackInputSet)`，使获准的返回进入既有 `Update` 导航管线。多个 `MessageReader` 各自有游标，先读取不能阻止另一个处理器再次派发；本地处理和 Router 派发应在同一决策路径内完成。窗口与 host 是不同对象，应用保存安装得到的 handle 并显式映射。原有 `DesktopBackRequested` / `DesktopBackInputSet` 是共享类型的兼容导出，不能当成另一条独立通道。
 
-插件幂等注册原始与返回消息通道，不安装窗口 runner 或要求 InputPlugin；实际设备输入由应用已有的 Bevy 后端提供，也可注入标准消息验证。当前仅转换鼠标 Back，不自动识别键盘返回、独立 Win32 系统指令或触控板返回手势，不影响延期的原生 Tab/Dispatch 接入。用法见[桌面返回接入](../guides/integration.md#桌面鼠标返回)。
+插件幂等注册原始与返回消息通道，不安装窗口 runner 或要求 InputPlugin；实际设备输入由应用已有的 Bevy 后端提供，也可注入标准消息验证。各 feature 只启用需要的 mouse 或 keyboard 输入，不隐式开启 Router ECS、Scene、Winit 或 Android 运行时。应用显式安装所需插件。
+
+Android 源是传统按键意图，不是现代返回 callback 或预测手势协议：Bevy 消息没有 Android 取消标志，无法还原 Activity 完整的释放/取消语义。当前 Winit 不会因应用忽略消息或 `NoBackEntry` 自动交还系统退出。独立 Win32 系统指令、触控板返回手势和原生 Tab/Dispatch 自动资格仍不在范围内。接线和 Android manifest 兼容开关见[集成指南](../guides/integration.md#android-传统返回)。

@@ -6,7 +6,7 @@
 
 交付基于官方 Bevy 依赖、可独立接入真实 UI 的通用嵌套路由库：应用声明页面和共享布局，库管理跳转、返回与当前路由信息，并按需保留页面状态、恢复访问位置。
 
-匹配、嵌套导航、memory history、同步 BSN、错误与 host 失效恢复、当前只读路由输入、父子独立 keep-alive 和访问级滚动恢复均已完成。已有公开组合、完整回归、独立 consumer、打包和 Linux/WSLg 窗口证据，具体源码与环境归[验证指南](development/verification.md)。现有输入范围是原生 pointer、离场手势/焦点撤权，以及 Ready 后显式消费的 keyboard/gamepad gate。可选 `desktop-back` 已接入鼠标返回意图，应用统一选择窗口对应 Router 和本地 UI 策略，具体接线归[集成指南](guides/integration.md#桌面鼠标返回)。
+匹配、嵌套导航、memory history、同步 BSN、错误与 host 失效恢复、当前只读路由输入、父子独立 keep-alive 和访问级滚动恢复均已完成。已有公开组合、完整回归、独立 consumer、打包和 Linux/WSLg 窗口证据，具体源码与环境归[验证指南](development/verification.md)。现有输入范围是原生 pointer、离场手势/焦点撤权，以及 Ready 后显式消费的 keyboard/gamepad gate。可选 `desktop-back` / `android-back` 已接入鼠标与 Android 传统返回意图，共用消息，由应用统一选择窗口对应 Router 和本地 UI 策略。Android 采用 manifest 兼容开关，不引入现代 callback 或预测手势；接线与范围归[集成指南](guides/integration.md#android-传统返回)。
 
 稳态执行减法已完成：空目标和空工作阶段直接退出，同一只读阶段复用 native 内容与切口事实，普通滚动按 marker 查找，focus 安装核查只在首次或调度变化时运行。沿用现有领域边界与官方依赖，保留正常滚动采样、异步轮询和真实写后复验；不扩展公共状态协议或重建整库架构。验证与测量分别归[验证指南](development/verification.md)和[性能基线](performance.md)。
 

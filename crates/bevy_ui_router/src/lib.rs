@@ -77,6 +77,10 @@ pub mod platform {
 }
 
 pub mod prelude {
+    #[cfg(feature = "android-back")]
+    pub use bevy_ui_router_platform::android_back::AndroidBackInputPlugin;
+    #[cfg(any(feature = "desktop-back", feature = "android-back"))]
+    pub use bevy_ui_router_platform::back_input::{PlatformBackInputSet, PlatformBackRequested};
     #[cfg(feature = "desktop-back")]
     pub use bevy_ui_router_platform::desktop_back::{
         DesktopBackInputPlugin, DesktopBackInputSet, DesktopBackRequested,
