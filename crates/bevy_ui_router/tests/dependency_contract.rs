@@ -89,11 +89,13 @@ fn renderer_neutral_packages_and_default_facade_resolve_without_bevy() {
     for (package, features, all_features) in [
         ("bevy_ui_router_core", None, false),
         ("bevy_ui_router_view", None, false),
+        ("bevy_ui_router_platform", None, false),
         ("bevy_ui_router_core", None, true),
         ("bevy_ui_router_view", None, true),
         ("bevy_ui_router", None, false),
         ("bevy_ui_router", Some(""), false),
         ("bevy_ui_router", Some("view"), false),
+        ("bevy_ui_router", Some("platform"), false),
     ] {
         let mut command = Command::new(env!("CARGO"));
         command.current_dir(workspace()).args([
@@ -164,6 +166,14 @@ fn bsn_dependency_direction_and_optional_bridge_resolve_as_declared() {
         ("bevy_ui_router_ecs", None, false, true, false),
         ("bevy_ui_router_ecs", Some("bsn"), true, true, true),
         ("bevy_ui_router", Some("bsn"), true, true, true),
+        (
+            "bevy_ui_router_platform",
+            Some("desktop-back"),
+            false,
+            false,
+            false,
+        ),
+        ("bevy_ui_router", Some("desktop-back"), false, false, false),
     ] {
         let mut command = Command::new(env!("CARGO"));
         command.current_dir(workspace()).args([

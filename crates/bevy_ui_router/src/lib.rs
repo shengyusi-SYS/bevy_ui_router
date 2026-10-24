@@ -73,12 +73,15 @@ pub mod bsn {
 
 #[cfg(feature = "platform")]
 pub mod platform {
-    pub mod prelude {
-        pub use crate::core::{BackCapabilitySnapshot, BackIntent, BackPolicy};
-    }
+    pub use bevy_ui_router_platform::*;
 }
 
 pub mod prelude {
+    #[cfg(feature = "desktop-back")]
+    pub use bevy_ui_router_platform::desktop_back::{
+        DesktopBackInputPlugin, DesktopBackInputSet, DesktopBackRequested,
+    };
+
     #[cfg(feature = "bsn")]
     pub use crate::bsn::{AppBsnExt, BsnBuildError, BsnSceneFactory, DefaultOutlet};
 

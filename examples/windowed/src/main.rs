@@ -2,6 +2,7 @@
 #[cfg(all(debug_assertions, feature = "ui-debug"))]
 mod ui_debug;
 use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
+use bevy_internal::window::PrimaryWindow;
 use bevy_internal::{input::mouse::MouseScrollUnit, picking::Pickable, prelude::*};
 use bevy_scene::{Scene, bsn};
 use bevy_ui_router::{
@@ -42,6 +43,9 @@ struct RestoreControl(RestoreAction);
 #[derive(Component)]
 struct Status;
 
+#[derive(Component)]
+struct WindowRouter(RouterHandle);
+
 #[derive(Resource)]
 struct Demo {
     router: RouterHandle,
@@ -63,7 +67,7 @@ fn main() {
     }))
     // Do not install InputDispatchPlugin or TabNavigationPlugin: this example
     // explicitly gates its target-addressed keyboard handler below.
-    .add_plugins(InputFocusPlugin);
+    .add_plugins((InputFocusPlugin, DesktopBackInputPlugin));
     #[cfg(all(debug_assertions, feature = "ui-debug"))]
     app.add_plugins(ui_debug::UiDebugPlugin);
 
@@ -234,6 +238,7 @@ fn main() {
         PreUpdate,
         (keyboard, restore_keyboard).after(RouterInputSet::Ready),
     )
+    .add_systems(PreUpdate, desktop_back.after(DesktopBackInputSet))
     .add_systems(
         Update,
         (start_initial_navigation, update_status)
@@ -264,7 +269,8 @@ fn register<S: Scene>(
     key
 }
 
-fn setup(mut commands: Commands, demo: Res<Demo>) {
+fn setup(mut commands: Commands, demo: Res<Demo>, window: Single<Entity, With<PrimaryWindow>>) {
+    commands.entity(*window).insert(WindowRouter(demo.router));
     commands.spawn(Camera2d);
     commands
         .spawn((
@@ -300,7 +306,7 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
                         ("Delayed [3]", Action::Delayed),
                         ("Outside [4]", Action::Outside),
                         ("Replace [R]", Action::Replace),
-                        ("Back [B]", Action::Back),
+                        ("Back [B / mouse side]", Action::Back),
                         ("Fail [E]", Action::Fail),
                     ] {
                         bar.spawn((
@@ -360,6 +366,24 @@ fn navigate(action: Action, demo: &mut Demo, navigation: &mut RouterNavigation) 
             demo.result = format!("{action:?} pending");
         }
         Err(error) => demo.result = format!("{action:?}: {error:?}"),
+    }
+}
+
+fn desktop_back(
+    mut requests: MessageReader<DesktopBackRequested>,
+    windows: Query<&WindowRouter>,
+    mut demo: ResMut<Demo>,
+    mut navigation: ResMut<RouterNavigation>,
+) {
+    // This is the single application return-policy handler. Local UI can handle
+    // a request here before deciding to navigate.
+    for request in requests.read() {
+        if windows
+            .get(request.window)
+            .is_ok_and(|target| target.0 == demo.router)
+        {
+            navigate(Action::Back, &mut demo, &mut navigation);
+        }
     }
 }
 

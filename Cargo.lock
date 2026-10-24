@@ -1152,6 +1152,7 @@ dependencies = [
  "bevy_asset",
  "bevy_camera",
  "bevy_ecs",
+ "bevy_input",
  "bevy_input_focus",
  "bevy_internal",
  "bevy_picking",
@@ -1162,6 +1163,7 @@ dependencies = [
  "bevy_ui_router_ecs",
  "bevy_ui_router_platform",
  "bevy_ui_router_view",
+ "bevy_window",
  "serde_json",
  "toml",
 ]
@@ -1204,6 +1206,9 @@ dependencies = [
 name = "bevy_ui_router_platform"
 version = "0.1.0"
 dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_input",
  "bevy_ui_router_core",
 ]
 

@@ -27,11 +27,12 @@ keep-alive 和滚动恢复是按需启用的体验增强：前者让布局与子
 - 当前已发布路由输入可只读查询，公共布局复用后仍可取得新 location 和自身 route-local params。
 - 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。
 - route-bound error view、router fallback、host loss/re-registration、stale 拒绝、局部 cleanup、输入与 focus 隔离。
+- 可选桌面鼠标 Back adapter，产生带窗口的返回意图；应用统一选择 Router 或优先处理本地 UI，再进入既有返回管线。
 - facade、可运行示例、独立 consumer 和相称的跨层验证。
 
 依赖采用官方 crates.io Bevy `0.19`，允许 `>=0.19.0, <0.20.0`；已验证的版本和环境归[验证说明](development/verification.md)。Core/View 与 facade 默认功能不依赖 Bevy。
 
-当前不支持 typed route/search、codegen、loader/action/async guard/revalidation、transition、跨父搬移或跨 host 缓存、multiple/named/dynamic outlets、queued/streaming/file/cached-asset BSN、hot reload、平台特定 adapter、后台 reaper 或公开 authority audit/probe。
+当前不支持 typed route/search、codegen、loader/action/async guard/revalidation、transition、跨父搬移或跨 host 缓存、multiple/named/dynamic outlets、queued/streaming/file/cached-asset BSN、hot reload、原生 OS 专有指令 adapter、后台 reaper 或公开 authority audit/probe。
 
 实例保留与访问记录是两个维度：不同 history entry 可以复用同一页面，滚动仍按 entry 恢复。页面的应用系统可用 `RouteActivity` 查询当前活动资格；布局、窗口和后台任务由应用配置。行为细节见[导航合同](contracts/navigation.md)，窗口与性能证据以专门验证文档为准。
 

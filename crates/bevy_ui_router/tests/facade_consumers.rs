@@ -47,6 +47,7 @@ impl Consumer {
         let directory = base.join(format!("{}-{stamp}-{name}", std::process::id()));
         let path = Value::String(facade.to_str().expect("UTF-8 workspace path").to_owned());
         let bsn = features.contains(&"bsn");
+        let desktop_back = features.contains(&"desktop-back");
         let features = Value::Array(
             features
                 .iter()
@@ -69,6 +70,18 @@ impl Consumer {
                     "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
                 ));
             }
+        }
+        if desktop_back {
+            if !ecs {
+                for dependency in ["bevy_app", "bevy_ecs"] {
+                    manifest.push_str(&format!(
+                        "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
+                    ));
+                }
+            }
+            manifest.push_str(
+                "bevy_input = { version = '=0.19.1', default-features = false, features = ['mouse'] }\n",
+            );
         }
         if native_ui {
             manifest.push_str(
@@ -225,6 +238,13 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
             include_str!("consumers/view.rs"),
         ),
         (
+            "platform",
+            false,
+            &["platform"][..],
+            false,
+            "use bevy_ui_router::platform::prelude::BackIntent; fn main() { let _ = BackIntent::NavigateBack; }",
+        ),
+        (
             "ecs",
             false,
             &["ecs"][..],
@@ -241,6 +261,16 @@ fn independent_facade_consumers_run_and_cannot_forge_authority() {
     ] {
         Consumer::new(name, defaults, features, ecs, source, false).run(!ecs);
     }
+
+    Consumer::new(
+        "desktop-back",
+        false,
+        &["desktop-back"],
+        false,
+        include_str!("consumers/desktop_back.rs"),
+        false,
+    )
+    .run(false);
 
     // Compile and execute the actual recommended examples, outside the workspace
     // dev-feature graph. Keep explicit dependencies aligned with the README.

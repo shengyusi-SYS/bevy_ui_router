@@ -35,7 +35,7 @@ python3 examples/windowed/ui_debug.py key Space
 | 操作 | 观察结果 |
 | --- | --- |
 | Overview / Settings，或 `1` / `2` | Push 到对应页面，状态栏同步当前位置和 history |
-| Replace（`R`）后 Back（`B`） | replace 不追加项，Back 返回前一成功项 |
+| Replace（`R`）后 Back（`B` 或鼠标后退侧键） | replace 不追加项，Back 返回前一成功项 |
 | 增加 Layout counter 和 page count，再在 Overview / Settings 往返 | 两个 leaf 显式缓存，原 layout/page Entity 和各自计数保留；cached page 不参与布局和输入 |
 | 增加 Layout counter，Outside（`4`）后进入另一个子页 | 原布局 A 及计数保留，目标子页由新路由选择；工具栏显示新的当前路径 |
 | 在列表区域滚动，切页后 Back | 恢复那次 history entry 的位置；再次 Push 同页可共享 Entity，后续 Back 仍恢复各次访问的位置 |

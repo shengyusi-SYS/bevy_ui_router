@@ -7,7 +7,7 @@
 | [导航与观察](navigation.md) | 匹配、location 复用、请求/history、snapshots | view 重建会触及 Scene；发布与终态顺序见 lifecycle |
 | [Scene 与挂载](scene.md) | driver 注册、同步 Scene profile、声明图创建、default outlet | host/identity/失败责任见 lifecycle；focus 意图见 input-focus |
 | [生命周期与清理](lifecycle.md) | host 接纳、identity/owner、publication、failure/recovery、cleanup | 导航结果见 navigation；撤权规则见 input-focus |
-| [输入与焦点](input-focus.md) | Ready 边界、pointer 历史手势、focus 意图与派发 | Scene 创建与 lifecycle publication 提供 source 和生效时机 |
+| [输入与焦点](input-focus.md) | Ready 边界、pointer 历史手势、focus 意图与派发、窗口返回意图 | Scene 创建与 lifecycle publication 提供 source 和生效时机 |
 
 产品目标与当前能力见[概览](../overview.md)，实现关系见[架构](../architecture/README.md)，按功能定位源码与测试见[开发入口](../development/README.md)。本文与专题页描述当前合同；未实施方案和执行计划不混入这些文件。
 

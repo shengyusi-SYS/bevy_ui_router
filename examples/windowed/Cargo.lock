@@ -1449,6 +1449,7 @@ dependencies = [
  "bevy_ui_router_bsn",
  "bevy_ui_router_core",
  "bevy_ui_router_ecs",
+ "bevy_ui_router_platform",
  "bevy_ui_router_view",
 ]
 
@@ -1483,6 +1484,16 @@ dependencies = [
  "bevy_ui_router_bsn",
  "bevy_ui_router_core",
  "bevy_ui_router_view",
+]
+
+[[package]]
+name = "bevy_ui_router_platform"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_input",
+ "bevy_ui_router_core",
 ]
 
 [[package]]

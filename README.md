@@ -21,13 +21,13 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
-窗口包含 push/replace/back、页面与布局计数、错误 fallback、焦点和跨页手势演示。需要桌面显示及图形驱动；示例选用 X11，Linux 构建需要 X11/xkbcommon 开发库。应用内 BRP 输入、布局查询与 renderer 截图见[窗口调试](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/debugging.md)。
+窗口包含 push/replace/back（按钮、B 键或鼠标后退侧键）、页面与布局计数、错误 fallback、焦点和跨页手势演示。需要桌面显示及图形驱动；示例选用 X11，Linux 构建需要 X11/xkbcommon 开发库。应用内 BRP 输入、布局查询与 renderer 截图见[窗口调试](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/debugging.md)。
 
 ## 接入应用
 
 当前使用仓库本地 `path` 依赖；完整独立应用 manifest 和装配步骤见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)。依赖声明为官方 Bevy `0.19`（`>=0.19.0, <0.20.0`），已验证 `0.19.0` / `0.19.1`，默认 lock 为 `0.19.1`。使用满足 Bevy 要求的 Rust 工具链；其 `bevy_ecs` 声明最低 Rust 1.95.0，本项目采用 2024 edition。
 
-默认 feature 为 `view`，不引入 Bevy；`bsn` 包含 `ecs` 和 `view`。即使代码同步构建 Scene，也必须安装 Scene runtime。当前支持单条嵌套链、每个 layout 的单个 default outlet 与代码驱动 native Scene；浏览器 URL/history adapter、cached Scene inclusion 和异步 Scene 加载未交付。页面发布后的应用数据加载可使用普通 Bevy 任务和系统。factory 产生新的 Scene，注册或请求入队成功不代表页面已经发布。
+默认 feature 为 `view`，不引入 Bevy；`bsn` 包含 `ecs` 和 `view`。可选 `desktop-back` 将鼠标后退键转换为窗口级返回消息，由应用唯一处理器选择 Router 并调用 `back`，装配见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md#桌面鼠标返回)。即使代码同步构建 Scene，也必须安装 Scene runtime。当前支持单条嵌套链、每个 layout 的单个 default outlet 与代码驱动 native Scene；浏览器 URL/history adapter、cached Scene inclusion 和异步 Scene 加载未交付。页面发布后的应用数据加载可使用普通 Bevy 任务和系统。factory 产生新的 Scene，注册或请求入队成功不代表页面已经发布。
 
 应用拥有 host 及窗口/相机/插件配置。原生 pointer 使用 Bevy UI picking；target-addressed keyboard/gamepad handler 应在 `RouterInputSet::Ready` 后检查 `RouterInputGate`。原生 TabNavigation/InputDispatch 不会因安装 Router 自动遵守 gate。详细行为按 [专题合同](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/contracts/README.md)。
 

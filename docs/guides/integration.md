@@ -238,3 +238,40 @@ app.add_systems(
 检查真实交互时，使用[调试指南](debugging.md)中的应用局部输入与 renderer 截图。
 headless 成功不等于窗口、原生平台或硬件设备验收；当前证据边界见
 [验证指南](../development/verification.md)。
+
+## 桌面鼠标返回
+
+在 facade 的 features 中加入 `desktop-back`，例如 `features = ["bsn", "desktop-back"]`。从 `bevy_ui_router::prelude::*` 或 `platform::prelude::*` 导入 adapter：
+
+```rust
+app.add_plugins(DesktopBackInputPlugin)
+    .add_systems(PreUpdate, desktop_back.after(DesktopBackInputSet));
+```
+
+由应用在窗口 Entity 上保存安装得到的 Router handle；下面的 `WindowRouter` 是应用自己的组件：
+
+```rust
+#[derive(Component)]
+struct WindowRouter(RouterHandle);
+
+fn desktop_back(
+    mut requests: MessageReader<DesktopBackRequested>,
+    windows: Query<&WindowRouter>,
+    mut navigation: ResMut<RouterNavigation>,
+) {
+    for request in requests.read() {
+        let Ok(target) = windows.get(request.window) else { continue };
+        // 在这个唯一处理器里先判断本地 UI 是否处理，再决定是否导航。
+        match navigation.back(target.0) {
+            Ok(request_id) => { /* 保存 ID，通过 RouterSnapshots 观察完成。 */ }
+            Err(error) => eprintln!("Back was not enqueued: {error:?}"),
+        }
+    }
+}
+```
+
+窗口由应用创建，例如 `commands.entity(window).insert(WindowRouter(router))`；host 不是窗口，adapter 不推断或选择当前 Router。`NoBackEntry` 是正常的入队结果，由应用决定是否显示反馈或交给宿主，不默认退出。返回一旦入队就沿现有 history、保留、滚动恢复和 cleanup 流程执行。
+
+同一意图只安排一个应用处理器；两个 `MessageReader` 不会互相消费，不能用“另一个 reader 先读过”阻止返回。完整可运行接线见[窗口示例](../../examples/windowed/src/main.rs)的 `WindowRouter`、`desktop_back` 和 `navigate`；[公开旅程](../../crates/bevy_ui_router/tests/desktop_back.rs)另示范本地弹层先处理与两个窗口分别导航。
+
+`desktop-back` 单独启用只需要 Bevy app/ECS/input，不带 Router ECS、Scene、UI renderer 或 Winit；生产应用沿用已有输入/窗口插件。`platform` 本身与默认 facade 仍不引入 Bevy。消息来源和范围归[输入合同](../contracts/input-focus.md#窗口级返回输入)，设备与平台证据归[验证指南](../development/verification.md)。

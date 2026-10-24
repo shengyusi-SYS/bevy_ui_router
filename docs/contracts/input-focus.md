@@ -33,3 +33,13 @@ facade/prelude 的 `RouteActivity` SystemParam 提供 `is_active(Entity)`，用�
 activity 独立于 authored visibility 和输入资格，也不是完整 frame-local 内容健康检查。Router 不会因隐藏缓存而暂停应用系统、observer 或任意副作用；应用选择是否执行自己的工作。pointer/keyboard/gamepad 仍遵守上面的输入边界，不以 activity 查询替代 gate。
 
 实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[activity](../../crates/bevy_ui_router_ecs/src/activity.rs)、[当前输入](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) 与 [公开调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。
+
+## 窗口级返回输入
+
+facade 或 Platform 的 `desktop-back` feature 提供 `DesktopBackInputPlugin`、`DesktopBackRequested` 和 `DesktopBackInputSet`。插件在 `PreUpdate` 的该 set 中、Bevy `InputSystems` 之后读取 `MouseButtonInput`；每个 `Back + Pressed` 产生一个带原 `window` Entity 的返回消息，保留事件顺序。Released、Forward 与其它按键不产生返回消息，原始输入及其它 reader 不被清空或消费。
+
+这是应用窗口级意图，不要求鼠标命中某个页面控件，也不经 picking。应用用一个处理器明确决定 window→RouterHandle、本地 UI 优先级及无 history 的行为，再调用公开 `RouterNavigation::back(router)` 并处理入队结果。`BackPolicy` 等中立类型不会自动安装这套决策；没有默认 Router、自动弹层处理或窗口退出行为。
+
+推荐应用处理器在同一 `PreUpdate` 中 `.after(DesktopBackInputSet)`，使获准的返回进入既有 `Update` 导航管线。多个 `MessageReader` 各自有游标，先读取不能阻止另一个处理器再次派发；本地处理和 Router 派发应在同一决策路径内完成。窗口与 host 是不同对象，应用保存安装得到的 handle 并显式映射。
+
+插件幂等注册原始与返回消息通道，不安装窗口 runner 或要求 InputPlugin；实际设备输入由应用已有的 Bevy 后端提供，也可注入标准消息验证。当前仅转换鼠标 Back，不自动识别键盘返回、独立 Win32 系统指令或触控板返回手势，不影响延期的原生 Tab/Dispatch 接入。用法见[桌面返回接入](../guides/integration.md#桌面鼠标返回)。

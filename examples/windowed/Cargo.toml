@@ -12,7 +12,7 @@ default = []
 ui-debug = ["bevy_internal/bevy_remote", "bevy_internal/serialize", "bevy_internal/png", "dep:serde_json", "dep:image"]
 
 [dependencies]
-bevy_ui_router = { path = "../../crates/bevy_ui_router", features = ["bsn"] }
+bevy_ui_router = { path = "../../crates/bevy_ui_router", features = ["bsn", "desktop-back"] }
 bevy_ecs = { version = "0.19", default-features = false }
 bevy_scene = { version = "0.19", default-features = false }
 bevy_input_focus = { version = "0.19", default-features = false }

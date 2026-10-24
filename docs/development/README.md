@@ -13,6 +13,7 @@
 | 页面后台工作活动资格 | [RouteActivity](../contracts/input-focus.md#页面活动查询) | ECS [activity](../../crates/bevy_ui_router_ecs/src/activity.rs) | [公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs)及[独立 BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) |
 | Scene/factory、运行装配、default outlet | [Scene 与挂载](../contracts/scene.md) | [BSN 合同](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs)、[native Scene](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs)、[mount](../../crates/bevy_ui_router_ecs/src/mount.rs) | [BSN facade](../../crates/bevy_ui_router/tests/bsn_facade_features.rs)及[独立 BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) |
 | host、identity、publication、failure/recovery、cleanup | [生命周期与清理](../contracts/lifecycle.md) | Core [integration](../../crates/bevy_ui_router_core/src/integration.rs)、[engine](../../crates/bevy_ui_router_core/src/engine.rs)，ECS [registry](../../crates/bevy_ui_router_ecs/src/registry.rs)、[navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[cleanup](../../crates/bevy_ui_router_ecs/src/cleanup.rs) | ECS 完整 crate、[native 回归](../../crates/bevy_ui_router_ecs/src/navigation/native_tests.rs)及公开旅程/consumer |
+| 桌面鼠标返回 | [窗口返回意图](../contracts/input-focus.md#窗口级返回输入) | Platform [desktop_back](../../crates/bevy_ui_router_platform/src/desktop_back.rs)，应用唯一处理器与公开 `back` | [公开返回旅程](../../crates/bevy_ui_router/tests/desktop_back.rs)、最小独立 consumer、窗口示例编译 |
 | pointer、keyboard/gamepad gate、focus | [输入与焦点](../contracts/input-focus.md)及[调度](../architecture/runtime.md#bevy-调度与输入) | ECS [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[plugin](../../crates/bevy_ui_router_ecs/src/plugin.rs) | [原生 pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) |
 | facade、features、依赖与示例 | [共同边界](../contracts/README.md#共同职责边界)、[注册](../contracts/scene.md#注册与运行装配) | [facade](../../crates/bevy_ui_router/src/lib.rs)、[manifest](../../crates/bevy_ui_router/Cargo.toml)、[App extension](../../crates/bevy_ui_router_ecs/src/app_ext.rs) | [独立 consumer](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs)、实际示例与打包 consumer |
 | 性能问题 | [性能基线](../performance.md)与热点所属专题 | 先 profile 对应生产路径，再选择修改 | 同语义 benchmark 对照与相应功能 gate |
@@ -25,7 +26,7 @@
 
 复杂功能可以组织为 `docs/changes/<feature>/design.md` 与 `plan.md`；独立子问题可拆分设计，多个功能不必塞入一份全局 spec。设计说明行为、边界、理由与验收，计划安排交付依赖、验证和审查。简单修复直接维护相关代码与基线，不为模板创建空文档。
 
-实例协调与当前输入已归入[导航合同](../contracts/navigation.md#实例保留)和[运行机制](../architecture/runtime.md)，访问级滚动统一意图归入[导航合同](../contracts/navigation.md#按访问恢复滚动)与[集成指南](../guides/integration.md#滚动恢复)。两项窗口组合已闭合，剩余任务归[路线图](../roadmap.md)；原生输入自动接线已延期，未来重启从[长期评估](../changes/navigation-experience/assessment.md)进入，不作为当前实施入口。
+实例协调与当前输入已归入[导航合同](../contracts/navigation.md#实例保留)和[运行机制](../architecture/runtime.md)，访问级滚动统一意图归入[导航合同](../contracts/navigation.md#按访问恢复滚动)与[集成指南](../guides/integration.md#滚动恢复)。两项窗口组合已闭合，剩余任务归[路线图](../roadmap.md)；原生 Tab/Dispatch 自动资格接线已延期，未来重启从[长期评估](../changes/navigation-experience/assessment.md)进入，不作为当前实施入口。
 
 未落地设计在页首标明草案、已确认或实施中及影响范围，链接相关当前合同。方案描述的是待改变部分，不重复抄写整个基线，也不能静默覆盖现行行为。当前没有需要恢复执行的旧 MVP 阶段计划。
 
