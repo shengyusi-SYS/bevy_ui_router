@@ -25,6 +25,7 @@ pub mod ownership;
 pub mod pattern;
 pub mod presentation;
 pub mod request;
+pub use request::NavigationKind;
 pub mod route_tree;
 pub mod slot;
 #[cfg(feature = "test-support")]
@@ -60,7 +61,7 @@ pub mod prelude {
         ActivePresentation, ActivePresentationKind, RouterAvailability, RouterUnavailableReason,
     };
     pub use crate::request::{
-        NavigationFailure, NavigationFailureKind, NavigationPhase, RequestStatus,
+        NavigationFailure, NavigationFailureKind, NavigationKind, NavigationPhase, RequestStatus,
     };
     pub use crate::route_tree::{RouteNodeOptions, RouteTree, RouteTreeBuilder};
     pub use crate::slot::RouteSlotKey;

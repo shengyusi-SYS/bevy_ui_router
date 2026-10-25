@@ -2,9 +2,12 @@
 
 use std::collections::VecDeque;
 
+pub(crate) mod exit;
 pub(crate) mod idle_host_loss;
 pub(crate) mod instances;
 pub(crate) mod retained;
+
+use exit::{CommitSettlementBinding, CoreExitProjection};
 
 use crate::admission::{
     AdmissionError, HostAdmissionAllocatorCounter, HostAdmissionAllocatorExhaustionEvidence,
@@ -66,8 +69,8 @@ use crate::presentation::{
     RouterUnavailableReason,
 };
 use crate::request::{
-    NavigationFailure, NavigationFailureKind, NavigationPhase, NavigationRequestRecord,
-    RequestRecordError, RequestStatus,
+    NavigationFailure, NavigationFailureKind, NavigationKind, NavigationPhase,
+    NavigationRequestRecord, RequestRecordError, RequestStatus,
 };
 use crate::route_tree::RouteTree;
 use crate::trace::{MountRejectionKind, NavigationTraceEvent, NavigationTraceEventKind};
@@ -2153,6 +2156,7 @@ pub(crate) enum CoreBackTargetReceiverStageProjection {
     ConfirmingMount,
     ReadyToCommit,
     CommitSealed,
+    PostCommitExit,
     PostCommitCleanup,
     FailureCleanupManifestPending(FailureCleanupReceiverProjection),
     FailureCleanupPrepared,
@@ -2795,7 +2799,10 @@ enum WorkStage {
     ConfirmingMount,
     ReadyToCommit,
     CommitSealed {
-        token: CleanupBatchToken,
+        token: CommitSettlementBinding,
+    },
+    PostCommitExit {
+        expected: Box<CoreExitProjection>,
     },
     PostCommitCleanup {
         outstanding: CleanupBatchToken,
@@ -2831,7 +2838,8 @@ enum WorkStageProjection {
     AwaitingReceipt,
     ConfirmingMount,
     ReadyToCommit,
-    CommitSealed(CleanupBatchToken),
+    CommitSealed(CommitSettlementBinding),
+    PostCommitExit(Box<CoreExitProjection>),
     PostCommitCleanup(CleanupBatchToken),
     PostCommitAuthorityAccepted {
         normal: CleanupBatchToken,
@@ -2859,6 +2867,9 @@ impl WorkStage {
             Self::ConfirmingMount => WorkStageProjection::ConfirmingMount,
             Self::ReadyToCommit => WorkStageProjection::ReadyToCommit,
             Self::CommitSealed { token } => WorkStageProjection::CommitSealed(token.clone()),
+            Self::PostCommitExit { expected } => {
+                WorkStageProjection::PostCommitExit(expected.clone())
+            }
             Self::PostCommitCleanup { outstanding } => {
                 WorkStageProjection::PostCommitCleanup(outstanding.clone())
             }
@@ -2907,7 +2918,8 @@ impl WorkStage {
             Self::PostCommitCleanup { outstanding } => Some(Self::PostCommitCleanup {
                 outstanding: outstanding.clone(),
             }),
-            Self::PostCommitAuthorityAccepted { .. }
+            Self::PostCommitExit { .. }
+            | Self::PostCommitAuthorityAccepted { .. }
             | Self::PostCommitAuthorityCleanup { .. }
             | Self::FailureCleanupManifestPending { .. }
             | Self::FailureCleanupPrepared { .. }
@@ -3393,12 +3405,7 @@ enum NavigationCommand {
     Back,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NavigationCommandKind {
-    Push,
-    Replace,
-    Back,
-}
+type NavigationCommandKind = NavigationKind;
 
 impl NavigationCommand {
     const fn kind(&self) -> NavigationCommandKind {
@@ -6105,7 +6112,8 @@ impl RouterEngine {
         // Publication, rather than the physical cleanup disposition, decides
         // whether the request outcome has already become committed.
         let status = match &current.stage {
-            WorkStage::PostCommitCleanup { .. }
+            WorkStage::PostCommitExit { .. }
+            | WorkStage::PostCommitCleanup { .. }
             | WorkStage::PostCommitAuthorityAccepted { .. }
             | WorkStage::PostCommitAuthorityCleanup { .. } => {
                 current.attempt.published_request_status()
@@ -6240,7 +6248,9 @@ impl RouterEngine {
         };
         self.records
             .push_back(NavigationRequestRecord::with_resolved_target(
-                request, location,
+                request,
+                location,
+                command.kind(),
             ));
         self.highest_issued = Some(request.sequence());
         self.queue.push_back(QueuedNavigation {
@@ -10253,6 +10263,7 @@ impl RouterEngine {
                 | WorkStage::ConfirmingMount
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
+                | WorkStage::PostCommitExit { .. }
                 | WorkStage::PostCommitCleanup { .. }
                 | WorkStage::PostCommitAuthorityAccepted { .. }
                 | WorkStage::PostCommitAuthorityCleanup { .. }
@@ -10685,6 +10696,9 @@ impl RouterEngine {
             Some(WorkStage::ReadyToCommit) => CoreBackTargetReceiverStageProjection::ReadyToCommit,
             Some(WorkStage::CommitSealed { .. }) => {
                 CoreBackTargetReceiverStageProjection::CommitSealed
+            }
+            Some(WorkStage::PostCommitExit { .. }) => {
+                CoreBackTargetReceiverStageProjection::PostCommitExit
             }
             Some(WorkStage::PostCommitCleanup { .. }) => {
                 CoreBackTargetReceiverStageProjection::PostCommitCleanup
@@ -11542,7 +11556,7 @@ impl RouterEngine {
             .as_mut()
             .expect("current work was validated")
             .stage = WorkStage::CommitSealed {
-            token: cleanup.clone(),
+            token: cleanup.clone().into(),
         };
         let source = self.observe_prepared_publication_source(publication.record_index);
         let sealed = SealedCommit {
@@ -12266,6 +12280,10 @@ impl RouterEngine {
             evidence: _,
             source: _,
         } = owner;
+        self.install_publication_plan(publication, mutation);
+    }
+
+    fn install_publication_plan(&mut self, publication: PublicationPlan, mutation: impl FnOnce()) {
         let PublicationPlan {
             state,
             inputs,
@@ -12625,6 +12643,7 @@ impl RouterEngine {
                 | WorkStage::ConfirmingMount
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
+                | WorkStage::PostCommitExit { .. }
                 | WorkStage::PostCommitAuthorityAccepted { .. }
                 | WorkStage::PostCommitAuthorityCleanup { .. }
                 | WorkStage::FailureCleanupManifestPending { .. }
@@ -12777,6 +12796,7 @@ impl RouterEngine {
                 | WorkStage::ConfirmingMount
                 | WorkStage::ReadyToCommit
                 | WorkStage::CommitSealed { .. }
+                | WorkStage::PostCommitExit { .. }
                 | WorkStage::PostCommitCleanup { .. }
                 | WorkStage::PostCommitAuthorityAccepted { .. }
                 | WorkStage::PostCommitAuthorityCleanup { .. }
@@ -15153,8 +15173,23 @@ impl RouterEngine {
 
     fn precompute_publication(
         &self,
-        mut current: CurrentWork,
+        current: CurrentWork,
         cleanup: CleanupBatchToken,
+        history_capability: Option<HistoryCommitCapability>,
+        next_record: Option<NavigationRequestRecord>,
+    ) -> Result<PublicationPlan, HistoryPreparationError> {
+        self.precompute_disposition_publication(
+            current,
+            cleanup.into(),
+            history_capability,
+            next_record,
+        )
+    }
+
+    fn precompute_disposition_publication(
+        &self,
+        mut current: CurrentWork,
+        settlement: CommitSettlementBinding,
         history_capability: Option<HistoryCommitCapability>,
         next_record: Option<NavigationRequestRecord>,
     ) -> Result<PublicationPlan, HistoryPreparationError> {
@@ -15326,12 +15361,12 @@ impl RouterEngine {
                     .expect("normal publication retains its matched branch")
                     .branch_fingerprint()
                     .clone();
-                let presentation = PreparedPresentationBinding::new(
+                let presentation = PreparedPresentationBinding::with_settlement(
                     execution,
                     active,
                     matched,
                     current.target_frames.clone(),
-                    cleanup.clone(),
+                    settlement.clone(),
                 );
                 Some(self.history.prepare(capability, presentation)?)
             }
@@ -15349,8 +15384,11 @@ impl RouterEngine {
         }
         .with_frames(source_frames, target_frames);
 
-        current.stage = WorkStage::PostCommitCleanup {
-            outstanding: cleanup,
+        current.stage = match settlement {
+            CommitSettlementBinding::Cleanup(outstanding) => {
+                WorkStage::PostCommitCleanup { outstanding }
+            }
+            CommitSettlementBinding::Exit(expected) => WorkStage::PostCommitExit { expected },
         };
 
         Ok(PublicationPlan {

@@ -12702,3 +12702,193 @@ fn host_loss_terminal_publishes_stable_unavailable_host_lost() {
         )
     );
 }
+
+#[test]
+fn deferred_exit_publishes_history_then_seals_the_actual_cleanup_manifest() {
+    let mut engine = ready_engine();
+    engine.push(RouteLocation::new("/items/1")).unwrap();
+    settle_current(&mut engine);
+    let old = engine.active().clone();
+    let request = engine.push(RouteLocation::new("/about")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let prepared = engine
+        .prepare_exit_commit(&ticket, None, Vec::new())
+        .unwrap();
+    assert_eq!(engine.active(), &old);
+    let mut owner = None;
+    engine
+        .validate_exit_publication(prepared)
+        .unwrap()
+        .publish(|original| owner = Some(original));
+    let owner = owner.unwrap();
+    assert_eq!(
+        engine.history().current(),
+        Some(&RouteLocation::new("/about"))
+    );
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Running(NavigationPhase::PostCommitCleanup)
+    );
+    let queued = engine.push(RouteLocation::new("/items/2")).unwrap();
+    assert_eq!(
+        engine.exit_release_demand(&owner).unwrap(),
+        super::exit::CoreExitReleaseDemand::QueuedRequest(queued)
+    );
+    assert!(engine.action().is_none());
+    let roots = owner.cleanup_roots().to_vec();
+    let error = engine
+        .begin_exit_cleanup(
+            owner,
+            CleanupManifestSeal::new(Vec::new(), manifest_digest(0xE020), 0),
+            |_, _| panic!("a foreign manifest must not install physical ownership"),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, CommitError::InvalidManifest);
+    assert!(matches!(
+        engine.current.as_ref().unwrap().stage,
+        WorkStage::PostCommitExit { .. }
+    ));
+    let mut actual = None;
+    engine
+        .begin_exit_cleanup(
+            error.owner,
+            CleanupManifestSeal::new(roots, manifest_digest(0xE021), 7),
+            |batch, retained| {
+                assert!(retained.is_empty());
+                actual = Some(batch);
+            },
+        )
+        .unwrap();
+    let actual = actual.unwrap();
+    assert_eq!(actual.obligation_count(), 7);
+    engine.complete_cleanup(valid_completion(&actual)).unwrap();
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(engine.action().is_some());
+    assert_eq!(
+        engine.history().current(),
+        Some(&RouteLocation::new("/about"))
+    );
+}
+
+#[test]
+fn cancelled_unpublished_exit_restores_original_history_capability() {
+    let mut engine = ready_engine();
+    engine.push(RouteLocation::new("/items/1")).unwrap();
+    settle_current(&mut engine);
+    let request = engine.replace(RouteLocation::new("/about")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let history = engine.testing_history_authority_snapshot();
+    let prepared = engine
+        .prepare_exit_commit(&ticket, None, Vec::new())
+        .unwrap();
+    assert!(
+        engine
+            .cancel_prepared_exit_commit(prepared)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(engine.testing_history_authority_snapshot(), history);
+    let roots = engine.current.as_ref().unwrap().cleanup_roots.clone();
+    let sealed = engine
+        .seal_commit(
+            &ticket,
+            CleanupManifestSeal::new(roots, manifest_digest(0xE022), 3),
+        )
+        .unwrap();
+    let cleanup = sealed.cleanup().clone();
+    let publication = engine.prepare_publication(sealed).unwrap();
+    engine
+        .validate_publication(publication)
+        .unwrap()
+        .publish(|| {});
+    engine.complete_cleanup(valid_completion(&cleanup)).unwrap();
+    assert_eq!(
+        engine.request(request).unwrap().kind(),
+        NavigationKind::Replace
+    );
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+}
+
+#[test]
+fn entirely_retained_exit_owns_real_pending_disposition_without_fake_cleanup() {
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("item").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let mut engine = ready_engine_with_tree(routes.build().unwrap()).with_keep_alive_capacity(2);
+    engine.push(RouteLocation::new("/items/1")).unwrap();
+    settle_current(&mut engine);
+    let original = engine.active().frames().last().unwrap().clone();
+    let request = engine.push(RouteLocation::new("/items/2")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let history = engine.testing_history_authority_snapshot();
+    let error = engine
+        .prepare_exit_commit(&ticket, None, Vec::new())
+        .unwrap_err();
+    assert_eq!(error.kind, CommitError::InvalidManifest);
+    assert!(error.plan.is_none());
+    assert!(error.owners.is_empty());
+    assert_eq!(engine.testing_history_authority_snapshot(), history);
+    assert!(matches!(
+        engine.current.as_ref().unwrap().stage,
+        WorkStage::ReadyToCommit
+    ));
+    let plan = engine.prepare_retained_commit_plan(&ticket, &[]).unwrap();
+    assert!(plan.disposable_roots().is_empty());
+    assert_eq!(plan.retained().len(), 1);
+    let prepared = engine
+        .prepare_exit_commit(&ticket, Some(plan), Vec::new())
+        .unwrap();
+    let mut exit = None;
+    engine
+        .validate_exit_publication(prepared)
+        .unwrap()
+        .publish(|owner| exit = Some(owner));
+    assert!(engine.retained_leaves.is_empty());
+    assert!(matches!(
+        engine.current.as_ref().unwrap().stage,
+        WorkStage::PostCommitExit { .. }
+    ));
+    let mut actual = None;
+    let mut retained = Vec::new();
+    engine
+        .begin_exit_cleanup(
+            exit.unwrap(),
+            CleanupManifestSeal::new(Vec::new(), manifest_digest(0xE023), 0),
+            |batch, owners| {
+                actual = Some(batch);
+                retained = owners;
+            },
+        )
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].projection().frame(), &original);
+    assert_eq!(engine.retained_leaves.len(), 1);
+    let actual = actual.unwrap();
+    assert_eq!(actual.obligation_count(), 0);
+    engine.complete_cleanup(valid_completion(&actual)).unwrap();
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+}

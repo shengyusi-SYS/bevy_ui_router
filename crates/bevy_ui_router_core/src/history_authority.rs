@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::HostVersion;
 use crate::cleanup::{CleanupBatchIdentity, CleanupBatchSeal, CleanupBatchToken};
+use crate::engine::exit::{CommitSettlementBinding, CoreExitProjection};
 use crate::fingerprint::{RouteBranchFingerprint, RouteSegmentReuseKey};
 use crate::frame::{FrameOrigin, LogicalChildSlotBinding, RouteFrameVersion};
 use crate::history::{HistorySnapshot, MemoryHistory};
@@ -1678,7 +1679,13 @@ pub(crate) struct PreparedPresentationBinding {
     matched: RouteBranchFingerprint,
     target_frames: Vec<RouteFrameVersion>,
     settlement: CleanupBatchIdentity,
-    cleanup: CleanupBatchSeal,
+    disposition: PresentationDispositionSeal,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PresentationDispositionSeal {
+    Cleanup(CleanupBatchSeal),
+    Exit(Box<CoreExitProjection>),
 }
 
 impl PreparedPresentationBinding {
@@ -1689,14 +1696,39 @@ impl PreparedPresentationBinding {
         target_frames: Vec<RouteFrameVersion>,
         cleanup: CleanupBatchToken,
     ) -> Self {
-        let (settlement, cleanup) = cleanup.into_parts();
+        Self::with_settlement(
+            execution,
+            presentation,
+            matched,
+            target_frames,
+            cleanup.into(),
+        )
+    }
+
+    pub(crate) fn with_settlement(
+        execution: HistoryExecutionBindingProjection,
+        presentation: ActivePresentation,
+        matched: RouteBranchFingerprint,
+        target_frames: Vec<RouteFrameVersion>,
+        binding: CommitSettlementBinding,
+    ) -> Self {
+        let (settlement, disposition) = match binding {
+            CommitSettlementBinding::Cleanup(cleanup) => {
+                let (identity, seal) = cleanup.into_parts();
+                (identity, PresentationDispositionSeal::Cleanup(seal))
+            }
+            CommitSettlementBinding::Exit(exit) => (
+                exit.batch_identity().clone(),
+                PresentationDispositionSeal::Exit(exit),
+            ),
+        };
         Self {
             execution,
             presentation,
             matched,
             target_frames,
             settlement,
-            cleanup,
+            disposition,
         }
     }
 }
@@ -1716,6 +1748,14 @@ pub(crate) struct PreparedHistoryPublication {
 }
 
 impl PreparedHistoryPublication {
+    pub(crate) fn into_capability(self) -> HistoryCommitCapability {
+        HistoryCommitCapability {
+            execution: self.execution,
+            source: self.source,
+            destination: self.destination,
+        }
+    }
+
     pub(crate) fn publication_facts(
         &self,
         source_presentation: &ActivePresentation,
@@ -1759,6 +1799,43 @@ impl PreparedHistoryPublication {
         target_frames: &[RouteFrameVersion],
         cleanup: &CleanupBatchToken,
     ) -> bool {
+        self.matches_disposition_projection(
+            execution,
+            source_revision,
+            target,
+            presentation,
+            matched,
+            target_frames,
+            &CommitSettlementBinding::Cleanup(cleanup.clone()),
+        )
+    }
+
+    pub(crate) fn target_revision(&self) -> HistoryRevision {
+        self.next.revision()
+    }
+
+    pub(crate) fn matches_disposition_projection(
+        &self,
+        execution: &HistoryExecutionBindingProjection,
+        source_revision: HistoryRevision,
+        target: &RouteLocation,
+        presentation: &ActivePresentation,
+        matched: &RouteBranchFingerprint,
+        target_frames: &[RouteFrameVersion],
+        settlement: &CommitSettlementBinding,
+    ) -> bool {
+        let disposition_matches = match settlement {
+            CommitSettlementBinding::Cleanup(cleanup) => {
+                self.presentation.settlement == *cleanup.batch_identity()
+                    && matches!(&self.presentation.disposition,
+                        PresentationDispositionSeal::Cleanup(seal) if seal == cleanup.manifest_seal())
+            }
+            CommitSettlementBinding::Exit(exit) => {
+                self.presentation.settlement == *exit.batch_identity()
+                    && matches!(&self.presentation.disposition,
+                        PresentationDispositionSeal::Exit(expected) if expected == exit)
+            }
+        };
         let destination_target = match &self.destination {
             FrozenHistoryDestination::Push { target }
             | FrozenHistoryDestination::Replace { target, .. } => target,
@@ -1771,8 +1848,7 @@ impl PreparedHistoryPublication {
             && self.presentation.presentation == *presentation
             && self.presentation.matched == *matched
             && self.presentation.target_frames == target_frames
-            && self.presentation.settlement == *cleanup.batch_identity()
-            && self.presentation.cleanup == *cleanup.manifest_seal()
+            && disposition_matches
             && self.next.projection.current() == Some(target)
     }
 

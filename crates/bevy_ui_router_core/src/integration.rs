@@ -1,3 +1,9 @@
+mod exit;
+pub use exit::{
+    DeferredExitOwner, ExitCleanupBeginError, ExitCommitPreparationError, ExitReleaseDemand,
+    PreparedExitCommit, ValidatedExitCommit,
+};
+
 use crate::admission::{
     AdmissionError as CoreAdmissionError,
     HostAdmissionAllocatorCounter as CoreHostAdmissionAllocatorCounter,
@@ -2937,6 +2943,10 @@ pub struct CommitTicket {
 }
 
 impl CommitTicket {
+    pub fn request(&self) -> NavigationRequestId {
+        self.inner.identity().request()
+    }
+
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn testing_duplicate(&self) -> Self {
@@ -6335,6 +6345,10 @@ pub fn project_cleanup_summary(
 }
 
 impl NavigationRequestView<'_> {
+    pub fn kind(&self) -> crate::request::NavigationKind {
+        self.record.kind()
+    }
+
     pub fn id(&self) -> NavigationRequestId {
         self.record.id()
     }

@@ -7,6 +7,14 @@ use crate::trace::{
     NavigationTraceError, NavigationTraceEvent, NavigationTraceEventKind, NavigationTraceLog,
 };
 
+/// Original accepted navigation command, unchanged by recovery or publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NavigationKind {
+    Push,
+    Replace,
+    Back,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavigationFailureKind {
     Match,
@@ -74,6 +82,7 @@ pub(crate) enum BackResolutionRecordState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NavigationRequestRecord {
     id: NavigationRequestId,
+    kind: NavigationKind,
     requested: Option<RouteLocation>,
     matched: Option<RouteBranchFingerprint>,
     back_resolution: Option<BackResolutionRecordState>,
@@ -86,10 +95,19 @@ pub(crate) struct NavigationRequestRecord {
 pub(crate) struct RequestedTargetAlreadyResolved;
 
 impl NavigationRequestRecord {
+    pub(crate) const fn kind(&self) -> NavigationKind {
+        self.kind
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_resolved_target(id: NavigationRequestId, requested: RouteLocation) -> Self {
+    pub(crate) fn with_resolved_target(
+        id: NavigationRequestId,
+        requested: RouteLocation,
+        kind: NavigationKind,
+    ) -> Self {
         Self {
             id,
+            kind,
             requested: Some(requested),
             matched: None,
             back_resolution: None,
@@ -103,6 +121,7 @@ impl NavigationRequestRecord {
     pub(crate) fn unresolved_back(id: NavigationRequestId) -> Self {
         Self {
             id,
+            kind: NavigationKind::Back,
             requested: None,
             matched: None,
             back_resolution: None,
@@ -309,7 +328,11 @@ mod tests {
     use crate::trace::NavigationTraceEventKind;
 
     fn record() -> NavigationRequestRecord {
-        NavigationRequestRecord::with_resolved_target(request_id(), RouteLocation::new("/items/7"))
+        NavigationRequestRecord::with_resolved_target(
+            request_id(),
+            RouteLocation::new("/items/7"),
+            NavigationKind::Push,
+        )
     }
 
     fn request_id() -> NavigationRequestId {

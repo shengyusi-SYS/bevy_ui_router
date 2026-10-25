@@ -1,6 +1,7 @@
 //! Instance selection, independent inventory, and linear lifecycle transfers.
 use super::instances::{InstanceFacts, RetainedOwnSlotProjection, TargetInstanceSourceKind};
 use super::*;
+use crate::cleanup::CleanupBatchIdentity;
 use crate::fingerprint::RouteSegmentReuseKey;
 
 /// Read-only facts about an original instance. A projection cannot recreate its owner.
@@ -58,6 +59,10 @@ pub struct RetainedLeafOwner {
 }
 
 impl RetainedLeafOwner {
+    pub(super) fn prepared(projection: RetainedLeafProjection) -> Self {
+        Self { projection }
+    }
+
     pub const fn projection(&self) -> &RetainedLeafProjection {
         &self.projection
     }
@@ -171,7 +176,7 @@ pub enum RetainedMissCleanupAuthorityFailCloseErrorKind {
 /// Frozen current/next partition. Only the issuing Core can turn it into a transfer.
 #[derive(Debug)]
 pub struct RetainedCommitPlan {
-    source: PreparedPublicationObservation,
+    pub(super) source: PreparedPublicationObservation,
     original_roots: Vec<RouteFrameVersion>,
     next_slots: Vec<LogicalChildSlotBinding>,
     retained: Vec<RetainedLeafProjection>,
@@ -331,16 +336,47 @@ impl RetainedInvalidationPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RetainedRegistryEntry {
     projection: RetainedLeafProjection,
-    retirement: Option<CleanupBatchToken>,
+    retirement: Option<RetainedRetirement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RetainedRetirement {
+    Cleanup(CleanupBatchToken),
+    Exit(CleanupBatchIdentity),
 }
 
 impl RetainedRegistryEntry {
+    pub(super) fn live(projection: RetainedLeafProjection) -> Self {
+        Self {
+            projection,
+            retirement: None,
+        }
+    }
+
+    pub(super) fn reserve_exit_retirement(&mut self, identity: CleanupBatchIdentity) {
+        self.retirement = Some(RetainedRetirement::Exit(identity));
+    }
+
+    pub(super) fn seal_exit_retirement(
+        &mut self,
+        identity: &CleanupBatchIdentity,
+        token: &CleanupBatchToken,
+    ) {
+        if matches!(&self.retirement, Some(RetainedRetirement::Exit(expected)) if expected == identity)
+        {
+            self.retirement = Some(RetainedRetirement::Cleanup(token.clone()));
+        }
+    }
+
     pub(super) const fn projection(&self) -> &RetainedLeafProjection {
         &self.projection
     }
 
     pub(super) const fn retirement(&self) -> Option<&CleanupBatchToken> {
-        self.retirement.as_ref()
+        match self.retirement.as_ref() {
+            Some(RetainedRetirement::Cleanup(token)) => Some(token),
+            Some(RetainedRetirement::Exit(_)) | None => None,
+        }
     }
 
     pub(super) fn is_live(&self) -> bool {
@@ -1053,7 +1089,7 @@ impl RouterEngine {
         candidates
     }
 
-    fn retained_plan_partition_is_current(&self, plan: &RetainedCommitPlan) -> bool {
+    pub(super) fn retained_plan_partition_is_current(&self, plan: &RetainedCommitPlan) -> bool {
         self.current
             .as_ref()
             .is_some_and(|current| self.retained_plan_partition_matches(plan, current))
@@ -2088,7 +2124,7 @@ impl RouterEngine {
         reclaim(physical);
         self.records[index] = record;
         self.retained_leaves
-            .retain(|entry| entry.retirement.as_ref() != Some(&cleanup));
+            .retain(|entry| entry.retirement() != Some(&cleanup));
         self.pending_retained_miss_cleanup = None;
         self.completed_cleanup.push(CompletedCleanupTombstone {
             request: receiver.identity().request,
@@ -2301,14 +2337,14 @@ impl RouterEngine {
                 .iter()
                 .any(|retiring| retiring == &entry.projection)
             {
-                entry.retirement = Some(cleanup.clone());
+                entry.retirement = Some(RetainedRetirement::Cleanup(cleanup.clone()));
             }
         }
     }
 
     pub(super) fn settle_retained_cleanup(&mut self, completed: &CleanupBatchToken) {
         self.retained_leaves
-            .retain(|entry| entry.retirement.as_ref() != Some(completed));
+            .retain(|entry| entry.retirement() != Some(completed));
     }
 
     #[cfg(test)]
