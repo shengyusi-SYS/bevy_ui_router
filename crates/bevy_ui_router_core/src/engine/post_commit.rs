@@ -1860,7 +1860,7 @@ impl RouterEngine {
         PostCommitAuthorityBeginCoreOutcome::Begun
     }
 
-    fn post_commit_receiver_projection(
+    pub(super) fn post_commit_receiver_projection(
         &self,
         normal: &CleanupBatchToken,
         stage: CorePostCommitCleanupStageProjection,

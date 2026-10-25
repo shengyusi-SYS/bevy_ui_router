@@ -12892,3 +12892,390 @@ fn entirely_retained_exit_owns_real_pending_disposition_without_fake_cleanup() {
         &RequestStatus::Succeeded
     );
 }
+
+#[test]
+fn deferred_exit_authority_rejects_foreign_host_and_seals_the_real_normal_batch() {
+    let (mut engine, mut issuer, lease) = ready_engine_with_tree_and_authority(tree());
+    engine.push(RouteLocation::new("/items/1")).unwrap();
+    settle_current(&mut engine);
+    let request = engine.push(RouteLocation::new("/about")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let prepared = engine
+        .prepare_exit_commit(&ticket, None, Vec::new())
+        .unwrap();
+    let mut exit = None;
+    engine
+        .validate_exit_publication(prepared)
+        .unwrap()
+        .publish(|owner| exit = Some(owner));
+    let exit = exit.unwrap();
+    let history = engine.history_snapshot();
+    let queued = engine.push(RouteLocation::new("/items/2")).unwrap();
+    let roots = exit.cleanup_roots().to_vec();
+    let (_, _, foreign_lease) = ready_engine_with_tree_and_authority(tree());
+    let foreign = foreign_lease.retirement_projection();
+    let error = engine
+        .begin_exit_authority_transfer(
+            exit,
+            foreign_lease,
+            CleanupManifestSeal::new(roots, manifest_digest(0xE030), 5),
+            PostCommitAuthorityCause::HostEntityMissing,
+            Vec::new(),
+            |_, _, _| panic!("a foreign host cannot receive the original exit"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        super::exit::ExitAuthorityBeginErrorKind::HostMismatch
+    );
+    assert_eq!(error.lease.retirement_projection(), foreign);
+    assert_eq!(engine.history_snapshot(), history);
+    assert!(matches!(
+        engine.current.as_ref().unwrap().stage,
+        WorkStage::PostCommitExit { .. }
+    ));
+    let mut accepted = None;
+    engine
+        .begin_exit_authority_transfer(
+            error.owner,
+            lease,
+            error.manifest,
+            PostCommitAuthorityCause::HostEntityMissing,
+            error.retained,
+            |normal, source, retained| accepted = Some((normal, source, retained)),
+        )
+        .unwrap();
+    let (normal, source, retained) = accepted.unwrap();
+    assert!(retained.is_empty());
+    assert_eq!(normal.obligation_count(), 5);
+    assert_eq!(normal.manifest_digest(), manifest_digest(0xE030));
+    assert_eq!(source.transfer.normal_source, normal.source_projection());
+    assert!(matches!(
+        engine.current.as_ref().unwrap().stage,
+        WorkStage::PostCommitAuthorityAccepted { .. }
+    ));
+    let (prepared, authority) = match engine.prepare_post_commit_authority_transfer(
+        source,
+        CleanupManifestSeal::new(
+            engine.active().frames().iter().rev().cloned().collect(),
+            manifest_digest(0xE031),
+            engine.active().frames().len(),
+        ),
+    ) {
+        PostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => (owner, batch),
+        _ => panic!("the released original exit joins the existing authority protocol"),
+    };
+    let mut installed = None;
+    assert!(matches!(
+        engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            prepared,
+            (),
+            |(), _, builder| {
+                let prior = builder.current_trace.len();
+                let (plan, physical) =
+                    bind_test_settlement_plan_with_authority(builder, prior, Vec::new());
+                Ok::<_, ((), ())>((physical, plan))
+            },
+            |physical, batch| installed = Some((batch, physical)),
+        ),
+        PostCommitAuthorityBeginCoreOutcome::Begun
+    ));
+    let (batch, physical) = installed.unwrap();
+    let (batch, _) = record_exact_post_commit_settlement_trace(&mut engine, batch, &physical);
+    let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+    let PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) =
+        engine.prepare_post_commit_compound_completion(batch, inputs)
+    else {
+        panic!("both actual obligation manifests complete the original request");
+    };
+    assert!(matches!(
+        engine.complete_post_commit_authority_compound(owner, |_| ()),
+        PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+    ));
+    assert_eq!(engine.history_snapshot(), history);
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(matches!(
+        engine.request(queued).unwrap().status(),
+        RequestStatus::Failed(_)
+    ));
+    assert!(engine.current.is_none() && engine.action.is_none());
+    assert!(!issuer.has_current());
+}
+
+#[test]
+fn deferred_exit_authority_requires_all_live_owners_and_preserves_retiring_bindings() {
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+        )
+        .unwrap();
+    let parent = routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("item").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            parent,
+            RoutePattern::path("detail").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("detail").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let (engine, mut issuer, lease) = ready_engine_with_tree_and_authority(routes.build().unwrap());
+    let mut engine = engine.with_keep_alive_capacity(3);
+    let mut owners = Vec::new();
+    for path in ["/items/1/detail", "/items/1", "/items/2/detail", "/items/2"] {
+        let normal = publish_retained_post_commit_test_navigation(&mut engine, path, &mut owners);
+        engine.complete_cleanup(valid_completion(&normal)).unwrap();
+    }
+    assert_eq!(owners.len(), 3);
+    engine = engine.with_keep_alive_capacity(2);
+    engine.push(RouteLocation::new("/items/3")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let plan = engine
+        .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(plan.retained().len(), 1);
+    assert_eq!(plan.retiring().len(), 2);
+    let original_retiring = plan.retiring().to_vec();
+    let (retiring, live) = owners
+        .into_iter()
+        .partition::<Vec<_>, _>(|owner| plan.retiring().contains(owner.projection()));
+    assert_eq!(live.len(), 1);
+    let original_live = live[0].projection().clone();
+    let prepared = engine
+        .prepare_exit_commit(&ticket, Some(plan), retiring)
+        .unwrap();
+    let mut exit = None;
+    engine
+        .validate_exit_publication(prepared)
+        .unwrap()
+        .publish(|owner| exit = Some(owner));
+    let exit = exit.unwrap();
+    let history = engine.history_snapshot();
+    let lease_identity = lease.retirement_projection();
+    let roots = exit.cleanup_roots().to_vec();
+    let error = engine
+        .begin_exit_authority_transfer(
+            exit,
+            lease,
+            CleanupManifestSeal::new(roots, manifest_digest(0xE032), 4),
+            PostCommitAuthorityCause::RequiredResourcesLost,
+            Vec::new(),
+            |_, _, _| panic!("missing Live inventory cannot authorize a partial transfer"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        super::exit::ExitAuthorityBeginErrorKind::RetainedInventoryMismatch
+    );
+    assert_eq!(error.lease.retirement_projection(), lease_identity);
+    assert_eq!(error.owner.retiring(), original_retiring);
+    let actual_manifest = error.manifest;
+    let error = engine
+        .begin_exit_authority_transfer(
+            error.owner,
+            error.lease,
+            CleanupManifestSeal::new(Vec::new(), manifest_digest(0xE033), 0),
+            PostCommitAuthorityCause::RequiredResourcesLost,
+            live,
+            |_, _, _| panic!("wrong roots cannot consume the original reservation or owners"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        super::exit::ExitAuthorityBeginErrorKind::InvalidManifest
+    );
+    assert_eq!(error.retained.len(), 1);
+    assert_eq!(error.retained[0].projection(), &original_live);
+    assert_eq!(error.owner.retiring(), original_retiring);
+    assert_eq!(engine.history_snapshot(), history);
+    let mut accepted = None;
+    engine
+        .begin_exit_authority_transfer(
+            error.owner,
+            error.lease,
+            actual_manifest,
+            PostCommitAuthorityCause::RequiredResourcesLost,
+            error.retained,
+            |normal, source, owners| accepted = Some((normal, source, owners)),
+        )
+        .unwrap();
+    let (normal, source, owners) = accepted.unwrap();
+    assert_eq!(normal.obligation_count(), 4);
+    assert_eq!(owners.len(), 2);
+    assert!(
+        owners
+            .iter()
+            .any(|owner| owner.projection() == &original_live)
+    );
+    for original in &original_retiring {
+        let entry = engine
+            .retained_leaves
+            .iter()
+            .find(|entry| entry.projection() == original)
+            .unwrap();
+        assert_eq!(entry.retirement(), Some(&normal));
+    }
+    let plan = engine
+        .prepare_retained_post_commit_authority_plan(&source, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(plan.retiring().len(), 2);
+    let roots = plan.logical_roots().to_vec();
+    let count = roots.len();
+    let (prepared, authority) = match engine.prepare_post_commit_authority_transfer(
+        source.with_retention(plan, owners),
+        CleanupManifestSeal::new(roots, manifest_digest(0xE034), count),
+    ) {
+        PostCommitAuthorityPreparationOutcome::Prepared { owner, batch } => (owner, batch),
+        _ => panic!("the complete original Live inventory joins authority cleanup"),
+    };
+    let mut installed = None;
+    assert!(matches!(
+        engine.begin_post_commit_authority_transfer(
+            &mut issuer,
+            prepared,
+            (),
+            |(), _, builder| {
+                let prior = builder.current_trace.len();
+                let (plan, physical) =
+                    bind_test_settlement_plan_with_authority(builder, prior, Vec::new());
+                Ok::<_, ((), ())>((physical, plan))
+            },
+            |physical, batch| installed = Some((batch, physical)),
+        ),
+        PostCommitAuthorityBeginCoreOutcome::Begun
+    ));
+    let (batch, physical) = installed.unwrap();
+    let (batch, _) = record_exact_post_commit_settlement_trace(&mut engine, batch, &physical);
+    let inputs = exact_post_commit_completion_inputs(&normal, &authority, &batch);
+    let PostCommitCompoundCompletionPreparationOutcome::Prepared(owner) =
+        engine.prepare_post_commit_compound_completion(batch, inputs)
+    else {
+        panic!("the two token-specific inventories complete together");
+    };
+    assert!(matches!(
+        engine.complete_post_commit_authority_compound(owner, |_| ()),
+        PostCommitCompoundCompletionCoreOutcome::Terminal { .. }
+    ));
+    assert!(engine.retained_leaves.is_empty());
+    assert_eq!(engine.history_snapshot(), history);
+}
+
+#[test]
+fn unsealed_exit_residual_transfers_original_owners_without_inventing_cleanup() {
+    let mut routes = RouteTree::builder()
+        .root_with_options(
+            RoutePattern::path("/").unwrap(),
+            RouteNodeOptions::new().with_view(RouteViewKey::new("root").unwrap()),
+        )
+        .unwrap();
+    routes
+        .route_with_options(
+            routes.root_id().unwrap(),
+            RoutePattern::path("items/:id").unwrap(),
+            RouteNodeOptions::new()
+                .with_view(RouteViewKey::new("item").unwrap())
+                .with_keep_alive(true),
+        )
+        .unwrap();
+    let (engine, mut issuer, lease) = ready_engine_with_tree_and_authority(routes.build().unwrap());
+    let mut engine = engine.with_keep_alive_capacity(2);
+    let mut owners = Vec::new();
+    for path in ["/items/1", "/items/2"] {
+        let normal = publish_retained_post_commit_test_navigation(&mut engine, path, &mut owners);
+        engine.complete_cleanup(valid_completion(&normal)).unwrap();
+    }
+    assert_eq!(owners.len(), 1);
+    let original_live = owners[0].projection().clone();
+    let request = engine.push(RouteLocation::new("/items/3")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let plan = engine
+        .prepare_retained_commit_plan(&ticket, &owners.iter().collect::<Vec<_>>())
+        .unwrap();
+    assert!(plan.retiring().is_empty());
+    let prepared = engine
+        .prepare_exit_commit(&ticket, Some(plan), Vec::new())
+        .unwrap();
+    let mut exit = None;
+    engine
+        .validate_exit_publication(prepared)
+        .unwrap()
+        .publish(|owner| exit = Some(owner));
+    let exit = exit.unwrap();
+    let history = engine.history_snapshot();
+    let completed = engine.completed_cleanup.clone();
+    let trace_len = engine.request(request).unwrap().trace().len();
+    let queued = engine.push(RouteLocation::new("/items/4")).unwrap();
+    let error = engine
+        .retire_exit_authority_to_residual(
+            &mut issuer,
+            exit,
+            lease,
+            Vec::new(),
+            PostCommitAuthorityCause::RequiredResourcesLost,
+            |_| panic!("a residual must acquire the complete original Live inventory"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        super::exit::ExitResidualErrorKind::RetainedInventoryMismatch
+    );
+    assert_eq!(engine.retained_leaves[0].projection(), &original_live);
+    assert_eq!(engine.request(request).unwrap().trace().len(), trace_len);
+    let mut residual = None;
+    engine
+        .retire_exit_authority_to_residual(
+            &mut issuer,
+            error.owner,
+            error.lease,
+            owners,
+            PostCommitAuthorityCause::RequiredResourcesLost,
+            |owner| residual = Some(owner),
+        )
+        .unwrap();
+    assert!(residual.is_some());
+    assert_eq!(engine.history_snapshot(), history);
+    assert_eq!(engine.completed_cleanup.len(), completed.len());
+    assert_eq!(
+        engine.request(request).unwrap().trace().len(),
+        trace_len + 1,
+        "the terminal records no fabricated cleanup-settled event"
+    );
+    assert_eq!(
+        engine.request(request).unwrap().status(),
+        &RequestStatus::Succeeded
+    );
+    assert!(
+        matches!(engine.request(queued).unwrap().status(), RequestStatus::Failed(failure) if failure.kind()==NavigationFailureKind::HostLost)
+    );
+    assert!(engine.retained_leaves.is_empty());
+    assert!(engine.current.is_none() && engine.action.is_none());
+    assert!(!issuer.has_current());
+    assert_eq!(
+        engine.availability(),
+        &RouterAvailability::Unavailable(RouterUnavailableReason::HostLost)
+    );
+    assert_eq!(
+        engine.host_admission_source.kind,
+        HostAdmissionSourceKind::RetryableHostLost
+    );
+    assert!(
+        !engine.host_admission_source_open,
+        "readmission requires a changed candidate observation"
+    );
+}

@@ -1,7 +1,8 @@
 mod exit;
 pub use exit::{
-    DeferredExitOwner, ExitCleanupBeginError, ExitCommitPreparationError, ExitReleaseDemand,
-    PreparedExitCommit, ValidatedExitCommit,
+    DeferredExitOwner, DeferredExitResidual, ExitAuthorityBeginError, ExitAuthorityBeginErrorKind,
+    ExitCleanupBeginError, ExitCommitPreparationError, ExitReleaseDemand, ExitResidualError,
+    ExitResidualErrorKind, PreparedExitCommit, ValidatedExitCommit,
 };
 
 use crate::admission::{

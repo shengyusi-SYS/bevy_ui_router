@@ -4,6 +4,7 @@ use super::*;
 use crate::engine::exit::{
     CoreDeferredExitOwner, CoreExitReleaseDemand, CorePreparedExitCommit, CoreValidatedExitCommit,
 };
+pub use crate::engine::exit::{ExitAuthorityBeginErrorKind, ExitResidualErrorKind};
 
 /// Original responsibility for instances whose final disposition is deferred.
 /// This is not an application animation session and cannot be cloned.
@@ -139,6 +140,82 @@ impl std::fmt::Debug for ExitCleanupBeginError {
     }
 }
 
+/// Rejection returns every original authority and retained-instance owner.
+pub struct ExitAuthorityBeginError {
+    owner: DeferredExitOwner,
+    lease: HostLease,
+    manifest: CleanupManifest,
+    retained: Vec<RetainedLeafOwner>,
+    kind: ExitAuthorityBeginErrorKind,
+}
+
+impl ExitAuthorityBeginError {
+    pub fn kind(&self) -> ExitAuthorityBeginErrorKind {
+        self.kind
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeferredExitOwner,
+        HostLease,
+        CleanupManifest,
+        Vec<RetainedLeafOwner>,
+        ExitAuthorityBeginErrorKind,
+    ) {
+        (
+            self.owner,
+            self.lease,
+            self.manifest,
+            self.retained,
+            self.kind,
+        )
+    }
+}
+
+impl std::fmt::Debug for ExitAuthorityBeginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExitAuthorityBeginError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Private physical residual authority. It has no request-driving or cleanup
+/// completion API and retains the original unsealed obligations.
+#[derive(Debug)]
+pub struct DeferredExitResidual {
+    _inner: crate::engine::exit::CoreDeferredExitResidual,
+}
+
+pub struct ExitResidualError {
+    owner: DeferredExitOwner,
+    lease: HostLease,
+    retained: Vec<RetainedLeafOwner>,
+    kind: ExitResidualErrorKind,
+}
+
+impl ExitResidualError {
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeferredExitOwner,
+        HostLease,
+        Vec<RetainedLeafOwner>,
+        ExitResidualErrorKind,
+    ) {
+        (self.owner, self.lease, self.retained, self.kind)
+    }
+}
+
+impl std::fmt::Debug for ExitResidualError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExitResidualError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExitReleaseDemand {
     Current,
@@ -146,6 +223,32 @@ pub enum ExitReleaseDemand {
 }
 
 impl RouterEngine {
+    #[doc(hidden)]
+    pub fn retire_exit_authority_to_residual(
+        &mut self,
+        owner: DeferredExitOwner,
+        lease: HostLease,
+        retained: Vec<RetainedLeafOwner>,
+        cause: PostCommitAuthorityCause,
+        install: impl FnOnce(DeferredExitResidual),
+    ) -> Result<(), ExitResidualError> {
+        self.inner
+            .retire_exit_authority_to_residual(
+                &mut self.admission,
+                owner.inner,
+                lease.inner,
+                retained,
+                cause.into(),
+                |inner| install(DeferredExitResidual { _inner: inner }),
+            )
+            .map_err(|error| ExitResidualError {
+                owner: DeferredExitOwner { inner: error.owner },
+                lease: HostLease { inner: error.lease },
+                retained: error.retained,
+                kind: error.kind,
+            })
+    }
+
     pub fn prepare_exit_commit(
         &mut self,
         ticket: &CommitTicket,
@@ -313,6 +416,59 @@ impl RouterEngine {
                 owner: DeferredExitOwner { inner: error.owner },
                 manifest,
                 error: map_commit_error(error.kind),
+            })
+    }
+
+    /// Seals the observed old-instance obligations and transfers the original
+    /// exit into the existing post-commit authority protocol in one tail.
+    /// `live_retained` must contain the entire current Live cache inventory;
+    /// the callback also receives the original newly retained exit instances.
+    #[doc(hidden)]
+    pub fn begin_exit_authority_transfer(
+        &mut self,
+        owner: DeferredExitOwner,
+        lease: HostLease,
+        manifest: CleanupManifest,
+        cause: PostCommitAuthorityCause,
+        live_retained: Vec<RetainedLeafOwner>,
+        install: impl FnOnce(CleanupBatch, PostCommitAuthorityPreparationSource, Vec<RetainedLeafOwner>),
+    ) -> Result<(), ExitAuthorityBeginError> {
+        let digest = manifest.manifest_digest;
+        let count = manifest.obligation_count;
+        let seal = CleanupManifestSeal::new(
+            manifest.logical_roots.clone(),
+            CleanupManifestDigest::from_opaque(digest),
+            count,
+        );
+        self.inner
+            .begin_exit_authority_transfer(
+                owner.inner,
+                lease.inner,
+                seal,
+                cause.into(),
+                live_retained,
+                |inner, source, retained| {
+                    install(
+                        CleanupBatch {
+                            inner,
+                            manifest_digest: digest,
+                            obligation_count: count,
+                        },
+                        PostCommitAuthorityPreparationSource {
+                            inner: source,
+                            normal_manifest_digest: digest,
+                            normal_obligation_count: count,
+                        },
+                        retained,
+                    );
+                },
+            )
+            .map_err(|error| ExitAuthorityBeginError {
+                owner: DeferredExitOwner { inner: error.owner },
+                lease: HostLease { inner: error.lease },
+                manifest,
+                retained: error.retained,
+                kind: error.kind,
             })
     }
 }
