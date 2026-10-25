@@ -26,6 +26,26 @@ Fix the machine, toolchain, dependencies, features, and optimization settings, a
 | `keep_alive` | Retention disabled, initial miss, warmed hit, LRU eviction, and corresponding idle updates | 1/32/128 nodes per page |
 | `instances` | Fresh parent/child, retained parent/fresh child, parent/child hits, dependency eviction | 1/32/128 nodes each for parent and child |
 | `steady` | Dynamic content after initial navigation, comparing two/three frames, ordinary scroll markers, and a no-Router control | 128/1024 nodes |
+| `transitions` | Disabled, enter-only, and held exit; publication, animation updates, release, finish, and idle | 32/128/1024 nodes per page |
+
+### Full animation path
+
+```sh
+ROUTER_BENCH_MODE=transitions ROUTER_BENCH_UI=1 cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > transitions-ui.csv
+ROUTER_BENCH_MODE=transitions cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > transitions-router.csv
+```
+
+Both variants use the public driver and completion commands. `ROUTER_BENCH_UI=1` adds real UI layout, UiStack, and picking systems, asserting valid page geometry and camera input, without a renderer. Omit it to observe Router and basic scheduling. `ROUTER_BENCH_CONTENT=32|128|1024` selects one content size; `ROUTER_BENCH_SHAPE=nested` exercises shared ancestor paths.
+
+Fresh creation and warmed cache hits are measured separately. Sixty-four short navigations warm request eviction and lifecycle paths, followed by idle updates. Each measured sample executes 32 animation updates and 32 post-finish updates; the disabled control performs the same update count. `holding_update` and `idle_update` are batch means per update; other phases measure one operation. Publication ends when the new route becomes active, while held-exit cleanup is charged to release. Publication alone cannot establish total navigation cost.
+
+The window example provides finite automatic sampling:
+
+```sh
+ROUTER_TRANSITION_PERF=/tmp/transitions-window.csv cargo run --release --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+```
+
+It warms and samples idle, slide/scale-rotation, and enter-only/held-exit modes, then writes CSV once on completion. Main World timing spans `First` to `Last`. Render timing brackets submission in `RenderSystems::Render`, including present scheduling/waits and possibly pipeline queue work in the same set. Update intervals are not presentation FPS, and these CPU measurements are not GPU execution times. Close BRP, screenshot capture, and other builds during comparisons; fix the window, renderer, and machine conditions.
 
 ### Keep-alive comparison
 

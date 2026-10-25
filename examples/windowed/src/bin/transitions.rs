@@ -13,6 +13,8 @@
 
 #[path = "transitions/animation.rs"]
 mod animation;
+#[path = "transitions/performance.rs"]
+mod performance;
 
 #[cfg(all(debug_assertions, feature = "ui-debug"))]
 #[path = "../ui_debug.rs"]
@@ -162,8 +164,9 @@ fn main() {
             .chain()
             .after(RouterScheduleSet::PublishSnapshots),
     )
-    .add_observer(click)
-    .run();
+    .add_observer(click);
+    performance::configure(&mut app);
+    app.run();
 }
 
 fn register<S: Scene>(

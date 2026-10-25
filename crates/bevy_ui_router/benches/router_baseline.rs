@@ -1,5 +1,6 @@
 //! Public-API, headless Router CPU-side elapsed-time baseline. See docs/performance.md.
-//! No renderer, UI layout, OS events, async I/O, or frame pacing is installed.
+//! No renderer, OS events, async I/O, or frame pacing is installed. The optional
+//! transitions UI mode installs normal UI layout and native picking systems.
 //! ROUTER_BENCH_SHAPE=flat (default) or nested selects equal-sized content trees.
 //! ROUTER_BENCH_MODE=keep_alive selects the separate retention comparison CSV.
 //! ROUTER_BENCH_MODE=instances measures parent/child inventory coordination.
@@ -8,6 +9,8 @@
 mod retained_instances;
 #[path = "router_baseline/steady.rs"]
 mod steady;
+#[path = "router_baseline/transitions.rs"]
+mod transitions;
 use std::{
     sync::{
         Arc,
@@ -790,10 +793,14 @@ fn main() {
         if smoke {
             "SMOKE ONLY, timings are not a baseline"
         } else {
-            "CPU-side wall time, no GPU/layout/I/O"
+            "CPU-side wall time, no renderer/GPU/I/O; selected mode controls UI layout"
         }
     );
     match std::env::var("ROUTER_BENCH_MODE") {
+        Ok(mode) if mode == "transitions" => {
+            transitions::run(shape, samples);
+            return;
+        }
         Ok(mode) if mode == "steady" => {
             steady::run(shape, samples);
             return;
@@ -813,7 +820,9 @@ fn main() {
         }
         Err(std::env::VarError::NotPresent) => {}
         mode => {
-            panic!("ROUTER_BENCH_MODE must be unset, steady, keep_alive or instances, got {mode:?}")
+            panic!(
+                "ROUTER_BENCH_MODE must be unset, steady, keep_alive, instances or transitions, got {mode:?}"
+            )
         }
     }
     println!(

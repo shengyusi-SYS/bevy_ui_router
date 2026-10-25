@@ -26,6 +26,26 @@ cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locke
 | `keep_alive` | 关闭保留、首次 miss、预热命中、LRU 淘汰，以及各自的空闲更新 | 每页 1/32/128 节点 |
 | `instances` | 父子 fresh、原父/新子、父子命中、父依赖淘汰 | 父和子各自 1/32/128 节点 |
 | `steady` | 首次导航后的动态内容，比较两层/三层 frame、普通滚动 marker 和无 Router 控制 | 128/1024 节点 |
+| `transitions` | 关闭过渡、仅进入、持有退出；分别测发布、逐帧更新、释放、完成与空闲 | 每页 32/128/1024 节点 |
+
+### 动画全路径
+
+```sh
+ROUTER_BENCH_MODE=transitions ROUTER_BENCH_UI=1 cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > transitions-ui.csv
+ROUTER_BENCH_MODE=transitions cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > transitions-router.csv
+```
+
+两种运行均使用公开 driver 和完成命令。`ROUTER_BENCH_UI=1` 增加真实 UI layout、UiStack 和 picking 系统，并检查页面几何与相机有效；不创建 renderer。省略该开关可观察 Router 与基础调度。`ROUTER_BENCH_CONTENT=32|128|1024` 可限定内容规模，`ROUTER_BENCH_SHAPE=nested` 可检查共享父链。
+
+fresh 与预热后的缓存命中分别测量。64 次短导航预热请求淘汰与生命周期，随后预热空闲更新；每个正式样本固定执行 32 次动画 update 和 32 次结束后 update。关闭过渡的控制也执行相同 update 数量。`holding_update` 和 `idle_update` 是每批 update 的平均耗时，其余列为一次阶段耗时。发布计时在新路由生效时结束，持有退出的清理工作记入 release；只比较发布耗时不能推断导航总成本。
+
+窗口示例提供有限的自动采样模式：
+
+```sh
+ROUTER_TRANSITION_PERF=/tmp/transitions-window.csv cargo run --release --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+```
+
+它对空闲、平移/缩放旋转、只进入/持有退出分别预热并采样，结束后一次性写 CSV。主 World 计时覆盖 `First` 到 `Last`；渲染计时位于 `RenderSystems::Render` 中，包含提交与 present 调度/等待，可能包含同 set 的 pipeline queue 处理。update 间隔不代表实际呈现 FPS，这些 CPU 计时也不代表 GPU 执行时间。正式对照关闭 BRP、截屏和其它构建，固定窗口、渲染后端及机器条件。
 
 ### Keep-alive 对照
 

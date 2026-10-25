@@ -40,6 +40,14 @@ pub(super) struct AnimationState {
     pub cancellations: u32,
 }
 
+impl AnimationState {
+    pub(super) fn is_running(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|animation| animation.last_sample.is_some())
+    }
+}
+
 struct Surface {
     entity: Entity,
     baseline: UiTransform,
