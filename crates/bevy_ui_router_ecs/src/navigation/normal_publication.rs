@@ -1,6 +1,26 @@
 use super::*;
+use crate::presentation::FrameMutationTarget;
 
 pub(super) type NormalPublicationSplice = crate::branch_transaction::PreparedMixedEntering;
+
+enum DispositionPreparation {
+    Immediate {
+        manifest: FrozenCleanupManifest,
+        root_rebase: Option<crate::branch_transaction::PreparedRootRebase>,
+    },
+    Exit,
+}
+
+enum PhysicalPublication {
+    Immediate {
+        cleanup: CleanupLedger,
+        retained: Vec<(
+            r3_core::RetainedLeafProjection,
+            crate::instance::InstancePayload,
+        )>,
+    },
+    Exit(super::deferred_exit::DeferredExitParts),
+}
 
 fn publication_view<'a>(
     world: &'a World,
@@ -24,6 +44,10 @@ pub(super) fn publish_normal_work(
     has_leaving: bool,
     mut sealed: Option<SealedNormalPreparation>,
 ) {
+    let transition = super::transitions::transition_for_pending(world, handle, &pending);
+    let hold_exit = transition
+        .as_ref()
+        .is_some_and(|id| has_leaving && crate::transition::transition_holds_exit(world, id));
     let host_is_current = world
         .resource::<RouterNavigation>()
         .entries
@@ -200,7 +224,13 @@ pub(super) fn publish_normal_work(
                 .iter_mut()
                 .find(|entry| entry.handle == handle)
                 .unwrap();
-            if entry.engine.keep_alive_capacity() == 0 && entry.retained.is_empty() {
+            if entry.engine.keep_alive_capacity() == 0
+                && entry.retained.is_empty()
+                && !matches!(
+                    entry.pending_back_target_execution,
+                    Some(PendingBackTargetExecution::Driving(_))
+                )
+            {
                 return Ok(None);
             }
             if sealed.is_some() {
@@ -248,6 +278,9 @@ pub(super) fn publish_normal_work(
                 .ok_or(None)?;
             #[cfg(feature = "bsn")]
             for (_, branch) in change.selected_mut(&mut entry.retained) {
+                if hold_exit {
+                    continue;
+                }
                 if let Err(error) = branch.prepare_native_cleanup(world) {
                     return Err(if error.is_retryable() {
                         None
@@ -293,6 +326,9 @@ pub(super) fn publish_normal_work(
     let retained_projections = retention_plan
         .map(|plan| plan.retained().to_vec())
         .unwrap_or_default();
+    let retiring_projections = retention_plan
+        .map(|plan| plan.retiring().to_vec())
+        .unwrap_or_default();
     let mut boundary_removals = retention_plan
         .map(|plan| plan.retiring().to_vec())
         .unwrap_or_default();
@@ -300,7 +336,11 @@ pub(super) fn publish_normal_work(
         boundary_removals.extend_from_slice(plan.activated());
     }
     #[cfg(feature = "bsn")]
-    if let Err(error) = splice.prepare_native_cleanup(world) {
+    if let Err(error) = if hold_exit {
+        Ok(())
+    } else {
+        splice.prepare_native_cleanup(world)
+    } {
         world.resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = navigation
@@ -357,6 +397,13 @@ pub(super) fn publish_normal_work(
     );
     let gate_before = view.current_live_interactive_entities(world);
     let (mut targets, mut isolate_count) = view.presentation_mutation_targets();
+    if hold_exit {
+        for target in &mut targets[..isolate_count] {
+            if target.is_active() {
+                *target = target.with_visual_presence(true, true);
+            }
+        }
+    }
     let mut transitions = view.lifecycle_transitions();
     {
         let navigation = world.resource::<RouterNavigation>();
@@ -401,6 +448,13 @@ pub(super) fn publish_normal_work(
             }
         };
         let resulting_claims = registry_plan.resulting_claims().to_vec();
+        if hold_exit {
+            return Some((
+                DispositionPreparation::Exit,
+                registry_plan,
+                resulting_claims,
+            ));
+        }
         let frozen_manifest = if uses_retention {
             let navigation = world.get_resource::<RouterNavigation>()?;
             let entry = navigation
@@ -458,10 +512,12 @@ pub(super) fn publish_normal_work(
             }
         };
         Some((
-            frozen_manifest,
+            DispositionPreparation::Immediate {
+                manifest: frozen_manifest,
+                root_rebase,
+            },
             registry_plan,
             resulting_claims,
-            root_rebase,
         ))
     })();
     #[cfg(feature = "bsn")]
@@ -484,16 +540,54 @@ pub(super) fn publish_normal_work(
     let mut commit_authority_contradiction = cleanup_preparation_contradiction
         .then_some(BeginAuthoritySettlementErrorKind::InvalidManifest);
     let mut retained_publication_contradiction = None;
-    let mut rejected_retained_publication = None;
+    let mut rejected_publication = None;
     let committed = (|| {
-        let (frozen_manifest, registry_plan, resulting_claims, root_rebase) = cleanup_preparation?;
+        let (disposition, registry_plan, resulting_claims) = cleanup_preparation?;
+        let (frozen_manifest, root_rebase) = match disposition {
+            DispositionPreparation::Immediate {
+                manifest,
+                root_rebase,
+            } => (Some(manifest), root_rebase),
+            DispositionPreparation::Exit => (None, None),
+        };
         if sealed
             .as_ref()
-            .is_some_and(|sealed| sealed.manifest != frozen_manifest)
+            .is_some_and(|sealed| frozen_manifest.as_ref() != Some(&sealed.manifest))
         {
             commit_authority_contradiction =
                 Some(BeginAuthoritySettlementErrorKind::InvalidManifest);
             return None;
+        }
+        if let Some(id) = &transition {
+            if crate::transition::seal_transition_publication(world, id, &resulting_claims).is_err()
+            {
+                commit_authority_contradiction = Some(BeginAuthoritySettlementErrorKind::Stale);
+                return None;
+            }
+        }
+        let release_targets = targets
+            .iter()
+            .copied()
+            .filter(FrameMutationTarget::has_inactive_presence)
+            .map(FrameMutationTarget::presence_release)
+            .collect::<Vec<_>>();
+        let visible_claims = resulting_claims
+            .iter()
+            .filter(|claim| {
+                release_targets
+                    .iter()
+                    .any(|target| target.entity() == claim.entity())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if hold_exit {
+            crate::transition::seal_transition_presence(
+                world,
+                transition
+                    .as_ref()
+                    .expect("held exit has its original session"),
+                visible_claims.clone(),
+            );
         }
         let pointer_targets = prepare_input_gate_mutation(
             world.get_resource_mut::<RouterInputGate>()?,
@@ -521,7 +615,14 @@ pub(super) fn publish_normal_work(
             .flat_map(|change| change.selected(&entry.retained).map(|(_, branch)| branch))
             .collect::<Vec<_>>();
         let view = splice_owner.as_ref()?.view(&entry.retained)?;
-        let leaving_assembly = if uses_retention {
+        let successor = (hold_exit && view.requires_root_cleanup_rebase())
+            .then(|| {
+                view.entering()
+                    .first_frame()
+                    .map(|frame| frame.frame().clone())
+            })
+            .flatten();
+        let leaving_assembly = if uses_retention && !hold_exit {
             let frames = view
                 .disposable_frames()
                 .chain(retired_branches.iter().flat_map(|branch| branch.frames()))
@@ -535,7 +636,7 @@ pub(super) fn publish_normal_work(
                 )
                 .collect::<Vec<_>>();
             Some(crate::cleanup::PreparedLeavingAssembly::reserve(
-                &frozen_manifest,
+                frozen_manifest.as_ref()?,
                 &frames,
                 &slots,
             )?)
@@ -560,21 +661,26 @@ pub(super) fn publish_normal_work(
                 branch.prepare_retained_claim_rebind(&resulting_claims, EntityLifecycle::Leaving)
             })
             .collect::<Option<Vec<_>>>()?;
-        let manifest_digest = frozen_manifest.digest();
-        let obligation_count = frozen_manifest.len();
-        let reserved_ledger = match CleanupLedger::reserve(frozen_manifest) {
-            Ok(reserved) => reserved,
-            Err(error) => match error.kind() {
-                CleanupLedgerReserveErrorKind::RetryableCapacity => {
-                    return None;
-                }
-                kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
-                | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
-                    let _returned_manifest = error.into_manifest();
-                    cleanup_reserve_contradiction = Some(kind);
-                    return None;
-                }
-            },
+        let manifest_facts = frozen_manifest
+            .as_ref()
+            .map(|manifest| (manifest.digest(), manifest.len()));
+        let reserved_ledger = if let Some(manifest) = frozen_manifest {
+            match CleanupLedger::reserve(manifest) {
+                Ok(reserved) => Some(reserved),
+                Err(error) => match error.kind() {
+                    CleanupLedgerReserveErrorKind::RetryableCapacity => {
+                        return None;
+                    }
+                    kind @ (CleanupLedgerReserveErrorKind::DomainExhausted
+                    | CleanupLedgerReserveErrorKind::UnfinalizedBoundaryFacts) => {
+                        let _returned_manifest = error.into_manifest();
+                        cleanup_reserve_contradiction = Some(kind);
+                        return None;
+                    }
+                },
+            }
+        } else {
+            None
         };
 
         let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
@@ -605,9 +711,37 @@ pub(super) fn publish_normal_work(
             );
         }
         let presentation_plan = presentation.seal_commit(isolate_count)?;
-        let prepared = if let Some(sealed) = sealed.take() {
-            crate::retained::PreparedPublication::Ordinary(sealed.prepared)
+        let prepared = if hold_exit {
+            let owners = retained_change
+                .as_mut()
+                .map(|change| change.take_owners(&mut entry.retained))
+                .unwrap_or_default();
+            match entry.engine.prepare_exit_commit(
+                pending.ticket.as_ref()?,
+                retention.take(),
+                owners,
+                match entry.pending_back_target_execution.as_ref() {
+                    Some(PendingBackTargetExecution::Driving(driving)) => {
+                        Some((&driving.history, &driving.continuation))
+                    }
+                    _ => None,
+                },
+            ) {
+                Ok(prepared) => super::publication::PreparedPublication::Exit(prepared),
+                Err(error) => {
+                    let (_plan, owners, error) = error.into_parts();
+                    assert!(
+                        entry.retained.restore_owners(owners).is_ok(),
+                        "original owners return before rejection"
+                    );
+                    retained_publication_contradiction = Some(error);
+                    return None;
+                }
+            }
+        } else if let Some(sealed) = sealed.take() {
+            super::publication::PreparedPublication::Ordinary(sealed.prepared)
         } else if let Some(plan) = retention.take() {
+            let (manifest_digest, obligation_count) = manifest_facts?;
             let owners = retained_change.as_mut()?.take_owners(&mut entry.retained);
             let manifest =
                 CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
@@ -623,7 +757,7 @@ pub(super) fn publish_normal_work(
                     _ => None,
                 },
             ) {
-                Ok(prepared) => crate::retained::PreparedPublication::Retained(prepared),
+                Ok(prepared) => super::publication::PreparedPublication::Retained(prepared),
                 Err(error) => {
                     let (_plan, _manifest, owners, error) = error.into_parts();
                     assert!(
@@ -635,13 +769,14 @@ pub(super) fn publish_normal_work(
                 }
             }
         } else {
+            let (manifest_digest, obligation_count) = manifest_facts?;
             let manifest =
                 CleanupManifest::new(logical_roots.clone(), manifest_digest, obligation_count);
             match entry
                 .engine
                 .prepare_commit(pending.ticket.as_ref()?, manifest)
             {
-                Ok(prepared) => crate::retained::PreparedPublication::Ordinary(prepared),
+                Ok(prepared) => super::publication::PreparedPublication::Ordinary(prepared),
                 Err(error) => {
                     commit_authority_contradiction = Some(match error {
                         IntegrationError::InvalidManifest => {
@@ -672,7 +807,7 @@ pub(super) fn publish_normal_work(
                                 continuation,
                             }),
                         );
-                        rejected_retained_publication = Some(prepared);
+                        rejected_publication = Some(prepared);
                         retained_publication_contradiction = Some(error);
                         return None;
                     }
@@ -684,7 +819,7 @@ pub(super) fn publish_normal_work(
         let engine = match validated {
             Ok(validated) => validated,
             Err((returned, error)) => {
-                rejected_retained_publication = returned;
+                rejected_publication = returned;
                 commit_authority_contradiction = Some(match error {
                     IntegrationError::InvalidManifest => {
                         BeginAuthoritySettlementErrorKind::InvalidManifest
@@ -704,8 +839,14 @@ pub(super) fn publish_normal_work(
         let scroll = entry
             .scroll
             .prepare(engine.history_publication(), scroll_observation);
-        let cleanup = engine.cleanup().clone();
-        let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
+        let cleanup_ledger = reserved_ledger.map(|ledger| {
+            ledger.bind_batch(
+                engine
+                    .cleanup()
+                    .expect("immediate publication has a concrete batch")
+                    .clone(),
+            )
+        });
         pending.ticket.take();
         let payloads = if let Some(change) = retained_change.take() {
             for ((_, branch), rebind) in change
@@ -734,24 +875,52 @@ pub(super) fn publish_normal_work(
         active.consume_native_focus_owners();
         let retired_payloads = payloads.retiring;
         let next_active = (!active.frames().is_empty()).then_some(active);
-        let next_cleanup = Some(if let Some(assembly) = leaving_assembly {
-            CleanupLedger::activate_leaving_forest(
-                cleanup_ledger,
-                assembly.assemble(leaving, retired_payloads),
-            )
+        let next_disposition = if hold_exit {
+            PhysicalPublication::Exit(super::deferred_exit::DeferredExitParts {
+                session: transition
+                    .clone()
+                    .expect("held exit has a prepared app session"),
+                disposable: leaving,
+                retaining: retained_projections
+                    .into_iter()
+                    .zip(retained_branch)
+                    .collect(),
+                retiring: retiring_projections
+                    .into_iter()
+                    .zip(retired_payloads)
+                    .collect(),
+                successor,
+                release_targets,
+                visible_claims,
+            })
         } else {
-            CleanupLedger::activate_leaving_branch(
-                cleanup_ledger,
-                (!leaving.frames().is_empty() || !leaving.child_slots().is_empty())
-                    .then_some(leaving),
-            )
-        });
-        let next_retained = retained_projections.into_iter().zip(retained_branch);
+            let cleanup_ledger = cleanup_ledger.expect("immediate disposition reserved its ledger");
+            let cleanup = if let Some(assembly) = leaving_assembly {
+                CleanupLedger::activate_leaving_forest(
+                    cleanup_ledger,
+                    assembly.assemble(leaving, retired_payloads),
+                )
+            } else {
+                CleanupLedger::activate_leaving_branch(
+                    cleanup_ledger,
+                    (!leaving.frames().is_empty() || !leaving.child_slots().is_empty())
+                        .then_some(leaving),
+                )
+            };
+            PhysicalPublication::Immediate {
+                cleanup,
+                retained: retained_projections
+                    .into_iter()
+                    .zip(retained_branch)
+                    .collect(),
+            }
+        };
         let retained_owner = &mut entry.retained;
         let active_owner = &mut entry.active;
         let cleanup_owner = &mut entry.cleanup_ledger;
+        let exit_owner = &mut entry.deferred_exit;
         let scroll_owner = &mut entry.scroll;
-        engine.publish(|owners| {
+        engine.publish(|responsibilities| {
             presentation_plan.apply_staged(
                 |_| focus_plan.apply(),
                 |_| {
@@ -765,16 +934,41 @@ pub(super) fn publish_normal_work(
                 |_| gate_plan.apply(),
             );
             *active_owner = next_active;
-            *cleanup_owner = next_cleanup;
             *scroll_owner = scroll.state;
-            for ((projection, branch), owner) in next_retained.zip(owners) {
-                retained_owner.install_published(projection, Some(owner), branch);
+            match (next_disposition, responsibilities) {
+                (
+                    PhysicalPublication::Immediate { cleanup, retained },
+                    super::publication::PublishedResponsibilities::Immediate(owners),
+                ) => {
+                    *cleanup_owner = Some(cleanup);
+                    for ((projection, branch), owner) in retained.into_iter().zip(owners) {
+                        retained_owner.install_published(projection, Some(owner), branch);
+                    }
+                }
+                (
+                    PhysicalPublication::Exit(parts),
+                    super::publication::PublishedResponsibilities::Exit(owner),
+                ) => {
+                    *exit_owner = Some(parts.install(owner));
+                }
+                _ => unreachable!("physical and logical disposition were prepared together"),
             }
         });
         Some(())
     })();
     if committed.is_some() {
+        if let Some(id) = &transition {
+            let _ = crate::transition::present_transition(world, id);
+        }
         return;
+    }
+    if transition.is_some() {
+        crate::transition::release_transition_presence(world, transition.as_ref().unwrap());
+        let _ = crate::transition::cancel_transition(
+            world,
+            handle,
+            crate::transition::TransitionCancelReason::PreparationAborted,
+        );
     }
     world.resource_scope(
         |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
@@ -792,11 +986,8 @@ pub(super) fn publish_normal_work(
                 {
                     commit_authority_contradiction = Some(BeginAuthoritySettlementErrorKind::Stale);
                 }
-                if let Some(prepared) = rejected_retained_publication.take() {
-                    match entry
-                        .engine
-                        .cancel_prepared_retained_commit_for_authority_settlement(prepared)
-                    {
+                if let Some(prepared) = rejected_publication.take() {
+                    match prepared.cancel(&mut entry.engine) {
                         Ok(owners) => {
                             assert!(
                                 entry.retained.restore_owners(owners).is_ok(),
@@ -804,7 +995,7 @@ pub(super) fn publish_normal_work(
                             );
                         }
                         Err((prepared, _)) => {
-                            pending.rejected_retained_publication = Some(Box::new(prepared));
+                            pending.rejected_publication = Some(Box::new(prepared));
                         }
                     }
                 }

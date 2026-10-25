@@ -73,6 +73,11 @@ path = "tests/retained_navigation.rs"
 required-features = ["bsn"]
 
 [[test]]
+name = "route_transitions"
+path = "tests/route_transitions.rs"
+required-features = ["bsn"]
+
+[[test]]
 name = "platform_back"
 path = "tests/platform_back.rs"
 required-features = ["bsn"]

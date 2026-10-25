@@ -8949,6 +8949,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         retained_miss_cleanup: None,
         pending_retained_invalidation: None,
         cleanup_ledger: None,
+        deferred_exit: None,
         post_commit_compound: None,
         settled_retired_host_evidence: None,
         idle_host_loss: None,
@@ -42949,9 +42950,10 @@ fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
             1
         );
     }
-    let retained = include_str!("retained.rs");
-    assert!(retained.contains(".validate_publication(prepared)"));
-    assert!(retained.contains(".validate_retained_publication(prepared)"));
+    let publication = include_str!("navigation/publication.rs");
+    assert!(publication.contains(".validate_publication(prepared)"));
+    assert!(publication.contains(".validate_retained_publication(prepared)"));
+    assert!(publication.contains(".validate_exit_publication(prepared)"));
     let publish_tails = [normal, projectionless]
         .into_iter()
         .flat_map(|source| {
@@ -42967,7 +42969,10 @@ fn core_publish_is_the_last_semantic_commit_step_on_both_paths() {
     assert_eq!(publish_tails.len(), 2, "splice and projectionless paths");
     for tail in publish_tails {
         assert!(tail.contains("*active_owner = next_active;"));
-        assert!(tail.contains("*cleanup_owner = next_cleanup;"));
+        assert!(
+            tail.contains("*cleanup_owner = next_cleanup;")
+                || tail.contains("*cleanup_owner = Some(cleanup);")
+        );
         for forbidden in [
             "?",
             ".sort",

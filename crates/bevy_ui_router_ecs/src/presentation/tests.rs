@@ -618,6 +618,8 @@ fn presentation_commit_fixture(
             current: EntityLifecycle::Active,
             next: EntityLifecycle::Leaving,
             active_after: false,
+            visible_before: true,
+            visible_after: false,
             interactive: true,
             kind: PresentationTargetKind::Frame,
         },
@@ -626,6 +628,8 @@ fn presentation_commit_fixture(
             current: EntityLifecycle::PreparedInert,
             next: EntityLifecycle::Active,
             active_after: true,
+            visible_before: false,
+            visible_after: true,
             interactive: true,
             kind: PresentationTargetKind::Frame,
         },
@@ -634,11 +638,61 @@ fn presentation_commit_fixture(
             current: EntityLifecycle::PreparedInert,
             next: EntityLifecycle::Active,
             active_after: true,
+            visible_before: false,
+            visible_after: true,
             interactive: false,
             kind: PresentationTargetKind::ChildSlot,
         },
     ];
     (leaving, entering, child_slot, targets)
+}
+
+#[test]
+fn visual_exit_hold_keeps_presence_without_retaining_input_and_can_be_released() {
+    let mut world = World::new();
+    let (leaving, entering, _, mut targets) = presentation_commit_fixture(&mut world);
+    world.entity_mut(leaving).insert(Node::default());
+    targets[0].kind = PresentationTargetKind::NativeShell;
+    targets[0] = targets[0].with_visual_presence(true, true);
+
+    let prepared = prepare_presentation_mutation(&mut world, &targets).unwrap();
+    prepared
+        .seal_commit(1)
+        .unwrap()
+        .apply_staged(|_| {}, |_| {}, |_| {});
+
+    assert_eq!(world.get::<Visibility>(leaving), Some(&Visibility::Visible));
+    assert_eq!(
+        world.get::<Node>(leaving).unwrap().display,
+        bevy_ui::Display::Flex
+    );
+    assert_eq!(world.get::<Pickable>(leaving), Some(&Pickable::IGNORE));
+    assert!(
+        world
+            .get::<RouterInputBarrier>(leaving)
+            .unwrap()
+            .denies_all()
+    );
+    assert_eq!(
+        world.get::<FrameLifecycle>(leaving),
+        Some(&FrameLifecycle(EntityLifecycle::Leaving))
+    );
+    assert_eq!(world.get::<Pickable>(entering), Some(&ACTIVE_PICKABLE));
+
+    let release = FrameMutationTarget {
+        current: EntityLifecycle::Leaving,
+        ..targets[0].with_visual_presence(true, false)
+    };
+    prepare_presentation_mutation(&mut world, &[release])
+        .unwrap()
+        .apply();
+    assert_eq!(world.get::<Visibility>(leaving), Some(&Visibility::Hidden));
+    assert_eq!(
+        world.get::<Node>(leaving).unwrap().display,
+        bevy_ui::Display::None
+    );
+    assert_eq!(world.get::<Pickable>(leaving), Some(&Pickable::IGNORE));
+    assert_eq!(world.get::<Pickable>(entering), Some(&ACTIVE_PICKABLE));
 }
 
 #[test]

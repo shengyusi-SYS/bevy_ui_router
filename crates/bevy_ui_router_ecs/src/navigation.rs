@@ -2042,6 +2042,7 @@ pub(crate) struct RouterEntry {
     retained_miss_cleanup: Option<Box<retained_miss::RetainedMissCleanup>>,
     pending_retained_invalidation: Option<crate::presentation::RetainedInvalidationEvidence>,
     pub(crate) cleanup_ledger: Option<CleanupLedger>,
+    deferred_exit: Option<deferred_exit::DeferredExit>,
     post_commit_compound: Option<Box<PostCommitCompoundHolder>>,
     settled_retired_host_evidence: Option<SettledRetiredHostEvidence>,
     idle_host_loss: Option<idle_host_loss::IdleHostLoss>,
@@ -5295,6 +5296,7 @@ impl AuthorityProtocolResidualOwner {
 }
 
 enum AuthorityProtocolResidualKind {
+    DeferredExit(Box<deferred_exit_authority::ExitResidual>),
     #[cfg(feature = "bsn")]
     NativeCreation(crate::presentation::native_scene::NativeSceneIsolationFailure),
     #[cfg(feature = "bsn")]
@@ -5528,6 +5530,7 @@ impl RouterEntry {
     pub(crate) fn cleanup_summary(&self) -> bevy_ui_router_core::CleanupSummary {
         self.cleanup_observation.summary(
             self.idle_host_loss.is_some()
+                || self.deferred_exit.is_some()
                 || self.retained_miss_cleanup.is_some()
                 || self.cleanup_ledger.is_some()
                 || self.post_commit_compound.is_some()
@@ -5653,6 +5656,7 @@ impl RouterNavigation {
             retained_miss_cleanup: None,
             pending_retained_invalidation: None,
             cleanup_ledger: None,
+            deferred_exit: None,
             post_commit_compound: None,
             settled_retired_host_evidence: None,
             idle_host_loss: None,
@@ -6182,6 +6186,31 @@ impl HostObservationDelivery {
 }
 
 pub(crate) fn observe_authority_system(world: &mut World) {
+    // Application writers end before the existing authority pipeline can
+    // retire an entering page. Held exits use their own original owner below.
+    if world.contains_resource::<crate::transition::RouteTransitionRuntime>() {
+        let invalid_sessions = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.deferred_exit.is_none()
+                    && crate::transition::current_transition(world, entry.handle).is_some()
+                    && entry
+                        .host
+                        .as_ref()
+                        .is_none_or(|host| !current_host_binding_is_exact(world, host))
+            })
+            .map(|entry| entry.handle)
+            .collect::<Vec<_>>();
+        for handle in invalid_sessions {
+            let _ = crate::transition::cancel_transition(
+                world,
+                handle,
+                crate::transition::TransitionCancelReason::AuthorityLost,
+            );
+        }
+    }
     let count = world.resource::<RouterNavigation>().entries.len();
     let mut confirmations_pending = world
         .resource::<RouterNavigation>()
@@ -6198,6 +6227,11 @@ pub(crate) fn observe_authority_system(world: &mut World) {
             world.resource_scope(|world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 'entry_work: {
                     let entry = &mut navigation.entries[index];
+                    deferred_exit_authority::archive_absent_exit_residual(world, entry);
+                    if entry.deferred_exit.is_some() {
+                        // Its original owner handles post-publication host loss.
+                        break 'entry_work;
+                    }
                     if entry.retained_miss_cleanup.is_some() {
                         break 'entry_work;
                     }
@@ -8016,7 +8050,7 @@ fn complete_zero_physical_failure(
             entry.pending_commit = Some(PendingCommit {
                 ticket: None,
                 final_task: None,
-                rejected_retained_publication: None,
+                rejected_publication: None,
                 branch,
             });
         }
@@ -14742,7 +14776,10 @@ fn drive_back_target_root_commit(world: &mut World, entry: &mut RouterEntry) -> 
     let Some(mut pending) = entry.pending_commit.take() else {
         return true;
     };
-    if entry.engine.keep_alive_capacity() > 0 && pending.ticket.is_some() {
+    if (entry.engine.keep_alive_capacity() > 0
+        || transitions::uses_normal_back_publication(world, entry))
+        && pending.ticket.is_some()
+    {
         // A hit has no fresh branch to bind. A fresh Back may retain its
         // departing leaf too. Both use the ordinary retention publisher, which
         // accepts this original Back execution together with its owners.
@@ -15343,6 +15380,7 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
         .map(|entry| entry.handle)
         .collect::<Vec<_>>();
     for handle in handles {
+        let _ = transitions::prepare_application_transition(world, handle);
         let work = world.resource_scope(
             |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = navigation
@@ -15372,10 +15410,16 @@ pub(crate) fn commit_presentation_system(world: &mut World) {
                 publish_ready_back_target(world, handle, pending, owner);
             }
             Some(PendingPublicationWork::Projectionless(work)) => {
+                let _ = crate::transition::cancel_transition(
+                    world,
+                    handle,
+                    crate::transition::TransitionCancelReason::Superseded,
+                );
                 publish_projectionless_work(world, handle, work)
             }
             None => {}
         }
+        let _ = transitions::cancel_prepared_only(world, handle);
     }
 }
 
@@ -15435,18 +15479,15 @@ fn prepare_commit_entry(
     let Some(mut pending) = entry.pending_commit.take() else {
         return None;
     };
-    if let Some(prepared) = pending.rejected_retained_publication.take() {
-        match entry
-            .engine
-            .cancel_prepared_retained_commit_for_authority_settlement(*prepared)
-        {
+    if let Some(prepared) = pending.rejected_publication.take() {
+        match prepared.cancel(&mut entry.engine) {
             Ok(owners) => {
                 assert!(
                     entry.retained.restore_owners(owners).is_ok(),
                     "cancelled publication returns its original cache capabilities"
                 );
             }
-            Err((prepared, _)) => pending.rejected_retained_publication = Some(Box::new(prepared)),
+            Err((prepared, _)) => pending.rejected_publication = Some(Box::new(prepared)),
         }
         let had_active = entry.active.is_some();
         let active = entry.active.take().unwrap_or_else(RealizedBranch::empty);
@@ -15889,8 +15930,12 @@ use post_commit::{
     settled_retired_host_allows_candidate,
 };
 
+pub(crate) mod deferred_exit;
+pub(crate) mod deferred_exit_authority;
 mod normal_publication;
+pub(crate) mod publication;
 mod retained_miss;
+mod transitions;
 use normal_publication::{NormalPublicationSplice, publish_normal_work};
 mod projectionless_publication;
 use projectionless_publication::{
@@ -19488,6 +19533,25 @@ fn drive_retained_invalidation_protocol(
 }
 
 pub(crate) fn settle_cleanup_system(world: &mut World) {
+    if world.contains_resource::<crate::transition::RouteTransitionRuntime>() {
+        let _ = deferred_exit::settle_native_ui_projection_failure(world);
+        let exits = world
+            .resource::<RouterNavigation>()
+            .entries
+            .iter()
+            .filter(|entry| entry.deferred_exit.is_some())
+            .map(|entry| entry.handle)
+            .collect::<Vec<_>>();
+        for handle in exits {
+            if deferred_exit::drive_deferred_exit(world, handle)
+                == deferred_exit::DeferredExitDrive::AuthorityRequired
+            {
+                deferred_exit_authority::drive_deferred_exit_authority(world, handle);
+            }
+        }
+        crate::transition::reap_absent_presence(world);
+        transitions::settle_application_transitions(world);
+    }
     if world
         .resource::<RouterNavigation>()
         .entries
@@ -20128,7 +20192,7 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 entry.pending_commit = Some(PendingCommit {
                     ticket: None,
                     final_task: None,
-                    rejected_retained_publication: None,
+                    rejected_publication: None,
                     branch,
                 });
                 bind_post_cleanup_back_resolution(entry);

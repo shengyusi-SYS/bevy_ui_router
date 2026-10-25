@@ -41,15 +41,15 @@ enum PostCommitAnyPhysicalProof {
 }
 
 pub(super) struct PreparedPostCommitPhysicalOwner {
-    original: CleanupLedger,
-    original_freeze: FrozenOriginalCleanupLedgerTransfer,
-    authority: PreparedPostCommitAuthorityLedger,
-    active: RealizedBranch,
-    retained: Vec<crate::instance::InstancePayload>,
-    retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
-    host: RetiredHostBinding,
-    edge: FrozenRetiredHostEdge,
-    input_isolation: Option<PreparedPostCommitInputIsolation>,
+    pub(super) original: CleanupLedger,
+    pub(super) original_freeze: FrozenOriginalCleanupLedgerTransfer,
+    pub(super) authority: PreparedPostCommitAuthorityLedger,
+    pub(super) active: RealizedBranch,
+    pub(super) retained: Vec<crate::instance::InstancePayload>,
+    pub(super) retained_boundaries: Option<crate::registry::PreparedRetainedBoundaries>,
+    pub(super) host: RetiredHostBinding,
+    pub(super) edge: FrozenRetiredHostEdge,
+    pub(super) input_isolation: Option<PreparedPostCommitInputIsolation>,
 }
 
 pub(super) struct PostCommitCompoundPhysicalOwner {
@@ -114,6 +114,11 @@ pub(super) struct PostCommitPreAcceptPhysicalOwner {
 }
 
 pub(super) enum PostCommitCompoundHolder {
+    DeferredExitAccepted(Box<Option<super::deferred_exit_authority::AcceptedExit>>),
+    DeferredExitRejected {
+        owner: Box<super::deferred_exit_authority::AcceptedExit>,
+        error: IntegrationError,
+    },
     PreAcceptInert {
         physical: PostCommitPreAcceptPhysicalOwner,
         evidence: PostCommitPreAcceptInertEvidence,
@@ -501,7 +506,7 @@ impl PostCommitBoundInertEvidence {
     }
 }
 
-fn post_commit_authority_loss_cause(
+pub(super) fn post_commit_authority_loss_cause(
     world: &World,
     host: &HostBinding,
 ) -> Option<PostCommitAuthorityCause> {
@@ -1089,7 +1094,7 @@ fn bind_prepared_post_commit_physical<'w>(
     Ok(((physical, registry), plan))
 }
 
-fn resume_prepared_post_commit_compound(
+pub(super) fn resume_prepared_post_commit_compound(
     world: &mut World,
     entry: &mut RouterEntry,
     owner: PreparedPostCommitAuthorityTransfer,
@@ -1377,6 +1382,7 @@ fn resume_retryable_post_commit_holder(
     holder: Box<PostCommitCompoundHolder>,
 ) -> Box<PostCommitCompoundHolder> {
     let retryable = match holder.as_ref() {
+        PostCommitCompoundHolder::DeferredExitAccepted(_) => true,
         PostCommitCompoundHolder::AcceptedInert { evidence, .. } => evidence.is_retryable(),
         PostCommitCompoundHolder::PreparedInert {
             evidence:
@@ -1390,6 +1396,15 @@ fn resume_retryable_post_commit_holder(
         return holder;
     }
     match *holder {
+        PostCommitCompoundHolder::DeferredExitAccepted(mut accepted) => {
+            super::deferred_exit_authority::resume_accepted(
+                world,
+                entry,
+                accepted
+                    .take()
+                    .expect("accepted exit installs every original owner in its tail"),
+            )
+        }
         PostCommitCompoundHolder::AcceptedInert {
             source, physical, ..
         } => resume_accepted_post_commit_compound(world, entry, source, *physical),

@@ -134,7 +134,7 @@ impl<'w, 'n> AuthoredVisibilityObservation<'w, 'n> {
         let display = prepared
             .filter(|target| matches!(target.kind, PresentationTargetKind::NativeShell))
             .map(|target| {
-                if target.active_after {
+                if target.visible_after {
                     Display::Flex
                 } else {
                     Display::None
@@ -144,7 +144,7 @@ impl<'w, 'n> AuthoredVisibilityObservation<'w, 'n> {
         let visibility = prepared
             .filter(|target| !matches!(target.kind, PresentationTargetKind::NativeContent))
             .map(|target| {
-                if target.active_after {
+                if target.visible_after {
                     Visibility::Visible
                 } else {
                     Visibility::Hidden
@@ -904,37 +904,24 @@ pub(super) fn observe_native_values<'w>(
     lifecycle: EntityLifecycle,
 ) -> Option<NativeContentObservation<'w>> {
     let root = frame.native_root()?;
-    let active = lifecycle == EntityLifecycle::Active;
-    let expected_node = Node {
-        display: if active { Display::Flex } else { Display::None },
-        width: Val::Percent(100.0),
-        height: Val::Percent(100.0),
-        ..Node::default()
-    };
     let registry = world.resource::<RouteEntityRegistry>();
-    let valid = frame.entities.iter().all(|entity| {
-        registry
-            .record(entity.entity)
-            .is_some_and(|record| record.claim() == entity.claim && record.lifecycle() == lifecycle)
-            && world.get::<RouteOwnershipSeal>(entity.entity)
+    let valid =
+        frame.entities.iter().all(|entity| {
+            registry.record(entity.entity).is_some_and(|record| {
+                record.claim() == entity.claim && record.lifecycle() == lifecycle
+            }) && world.get::<RouteOwnershipSeal>(entity.entity)
                 == Some(&RouteOwnershipSeal::new(entity.claim.seal()))
-            && world.get::<FrameLifecycle>(entity.entity) == Some(&FrameLifecycle(lifecycle))
-            && world.get::<ChildOf>(entity.entity).map(ChildOf::parent) == Some(entity.parent)
-    }) && world.get::<Node>(frame.shell()) == Some(&expected_node)
-        && world.get::<FrameShell>(frame.shell()) == Some(&FrameShell(frame.frame.clone()))
-        && world.get::<Visibility>(frame.shell())
-            == Some(if active {
-                &Visibility::Visible
-            } else {
-                &Visibility::Hidden
-            })
-        && world.get::<Pickable>(frame.shell()) == Some(&Pickable::IGNORE)
-        && world
-            .get::<RouterInputBarrier>(frame.shell())
-            .is_some_and(RouterInputBarrier::denies_all)
-        && world
-            .get::<Children>(frame.shell())
-            .is_some_and(|children| children.len() == 1 && children[0] == root);
+                && world.get::<FrameLifecycle>(entity.entity) == Some(&FrameLifecycle(lifecycle))
+                && world.get::<ChildOf>(entity.entity).map(ChildOf::parent) == Some(entity.parent)
+        }) && shell_visual_values_are_current(world, frame.shell(), frame.frame(), lifecycle)
+            && world.get::<FrameShell>(frame.shell()) == Some(&FrameShell(frame.frame.clone()))
+            && world.get::<Pickable>(frame.shell()) == Some(&Pickable::IGNORE)
+            && world
+                .get::<RouterInputBarrier>(frame.shell())
+                .is_some_and(RouterInputBarrier::denies_all)
+            && world
+                .get::<Children>(frame.shell())
+                .is_some_and(|children| children.len() == 1 && children[0] == root);
     if !valid {
         return None;
     }

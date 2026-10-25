@@ -3334,6 +3334,15 @@ impl RealizedBranch {
         self.frames[0].apply_mount_rebase(prepared.frame);
     }
 
+    /// The caller freezes the exact successor index during preparation.
+    pub(crate) fn apply_frame_mount_rebase(
+        &mut self,
+        index: usize,
+        prepared: PreparedFrameMountRebase,
+    ) {
+        self.frames[index].apply_mount_rebase(prepared);
+    }
+
     pub(crate) fn interactive_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
         self.frames
             .iter()
@@ -3667,8 +3676,8 @@ impl PreparedBranch {
 pub(crate) struct PendingCommit {
     pub(crate) ticket: Option<CommitTicket>,
     pub(crate) final_task: Option<RootFrameTask>,
-    pub(crate) rejected_retained_publication:
-        Option<Box<bevy_ui_router_core::integration::PreparedRetainedCommit>>,
+    pub(crate) rejected_publication:
+        Option<Box<crate::navigation::publication::ReturnedPublication>>,
     pub(crate) branch: PreparedBranch,
 }
 
@@ -3677,7 +3686,7 @@ impl PendingCommit {
         Self {
             ticket: None,
             final_task: None,
-            rejected_retained_publication: None,
+            rejected_publication: None,
             branch: PreparedBranch::empty(),
         }
     }

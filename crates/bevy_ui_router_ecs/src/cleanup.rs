@@ -66,7 +66,9 @@ const OBLIGATION_DOMAIN: u64 = 0x4543_534f_424c_4947;
 const COMPLETION_DOMAIN: u64 = 0x4543_5343_4f4d_504c;
 static NEXT_LEDGER_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
+mod deferred_exit;
 mod post_commit;
+pub(crate) use deferred_exit::DeferredExitManifestError;
 pub(crate) use post_commit::{
     FrozenOriginalCleanupLedgerTransfer, FrozenPostCommitAuthorityPartition,
     FrozenPostCommitAuthorityTarget, PostCommitAuthorityFreezeFailure,
@@ -2747,6 +2749,7 @@ pub(crate) enum FailedManifestBuildError {
 enum LeavingMountProof<'a> {
     FreshSuccessor(Option<PayloadRef<'a>>),
     RetainedPartition,
+    DeferredExit,
 }
 
 impl FrozenCleanupManifest {
@@ -3248,7 +3251,16 @@ impl FrozenCleanupManifest {
 
         let mut parent_candidates = frames
             .iter()
+            .filter(|frame| {
+                !matches!(mount_proof, LeavingMountProof::DeferredExit)
+                    || !obligations
+                        .iter()
+                        .any(|obligation| obligation.entity() == frame.mount_binding().slot())
+            })
             .map(|frame| match mount_proof {
+                LeavingMountProof::DeferredExit => {
+                    deferred_exit::deferred_frame_mount_parent_candidate(world, registry, frame)
+                }
                 LeavingMountProof::RetainedPartition => {
                     if authorized_retired.contains(&frame.frame()) {
                         retained_frame_mount_parent_candidate(world, registry, frame)
@@ -3265,6 +3277,12 @@ impl FrozenCleanupManifest {
         parent_candidates.extend(
             child_slots
                 .iter()
+                .filter(|slot| {
+                    !matches!(mount_proof, LeavingMountProof::DeferredExit)
+                        || !obligations
+                            .iter()
+                            .any(|obligation| obligation.entity() == slot.anchor())
+                })
                 .map(|slot| mounted_anchor_parent_candidate(world, slot))
                 .collect::<Option<Vec<_>>>()?,
         );

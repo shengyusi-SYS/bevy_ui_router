@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+pub(crate) mod native_ui_candidates;
+
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     change_detection::{DetectChangesMut, Mut},
@@ -909,9 +911,11 @@ pub(crate) fn filter_inactive_router_pointer_state_system(world: &mut World) {
 
     let gate = world.resource::<RouterInputGate>();
     let mut denied = gate.revoked.iter().copied().collect::<HashSet<_>>();
-    denied.extend(candidates.into_iter().filter(|target| {
-        !gate.allows_pointer(*target) && target_has_exact_router_boundary(world, *target)
-    }));
+    denied.extend(
+        candidates
+            .into_iter()
+            .filter(|target| target_is_denied_router_input(world, *target)),
+    );
     revoke_router_pointer_targets(world, &denied);
     let mut gate = world.resource_mut::<RouterInputGate>();
     if !gate.revoked.is_empty() {
@@ -919,9 +923,20 @@ pub(crate) fn filter_inactive_router_pointer_state_system(world: &mut World) {
     }
 }
 
+fn target_is_denied_router_input(world: &World, target: Entity) -> bool {
+    world
+        .get_resource::<RouterInputGate>()
+        .is_some_and(|gate| !gate.allows_pointer(target))
+        && target_has_exact_router_boundary(world, target)
+}
+
 fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
-    let registry = world.resource::<RouteEntityRegistry>();
-    let quarantine = world.resource::<QuarantineLeaseTable>();
+    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
+        return false;
+    };
+    let Some(quarantine) = world.get_resource::<QuarantineLeaseTable>() else {
+        return false;
+    };
     let mut current = target;
     let mut visited = HashSet::new();
     while visited.insert(current) {

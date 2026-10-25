@@ -9,6 +9,9 @@ use bevy_picking::{
 
 use crate::app_ext::ViewDriverStore;
 use crate::host::{HostCandidateRevisionLatch, HostCandidateRevisionState};
+use crate::input::native_ui_candidates::{
+    NativeUiInputProjection, project_native_ui_input_stack, restore_native_ui_input_stack,
+};
 use crate::input::{
     RouteFocusState, RouterInputGate, filter_inactive_router_pointer_state_system,
     input_ready_system, refresh_input_gate_system,
@@ -64,6 +67,7 @@ pub(crate) fn install_foundations(app: &mut App) {
     app.insert_resource(RouterInstallMarker)
         .init_resource::<InputFocus>()
         .init_resource::<RouteFocusState>()
+        .init_resource::<NativeUiInputProjection>()
         .init_resource::<HostCandidateRevisionState>()
         .init_resource::<HostCandidateRevisionLatch>()
         .init_resource::<RouteEntityRegistry>()
@@ -97,7 +101,7 @@ pub(crate) fn install_foundations(app: &mut App) {
     .configure_sets(
         PreUpdate,
         (
-            RouterInputSet::Refresh.before(PickingSystems::Hover),
+            RouterInputSet::Refresh.before(PickingSystems::Backend),
             RouterInputSet::Ready.after(PickingSystems::Hover),
         )
             .chain(),
@@ -130,6 +134,12 @@ pub(crate) fn install_foundations(app: &mut App) {
         PreUpdate,
         (
             refresh_input_gate_system.in_set(RouterInputSet::Refresh),
+            project_native_ui_input_stack
+                .after(RouterInputSet::Refresh)
+                .before(PickingSystems::Backend),
+            restore_native_ui_input_stack
+                .after(PickingSystems::Backend)
+                .before(PickingSystems::Hover),
             filter_inactive_router_pointer_state_system
                 .in_set(PickingSystems::Hover)
                 .after(generate_hovermap)
@@ -213,7 +223,7 @@ mod tests {
             )
         };
         assert_eq!(installed_systems.0.len(), 6);
-        assert_eq!(installed_systems.1.len(), 3);
+        assert_eq!(installed_systems.1.len(), 5);
         for (label, kind) in [
             (
                 Update.intern(),

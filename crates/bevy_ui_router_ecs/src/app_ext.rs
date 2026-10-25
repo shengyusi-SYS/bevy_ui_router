@@ -15,6 +15,7 @@ pub struct RouterConfig {
     views: RouteViewRegistry,
     fallback: RouteViewKey,
     keep_alive_capacity: usize,
+    transition_driver: Option<Box<dyn crate::transition::RouteTransitionDriver>>,
 }
 
 impl RouterConfig {
@@ -24,6 +25,7 @@ impl RouterConfig {
             views,
             fallback,
             keep_alive_capacity: 0,
+            transition_driver: None,
         }
     }
 
@@ -34,13 +36,14 @@ impl RouterConfig {
         self
     }
 
-    fn into_parts(self) -> (RouteTree, RouteViewRegistry, RouteViewKey, usize) {
-        (
-            self.routes,
-            self.views,
-            self.fallback,
-            self.keep_alive_capacity,
-        )
+    /// Adds application-owned animation around route publication. Without a
+    /// driver navigation keeps its ordinary presentation and cleanup behavior.
+    pub fn with_transition_driver(
+        mut self,
+        driver: impl crate::transition::RouteTransitionDriver,
+    ) -> Self {
+        self.transition_driver = Some(Box::new(driver));
+        self
     }
 }
 
@@ -363,7 +366,13 @@ impl TestAppRouterExt for App {
 impl AppRouterExt for App {
     fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError> {
         crate::plugin::install_foundations(self);
-        let (routes, views, fallback, keep_alive_capacity) = config.into_parts();
+        let RouterConfig {
+            routes,
+            views,
+            fallback,
+            keep_alive_capacity,
+            transition_driver,
+        } = config;
         let drivers = self.world().resource::<ViewDriverStore>();
         let mut binding_error = None;
         #[cfg(feature = "bsn")]
@@ -448,6 +457,10 @@ impl AppRouterExt for App {
         self.world_mut()
             .resource_mut::<crate::snapshots::RouterSnapshots>()
             .install_router(handle, projection);
+        if let Some(driver) = transition_driver {
+            crate::transition::register_transition_driver(self.world_mut(), handle, driver)
+                .expect("a newly installed router has no transition driver");
+        }
         Ok(handle)
     }
 }

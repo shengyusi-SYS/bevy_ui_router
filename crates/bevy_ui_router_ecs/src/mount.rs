@@ -1066,13 +1066,20 @@ fn validate_mounted_child_slot_with_policy(
     let Some(record) = registry.record(slot.slot) else {
         return false;
     };
-    let (component_lifecycle, visibility) = match lifecycle {
+    let (component_lifecycle, mut visibility) = match lifecycle {
         EntityLifecycle::PreparedInert => (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden),
         EntityLifecycle::Active => (ChildSlotLifecycle::Active, Visibility::Visible),
         EntityLifecycle::Retained => (ChildSlotLifecycle::Retained, Visibility::Hidden),
         EntityLifecycle::Leaving => (ChildSlotLifecycle::Leaving, Visibility::Hidden),
         EntityLifecycle::Quarantined => (ChildSlotLifecycle::Quarantined, Visibility::Hidden),
     };
+    if matches!(
+        lifecycle,
+        EntityLifecycle::Retained | EntityLifecycle::Leaving
+    ) && crate::transition::holds_visible_claim(world, &slot.slot_claim)
+    {
+        visibility = Visibility::Visible;
+    }
     record.claim() == slot.slot_claim
         && record.lifecycle() == lifecycle
         && manifest_matches_policy(world, slot.slot, record.manifest(), allow_foreign_additions)

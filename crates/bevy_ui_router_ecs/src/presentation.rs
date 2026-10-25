@@ -1064,18 +1064,16 @@ impl RetainedBoundaryProof {
                 .filter(|child| **child == self.shell)
                 .count()
                 != 1
-            || world.get::<Visibility>(self.shell) != Some(&Visibility::Hidden)
+            || !shell_visual_values_are_current(
+                world,
+                self.shell,
+                self.projection.frame(),
+                EntityLifecycle::Retained,
+            )
             || world.get::<Pickable>(self.shell) != Some(&Pickable::IGNORE)
             || !world
                 .get::<RouterInputBarrier>(self.shell)
                 .is_some_and(RouterInputBarrier::denies_all)
-            || world.get::<Node>(self.shell)
-                != Some(&Node {
-                    display: bevy_ui::Display::None,
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..Node::default()
-                })
         {
             return false;
         }
@@ -1215,13 +1213,12 @@ impl RetainedBoundaryProof {
             let role_matches = match entity.role {
                 RealizedRole::Shell => {
                     world.get::<FrameShell>(entity.entity) == Some(&FrameShell(frame.clone()))
-                        && world.get::<Node>(entity.entity)
-                            == Some(&Node {
-                                display: bevy_ui::Display::None,
-                                width: Val::Percent(100.0),
-                                height: Val::Percent(100.0),
-                                ..Node::default()
-                            })
+                        && shell_visual_values_are_current(
+                            world,
+                            entity.entity,
+                            frame,
+                            EntityLifecycle::Retained,
+                        )
                 }
                 RealizedRole::ContentTarget if self.native_root.is_some() => {
                     world.get::<FrameContentTarget>(entity.entity)
@@ -1483,8 +1480,79 @@ pub(crate) struct FrameMutationTarget {
     current: EntityLifecycle,
     next: EntityLifecycle,
     active_after: bool,
+    visible_before: bool,
+    visible_after: bool,
     interactive: bool,
     kind: PresentationTargetKind,
+}
+
+/// Layout can be application-controlled only for an exact live transition
+/// surface. Presence stays explicit; ordinary shells retain their full value
+/// contract. Callers still validate structure, input and ownership separately.
+fn shell_visual_values_are_current(
+    world: &World,
+    shell: Entity,
+    frame: &RouteFrameVersion,
+    lifecycle: EntityLifecycle,
+) -> bool {
+    let authorized_display =
+        crate::transition::transition_surface_display(world, frame, shell, lifecycle);
+    let held_presence = world
+        .get_resource::<RouteEntityRegistry>()
+        .and_then(|registry| registry.record(shell))
+        .is_some_and(|record| crate::transition::holds_visible_claim(world, &record.claim()));
+    let display =
+        authorized_display.unwrap_or(if lifecycle == EntityLifecycle::Active || held_presence {
+            bevy_ui::Display::Flex
+        } else {
+            bevy_ui::Display::None
+        });
+    let expected = Node {
+        display,
+        width: Val::Percent(100.0),
+        height: Val::Percent(100.0),
+        ..Node::default()
+    };
+    world.get::<Node>(shell).is_some_and(|node| {
+        node.display == display && (authorized_display.is_some() || *node == expected)
+    }) && world.get::<Visibility>(shell)
+        == Some(if display == bevy_ui::Display::None {
+            &Visibility::Hidden
+        } else {
+            &Visibility::Visible
+        })
+}
+
+impl FrameMutationTarget {
+    pub(crate) const fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    /// A visual hold changes presence only. The caller must derive this target
+    /// from its original lifecycle owner; input and activity remain unchanged.
+    pub(crate) fn with_visual_presence(mut self, before: bool, after: bool) -> Self {
+        self.visible_before = before;
+        self.visible_after = after;
+        self
+    }
+
+    pub(crate) const fn is_active(&self) -> bool {
+        matches!(self.current, EntityLifecycle::Active)
+    }
+
+    pub(crate) const fn has_inactive_presence(&self) -> bool {
+        self.visible_after && !self.active_after
+    }
+
+    /// Freeze the release target from the already prepared next role, before
+    /// publication. Releasing presence never reactivates a target.
+    pub(crate) fn presence_release(mut self) -> Self {
+        self.current = self.next;
+        self.visible_before = self.visible_after;
+        self.visible_after = false;
+        self.active_after = false;
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1510,6 +1578,7 @@ struct PreparedEntityMutation<'w> {
     current: EntityLifecycle,
     next: EntityLifecycle,
     active_after: bool,
+    visible_after: bool,
     interactive: bool,
 }
 
@@ -1605,14 +1674,14 @@ impl PreparedEntityMutation<'_> {
 
     fn apply_base_activation(&mut self) {
         if let Some(visual) = &mut self.visual {
-            *visual.visibility = if self.active_after {
+            *visual.visibility = if self.visible_after {
                 Visibility::Visible
             } else {
                 Visibility::Hidden
             };
         }
         if let Some(node) = &mut self.shell_node {
-            node.display = if self.active_after {
+            node.display = if self.visible_after {
                 bevy_ui::Display::Flex
             } else {
                 bevy_ui::Display::None
@@ -1650,7 +1719,7 @@ impl PreparedEntityMutation<'_> {
     fn is_base_active(&self) -> bool {
         self.visual.as_ref().is_none_or(|visual| {
             *visual.visibility
-                == if self.active_after {
+                == if self.visible_after {
                     Visibility::Visible
                 } else {
                     Visibility::Hidden
@@ -1662,7 +1731,7 @@ impl PreparedEntityMutation<'_> {
     fn is_final(&self) -> bool {
         self.visual.as_ref().is_none_or(|visual| {
             *visual.visibility
-                == if self.active_after {
+                == if self.visible_after {
                     Visibility::Visible
                 } else {
                     Visibility::Hidden
@@ -1807,6 +1876,8 @@ pub(crate) fn child_slot_mutation_target(
         current,
         next,
         active_after,
+        visible_before: current == EntityLifecycle::Active,
+        visible_after: active_after,
         interactive: false,
         kind: PresentationTargetKind::ChildSlot,
     }
@@ -2231,6 +2302,8 @@ impl RealizedFrame {
                 current,
                 next,
                 active_after,
+                visible_before: current == EntityLifecycle::Active,
+                visible_after: active_after,
                 interactive: entity.role == RealizedRole::SolidRect,
                 kind: if self.native_root().is_some() {
                     if entity.entity == self.shell {
@@ -3785,6 +3858,7 @@ fn prepare_presentation_access<'w>(
                     current: target.current,
                     next: target.next,
                     active_after: target.active_after,
+                    visible_after: target.visible_after,
                     interactive: false,
                 },
             ));
@@ -3819,19 +3893,24 @@ fn prepare_presentation_access<'w>(
         };
         if found[index]
             || !pickable_valid
+            || *visibility
+                != if target.visible_before {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                }
             || (matches!(
                 target.current,
                 EntityLifecycle::PreparedInert
                     | EntityLifecycle::Retained
                     | EntityLifecycle::Leaving
-            ) && (*visibility != Visibility::Hidden || !barrier.denies_all()))
+            ) && !barrier.denies_all())
             || (target.current == EntityLifecycle::Active
-                && (*visibility != Visibility::Visible
-                    || if target.interactive {
-                        !barrier.allows_all()
-                    } else {
-                        !barrier.denies_all()
-                    }))
+                && if target.interactive {
+                    !barrier.allows_all()
+                } else {
+                    !barrier.denies_all()
+                })
         {
             return None;
         }
@@ -3859,6 +3938,7 @@ fn prepare_presentation_access<'w>(
                 current: target.current,
                 next: target.next,
                 active_after: target.active_after,
+                visible_after: target.visible_after,
                 interactive: target.interactive,
             },
         ));
@@ -4584,7 +4664,13 @@ fn mount_slot_children_are_acceptable(
                 }
                 EntityLifecycle::Leaving => {
                     leaving_shells += 1;
-                    if world.get::<Visibility>(child) != Some(&Visibility::Hidden) {
+                    let visibility =
+                        if crate::transition::holds_visible_claim(world, &record.claim()) {
+                            Visibility::Visible
+                        } else {
+                            Visibility::Hidden
+                        };
+                    if world.get::<Visibility>(child) != Some(&visibility) {
                         return false;
                     }
                 }

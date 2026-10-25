@@ -27,7 +27,7 @@ pub mod core {
         ActivePresentation, ActivePresentationKind, RouterAvailability, RouterUnavailableReason,
     };
     pub use bevy_ui_router_core::request::{
-        NavigationFailure, NavigationFailureKind, NavigationPhase, RequestStatus,
+        NavigationFailure, NavigationFailureKind, NavigationKind, NavigationPhase, RequestStatus,
     };
     pub use bevy_ui_router_core::route_tree::{
         RouteNode, RouteNodeOptions, RouteTree, RouteTreeBuilder,
@@ -57,11 +57,12 @@ pub mod ecs {
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
         NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
         RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
-        RouteScrollRestoreId, RouteScrollRestorePolicy, RouterConfig, RouterHandle,
-        RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterScrollSet,
-        RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
-        ViewDriverRegistrationErrorKind,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
+        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
+        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
+        TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
 }
 
@@ -95,13 +96,13 @@ pub mod prelude {
         DiagnosticSnapshot, ErrorBoundaryKey, FrameOrigin, HistoryError, HistorySnapshot,
         HostSnapshot, HostTraceEvent, HostTraceEventKind, HostVersion, MatchedBranch, MatchedRoute,
         MemoryHistory, MountRejectionKind, NavigationFailure, NavigationFailureKind,
-        NavigationPhase, NavigationRequestId, NavigationTraceEvent, NavigationTraceEventKind,
-        ReportDisposition, RequestStatus, RouteBranchFingerprint, RouteError, RouteErrorKind,
-        RouteErrorSourceCategory, RouteExplicitKey, RouteFrameId, RouteFrameStatus,
-        RouteFrameVersion, RouteGeneration, RouteHostId, RouteId, RouteInputRef, RouteLocation,
-        RouteMatcher, RouteMeta, RouteNodeOptions, RouteParams, RoutePathSegment, RoutePattern,
-        RoutePatternKind, RouteSlotId, RouteSlotKey, RouteTree, RouteTreeBuilder, RouteViewInput,
-        RouteViewKey, RouteViewKeyError, RouterAvailability, RouterInstanceId,
+        NavigationKind, NavigationPhase, NavigationRequestId, NavigationTraceEvent,
+        NavigationTraceEventKind, ReportDisposition, RequestStatus, RouteBranchFingerprint,
+        RouteError, RouteErrorKind, RouteErrorSourceCategory, RouteExplicitKey, RouteFrameId,
+        RouteFrameStatus, RouteFrameVersion, RouteGeneration, RouteHostId, RouteId, RouteInputRef,
+        RouteLocation, RouteMatcher, RouteMeta, RouteNodeOptions, RouteParams, RoutePathSegment,
+        RoutePattern, RoutePatternKind, RouteSlotId, RouteSlotKey, RouteTree, RouteTreeBuilder,
+        RouteViewInput, RouteViewKey, RouteViewKeyError, RouterAvailability, RouterInstanceId,
         RouterUnavailableReason,
     };
 
@@ -116,9 +117,11 @@ pub mod prelude {
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
         NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
         RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
-        RouteScrollRestoreId, RouteScrollRestorePolicy, RouterConfig, RouterHandle,
-        RouterHostRegistration, RouterInputGate, RouterInstallError, RouterInstallErrorKind,
-        RouterNavigation, RouterScrollSet, RouterSnapshot, RouterSnapshots,
-        ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
+        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
+        RouterInstallErrorKind, RouterNavigation, RouterScrollSet, RouterSnapshot, RouterSnapshots,
+        TransitionCancelReason, TransitionPreparation, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
     };
 }

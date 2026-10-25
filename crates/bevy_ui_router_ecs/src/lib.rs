@@ -32,6 +32,7 @@ mod snapshots;
 mod task10_regression_tests;
 #[cfg(test)]
 mod test_support;
+mod transition;
 
 pub use activity::RouteActivity;
 pub use app_ext::{
@@ -49,6 +50,10 @@ pub use scroll::{
     RouteScrollRestoreId, RouteScrollRestorePolicy,
 };
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
+pub use transition::{
+    RouteTransitionCommandsExt, RouteTransitionContext, RouteTransitionDriver, RouteTransitionId,
+    RouteTransitionTarget, TransitionCancelReason, TransitionPreparation,
+};
 
 pub mod prelude {
     #[cfg(feature = "bsn")]
@@ -57,10 +62,11 @@ pub mod prelude {
         AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
         NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
         RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
-        RouteScrollRestoreId, RouteScrollRestorePolicy, RouterConfig, RouterHandle,
-        RouterHostRegistration, RouterInputGate, RouterInputSet, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterScheduleSet, RouterScrollSet,
-        RouterSnapshot, RouterSnapshots, ViewDriverRegistrationError,
-        ViewDriverRegistrationErrorKind,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
+        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
+        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
+        TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
 }

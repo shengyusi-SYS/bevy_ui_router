@@ -1076,7 +1076,7 @@ pub(super) fn publish_projectionless_work(
     };
     let mut branch_owners = None;
     let mut failure = None;
-    let mut rejected_retained_publication = None;
+    let mut rejected_publication = None;
     let committed = (|| {
         let (presentation, resources) = crate::presentation::prepare_publication_access(
             world,
@@ -1188,7 +1188,7 @@ pub(super) fn publish_projectionless_work(
                     owners,
                     None,
                 )
-                .map(crate::retained::PreparedPublication::Retained)
+                .map(super::publication::PreparedPublication::Retained)
                 .map_err(|error| {
                     let (_plan, _manifest, owners, kind) = error.into_parts();
                     assert!(
@@ -1201,7 +1201,7 @@ pub(super) fn publish_projectionless_work(
             entry
                 .engine
                 .prepare_commit(pending.ticket.as_ref().unwrap(), manifest)
-                .map(crate::retained::PreparedPublication::Ordinary)
+                .map(super::publication::PreparedPublication::Ordinary)
                 .map_err(r3_core::RetainedPublicationError::Integration)
         };
         let prepared = match prepared {
@@ -1217,7 +1217,7 @@ pub(super) fn publish_projectionless_work(
         let engine = match prepared.validate(&mut entry.engine) {
             Ok(validated) => validated,
             Err((returned, error)) => {
-                rejected_retained_publication = returned;
+                rejected_publication = returned;
                 failure = Some(ProjectionlessCommitFailure::post_report(
                     admission.clone(),
                     match error {
@@ -1240,7 +1240,10 @@ pub(super) fn publish_projectionless_work(
         let scroll = entry
             .scroll
             .prepare(engine.history_publication(), scroll_observation);
-        let cleanup = engine.cleanup().clone();
+        let cleanup = engine
+            .cleanup()
+            .expect("immediate publication has a concrete batch")
+            .clone();
         let cleanup_ledger = reserved_ledger.bind_batch(cleanup);
         pending.ticket.take();
         let (mut leaving, mut entering) = branch_owners
@@ -1307,18 +1310,13 @@ pub(super) fn publish_projectionless_work(
                 .iter_mut()
                 .find(|entry| entry.handle == handle)
                 .unwrap();
-            if let Some(prepared) = rejected_retained_publication.take() {
-                match entry
-                    .engine
-                    .cancel_prepared_retained_commit_for_authority_settlement(prepared)
-                {
+            if let Some(prepared) = rejected_publication.take() {
+                match prepared.cancel(&mut entry.engine) {
                     Ok(owners) => assert!(
                         entry.retained.restore_owners(owners).is_ok(),
                         "rejected fallback validation returns every original cache owner"
                     ),
-                    Err((prepared, _)) => {
-                        pending.rejected_retained_publication = Some(Box::new(prepared))
-                    }
+                    Err((prepared, _)) => pending.rejected_publication = Some(Box::new(prepared)),
                 }
             }
             if branch_owners.is_none() {

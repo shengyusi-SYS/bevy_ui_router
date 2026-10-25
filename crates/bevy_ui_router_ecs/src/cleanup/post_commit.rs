@@ -915,67 +915,25 @@ pub(crate) enum PostCommitAuthoritySettlementFailure {
     ReceiptCommitRejected,
 }
 
-impl CleanupLedger {
-    pub(crate) fn post_commit_transfer_requires_ordinary_settlement(&self, world: &World) -> bool {
-        self.completion_digest.is_none()
-            && quarantine_disposition(
-                &collect_evidence(world, &self.obligations, &self.receipts),
-                &self.obligations,
-            )
-            .is_some()
-    }
+/// The observed physical source contains no Core token or lifecycle owner. A
+/// deferred exit can prepare this proof before its original reservation seals;
+/// settlement still requires the subsequently bound real ledger and Core pair.
+struct OriginalCleanupPhysicalSource<'a> {
+    obligations: &'a [CleanupObligation],
+    receipts: &'a [Option<CleanupReceipt>],
+    manifest_digest: u64,
+    ledger_domain: u64,
+    next_attempt: u64,
+    issued_attempt_revision: Option<u64>,
+    completion_digest: Option<u64>,
+}
 
-    pub(crate) fn preflight_post_commit_transfer_source_kind(
+impl OriginalCleanupPhysicalSource<'_> {
+    fn freeze(
         &self,
-    ) -> Result<(), PostCommitOriginalFreezeFailure> {
-        if !matches!(self.owner, Some(CleanupOwner::Leaving(_)) | None)
-            || self.back_no_target_batch.is_some()
-            || self.back_no_target_capacity.is_some()
-            || self.authority_host_children.is_some()
-            || self.back_no_target_authority_partition.is_some()
-            || self.failure_cleanup_partition.is_some()
-            || self.stopped.is_some()
-        {
-            return Err(PostCommitOriginalFreezeFailure::IneligibleSource);
-        }
-        Ok(())
-    }
-
-    /// Freezes the complete original cleanup owner before it crosses into the
-    /// post-commit compound. Existing receipts must already have gone through
-    /// the sole legacy Core consumer; this boundary never replays them.
-    pub(crate) fn freeze_for_post_commit_transfer(
-        &mut self,
         world: &World,
     ) -> Result<FrozenOriginalCleanupLedgerTransfer, PostCommitOriginalFreezeFailure> {
-        self.preflight_post_commit_transfer_source_kind()?;
-        let batch = self.batch.as_ref().ok_or_else(|| {
-            PostCommitOriginalFreezeFailure::Permanent(
-                PostCommitOriginalFreezePermanentEvidence::InvalidLedgerShape,
-            )
-        })?;
-        if batch.manifest_digest() != self.manifest_digest
-            || batch.obligation_count() != self.obligations.len()
-            || self.receipts.len() != self.obligations.len()
-            || self.mount_parents.len() > self.obligations.len()
-        {
-            return Err(PostCommitOriginalFreezeFailure::Permanent(
-                PostCommitOriginalFreezePermanentEvidence::InvalidLedgerShape,
-            ));
-        }
-        if !self.obligations.is_empty() && !matches!(self.owner, Some(CleanupOwner::Leaving(_))) {
-            return Err(PostCommitOriginalFreezeFailure::Permanent(
-                PostCommitOriginalFreezePermanentEvidence::InvalidOwner,
-            ));
-        }
-        if self.obligations.is_empty() && self.owner.is_some() {
-            return Err(PostCommitOriginalFreezeFailure::Permanent(
-                PostCommitOriginalFreezePermanentEvidence::InvalidOwner,
-            ));
-        }
-
-        let superseded_attempt_revision =
-            self.issued_attempt.as_ref().map(|attempt| attempt.revision);
+        let superseded_attempt_revision = self.issued_attempt_revision;
         let next_attempt = match superseded_attempt_revision {
             Some(revision) if self.next_attempt <= revision => {
                 revision.checked_add(1).ok_or_else(|| {
@@ -1138,8 +1096,6 @@ impl CleanupLedger {
         partition_entities.extend(protected.iter().map(|entity| entity.entity));
         partition_entities.sort_by_key(|entity| entity.to_bits());
         partition_entities.dedup();
-        self.issued_attempt = None;
-        self.next_attempt = next_attempt;
         Ok(FrozenOriginalCleanupLedgerTransfer {
             batch_manifest_digest: self.manifest_digest,
             batch_obligation_count: self.obligations.len(),
@@ -1154,6 +1110,112 @@ impl CleanupLedger {
             partition_entities,
             roots,
         })
+    }
+}
+
+impl PreparedCleanupLedger {
+    pub(crate) fn freeze_unbound_post_commit_source(
+        &self,
+        world: &World,
+    ) -> Result<FrozenOriginalCleanupLedgerTransfer, PostCommitOriginalFreezeFailure> {
+        if self.batch.is_some()
+            || self.failure_cleanup_partition.is_some()
+            || self.receipts.len() != self.obligations.len()
+            || self.receipts.iter().any(Option::is_some)
+            || self.mount_parents.len() > self.obligations.len()
+        {
+            return Err(PostCommitOriginalFreezeFailure::Permanent(
+                PostCommitOriginalFreezePermanentEvidence::InvalidLedgerShape,
+            ));
+        }
+        OriginalCleanupPhysicalSource {
+            obligations: &self.obligations,
+            receipts: &self.receipts,
+            manifest_digest: self.manifest_digest,
+            ledger_domain: self.ledger_domain,
+            next_attempt: 1,
+            issued_attempt_revision: None,
+            completion_digest: self
+                .obligations
+                .is_empty()
+                .then_some(canonical_empty_completion_digest()),
+        }
+        .freeze(world)
+    }
+}
+
+impl CleanupLedger {
+    pub(crate) fn post_commit_transfer_requires_ordinary_settlement(&self, world: &World) -> bool {
+        self.completion_digest.is_none()
+            && quarantine_disposition(
+                &collect_evidence(world, &self.obligations, &self.receipts),
+                &self.obligations,
+            )
+            .is_some()
+    }
+
+    pub(crate) fn preflight_post_commit_transfer_source_kind(
+        &self,
+    ) -> Result<(), PostCommitOriginalFreezeFailure> {
+        if !matches!(self.owner, Some(CleanupOwner::Leaving(_)) | None)
+            || self.back_no_target_batch.is_some()
+            || self.back_no_target_capacity.is_some()
+            || self.authority_host_children.is_some()
+            || self.back_no_target_authority_partition.is_some()
+            || self.failure_cleanup_partition.is_some()
+            || self.stopped.is_some()
+        {
+            return Err(PostCommitOriginalFreezeFailure::IneligibleSource);
+        }
+        Ok(())
+    }
+
+    /// Freezes the complete original cleanup owner before it crosses into the
+    /// post-commit compound. Existing receipts must already have gone through
+    /// the sole legacy Core consumer; this boundary never replays them.
+    pub(crate) fn freeze_for_post_commit_transfer(
+        &mut self,
+        world: &World,
+    ) -> Result<FrozenOriginalCleanupLedgerTransfer, PostCommitOriginalFreezeFailure> {
+        self.preflight_post_commit_transfer_source_kind()?;
+        let batch = self.batch.as_ref().ok_or_else(|| {
+            PostCommitOriginalFreezeFailure::Permanent(
+                PostCommitOriginalFreezePermanentEvidence::InvalidLedgerShape,
+            )
+        })?;
+        if batch.manifest_digest() != self.manifest_digest
+            || batch.obligation_count() != self.obligations.len()
+            || self.receipts.len() != self.obligations.len()
+            || self.mount_parents.len() > self.obligations.len()
+        {
+            return Err(PostCommitOriginalFreezeFailure::Permanent(
+                PostCommitOriginalFreezePermanentEvidence::InvalidLedgerShape,
+            ));
+        }
+        if !self.obligations.is_empty() && !matches!(self.owner, Some(CleanupOwner::Leaving(_))) {
+            return Err(PostCommitOriginalFreezeFailure::Permanent(
+                PostCommitOriginalFreezePermanentEvidence::InvalidOwner,
+            ));
+        }
+        if self.obligations.is_empty() && self.owner.is_some() {
+            return Err(PostCommitOriginalFreezeFailure::Permanent(
+                PostCommitOriginalFreezePermanentEvidence::InvalidOwner,
+            ));
+        }
+
+        let frozen = OriginalCleanupPhysicalSource {
+            obligations: &self.obligations,
+            receipts: &self.receipts,
+            manifest_digest: self.manifest_digest,
+            ledger_domain: self.ledger_domain,
+            next_attempt: self.next_attempt,
+            issued_attempt_revision: self.issued_attempt.as_ref().map(|attempt| attempt.revision),
+            completion_digest: self.completion_digest,
+        }
+        .freeze(world)?;
+        self.issued_attempt = None;
+        self.next_attempt = frozen.next_attempt;
+        Ok(frozen)
     }
 
     pub(crate) fn post_commit_original_receipt_proof(
