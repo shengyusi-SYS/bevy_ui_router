@@ -8,7 +8,6 @@ See the [overview](overview.en.md) for available features and the [behavior cont
 
 | Work | Deliverable |
 | --- | --- |
-| View transition lifecycle | Controlled APIs for application animations to keep leaving views alive, then complete or cancel a transition, with an example and combined behavior tests. See the [design](changes/view-transitions/design.en.md) and [plan](changes/view-transitions/plan.en.md) |
 | Public documentation | English and Chinese user and developer guides, runnable examples, file cleanup, and privacy checks |
 | Release preparation | MIT OR Apache-2.0 dual licensing is selected; choose the release version, then validate the final packages with an independent consumer |
 

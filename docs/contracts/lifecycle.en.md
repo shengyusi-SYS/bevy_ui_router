@@ -32,11 +32,19 @@ This point switches Router state and input eligibility together: only old or new
 
 Stale or mismatched results settle their own pending obligations while preserving the current request's identity and result. Asynchronous work carries movable data across await, with World mutation in apply; current BSN creation is synchronous.
 
+## Optional transition presence
+
+`RouteTransitionDriver::prepare` runs before the first visible presentation; `presented` means the new route has published. The application owns effects, timing, and redraw. Router owns exact presentation surfaces, completion/cancellation, and instance disposition. See the [transition guide](../guides/transitions.en.md).
+
+A held exit may remain visible but has no activity, current input, or focus. Publication fixes the retain/dispose/retire partition; release freezes the actual dynamic-content cleanup manifest. An outgoing retained instance becomes a Live cache candidate only after its original exit owner transfers it. Entering animation may outlive request completion; an unreleased exit remains the request's responsibility.
+
+Requests keep their original order. A new request first cancels a held exit session and finishes that handoff. With enter-only animation, an actual view change cancels the previous session; equivalent navigation does not restart it. Completion commands match opaque session identity, so stale commands cannot finish a newer session. Cancellation must stop application writers before returning.
+
 ## Inactive instances and long-lived owners
 
 Eligible [retained instances](navigation.en.md#retained-instances) transfer individually to independent, non-Clone long-lived owners issued by Core. ECS keeps original content and instance-owned slots, with separate parent/child responsibility. The original request can terminate after these transfers and its other cleanup complete.
 
-A retained shell stays in its original child slot alongside an active sibling, with its own retained role/claim. It is hidden and excluded from layout. Valid protected instances match their complete scope and original owner. Before a hit, inventory, current, and next are revalidated separately. Rejection, cancellation, or cleanup errors keep or return the original owner to the corresponding holder.
+A retained shell stays in its original child slot alongside an active sibling, with its own retained role/claim. Once available as Live cache inventory, it is hidden and excluded from layout. Valid protected instances match their complete scope and original owner. Before a hit, inventory, current, and next are revalidated separately. Rejection, cancellation, or cleanup errors keep or return the original owner to the corresponding holder.
 
 Capacity eviction, parent-scope invalidation, and host loss settle through cleanup owners. Retired inventory keeps its original normal cleanup token; live owners bind to the appropriate token during controlled transfer. Every responsibility transfers once. Readmission waits for original settlement. A new incarnation starts with new content, while history follows its existing rules.
 

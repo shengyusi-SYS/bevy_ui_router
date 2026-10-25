@@ -18,6 +18,7 @@
 | 桌面鼠标与 Android 传统返回 | [窗口返回](../contracts/input-focus.md#窗口级返回输入) | Platform [back input](../../crates/bevy_ui_router_platform/src/back_input.rs) 和两个输入源，应用的返回处理器 | [返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs)、最小依赖应用、窗口示例编译 |
 | pointer、keyboard/gamepad gate、focus | [输入与焦点](../contracts/input-focus.md)、[调度](../architecture/runtime.md#bevy-调度与输入) | ECS [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[plugin](../../crates/bevy_ui_router_ecs/src/plugin.rs) | [原生 pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs)、窗口交互 |
 | facade、features、依赖、示例与包内容 | [共同边界](../contracts/README.md#共同职责边界)、[Scene 注册](../contracts/scene.md#注册与运行装配) | [facade](../../crates/bevy_ui_router/src/lib.rs)、[manifest](../../crates/bevy_ui_router/Cargo.toml)、[App extension](../../crates/bevy_ui_router_ecs/src/app_ext.rs) | [独立应用](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖检查](../../crates/bevy_ui_router/tests/dependency_contract.rs)、示例及打包 consumer |
+| 路由过渡 | [过渡指南](../guides/transitions.md)、[生命周期](../contracts/lifecycle.md) | Core [exit](../../crates/bevy_ui_router_core/src/engine/exit.rs)、ECS [transition](../../crates/bevy_ui_router_ecs/src/transition.rs) 与 [退出处置](../../crates/bevy_ui_router_ecs/src/navigation/deferred_exit.rs) | [公开过渡旅程](../../crates/bevy_ui_router/tests/route_transitions.rs)、真实 picking 与窗口效果 |
 | 性能 | [性能指南](../performance.md)与对应功能合同 | 根据 profile 定位实际热点 | 同机 benchmark 比较和对应行为测试 |
 
 跨层改动沿着行为读取相关主题。例如，导航复用会影响 Scene 重建、frame 身份和焦点；outlet 变动会影响挂载与失败清理。测试选择见[按变更风险选择检查](verification.md#按变更风险选择检查)。
@@ -26,7 +27,7 @@
 
 从用户问题、期望行为和当前实现缺口开始，说明需要调整的模块和合同。复杂功能可放在 `docs/changes/<feature>/design.md` 与 `plan.md`：设计说明行为、边界和理由，计划安排交付顺序、检查和审查。简单修复直接更新相关代码、测试和文档。
 
-未完成的设计在页首标注状态和影响范围，并链接当前合同。当前推进的主题见[路线图](../roadmap.md)，已确认的过渡工作见[设计](../changes/view-transitions/design.md)和[计划](../changes/view-transitions/plan.md)。输入扩展等设计取舍见[工程经验](design-lessons.md)。
+未完成的设计在页首标注状态和影响范围，并链接当前合同。当前推进的主题见[路线图](../roadmap.md)。输入扩展等设计取舍见[工程经验](design-lessons.md)。
 
 功能完成后，将内容更新到对应位置：
 

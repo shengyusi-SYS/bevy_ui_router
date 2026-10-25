@@ -3,6 +3,7 @@ name = "router_windowed"
 version = "0.0.0"
 edition = "2024"
 publish = false
+default-run = "router_windowed"
 
 [workspace]
 resolver = "3"

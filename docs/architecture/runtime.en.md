@@ -55,10 +55,20 @@ sequenceDiagram
             Nav->>Core: return execution and mounting results
         end
     end
+    opt Application configures a transition driver
+        Nav->>App: prepare hidden entering and current leaving views
+    end
     Nav->>World: prepare current/next, input, focus, and subsequent owners
     Nav->>World: apply prepared publication tail
     Nav->>Core: publish presentation / history
-    Nav->>World: clean up leaving content
+    opt Application transition
+        Nav->>App: presented (new route is effective)
+        opt Application holds leaving views
+            App->>Nav: release / finish, or a new request cancels
+            Nav->>World: hide old views, freeze actual cleanup scope
+        end
+    end
+    Nav->>World: clean up leaving content / transfer retained instances
     Nav-->>App: update RouterSnapshots
 ```
 
@@ -67,6 +77,8 @@ Fresh content uses official `ScenePatch::load/resolve` and the Scene executor. A
 Mixed branches prepare as `Current* → Retained* → Fresh*`. Core decides selection, capacity, and eviction; ECS holds each instance's original content and owned slots. A fresh child uses the parent mount selected for this request. New slots belong to preparation until publication, then transfer to the parent; failure cleans them up. Parent dependency eviction runs child-first.
 
 Publication preparation combines the physical switch, claim rebinds, input/focus changes, and subsequent owners. The tail applies prepared state, and Core publishes presentation/history last. See the [publication contract](../contracts/lifecycle.en.md#ownership-and-publication). Cleanup of old content may follow: the request can remain in `PostCommitCleanup` while the new page and history are already effective.
+
+Optional transitions separate the application presentation session from physical exit ownership. The application prepares initial styles before publication and starts its own animation afterward. Enter-only animation does not delay request completion. An exit hold keeps the old page visible but inactive; release then freezes actual containment for cleanup. See the [transition guide](../guides/transitions.en.md).
 
 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) manages scroll records. Core provides entry and target frame/reuse facts; preparation freezes restoration intents, and the tail installs them. Existing and late containers receive their requested position before normal layout and settle once afterward. While waiting, restoration targets and displayed positions remain separate; leaving revalidates bindings and application edits. See [scroll restoration by visit](../contracts/navigation.en.md#scroll-restoration-by-visit).
 
@@ -77,7 +89,10 @@ Failure first settles its physical obligations, then follows the error boundary,
 ```mermaid
 flowchart TB
     subgraph PreUpdate
-        Refresh["RouterInputSet::Refresh"] --> HoverMap["picking hovermap"]
+        Refresh["RouterInputSet::Refresh"] --> Candidates["visible exit: project UiStack candidates"]
+        Candidates --> Backend["official picking Backend"]
+        Backend --> Restore["restore original UiStack"]
+        Restore --> HoverMap["picking hovermap"]
         HoverMap --> Filter["filter inactive pointer state"]
         Filter --> Interaction["picking interactions"]
         Interaction --> Ready["RouterInputSet::Ready"]
@@ -107,7 +122,7 @@ Applications use these public ordering points:
 
 The other lifecycle sets in the diagram are crate-private and orchestrated by ECS. Plugins and App extensions share idempotent installation.
 
-Input eligibility refreshes before picking hover, and inactive targets are filtered between hover generation and interactions. Publication revokes leaving targets' historical hover, press, click, drag, and focus in the same call. Applications integrate target filtering for native TabNavigation/InputDispatch; see the [integration guide](../guides/integration.en.md).
+Input eligibility refreshes before the picking Backend. While an exit is visible, its native UI candidates are temporarily excluded and the complete stack is restored after Backend, allowing the new page to receive hits. Inactive targets are then filtered between hover generation and interactions. Publication revokes leaving targets' historical hover, press, click, drag, and focus in the same call. Applications integrate target filtering for native TabNavigation/InputDispatch; see the [integration guide](../guides/integration.en.md).
 
 Read-only phases can reuse frame content, membership, and child-slot boundaries within one World borrow. Writes and new scheduling phases require a new observation. Focus also validates shells, committed boundaries, and the closure outside slots; retained instances validate all descendants and their separation from input/focus.
 

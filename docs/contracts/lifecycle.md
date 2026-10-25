@@ -32,11 +32,19 @@ pending shell 用 `Display::None` 隔离，同时保留普通内容 authored 值
 
 旧或不匹配结果只结算自己的 pending 责任，当前请求保持原身份与结果。异步执行只跨 await 携带可移动数据，World mutation 留在 apply；当前 BSN 使用同步 Scene 创建。
 
+## 可选过渡存续
+
+`RouteTransitionDriver` 的 prepare 在首次可见前运行；presented 表示新路由已发布。应用负责效果、时间与重绘，Router 负责精确展示表面、完成/取消和实例处置。接口见[过渡指南](../guides/transitions.md)。
+
+旧页在退出存续期间可以可见，但不具有 activity、当前输入或 focus。发布时确定 retain/dispose/retire 分区；释放时才冻结动态内容的实际清理清单。旧页在原退出 owner 交接完成后成为可命中的 Live cache。进入动画可在请求终态后继续；旧页存续未释放时请求仍承担退出责任。
+
+连续请求按原顺序执行：持有退出页时，新请求先同步取消旧会话并完成退出交接；只有进入动画时，实际改变视图才取消原会话，等价导航不重启动画。完成命令按不透明会话身份匹配，旧命令不结算新会话。取消回调返回前必须停止应用写入。
+
 ## 非活动实例与长期 owner
 
 符合[实例保留](navigation.md#实例保留)条件的离场实例，逐一移交 Core 签发的独立、不可 Clone 的长期 owner。ECS 保存原内容和实例自有 slots，父子分别承担责任。移交和其余清理完成后，原请求可以终结。
 
-retained shell 保留在原 child slot 下，与 active sibling 共存，具有自己的 retained role/claim。它隐藏且不参与布局。合法 protected 实例需匹配完整 scope 和原 owner；命中前分别复验库存、current 与 next。拒绝、取消或清理错误时，原 owner 继续由对应 holder 持有或返还。
+retained shell 保留在原 child slot 下，与 active sibling 共存，具有自己的 retained role/claim。成为可命中库存后，它隐藏且不参与布局。合法 protected 实例需匹配完整 scope 和原 owner；命中前分别复验库存、current 与 next。拒绝、取消或清理错误时，原 owner 继续由对应 holder 持有或返还。
 
 容量淘汰、父 scope 失效及 host loss 通过 cleanup owner 结算。已退休库存保留原 normal cleanup token，live owner 在受控移交时绑定对应 token，每份责任只移交一次。host 重新接纳等待原 settlement；新 incarnation 从新内容开始，history 按原规则保留。
 

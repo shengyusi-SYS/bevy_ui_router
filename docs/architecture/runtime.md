@@ -55,10 +55,20 @@ sequenceDiagram
             Nav->>Core: 交回执行与挂载结果
         end
     end
+    opt 应用配置过渡 driver
+        Nav->>App: prepare 隐藏的新页与仍活动的旧页
+    end
     Nav->>World: 准备 current/next、输入、focus 和后续 owner
     Nav->>World: 执行预备好的 publication tail
     Nav->>Core: 发布 presentation / history
-    Nav->>World: 清理离场内容
+    opt 本次应用过渡
+        Nav->>App: presented（新路由已生效）
+        opt 应用要求保留旧页至退出结束
+            App->>Nav: release / finish，或新请求触发取消
+            Nav->>World: 隐藏旧页，冻结实际清理范围
+        end
+    end
+    Nav->>World: 清理离场内容 / 移交保留实例
     Nav-->>App: 更新 RouterSnapshots
 ```
 
@@ -67,6 +77,8 @@ fresh 路径通过官方 `ScenePatch::load/resolve` 和 Scene executor 应用新
 混合分支按 `Current* → Retained* → Fresh*` 准备。Core 决定选择、容量和淘汰，ECS 持有每个实例的原内容及其自有 slots。fresh 子使用本次选中的父挂载；新 slot 在发布前属于 preparation，成功后交给父实例，失败时清理。父依赖淘汰按 child-first 顺序执行。
 
 发布准备完成物理切换、claim rebind、输入/focus 和后续 owner 的组合。tail 只应用已准备状态，Core 最后发布 presentation/history。具体规则见[publication 合同](../contracts/lifecycle.md#ownership-与-publication)。旧内容清理可以随后进行，此时请求可能仍为 `PostCommitCleanup`，新页面和 history 已生效。
+
+可选过渡把应用展示会话与物理退出 owner 分开。应用先写初始样式，发布后才推进自己的动画；只做进入动画不延后请求终态。需要退出存续时，旧页可见但已非 active，原清理责任延至 release；动态内容此时才按真实 containment 冻结。具体接入见[过渡指南](../guides/transitions.md)。
 
 滚动记录归 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 提供 entry 与目标 frame/reuse 事实；准备阶段冻结恢复意图，tail 安装意图。早已存在和后来出现的容器都在正常布局前写入恢复位置，布局后结算一次。等待期间分别保存恢复目标与实际显示位置，离场时复验绑定和应用的新值。详见[按访问恢复滚动](../contracts/navigation.md#按访问恢复滚动)。
 
@@ -77,7 +89,10 @@ fresh 路径通过官方 `ScenePatch::load/resolve` 和 Scene executor 应用新
 ```mermaid
 flowchart TB
     subgraph PreUpdate
-        Refresh["RouterInputSet::Refresh"] --> HoverMap["picking hovermap"]
+        Refresh["RouterInputSet::Refresh"] --> Candidates["有可见退出页：投影 UiStack 候选"]
+        Candidates --> Backend["官方 picking Backend"]
+        Backend --> Restore["恢复原 UiStack"]
+        Restore --> HoverMap["picking hovermap"]
         HoverMap --> Filter["过滤非活动 pointer 状态"]
         Filter --> Interaction["picking interactions"]
         Interaction --> Ready["RouterInputSet::Ready"]
@@ -107,7 +122,7 @@ flowchart TB
 
 图中其余生命周期 set 为 crate-private，由 ECS 编排。插件和 App extensions 共用幂等安装逻辑。
 
-输入在 picking hover 前刷新资格，在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[接入指南](../guides/integration.md)。
+输入在 picking Backend 前刷新资格；有可见退出页时暂时排除其原生 UI 候选，Backend 后恢复完整栈，避免旧页阻挡新页命中。随后在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[接入指南](../guides/integration.md)。
 
 只读阶段可复用本轮 frame 内容、membership 和 child-slot 切口，写入后或进入新调度阶段重新观察。focus 还验证 shell、已提交切口和 slot 外侧闭包；保留实例验证完整后代及其与输入/focus 的隔离。
 

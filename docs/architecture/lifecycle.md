@@ -27,6 +27,14 @@ history 签发与配对位于 [history_authority.rs](../../crates/bevy_ui_router
 
 空闲 host loss 使用独立 settlement owner，由 Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) 与 ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs) 处理，已终结请求保持终态。
 
+## 延后退出与应用展示
+
+[Core exit](../../crates/bevy_ui_router_core/src/engine/exit.rs) 将稳定 cleanup batch identity 与实际 manifest seal 分开。普通导航仍立即 seal；可见退出在 publication 移交原 `DeferredExitOwner`，释放后才从实际 containment 建立 manifest。history 始终在第一次 publication 提交，不在 release 重发。
+
+ECS [transition](../../crates/bevy_ui_router_ecs/src/transition.rs) 只持有应用 session 与受控展示值；[deferred_exit](../../crates/bevy_ui_router_ecs/src/navigation/deferred_exit.rs) 持有原逻辑 owner、实体分区和冻结的隐藏目标。会话可先取消，精确 presence 投影持续到旧内容真实隐藏。可见性不改变 lifecycle/input。
+
+发布前准备在原 active owner 仍可查询时调用应用，current 与 next claims 分别冻结。立即、retained 和 deferred 发布共用 [publication](../../crates/bevy_ui_router_ecs/src/navigation/publication.rs) 接收器；Back 保留原 continuation。退出 release 将真实 seal 接入原 ledger，不建立平行的动画清理状态机。
+
 ## 准备结果与失败分流
 
 `reconciliation_preflight` 检查 host/current 与 pending entering。[lifecycle_preparation.rs](../../crates/bevy_ui_router_ecs/src/lifecycle_preparation.rs) 保存 source、expectation 和 observed state。不同 preparation 路径有各自的具体类型，以下按含义对照。

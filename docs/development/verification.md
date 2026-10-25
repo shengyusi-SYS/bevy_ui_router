@@ -79,7 +79,8 @@ gitleaks git . --redact --log-opts="--all --full-history" --report-format json -
 | 平台返回 | [返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs)、[桌面 consumer](../../crates/bevy_ui_router/tests/consumers/desktop_back.rs)、[Android consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs) | 按窗口传递意图、过滤重复、双源通道、弹层优先与定向 Back |
 | 输入与焦点 | [pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 活动命中、离场撤销、已开始手势和其它有效目标 |
 | 保留实例 | [保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立保留、原父/新子、容量淘汰、失效清理和后续导航 |
-| 滚动恢复 | [滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 真实布局、早晚容器、ready/cancel、二维裁剪、用户滚动优先和旧 ID |
+| 路由过渡 | [过渡旅程](../../crates/bevy_ui_router/tests/route_transitions.rs)、[原生重叠输入](../../crates/bevy_ui_router_ecs/src/input/native_ui_candidates/tests.rs) | prepare/current 输入、首帧样式、enter-only、动态退出、父子保留、Back、连续导航、host 失效与重新接入 |
+| 滚动恢复 | [滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 真实布局、早晚容器、ready/cancel、二维裁剪、用户滚动优先、旧 ID，以及过渡与缓存淘汰中的多次访问恢复 |
 | 页面系统 | [活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 可变应用 Query、保留页失活/恢复、动态后代与精确父链 |
 | 集成边界 | [consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 各 feature 的可见 API、最小依赖和官方 Bevy 来源 |
 
@@ -104,6 +105,7 @@ cargo fetch --manifest-path examples/windowed/Cargo.toml --locked
 cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
 cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
 ```
 
 Linux 构建采用 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev` 和 `libxrandr-dev`。交互检查包括 push/replace/back、布局与页面计数、不同访问的滚动位置、晚到内容、点击和 Space、焦点释放、跨页手势、错误 fallback 和恢复。具体步骤与 BRP 命令见[窗口调试](../guides/debugging.md)。
@@ -144,7 +146,7 @@ python3 scripts/check-packaged-consumer.py
 | 官方 Bevy `0.19.0` / `0.19.1` | workspace、公开旅程和独立 consumer 的相应回归；默认 lock 为 `0.19.1` | 更新依赖时运行对应版本检查 |
 | Headless Scene/UI | 导航、布局、picking、focus、保留、活动与滚动组合 | 按功能改动选择完整操作链 |
 | 打包产物 | 六个库包和解压后的 BSN consumer | 最终发布树重新打包并运行 consumer |
-| Linux/WSLg 窗口 | llvmpipe 软件渲染；BRP 输入和 renderer 截图覆盖导航、保留、滚动、焦点、手势、fallback | 窗口交互改动后按调试指南复测 |
+| Linux/WSLg 窗口 | llvmpipe 软件渲染；BRP 输入和 renderer 截图覆盖导航、保留、滚动、焦点、手势、fallback 和应用自定义过渡 | 窗口交互改动后按调试指南复测 |
 | Android | 最小 `android-back` 的 `aarch64-linux-android` 编译、Bevy 消息与调度测试 | APK、设备和系统返回行为待实测 |
 | Windows 原生、物理 GPU、硬件输入 | 待验证 | 在目标平台记录系统、设备、命令和交互结果 |
 | Rust 最低版本 | 依赖声明要求已核对 | 最低工具链运行待验证 |

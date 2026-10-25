@@ -18,14 +18,17 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 | [bsn_quick_start.rs](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) | 注册 Scene、建立 Router、导航、读取结果 | 无窗口，完成后退出 |
 | [bsn_nested.rs](../../crates/bevy_ui_router/examples/bsn_nested.rs) | 嵌套布局、query 更新、应用异步内容、滚动恢复 | 无窗口，使用真实 UI 布局，完成后退出 |
 | [windowed](../../examples/windowed/) | 可点击页面、状态保留、焦点、错误恢复 | 交互窗口 |
+| [transitions](../../examples/windowed/src/bin/transitions.rs) | 应用自定义过渡、退出释放、快速连续导航 | 交互窗口 |
 
 启动窗口示例：
 
 ```sh
-cargo run --locked --manifest-path examples/windowed/Cargo.toml
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin router_windowed
 ```
 
 窗口示例自行配置窗口、相机、字体和样式。Linux 构建采用 X11，需要 X11/xkbcommon 开发库；运行需要桌面显示和图形驱动。输入自动化和截图见[窗口调试](debugging.md)。
+
+路由过渡默认关闭。接入应用动画以及运行两种效果的独立示例，见[应用自定义路由过渡](transitions.md)。
 
 ## 在独立 Cargo 应用中使用
 

@@ -18,14 +18,17 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 | [bsn_quick_start.rs](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) | Register Scenes, create a Router, navigate, and read results | Headless; exits when complete |
 | [bsn_nested.rs](../../crates/bevy_ui_router/examples/bsn_nested.rs) | Nested layouts, query updates, application async content, and scroll restoration | Headless with real UI layout; exits when complete |
 | [windowed](../../examples/windowed/) | Clickable pages, retained state, focus, and error recovery | Interactive window |
+| [transitions](../../examples/windowed/src/bin/transitions.rs) | Application animation, exit release, and successive navigation | Interactive window |
 
 Start the windowed example:
 
 ```sh
-cargo run --locked --manifest-path examples/windowed/Cargo.toml
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin router_windowed
 ```
 
 The windowed application configures its window, camera, font, and styling. Its Linux build uses X11 and needs the X11/xkbcommon development libraries. Running it requires a display and graphics driver. See [window debugging](debugging.en.md) for automated input and screenshots.
+
+Route transitions are disabled by default. See [application-defined route transitions](transitions.en.md) to connect application animation and run the separate example with two effects.
 
 ## Use Router in a separate Cargo application
 

@@ -29,6 +29,7 @@ Bevy UI Router 把页面组织、切换和返回集中到一个路由系统。�
 - 布局与子页分别选择 keep-alive，按容量和父依赖管理非活动实例；默认容量为 0。
 - 按访问记录恢复二维滚动位置，支持晚出现的容器、内容 ready、取消和应用主动滚动。
 - 页面活动查询、原生 pointer 隔离、离场手势撤销和焦点释放；键盘/手柄处理器通过显式 gate 接入。
+- 可选的[过渡生命周期](guides/transitions.md)：首次可见前准备、退出存续和完成/取消；具体动画由应用实现。
 - 可选桌面鼠标后退键和 Android 传统 Back 输入，由应用选择窗口对应的 Router。
 
 页面数据加载由普通 Bevy 任务和系统完成；任务返回数据，系统在 World 中安装内容。窗口、主题、相机、业务数据和后台工作策略由应用配置。
@@ -39,4 +40,4 @@ Bevy UI Router 把页面组织、切换和返回集中到一个路由系统。�
 
 当前依赖系列为官方 Bevy 0.19；锁文件使用 0.19.1。工具和平台验证范围见[验证指南](development/verification.md)。
 
-过渡生命周期正在开发。浏览器 URL/history、异步 Scene 加载、typed routes 和多出口等后续方向见[路线图](roadmap.md)。开始使用时，阅读[接入指南](guides/integration.md)；查询具体规则时，阅读[行为合同](contracts/README.md)。
+浏览器 URL/history、异步 Scene 加载、typed routes 和多出口等后续方向见[路线图](roadmap.md)。开始使用时，阅读[接入指南](guides/integration.md)；查询具体规则时，阅读[行为合同](contracts/README.md)。

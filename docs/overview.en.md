@@ -29,6 +29,7 @@ For routes such as `/projects` and `/projects/:id`, a parent layout can hold nav
 - Independent keep-alive choices for layouts and child pages, with capacity and parent-dependency management. The default inactive capacity is zero.
 - Per-visit two-dimensional scroll restoration, including late containers, explicit content readiness, cancellation, and application-initiated scrolling.
 - Page activity queries, native pointer isolation, gesture revocation on exit, and focus release. Keyboard and gamepad handlers use an explicit input gate.
+- Optional [transition lifecycle](guides/transitions.en.md): preparation before first display, exit presence, and completion/cancellation; applications implement the effects.
 - Optional mouse back-button and Android legacy Back input, with the application selecting a Router for the source window.
 
 Application data loads through ordinary Bevy tasks and systems. Tasks return data; systems install it in the World. The application configures windows, themes, cameras, business data, and background-work policies.
@@ -39,4 +40,4 @@ For Bevy UI, start with the `bsn` feature of `bevy_ui_router`. Core makes routin
 
 The dependency series is official Bevy 0.19, with 0.19.1 in the lockfile. See [verification](development/verification.en.md) for toolchain and platform coverage.
 
-View transition lifecycle support is in development. The [roadmap](roadmap.en.md) also covers browser URL/history integration, asynchronous Scene loading, typed routes, and multiple outlets. Start with [integration](guides/integration.en.md), or consult the [behavior contracts](contracts/README.en.md) for detailed rules.
+The [roadmap](roadmap.en.md) also covers browser URL/history integration, asynchronous Scene loading, typed routes, and multiple outlets. Start with [integration](guides/integration.en.md), or consult the [behavior contracts](contracts/README.en.md) for detailed rules.

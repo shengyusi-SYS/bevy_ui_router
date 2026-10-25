@@ -33,6 +33,12 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml
 
 窗口可体验页面切换、返回、布局和页面计数、错误恢复、键盘交互与滚动。Linux 使用 X11；依赖安装和窗口操作见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)。
 
+应用自定义过渡示例提供平移、缩放旋转和连续导航取消，具体效果完全在应用中实现：
+
+```sh
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+```
+
 ## 接入应用
 
 当前从仓库使用本地依赖，下面的路径指向你的 checkout：

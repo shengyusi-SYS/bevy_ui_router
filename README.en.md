@@ -33,6 +33,12 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml
 
 The window demonstrates navigation, back, layout and page counters, error recovery, keyboard interaction, and scrolling. On Linux it uses X11; see the [integration guide](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md) for build dependencies and controls.
 
+The application transition example provides slide, scale/rotation, and cancellation during queued navigation. Effects live entirely in application code:
+
+```sh
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+```
+
 ## Add it to an application
 
 Use a local dependency pointing to your checkout:

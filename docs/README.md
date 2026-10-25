@@ -8,6 +8,7 @@
 | --- | --- |
 | 了解 Router 解决什么问题 | [产品概览](overview.md) |
 | 将路由接入 Bevy 应用 | [接入指南](guides/integration.md) |
+| 添加应用自定义动画 | [过渡指南](guides/transitions.md) |
 | 调试窗口、导航和输入 | [调试指南](guides/debugging.md) |
 | 查询导航、Scene、生命周期和输入行为 | [行为合同](contracts/README.md) |
 | 理解模块分工与数据结构 | [架构总览](architecture/README.md) |
@@ -18,10 +19,6 @@
 | 测量导航和空闲更新成本 | [性能测量](performance.md) |
 | 理解关键设计选择 | [设计理由](development/design-lessons.md) |
 | 查看后续工作 | [路线图](roadmap.md) |
-
-## 正在开发
-
-[路由过渡生命周期设计](changes/view-transitions/design.md)与[实施计划](changes/view-transitions/plan.md)记录当前开发工作。具体动画由应用/UI 层实现；现行行为以行为合同和公开 API 为准。
 
 ## 查阅 API 与历史
 

@@ -79,7 +79,8 @@ gitleaks git . --redact --log-opts="--all --full-history" --report-format json -
 | Platform Back | [Back journeys](../../crates/bevy_ui_router/tests/platform_back.rs), [desktop consumer](../../crates/bevy_ui_router/tests/consumers/desktop_back.rs), [Android consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs) | Per-window intent, repeat filtering, shared source channel, overlay priority, and targeted Back |
 | Input and focus | [Pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs), [focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | Active hits, departure revocation, started gestures, and other valid targets |
 | Retained instances | [Retention journeys](../../crates/bevy_ui_router/tests/retained_navigation.rs) | Independent parent/child retention, retained parent with a new child, eviction, invalidation cleanup, and subsequent navigation |
-| Scroll restoration | [Scroll journeys](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | Real layout, early/late containers, ready/cancel, two-dimensional clamping, user scrolling priority, and stale IDs |
+| Route transitions | [Transition journeys](../../crates/bevy_ui_router/tests/route_transitions.rs), [native overlapping input](../../crates/bevy_ui_router_ecs/src/input/native_ui_candidates/tests.rs) | prepare/current inputs, initial styles, enter-only, dynamic exits, nested retention, Back, queued navigation, host loss/readmission |
+| Scroll restoration | [Scroll journeys](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | Real layout, early/late containers, ready/cancel, two-dimensional clamping, user scrolling priority, stale IDs, and repeated visits with transitions and cache eviction |
 | Page systems | [Activity journeys](../../crates/bevy_ui_router/tests/public_activity.rs) | Mutable application queries, retained-page deactivation/reactivation, dynamic descendants, and exact parent chains |
 | Integration boundaries | [Consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs), [dependency contract](../../crates/bevy_ui_router/tests/dependency_contract.rs) | Visible APIs for each feature, minimal dependencies, and official Bevy sources |
 
@@ -104,6 +105,7 @@ cargo fetch --manifest-path examples/windowed/Cargo.toml --locked
 cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
 cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
 ```
 
 The Linux build uses X11. CI installs `libxkbcommon-dev`, `libx11-dev`, `libxi-dev`, `libxcursor-dev`, and `libxrandr-dev`. Interaction checks cover push/replace/back, layout and page counters, positions for separate visits, delayed content, clicks and Space, focus release, gestures across navigation, error fallback, and recovery. See [window debugging](../guides/debugging.en.md) for steps and BRP commands.
@@ -144,7 +146,7 @@ This table summarizes historical verification recorded in the repository and hel
 | Official Bevy `0.19.0` / `0.19.1` | Corresponding workspace, public-journey, and standalone-consumer regressions; the default lock selects `0.19.1` | Run the relevant version checks when updating dependencies |
 | Headless Scene/UI | Combined navigation, layout, picking, focus, retention, activity, and scrolling | Select complete journeys for the changed behavior |
 | Package archives | Six library packages and the extracted BSN consumer | Repackage the final release tree and run its consumer |
-| Linux/WSLg window | llvmpipe software rendering; BRP input and renderer screenshots cover navigation, retention, scrolling, focus, gestures, and fallback | Repeat the debugging steps after interaction changes |
+| Linux/WSLg window | llvmpipe software rendering; BRP input and renderer screenshots cover navigation, retention, scrolling, focus, gestures, fallback, and application transitions | Repeat the debugging steps after interaction changes |
 | Android | Minimal `android-back` compilation for `aarch64-linux-android`, plus Bevy message/scheduling tests | APK, device, and system Back checks remain to be run |
 | Native Windows, physical GPU, hardware input | Awaiting verification | Record system, device, commands, and interaction results on the target platform |
 | Minimum Rust version | Dependency requirements checked | Minimum-toolchain execution remains to be run |

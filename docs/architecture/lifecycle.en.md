@@ -27,6 +27,14 @@ History issuance and pairing live in [history_authority.rs](../../crates/bevy_ui
 
 Idle host loss uses a separate settlement owner, managed by Core [idle_host_loss.rs](../../crates/bevy_ui_router_core/src/engine/idle_host_loss.rs) and ECS [idle_host_loss.rs](../../crates/bevy_ui_router_ecs/src/navigation/idle_host_loss.rs). Completed requests remain terminal.
 
+## Deferred exit and application presentation
+
+[Core exit](../../crates/bevy_ui_router_core/src/engine/exit.rs) separates stable cleanup batch identity from the actual manifest seal. Ordinary navigation seals immediately. A visible exit transfers its original `DeferredExitOwner` at publication and creates the manifest from actual containment only on release. History commits at the original publication, never again at release.
+
+ECS [transition](../../crates/bevy_ui_router_ecs/src/transition.rs) holds application sessions and authorized presentation values. [deferred_exit](../../crates/bevy_ui_router_ecs/src/navigation/deferred_exit.rs) holds the original logical owner, entity partitions, and frozen hiding targets. A session may cancel first; its exact presence projection remains until the old content is physically hidden. Visibility never grants lifecycle/input activity.
+
+Preparation calls application code while original active owners remain queryable and freezes current/next claims independently. Immediate, retained, and deferred publication share the [publication](../../crates/bevy_ui_router_ecs/src/navigation/publication.rs) receiver; Back keeps its original continuation. Release joins the real seal to the existing ledger rather than introducing a parallel animation cleanup state machine.
+
 ## Preparation outcomes and failure routing
 
 `reconciliation_preflight` checks host/current and pending entering content. [lifecycle_preparation.rs](../../crates/bevy_ui_router_ecs/src/lifecycle_preparation.rs) keeps the source, expectation, and observed state. Each preparation path has its own concrete types; this table compares their meanings.
