@@ -1458,7 +1458,30 @@ impl<'a> ReconciliationSpliceView<'a> {
         &self,
         claims: &[ExactRegistryClaim],
     ) -> Option<PreparedReconciliationClaimRebind> {
-        let transitions = self.lifecycle_transitions();
+        self.prepare_claim_rebind_with_retiring(claims, &[])
+    }
+
+    /// Retiring cache instances remain separate owners. Their exact projected
+    /// claims only refresh aliases held by the resulting branch while disposal
+    /// is deferred; they never become splice-owned mutation targets.
+    pub(crate) fn prepare_claim_rebind_with_retiring(
+        &self,
+        claims: &[ExactRegistryClaim],
+        retiring: &[&crate::instance::InstancePayload],
+    ) -> Option<PreparedReconciliationClaimRebind> {
+        let mut transitions = self.lifecycle_transitions();
+        for payload in retiring {
+            for claim in payload.as_payload_ref().claims() {
+                if claim.lifecycle() != EntityLifecycle::Retained
+                    || transitions
+                        .iter()
+                        .any(|(source, _)| source.entity() == claim.entity())
+                {
+                    return None;
+                }
+                transitions.push((claim.clone(), EntityLifecycle::Leaving));
+            }
+        }
         if claims.len() != transitions.len()
             || claims.iter().enumerate().any(|(index, claim)| {
                 claims[index + 1..]

@@ -1,7 +1,7 @@
 //! Opt-in restoration exercised through the public BSN/router and real UI layout.
 use std::sync::{Arc, Mutex};
 
-use bevy_app::{App, PostUpdate};
+use bevy_app::{App, PostUpdate, Update};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
@@ -13,9 +13,9 @@ use bevy_internal::{
 use bevy_scene::{PatchFromTemplate, ScenePlugin, bsn};
 use bevy_ui::{
     ComputedNode, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, FlexDirection, Node,
-    Overflow, ScrollPosition, UiSystems, UiTransform, Val,
+    Overflow, PositionType, ScrollPosition, UiSystems, UiTransform, Val, Val2,
 };
-use bevy_ui_router::prelude::*;
+use bevy_ui_router::{ecs::RouterScheduleSet, prelude::*};
 
 #[derive(Component, Clone, Default)]
 struct Page(&'static str);
@@ -35,6 +35,7 @@ struct FixtureOptions {
     keep_alive_capacity: usize,
     retained_layout: bool,
     explicit_body: bool,
+    transitions: bool,
 }
 
 impl Default for FixtureOptions {
@@ -47,6 +48,7 @@ impl Default for FixtureOptions {
             keep_alive_capacity: 0,
             retained_layout: false,
             explicit_body: false,
+            transitions: false,
         }
     }
 }
@@ -57,6 +59,57 @@ struct Fixture {
     host: Entity,
     camera: Option<Entity>,
     content_size: Arc<Mutex<Vec2>>,
+}
+
+#[derive(Resource, Default)]
+struct ScrollTransitionSession(Option<(RouteTransitionId, u8)>);
+
+struct ScrollTransition;
+
+impl RouteTransitionDriver for ScrollTransition {
+    fn prepare(
+        &mut self,
+        world: &mut World,
+        context: &RouteTransitionContext,
+    ) -> TransitionPreparation {
+        for target in context
+            .entering()
+            .iter()
+            .chain(context.leaving())
+            .filter(|target| target.is_outermost())
+        {
+            world
+                .get_mut::<Node>(target.surface())
+                .unwrap()
+                .position_type = PositionType::Absolute;
+            world
+                .get_mut::<UiTransform>(target.surface())
+                .unwrap()
+                .translation = Val2::px(20.0, 15.0);
+        }
+        TransitionPreparation::Run { hold_exit: true }
+    }
+
+    fn presented(&mut self, world: &mut World, id: &RouteTransitionId) {
+        world.resource_mut::<ScrollTransitionSession>().0 = Some((id.clone(), 0));
+    }
+
+    fn cancelled(&mut self, world: &mut World, _: &RouteTransitionId, _: TransitionCancelReason) {
+        world.resource_mut::<ScrollTransitionSession>().0 = None;
+    }
+}
+
+fn finish_scroll_transition(mut session: ResMut<ScrollTransitionSession>, mut commands: Commands) {
+    let Some((id, frames)) = session.0.as_mut() else {
+        return;
+    };
+    *frames += 1;
+    // Real normal layouts run while the outgoing page remains visible. Ending
+    // the test application effect must not rewrite restored scroll positions.
+    if *frames == 3 {
+        commands.finish_route_transition(id.clone());
+        session.0 = None;
+    }
 }
 
 fn fixture(options: FixtureOptions) -> Fixture {
@@ -223,16 +276,20 @@ fn fixture(options: FixtureOptions) -> Fixture {
                 .unwrap();
         }
     }
-    let router = app
-        .add_ui_router(
-            RouterConfig::new(
-                routes.build().unwrap(),
-                views,
-                RouteViewKey::new("fallback").unwrap(),
-            )
-            .with_keep_alive_capacity(options.keep_alive_capacity),
-        )
-        .unwrap();
+    let mut config = RouterConfig::new(
+        routes.build().unwrap(),
+        views,
+        RouteViewKey::new("fallback").unwrap(),
+    )
+    .with_keep_alive_capacity(options.keep_alive_capacity);
+    if options.transitions {
+        app.init_resource::<ScrollTransitionSession>().add_systems(
+            Update,
+            finish_scroll_transition.after(RouterScheduleSet::PublishSnapshots),
+        );
+        config = config.with_transition_driver(ScrollTransition);
+    }
+    let router = app.add_ui_router(config).unwrap();
     let host = app
         .world_mut()
         .spawn((
@@ -612,6 +669,7 @@ fn repeated_entries_restore_distinct_positions_on_cache_hits_misses_and_eviction
             mut app, router, ..
         } = fixture(FixtureOptions {
             keep_alive_capacity: capacity,
+            transitions: true,
             ..Default::default()
         });
         push(&mut app, router, "/a");
@@ -647,7 +705,11 @@ fn repeated_entries_restore_distinct_positions_on_cache_hits_misses_and_eviction
         push(&mut app, router, "/c");
         assert_eq!(history(&app, router).entries().len(), 4);
         if capacity == 1 {
-            assert!(app.world().get_entity(original_b).is_err());
+            assert!(
+                app.world().get_entity(original_b).is_err(),
+                "retired b remains: {:?}",
+                app.world().resource::<RouterSnapshots>().get(router)
+            );
         }
 
         back(&mut app, router);

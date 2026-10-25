@@ -697,7 +697,11 @@ pub(super) fn publish_normal_work(
             })
             .cloned()
             .collect::<Vec<_>>();
-        let claim_rebind = view.prepare_claim_rebind(&splice_claims)?;
+        let claim_rebind = if hold_exit {
+            view.prepare_claim_rebind_with_retiring(&resulting_claims, &retired_branches)?
+        } else {
+            view.prepare_claim_rebind(&splice_claims)?
+        };
         if pending.ticket.is_none() {
             let task = pending
                 .final_task

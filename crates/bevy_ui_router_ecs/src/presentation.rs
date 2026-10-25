@@ -2161,10 +2161,10 @@ impl RealizedFrame {
                 return None;
             }
             prior.push(child);
-            // Other retained peers keep their independently re-observed proof.
-            if current_leaving {
-                peers.push(claim);
-            }
+            // Publication rebinds peers selected for retirement to Leaving.
+            // Peers that remain Retained are removed from this alias list and
+            // continue to use their independent retained-boundary proof.
+            peers.push(claim);
         }
         let mut mount = FrameMountBinding::from_mounted_child_slot(slot);
         if let FrameMountBindingKind::ChildOutlet {
