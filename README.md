@@ -69,6 +69,10 @@ bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = 
 - [贡献指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/CONTRIBUTING.md)：开发入口和检查方法。
 - [路线图](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/roadmap.md)：正在开发的能力及发布准备。
 
+## 生产实践
+
+[涟音 LianYin](https://lianyin.eztools.fun/zh-cn/) 是一款跨平台、跨设备音乐播放器，在实际产品中使用本库管理页面导航、历史返回、页面保留和滚动位置恢复。产品介绍与版本发布见[涟音仓库](https://github.com/shengyusi-SYS/lianyin)。
+
 ## 许可证
 
 本项目采用双许可证，可选择 [MIT](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/LICENSE-MIT) 或 [Apache-2.0](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/LICENSE-APACHE)。

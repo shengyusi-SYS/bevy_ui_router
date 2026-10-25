@@ -69,6 +69,10 @@ Your application owns its windows, cameras, UI styling, and data tasks. Router m
 - [Contributing](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/CONTRIBUTING.en.md): development entry points and checks.
 - [Roadmap](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/roadmap.en.md): work in progress and release preparation.
 
+## Production use
+
+[LianYin](https://lianyin.eztools.fun/en/) is a cross-platform, multi-device music player that uses this library in production for navigation, history, page retention, and scroll restoration. See the [LianYin repository](https://github.com/shengyusi-SYS/lianyin) for product information and releases.
+
 ## License
 
 Licensed under either [MIT](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/LICENSE-APACHE), at your option.
