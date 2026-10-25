@@ -27,7 +27,7 @@ use crate::{
     components::{RouteOwnershipSeal, RouterInputBarrier},
     registry::{
         ComponentManifest, EntityLifecycle, EntityOwner, ExactRegistryClaim, QuarantineLeaseTable,
-        RegistryOwner, RegistryWriteError, RouteEntityRegistry,
+        RegistryOwner, RegistryWriteError, RouteEntityRecord, RouteEntityRegistry,
         apply_prepared_exact_registry_retirement, prepare_exact_registry_retirement,
     },
 };
@@ -699,19 +699,41 @@ fn allocation_identity_fields_are_exact(
     claim: &ExactRegistryClaim,
     temporary_markers_released: bool,
 ) -> bool {
-    let record_is_exact = world
-        .resource::<RouteEntityRegistry>()
-        .record(claim.entity())
-        .is_some_and(|record| record.claim() == *claim);
+    allocation_identity_with_record_is_exact(
+        world,
+        role,
+        claim,
+        temporary_markers_released,
+        world
+            .resource::<RouteEntityRegistry>()
+            .record(claim.entity()),
+    )
+}
+
+fn allocation_identity_with_record_is_exact(
+    world: &World,
+    role: NativeSceneAllocationRole,
+    claim: &ExactRegistryClaim,
+    temporary_markers_released: bool,
+    record: Option<&RouteEntityRecord>,
+) -> bool {
+    let record_is_exact = record.is_some_and(|record| record.claim() == *claim);
+    // Absence stays available to the original relationship classification for
+    // a released ordinary declaration; it is not an early identity rejection.
+    let entity = world.get_entity(claim.entity()).ok();
+    let seal = entity
+        .as_ref()
+        .and_then(|entity| entity.get::<RouteOwnershipSeal>());
+    let lifecycle = entity
+        .as_ref()
+        .and_then(|entity| entity.get::<FrameLifecycle>());
     let markers_match = if temporary_markers_released {
         matches!(role, NativeSceneAllocationRole::Declaration(index) if index > 0)
-            && world.get::<RouteOwnershipSeal>(claim.entity()).is_none()
-            && world.get::<FrameLifecycle>(claim.entity()).is_none()
+            && seal.is_none()
+            && lifecycle.is_none()
     } else {
-        world.get::<RouteOwnershipSeal>(claim.entity())
-            == Some(&RouteOwnershipSeal::new(claim.seal()))
-            && world.get::<FrameLifecycle>(claim.entity())
-                == Some(&FrameLifecycle(EntityLifecycle::PreparedInert))
+        seal == Some(&RouteOwnershipSeal::new(claim.seal()))
+            && lifecycle == Some(&FrameLifecycle(EntityLifecycle::PreparedInert))
     };
     if !record_is_exact || !markers_match {
         return false;
@@ -719,12 +741,13 @@ fn allocation_identity_fields_are_exact(
     match role {
         NativeSceneAllocationRole::Shell => {
             matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameShell(frame))
-                if world.get::<FrameShell>(claim.entity()) == Some(&FrameShell(frame.clone())))
+                if entity.as_ref().and_then(|entity| entity.get::<FrameShell>())
+                    == Some(&FrameShell(frame.clone())))
                 && shell_is_inert(world, claim.entity())
         }
         NativeSceneAllocationRole::Declaration(0) => {
             matches!(claim.owner(), RegistryOwner::Committed(EntityOwner::FrameContentTarget(frame))
-                if world.get::<FrameContentTarget>(claim.entity())
+                if entity.as_ref().and_then(|entity| entity.get::<FrameContentTarget>())
                     == Some(&FrameContentTarget(frame.clone())))
         }
         NativeSceneAllocationRole::Declaration(index) => matches!(
@@ -874,14 +897,29 @@ fn validate_adoption(
     scratch.containment.clear();
     scratch.stack.clear();
     scratch.visited.clear();
-    for allocation in allocations {
-        if !allocation_has_exact_private_identity(world, allocation) {
-            return Err(NativeSceneAdoptionError::AllocationDrift {
-                declaration: match allocation.role {
-                    NativeSceneAllocationRole::Shell => None,
-                    NativeSceneAllocationRole::Declaration(index) => Some(index),
-                },
-            });
+    if !allocations.is_empty() {
+        let registry = world.resource::<RouteEntityRegistry>();
+        // Index this immutable observation only. Rebuild after every marker
+        // write, preserving record()'s first-record behavior for each Entity.
+        let mut records = EntityHashMap::with_capacity(registry.records().len());
+        for record in registry.records() {
+            records.entry(record.entity()).or_insert(record);
+        }
+        for allocation in allocations {
+            if !allocation_identity_with_record_is_exact(
+                world,
+                allocation.role,
+                &allocation.claim,
+                allocation.temporary_markers_released,
+                records.get(&allocation.entity()).copied(),
+            ) {
+                return Err(NativeSceneAdoptionError::AllocationDrift {
+                    declaration: match allocation.role {
+                        NativeSceneAllocationRole::Shell => None,
+                        NativeSceneAllocationRole::Declaration(index) => Some(index),
+                    },
+                });
+            }
         }
     }
     validate_adoption_relationships(world, allocations, declarations, topology, scratch)
