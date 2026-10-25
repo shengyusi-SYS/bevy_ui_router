@@ -2,3 +2,7 @@
 /examples/windowed/target
 .superpowers/
 /.advisor-state/
+/.openviking/
+/advisor.project.json
+/crates/*/.advisor.json
+**/__pycache__/

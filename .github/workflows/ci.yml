@@ -18,6 +18,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
+      - name: Check documentation and package licenses
+        run: python3 scripts/check-docs.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt

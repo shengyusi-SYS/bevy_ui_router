@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Bevy scene notation adapters for Bevy UI Router"
 repository.workspace = true
 readme.workspace = true
+license.workspace = true
 
 [dependencies]
 bevy_ecs = { version = "0.19", default-features = false }

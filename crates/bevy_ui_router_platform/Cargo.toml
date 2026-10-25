@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Platform navigation contracts for Bevy UI Router"
 repository.workspace = true
 readme.workspace = true
+license.workspace = true
 
 [features]
 default = []

@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Renderer-neutral routing, history, and lifecycle state for Bevy UI Router"
 repository.workspace = true
 readme.workspace = true
+license.workspace = true
 
 [features]
 test-support = []

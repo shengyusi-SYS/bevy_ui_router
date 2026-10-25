@@ -1,43 +1,42 @@
 # 产品概览
 
-本文说明核心需求与当前范围。系统关系见[架构总览](architecture/README.md)，行为细节按[专题合同](contracts/README.md)查阅，发布安排见[路线图](roadmap.md)。
+[English](overview.en.md) | 简体中文
 
-## 核心需求与当前范围
+Bevy UI Router 把页面组织、切换和返回集中到一个路由系统。应用提供页面 Scene 和显示它们的 host，Router 根据路由树选择内容，并维护当前页面与访问记录。
 
-提供独立、通用的 Bevy UI Router，让应用声明页面及其嵌套关系，由库统一管理页面跳转、返回和当前路由信息，减少业务页面重复维护导航逻辑。
+## 页面、布局与访问
 
-从应用使用者的角度，核心需求是：
+假设应用有 `/projects` 和 `/projects/:id`。父布局可以放导航栏，子页面显示项目列表或详情。切换子页时，共用父布局和其中的局部状态保持连续。`RouteInputs` 让复用布局读到新的路径、该布局自身的 route-local 参数和查询信息。
 
-- **组织页面。** 用路由树描述页面、参数和共享布局，在应用自己的 UI host 中展示对应内容。
-- **切换与返回。** 通过 push、replace、back 导航，统一管理当前展示与访问记录；普通子页切换保留可复用的公共布局。
-- **获得正确上下文。** 页面能够读取当前路由和参数，复用布局也能看到本次导航的信息；错误呈现有明确结果。
+`push` 增加一次访问，`replace` 替换当前访问，`back` 回到上一项记录。访问记录保存在内存中。一次访问和一个页面实例分开管理：多次访问可以复用同一个页面，滚动位置仍按各次访问分别保存。
 
-keep-alive 和滚动恢复是按需启用的体验增强：前者让布局与子页独立保留离场状态，后者让返回时恢复该次访问的位置。异步页面、过渡动画等另按实际需求选题。
+| 概念 | 含义 |
+| --- | --- |
+| Route | 路由树中的一项，描述匹配规则和视图 |
+| Scene / factory | 页面构建内容 / 每次构建时生成新 Scene 的函数 |
+| Host | 应用提供的 UI 容器 |
+| Outlet | 布局中放置子页面的位置 |
+| Frame | Router 管理的一层页面或布局实例 |
+| History entry | 一次成功导航形成的访问记录 |
+| Publication | 页面准备完成并成为当前路由呈现的时刻 |
 
-正确性底线是当前展示与路由输入相符，访问记录按导航结果更新，非活动内容不继续响应集成输入或保留焦点，失败不会误动应用拥有的 host。内部身份、owner 和 publication 协议用于落实这些行为，具体合同见[生命周期](contracts/lifecycle.md)。
+## 已有能力
 
-输入目标是离场或缓存内容退出 Tab 候选、输入目标和有效焦点，已开始手势随离场撤销，应用公共控件及其它有效路由内容照常工作。当前原生 pointer 和显式 keyboard/gamepad gate 已接通；原生 Tab/Dispatch 自动资格接入因需要 patch 引擎而延期，不是当前发布前置。现行接入见[输入合同](contracts/input-focus.md)，剩余交付见[路线图](roadmap.md)。
+- 静态路径、路径参数、末尾 wildcard、默认子页和无路径布局。
+- 单条嵌套链，每层布局一个 default outlet；公共前缀复用、变化部分替换。
+- `push`、`replace`、`back`，以及当前状态、请求结果和诊断快照。
+- 同步、代码构建的 Bevy Scene/BSN 页面、路由错误页面和 Router fallback。
+- 布局与子页分别选择 keep-alive，按容量和父依赖管理非活动实例；默认容量为 0。
+- 按访问记录恢复二维滚动位置，支持晚出现的容器、内容 ready、取消和应用主动滚动。
+- 页面活动查询、原生 pointer 隔离、离场手势撤销和焦点释放；键盘/手柄处理器通过显式 gate 接入。
+- 可选桌面鼠标后退键和 Android 传统 Back 输入，由应用选择窗口对应的 Router。
 
-当前实现范围：
+页面数据加载由普通 Bevy 任务和系统完成；任务返回数据，系统在 World 中安装内容。窗口、主题、相机、业务数据和后台工作策略由应用配置。
 
-- builder-first 路由树，静态/参数/末尾 wildcard 匹配，index route、pathless layout，以及 raw location/search/fragment。
-- 单条嵌套路由链，每个 layout 一个 default outlet，common-prefix 保留、suffix 替换和 memory history。
-- 显式滚动容器按 history entry 保存二维位置，Back 统一恢复已有和晚出现容器；支持内容 ready、取消与应用滚动优先，由正常 UI 布局单次裁剪。
-- 有 normal 父作用域的布局与页面可分别 opt-in 保留原 Entity 和局部状态；返回时仍由新路由选择子页。非活动容量默认 0，启用后按简单 LRU 与父依赖闭包淘汰。
-- 当前已发布路由输入可只读查询，公共布局复用后仍可取得新 location 和自身 route-local params。
-- 官方同步、代码驱动的 Bevy Scene/BSN adapter，以及 renderer-neutral 的 Core/View 边界。
-- route-bound error view、router fallback、host loss/re-registration、stale 拒绝、局部 cleanup、输入与 focus 隔离。
-- 可选桌面鼠标与 Android 传统 Back adapter，共用带窗口的返回意图；应用统一选择 Router 或优先处理本地 UI，再进入既有返回管线。Android 兼容条件见[集成指南](guides/integration.md#android-传统返回)。
-- facade、可运行示例、独立 consumer 和相称的跨层验证。
+## 选择接入层
 
-依赖采用官方 crates.io Bevy `0.19`，允许 `>=0.19.0, <0.20.0`；已验证的版本和环境归[验证说明](development/verification.md)。Core/View 与 facade 默认功能不依赖 Bevy。
+推荐通过 `bevy_ui_router` 的 `bsn` feature 接入 Bevy UI。Core 管理路由决策，View 提供与渲染器无关的视图合同，ECS 执行实体变更，BSN 构建 Scene，Platform 传递平台返回意图。默认 `view` feature 和 Core/View 使用独立于 Bevy 的类型。
 
-当前不支持 typed route/search、codegen、loader/action/async guard/revalidation、transition、跨父搬移或跨 host 缓存、multiple/named/dynamic outlets、queued/streaming/file/cached-asset BSN、hot reload、原生 OS 专有指令 adapter、后台 reaper 或公开 authority audit/probe。
+当前依赖系列为官方 Bevy 0.19；锁文件使用 0.19.1。工具和平台验证范围见[验证指南](development/verification.md)。
 
-实例保留与访问记录是两个维度：不同 history entry 可以复用同一页面，滚动仍按 entry 恢复。页面的应用系统可用 `RouteActivity` 查询当前活动资格；布局、窗口和后台任务由应用配置。行为细节见[导航合同](contracts/navigation.md)，窗口与性能证据以专门验证文档为准。
-
-不引入业务、品牌、主题、数据服务、权限或应用 shell 假设。多 Router 保留 handle 命名空间隔离，但完整多 Router 产品旅程不是 MVP 前置。
-
-## 扩展边界
-
-当前范围是开发基线，可以随已确认功能演进。新增功能先说明消费者问题、可观察行为及影响的专题，避免把历史未实现方案或理论能力自动升级为需求。未来设计与实施入口见[开发指南](development/README.md)。
+过渡生命周期正在开发。浏览器 URL/history、异步 Scene 加载、typed routes 和多出口等后续方向见[路线图](roadmap.md)。开始使用时，阅读[接入指南](guides/integration.md)；查询具体规则时，阅读[行为合同](contracts/README.md)。

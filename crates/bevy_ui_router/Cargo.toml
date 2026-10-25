@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Composable routing for Bevy applications with optional ECS and BSN integration"
 repository.workspace = true
 readme.workspace = true
+license.workspace = true
 autotests = false
 
 [features]

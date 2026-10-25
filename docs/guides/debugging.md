@@ -1,26 +1,44 @@
 # 窗口调试
 
-[交互示例](../../examples/windowed/src/main.rs)提供独立应用内的 Bevy Remote Protocol（BRP）入口。用它发送输入、查询实际布局及获取 renderer 截图，避免操作系统鼠标、键盘和焦点影响其它窗口。此功能属于示例，不是 Router 库的 `devtools` 能力。
+[中文](debugging.md) | [English](debugging.en.md)
+
+[窗口示例](../../examples/windowed/src/main.rs)提供 Bevy Remote Protocol（BRP）调试入口，可以向示例窗口发送输入、读取布局和状态、保存渲染截图。输入在应用内处理，系统鼠标和键盘焦点保持原位。
 
 ## 启动和观察
 
-在第一个终端从仓库根目录启动窗口：
+在仓库根目录启动：
 
 ```sh
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --features ui-debug
 ```
 
-窗口启动后，在第二个终端从同一根目录运行 client：
+在另一个终端，从同一目录运行 Python client：
 
 ```sh
 python3 examples/windowed/ui_debug.py snapshot
 python3 examples/windowed/ui_debug.py find "Layout counter"
-python3 examples/windowed/ui_debug.py capture /tmp/router-ui.png
+python3 examples/windowed/ui_debug.py capture router-ui.png
 ```
 
-需要桌面显示与图形驱动，Python client 仅使用标准库。上述 `ui-debug` 模式不请求启动焦点；`ui-debug` 仅在 debug 构建显式启用时监听 `127.0.0.1:15703`，窗口持续更新以处理请求。标准 release 构建不会启用此调试入口。
+运行需要桌面显示和图形驱动，Python client 使用标准库。`ui-debug` 在启用该 feature 的 debug 构建中监听 `127.0.0.1:15703`，并让窗口持续更新以处理请求；release 构建保持普通运行方式。调试窗口启动时不请求窗口焦点。
 
-`snapshot` 返回窗口 Entity、scale factor、实际 UI 布局、文本、焦点、`router_active`、输入资格、当前路由输入及请求/实际滚动位置。`route_location` 保持为 path，`route_search`、`route_fragment` 分别保留原字符串，`route_id` 标识所属 frame 的 route；非活动内容的这些字段为 null，fallback 的 route ID 也为 null。状态栏同样分开显示 path、search 和 fragment，不拼接或归一化 URL。`pending_restore` 是当前 scope 的 `list` 恢复目标，容器尚未创建时也可查询。`find` 按名称或显示文本检索节点；缓存节点仍存在，定位当前页面时选 `router_active=true`。点击使用窗口内**逻辑坐标**；从 snapshot 取得的 `center_physical` 应除以对应窗口的 `scale_factor`：
+`snapshot` 提供以下信息：
+
+| 字段 | 含义 |
+| --- | --- |
+| `windows`、`scale_factor` | 窗口 Entity 和显示缩放 |
+| `center_physical`、`size_physical` | 实际节点位置和尺寸，以物理像素表示 |
+| `router_active` | 内容是否属于当前活动页面 |
+| `pointer_allowed`、`keyboard_allowed` | 当前输入资格 |
+| `route_location`、`route_search`、`route_fragment` | 分开的 path、search、fragment 原字符串 |
+| `route_id` | 所属 frame 的 route；fallback 为 null |
+| `scroll_requested`、`scroll_actual` | 请求位置与布局裁剪后的实际位置 |
+| `pending_restore` | 当前 scope 中 `list` 的待恢复位置，容器创建前也可查询 |
+| `focus` | 当前焦点 Entity |
+
+非活动内容的路由字段为 null。`find` 按名称或显示文本筛选节点；查找当前页面时再选择 `router_active=true`，因为保留页面的 Entity 仍然存在。
+
+点击使用窗口内的**逻辑坐标**。将目标的 `center_physical` 除以该窗口的 `scale_factor`，再传给 `click`。例如，查询得到逻辑位置为 `(100, 120)` 时：
 
 ```sh
 python3 examples/windowed/ui_debug.py click 100 120
@@ -28,36 +46,59 @@ python3 examples/windowed/ui_debug.py key Digit2 --logical '{"Character":"2"}'
 python3 examples/windowed/ui_debug.py key Space
 ```
 
-上面的点击坐标仅示意，实际目标以查询结果为准。client 在按下/释放之间等待应用帧推进，截图通过 `router/capture` 和 `router/capture_status` 取得 PNG。普通调用可用 `--url` 指定端点；完整参数见 `python3 examples/windowed/ui_debug.py --help`。
+client 在按下与释放之间等待应用帧推进。截图通过 `router/capture` 和 `router/capture_status` 获取 PNG。使用 `--url` 选择端点，完整参数见 `python3 examples/windowed/ui_debug.py --help`。
 
 ## 用户行为检查
 
 | 操作 | 观察结果 |
 | --- | --- |
-| Overview / Settings，或 `1` / `2` | Push 到对应页面，状态栏同步当前位置和 history |
-| Replace（`R`）后 Back（`B` 或鼠标后退侧键） | replace 不追加项，Back 返回前一成功项 |
-| 增加 Layout counter 和 page count，再在 Overview / Settings 往返 | 两个 leaf 显式缓存，原 layout/page Entity 和各自计数保留；cached page 不参与布局和输入 |
-| 增加 Layout counter，Outside（`4`）后进入另一个子页 | 原布局 A 及计数保留，目标子页由新路由选择；工具栏显示新的当前路径 |
-| 在列表区域滚动，切页后 Back | 恢复那次 history entry 的位置；再次 Push 同页可共享 Entity，后续 Back 仍恢复各次访问的位置 |
-| Delayed（`3`）→ Load（`L`）→ 滚动 → Outside → Back | Delayed 未保留，返回为新页面；列表尚无，恢复意图已存在 |
-| 上一步返回后，Ready（`G`）再 Load | 正常首布局恢复原位置；也可先 Load，内容准备好后 Ready |
-| 返回后 Cancel（`C`）再 Load，或等待 ready 时主动滚动 | 取消保持新列表初值；应用滚动取消等待目标，随后 Ready 不覆盖它 |
-| 点击 page counter 获焦，再按 Space | 当前 page 计数增加；切换后旧焦点释放，新页点击前不响应 Space |
-| 按住页面按钮，按 `1`/`2` 切页，再释放 | 旧页面不接收 release/click；新页面与其它有效目标仍可交互 |
-| Fail（`E`），再 Overview | 原 Build error 显示 fallback，失败不增加 history，后续显式导航恢复 |
+| Overview / Settings，或 `1` / `2` | Push 到页面，状态栏更新位置和 history |
+| Replace（`R`）后 Back（`B` 或鼠标后退侧键） | Replace 更新当前项，Back 返回前一成功项 |
+| 增加 Layout counter 和 page count，在 Overview / Settings 往返 | 原 layout/page Entity 及各自计数保留，离场页面退出布局和输入 |
+| 增加 Layout counter，Outside（`4`）后进入另一子页 | 布局 A 和计数保留，子页按新路由选择，工具栏显示新路径 |
+| 在列表区域滚动，切页后 Back | 恢复该 history entry 的位置；重复访问同一页面分别保存位置 |
+| Delayed（`3`）→ Load（`L`）→ 滚动 → Outside → Back | 返回新建的 Delayed 页面；列表创建前已有恢复意图 |
+| 上一步返回后，Ready（`G`）再 Load | 首次正常布局恢复原位置；也可先 Load，待内容准备好后 Ready |
+| 返回后 Cancel（`C`）再 Load，或等待 ready 时主动滚动 | 取消等待中的恢复，保留新列表初值或用户的新位置 |
+| 点击 page counter 获焦，再按 Space | 当前页面计数增加；切页释放旧焦点，新页点击后取得焦点 |
+| 按住页面按钮，按 `1`/`2` 切页，再释放 | 离场页面的手势撤销，当前页面与其它有效目标继续交互 |
+| Fail（`E`），再 Overview | 显示 Build error fallback，失败保持 history，后续导航恢复页面 |
 
-fallback 会替换路由布局并清理旧缓存；恢复后布局和页面为新实例。终端输出和状态栏可核对请求、目标 Entity、history cursor 与 focus；页面键盘 handler 在 `RouterInputSet::Ready` 后检查 gate。
+示例的保留容量为 3，布局 A、Overview 和 Settings 开启保留；Delayed 和 Outside 离场后清理。fallback 替换路由布局并清理旧缓存，恢复后得到新布局和页面。Load 演示稍后创建应用内容，Ready/Cancel 使用公开滚动命令。
 
-示例容量为 3，布局 A、Overview、Settings 分别开启保留，Delayed 和 Outside 未开启。Load 仅模拟应用在稍后创建内容，Ready/Cancel 通过公开滚动命令消费意图；它没有引入异步 Scene 或加载框架。
+终端和状态栏提供请求、目标 Entity、history cursor 与 focus。页面 keyboard handler 在 `RouterInputSet::Ready` 后查询 gate。
 
-滚动未恢复时，先核对是否为成功 Back 及目标访问是否已有记录，再检查 `router_active`、`pending_restore` 与请求/实际位置。显式策略等待应用 ready；应用主动滚动、取消或绑定失效也会消费意图，`pending_restore=null` 本身不说明是哪种原因。重复 key 和缺少正常 layout/camera 的终端警告附带首次发现的 Router、frame、generation 和 key；每个 Router 每类警告仍最多一次，不枚举后续所有问题。恢复规则见[导航合同](../contracts/navigation.md#按访问恢复滚动)。
+## 滚动和持续手势
 
-列表滚动使用实际 `MouseWheel` 消息：先把 cursor 移到 snapshot 中的 `overview-scroll`、`settings-scroll` 或已加载的 `delayed-scroll` 区域，再向 `router/input` 发送 `MouseWheel`，字段为 `window`、`unit: "Pixel"`、`x: 0.0`、`y` 和 `phase: "Moved"`；负 `y` 向下滚动。Router marker 负责访问记录，示例自己的 scroll observer 负责修改 Bevy `ScrollPosition`。
+列表使用真实 `MouseWheel` 消息。先把 cursor 移到 `overview-scroll`、`settings-scroll` 或已加载的 `delayed-scroll` 区域，再通过 `router/input` 发送事件：
 
-跨页按住手势通过 `rpc router/input` 分别发送 `MouseButtonInput`：参数中的 `window` 使用 snapshot 返回的真实窗口 Entity，`button` 为 `Left`，`state` 依次为 `Pressed`、`Released`。保持按下期间切换页面，等待帧推进后再释放；拆开发送只用于持续手势检查，普通交互优先使用 `click`/`key`。参数编码与消息结构见 [client](../../examples/windowed/ui_debug.py) 的 `Bridge.event` 和 `Bridge.click`。
+```json
+{
+  "MouseWheel": {
+    "window": 123,
+    "unit": "Pixel",
+    "x": 0.0,
+    "y": -120.0,
+    "phase": "Moved"
+  }
+}
+```
 
-## 证据边界
+把示意的 `123` 换成 snapshot 中的窗口 Entity；负 `y` 向下滚动。传递方式是 `python3 examples/windowed/ui_debug.py rpc router/input '<JSON>'`。示例的 scroll observer 修改 Bevy `ScrollPosition`，Router 的 marker 负责按访问保存位置。
 
-输入沿真实 Bevy `WindowEvent` 与 typed message 管线，截图来自 renderer；它们验证引擎交互和最终图像，不等同于 OS/硬件输入。snapshot 中的请求成功或正尺寸布局也不等于该时刻已呈现在屏幕上。
+持续手势分两次发送 `MouseButtonInput`，使用相同窗口、`button: "Left"`，并将 `state` 分别设为 `Pressed`、`Released`。在两次调用之间切换页面并等待帧推进，即可检查离场撤销。普通点击使用 `click`；消息编码见 [client](../../examples/windowed/ui_debug.py) 的 `Bridge.event` 和 `Bridge.click`。
 
-持续调试更新、BRP 轮询和截图会影响测量，不用于功耗或正式性能结论。窗口与 headless benchmark 分别说明，见[性能基线](../performance.md)；完整测试入口见[验证指南](../development/verification.md)。
+## 排查问题
+
+| 现象 | 检查方法 |
+| --- | --- |
+| client 无法连接 | 确认以 `--features ui-debug` 启动 debug 构建，进程仍在运行，端点为 `127.0.0.1:15703` |
+| 点击落在错误位置 | 用新 snapshot 定位活动节点，按窗口缩放把物理坐标换成逻辑坐标 |
+| Back 后位置未恢复 | 确认 Back 成功且该次访问已有记录，再查看 `router_active`、`pending_restore` 和两个滚动位置字段 |
+| 显式恢复一直等待 | 内容准备好后发送 Ready；确认 key 唯一、容器有 `ScrollPosition` 和 scroll overflow |
+| `pending_restore` 已消失 | 检查是否已恢复、用户已滚动、应用已取消，或绑定已失效 |
+| 有布局数据但截图为空 | 检查窗口、camera/render target 和 renderer；等待帧推进后再次截图 |
+
+重复 key 或缺少有效 layout/camera 时，终端警告会带上首次发现的 Router、frame、generation 和 key。每个 Router 每类警告显示一次。恢复规则见[导航合同](../contracts/navigation.md#按访问恢复滚动)。
+
+调试输入经过 Bevy `WindowEvent` 和 typed message 管线，截图来自 renderer。需要检查系统事件、真实设备或原生平台行为时，在对应环境执行同一交互步骤，并记录运行环境。自动化轮询、持续更新和截图会增加运行开销；性能测量使用[性能指南](../performance.md)中的专用命令。完整测试入口见[验证指南](../development/verification.md)。

@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Bevy ECS lifecycle, UI ownership, and input integration for Bevy UI Router"
 repository.workspace = true
 readme.workspace = true
+license.workspace = true
 
 [features]
 default = []

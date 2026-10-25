@@ -1,40 +1,68 @@
 # Bevy UI Router
 
-面向 Bevy UI 的嵌套路由库：声明路由树和 Scene，通过 `push` / `replace` / `back` 切换页面，保留公共布局及局部状态，并统一处理 memory history、错误恢复、输入和焦点。Core/View 保持 renderer-neutral；推荐使用 facade 的 `bsn` feature。
+[English](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/README.en.md) | 简体中文
 
-当前尚未发布 crates.io，具体许可证和发布版本待确定，暂不授予开源许可证。功能与发布准备已有本地验证，运行环境及未验证项见[验证指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/development/verification.md)。
+为 Bevy UI 组织页面、共享布局和返回记录。声明路由树和页面 Scene 后，用 `push`、`replace` 和 `back` 切换页面；Router 会保留可复用的布局，并处理页面挂载、错误呈现、输入和焦点。
 
-## 快速运行
+- **嵌套页面**：支持路径参数、默认子页和无路径布局，每层布局提供一个默认出口。
+- **连续体验**：布局和子页可分别保留实体与局部状态，返回时按访问记录恢复滚动位置。
+- **当前上下文**：页面与复用布局都能读取当前路由、参数和活动状态。
+- **按需集成**：Core/View 可独立使用；`bsn` feature 接入 Bevy Scene；桌面鼠标和 Android 返回通过可选 adapter 接入。
 
-在完整 checkout 根目录执行：
+## 运行示例
+
+克隆仓库后，在根目录运行最小示例：
 
 ```sh
+git clone https://github.com/shengyusi-SYS/bevy_ui_router.git
+cd bevy_ui_router
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
+```
+
+成功时输出 `Succeeded` 和当前路径，然后退出。这个示例用有限次更新演示完整导航流程。接着运行嵌套示例，查看共享布局、当前输入、页面数据加载和滚动恢复：
+
+```sh
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-[quick start](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)演示 Scene runtime、factory、路由注册、host、导航和 snapshot；[嵌套示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_nested.rs)演示内部 outlet、跨 query 布局复用、应用异步内容与就绪后的滚动恢复，离开布局后返回另一子页仍保留原工具栏状态并读取新的当前输入。这两个程序都是有限次更新的 headless 演示，不打开 OS 窗口；quick start 不运行 UI 布局。
-
-交互窗口是独立、不可发布的应用 crate，图形依赖不进入 Router 库：
+打开交互窗口：
 
 ```sh
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
-窗口包含 push/replace/back（按钮、B 键或鼠标后退侧键）、页面与布局计数、错误 fallback、焦点和跨页手势演示。需要桌面显示及图形驱动；示例选用 X11，Linux 构建需要 X11/xkbcommon 开发库。应用内 BRP 输入、布局查询与 renderer 截图见[窗口调试](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/debugging.md)。
+窗口可体验页面切换、返回、布局和页面计数、错误恢复、键盘交互与滚动。Linux 使用 X11；依赖安装和窗口操作见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)。
 
 ## 接入应用
 
-当前使用仓库本地 `path` 依赖；完整独立应用 manifest 和装配步骤见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)。依赖声明为官方 Bevy `0.19`（`>=0.19.0, <0.20.0`），已验证 `0.19.0` / `0.19.1`，默认 lock 为 `0.19.1`。使用满足 Bevy 要求的 Rust 工具链；其 `bevy_ecs` 声明最低 Rust 1.95.0，本项目采用 2024 edition。
+当前从仓库使用本地依赖，下面的路径指向你的 checkout：
 
-默认 feature 为 `view`，不引入 Bevy；`bsn` 包含 `ecs` 和 `view`。可选 `desktop-back` / `android-back` 将鼠标后退键 / Android 传统 Back 键转换为共用窗口级返回消息，由应用唯一处理器选择 Router 并调用 `back`，装配与 Android manifest 兼容条件见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md#桌面鼠标返回)。即使代码同步构建 Scene，也必须安装 Scene runtime。当前支持单条嵌套链、每个 layout 的单个 default outlet 与代码驱动 native Scene；浏览器 URL/history adapter、cached Scene inclusion 和异步 Scene 加载未交付。页面发布后的应用数据加载可使用普通 Bevy 任务和系统。factory 产生新的 Scene，注册或请求入队成功不代表页面已经发布。
+```toml
+[dependencies]
+bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = ["bsn"] }
+```
 
-应用拥有 host 及窗口/相机/插件配置。原生 pointer 使用 Bevy UI picking；target-addressed keyboard/gamepad handler 应在 `RouterInputSet::Ready` 后检查 `RouterInputGate`。原生 TabNavigation/InputDispatch 不会因安装 Router 自动遵守 gate。详细行为按 [专题合同](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/contracts/README.md)。
+本项目使用 Rust 2024 edition 和 Bevy 0.19，锁文件固定 Bevy 0.19.1。使用能够构建该版本 Bevy 的 Rust 工具链。
 
-## 开发入口
+从[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)开始，按顺序安装 Scene runtime、注册页面 factory、声明路由、挂载 host，再发送导航请求。完整可运行源码见[最小示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)。
 
-- [文档索引](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/README.md)：产品、架构、专题合同、使用和验证入口。
-- [架构图解](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/architecture/README.md)：crate 依赖和源码地图；运行机制另页说明。
-- [开发指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/development/README.md)：按功能定位合同、实现和测试，组织后续设计与计划。
-- [性能基线](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/performance.md)：公开 API benchmark、计时边界和历史数据；CI 只验证夹具行为，不设耗时门禁。
-- [路线图](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/roadmap.md)：首次发布准备和尚未排期的能力。
+| Feature | 用途 |
+| --- | --- |
+| `view`（默认） | renderer-neutral 的视图描述和注册 |
+| `ecs` | Bevy 插件、host、导航、快照、活动状态和输入 gate |
+| `bsn` | 推荐的 Scene 集成，包含 `ecs` 和 `view` |
+| `platform` | 平台导航接口 |
+| `desktop-back` / `android-back` | 鼠标后退侧键 / Android 传统返回键 |
+
+应用负责窗口、相机、UI 样式及数据任务。Router 管理 host 中的路由内容。键盘和手柄处理器在 `RouterInputSet::Ready` 后查询 `RouterInputGate`；接线示例见指南。
+
+## 文档与贡献
+
+- [文档索引](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/README.md)：中英文使用与开发文档。
+- [产品概览](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/overview.md)：能力与常用概念。
+- [贡献指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/CONTRIBUTING.md)：开发入口和检查方法。
+- [路线图](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/roadmap.md)：正在开发的能力及发布准备。
+
+## 许可证
+
+本项目采用双许可证，可选择 [MIT](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/LICENSE-MIT) 或 [Apache-2.0](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/LICENSE-APACHE)。

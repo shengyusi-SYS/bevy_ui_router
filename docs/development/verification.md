@@ -1,40 +1,43 @@
 # 验证与发布检查
 
-本页说明检查入口、证据范围和如何选择验证，不维护固定测试清单或阶段执行日志。产品行为归 [专题合同](../contracts/README.md)，模块边界见 [架构](../architecture/README.md)，应用接线见 [集成指南](../guides/integration.md)。
+[中文](verification.md) | [English](verification.en.md)
+
+本页列出开发、集成和发布前的检查命令。行为定义见[专题合同](../contracts/README.md)，装配步骤见[集成指南](../guides/integration.md)。在仓库根目录执行命令，并记录所用源码、feature、工具链和运行环境。
 
 ## 按变更风险选择检查
 
-| 变更 | 所需验证 |
+| 变更 | 检查内容 |
 | --- | --- |
-| 文档整理 | 本地文件和锚点链接、命令与实际 target 一致、合同没有遗漏或互相冲突；不因修改文档重复运行全部 runtime 测试 |
-| Core/View 局部逻辑 | 格式、相关 crate 测试及对应公共行为；公共 API 变化同时运行独立 consumer |
-| ECS/BSN 安装、Scene 或 outlet | 受影响 crate 与 facade 测试，真实 `App::update` 及官方 Scene 路径 |
-| lifecycle、failure、terminal、cleanup 或 publication | 受影响完整 crate、公开导航/恢复旅程和独立 facade consumer；包含 owner 收敛、拒绝、写后 drift 与后续请求 |
-| 输入/focus | 真实管线正向命中、非活动拒绝、已开始手势撤权、focus 释放及其它有效目标保留 |
-| feature、依赖、示例或发布配置 | 依赖合同、独立 consumer、实际示例、独立窗口编译；发布配置还需验证打包产物 |
-| 性能修改 | 相同语义检查和优化构建同机对照；方法与数据归 [性能基线](../performance.md) |
+| 文档 | 中英文内容对应、文件与锚点链接、命令与实际 target、发布内容扫描 |
+| Core/View 局部逻辑 | 格式、受影响 crate 测试、对应公共行为；公共 API 变化加独立 consumer |
+| ECS/BSN 安装、Scene 或 outlet | 受影响 crate 与 facade 测试，实际 `App::update` 和官方 Scene 路径 |
+| lifecycle、failure、terminal、cleanup 或 publication | 受影响完整 crate、公开导航/恢复旅程、独立 facade consumer；覆盖 owner 收敛、拒绝、写后变化与后续请求 |
+| 输入/focus | 正常命中、非活动拒绝、已开始手势撤销、焦点释放、其它有效目标继续交互 |
+| feature、依赖、示例、发布配置 | 依赖检查、最小 consumer、示例、窗口编译；发布配置还检查打包产物 |
+| 性能 | 对应行为测试和同机优化构建比较，方法见[性能指南](../performance.md) |
 
-回归应经生产入口导出结论。私有 seam 可以改变生产 predicate 的输入事实，不能直接注入“成功”“终结”或生命周期分类。新增组合行为要重新验证：分别通过的 search 重建与 Back 测试，曾遗漏两者组合后的 child mount 停滞。
+测试通过生产入口观察结果。需要构造特殊情况时，让 test-only seam 改变生产判断实际读取的输入事实，再由正常逻辑得出结果。组合行为一起验证，例如 query 导致重建后再 Back，或清理期间 host 失效后重新注册。
 
 ## 自动检查入口
 
-从仓库根目录执行，与 [CI](../../.github/workflows/ci.yml) 的主检查一致：
+使用支持 Bevy `0.19` 的 Rust 工具链；当前 `bevy_ecs 0.19.1` 声明最低 Rust `1.95.0`，项目采用 2024 edition。安装 rustfmt 后执行：
 
 ```sh
+cargo fetch --locked
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-features --locked
 ```
 
-首次执行先运行 `cargo fetch --locked`。独立 consumer 会离线解析自己的 workspace，所需 registry 数据与依赖必须已经可用。共享 target 同时只由一个 Cargo/rustc 验证负责人使用。
+这些是 [CI](../../.github/workflows/ci.yml) 的主检查。独立 consumer 在自己的 workspace 中离线解析依赖，`cargo fetch` 提前准备 registry 和依赖缓存。共享 target 由一位验证负责人顺序运行 Cargo/rustc。
 
-修改 ECS 可选 BSN 接线时补充不含 BSN 的路径：
+全特性与最小 feature 各有检查用途。修改 ECS 的可选 BSN 接线时，补充基础 ECS 路径：
 
 ```sh
 cargo test -p bevy_ui_router_ecs --no-default-features --locked
 ```
 
-返回 adapter 另可独立运行各自最小 feature：
+修改返回 adapter 时，运行单独输入源和组合路由测试：
 
 ```sh
 cargo test -p bevy_ui_router_platform --features desktop-back --locked
@@ -42,39 +45,58 @@ cargo test -p bevy_ui_router_platform --features android-back --locked
 cargo test -p bevy_ui_router --features bsn,desktop-back,android-back --test platform_back --locked
 ```
 
-全特性检查不能代替最小 feature 检查。独立 consumer 和依赖合同负责验证默认、无默认、`view`、`ecs`、`bsn`、`platform`、`desktop-back` 与 `android-back` 的真实依赖与可见 API；无需另抄一份 Markdown export allowlist。
+只检查公共 feature/依赖与独立消费者时：
+
+```sh
+cargo test -p bevy_ui_router --test dependency_contract --test facade_consumers --locked
+```
+
+consumer harness 分别使用无默认、默认 `view`、显式 `view`、`ecs`、`bsn`、`platform`、`desktop-back` 和 `android-back`。每个应用声明自己的最小依赖；两个推荐示例也会以原样源码编译运行。编译拒绝用例按错误类别、目标符号和源码位置检查私有 API 及 feature 边界。
+
+文档与发布内容检查：
+
+```sh
+python3 scripts/check-docs.py
+python3 scripts/check-release-content.py --output /tmp/router-release-audit.json
+```
+
+发布内容脚本按规则扫描当前文件，并输出脱敏报告。需要同时检查 Git 历史时加 `--history`；额外项目词汇可放在本机文本文件中，通过 `--term-file` 传入。检查报告中的匹配项后再决定处理方式，敏感原文保留在本机审阅。
+
+使用 [Gitleaks](https://github.com/gitleaks/gitleaks) 扫描提交历史中的凭据：
+
+```sh
+gitleaks git . --redact --log-opts="--all --full-history" --report-format json --report-path /tmp/router-gitleaks.json
+```
 
 ## 从模块验证到用户行为
 
-| 责任 | 直接验证入口 | 高层证据 |
+| 主题 | 测试入口 | 覆盖的操作 |
 | --- | --- | --- |
-| Core：匹配、branch diff、请求、history | [Core tests](../../crates/bevy_ui_router_core/tests)、`src/engine_tests.rs` | [公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) 的嵌套切换、参数/search/fragment、Back、失败及恢复 |
-| View：renderer-neutral 输入与 binding | [View public API](../../crates/bevy_ui_router_view/tests/public_api.rs) | [view consumer](../../crates/bevy_ui_router/tests/consumers/view.rs) 的独立使用 |
-| ECS：host、identity、staging、publication、cleanup | [ECS public API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、`src/navigation_tests.rs`、`src/cleanup_tests.rs` | 公开导航旅程的旧内容清理、布局保留、失效缓存部分清理后的 host loss/readmission 与后续请求 |
-| BSN：factory、resolve/apply、outlet、containment | [BSN facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs) | [BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) 及两个原样示例 |
-| 桌面鼠标 / Android 传统返回 | Platform 消息转换回归、[facade 公开返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs) | InputPlugin 共存、每来源窗口/事件顺序、重复过滤、双源共用通道、唯一应用处理器、双 Router 定向返回、原页状态复用与无 history；最小独立 consumer 不借其它 feature 的依赖 |
-| 输入与焦点 | [原生 pointer 测试](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus 测试](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 窗口中的点击/Space、跨页手势与独立目标保护 |
-| 保留页与普通页交接 | [公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立 opt-in、原父/新子、内部库存与 LRU 依赖淘汰；OwnInvalid、fresh 失败、部分清理 host loss 后原请求终结与残留责任 |
-| entry 滚动恢复 | [公开滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 正常 UI layout 的早晚绑定、显式 ready、二维裁剪、取消与应用优先、未完成记录及旧 ID 失效；保留既有失败、host 重接纳、原父/fresh 子 Back 与当前输入组合 |
-| 页面活动资格 | [公开活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 非交互内容、可变应用 Query、缓存失活/恢复、动态后代和 exact 父链/host registration |
-| facade 与 feature/依赖边界 | [独立 consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 最小依赖的独立应用运行与逐 case 编译拒绝 |
+| Core 导航 | [Core tests](../../crates/bevy_ui_router_core/tests)、[公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) | 路由匹配、嵌套切换、参数/query/fragment、history、失败与恢复 |
+| View | [公共 API](../../crates/bevy_ui_router_view/tests/public_api.rs)、[独立 view consumer](../../crates/bevy_ui_router/tests/consumers/view.rs) | 路由输入和 renderer-neutral 绑定 |
+| ECS 生命周期 | [公共 API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、[导航测试](../../crates/bevy_ui_router_ecs/src/navigation_tests.rs)、[清理测试](../../crates/bevy_ui_router_ecs/src/cleanup_tests.rs) | host 注册、身份检查、准备、发布、局部清理和重新接纳 |
+| BSN | [facade 测试](../../crates/bevy_ui_router/tests/bsn_facade_features.rs)、[独立 BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) | factory、Scene 应用、outlet 与内容归属 |
+| 平台返回 | [返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs)、[桌面 consumer](../../crates/bevy_ui_router/tests/consumers/desktop_back.rs)、[Android consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs) | 按窗口传递意图、过滤重复、双源通道、弹层优先与定向 Back |
+| 输入与焦点 | [pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 活动命中、离场撤销、已开始手势和其它有效目标 |
+| 保留实例 | [保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立保留、原父/新子、容量淘汰、失效清理和后续导航 |
+| 滚动恢复 | [滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 真实布局、早晚容器、ready/cancel、二维裁剪、用户滚动优先和旧 ID |
+| 页面系统 | [活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 可变应用 Query、保留页失活/恢复、动态后代与精确父链 |
+| 集成边界 | [consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 各 feature 的可见 API、最小依赖和官方 Bevy 来源 |
 
-私有测试可以覆盖内部写入窗口、stale owner 和故障注入；公开旅程证明推荐入口与普通调度能够兑现行为。二者互补，不能以一个 snapshot 或私有 probe 替代完整用户路径。
-
-独立 consumer 按不同 feature 配置编译运行，并直接消费推荐示例的原样源码，使用显式依赖，避免借用仓库 dev-dependency 的 feature 合并。编译拒绝逐 case 断言错误类别、目标符号及 consumer source，防止无关错误掩盖权限边界失效。依赖规则的 LF/CRLF 输入由解析单测覆盖，不重复运行整套 consumer，也不代表 Windows 原生验证。
+内部测试覆盖具体写入窗口和故障条件，公开旅程串起推荐入口与正常调度。开发中同时关注两层，让局部修改和用户操作保持一致。
 
 ## 示例与窗口
 
-两个有限次 headless 演示：
+运行两个无窗口示例：
 
 ```sh
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-quick start 验证最小 Scene runtime 和请求结果；nested 示例执行真实 UI 布局，跨 query 保留原父布局并更新当前输入，默认子页重建。应用任务只返回普通数据，主线程安装内容后 ready 当前滚动意图，Back 的 fresh 子页在正常布局后恢复二维位置；离开布局后返回新子页，核对原父 Entity、工具栏状态、活动资格和新的当前输入。两者均不打开操作系统窗口或启用 GPU renderer；独立 consumer 原样编译运行两者。
+quick start 检查最小 Scene runtime 和请求结果。nested 使用真实 UI layout，组合共享布局、query 更新、应用任务、当前路由输入和显式滚动恢复。两者完成有限次更新后退出。
 
-窗口应用是独立 workspace，图形依赖与 headless 库验证分开：
+窗口应用有独立 workspace，分别检查默认和调试 feature：
 
 ```sh
 cargo fmt --manifest-path examples/windowed/Cargo.toml --all --check
@@ -84,15 +106,13 @@ cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-fea
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 ```
 
-窗口示例容量为 3，布局 A、Overview、Settings 独立开启保留，Delayed 和 Outside 不保留。它演示原父/新子与当前输入、自动 entry 滚动，以及 Back 到 fresh Delayed 后晚创建列表、ready、取消和应用滚动优先。quick start 演示默认关闭，nested 为父布局开启容量 1，子页保持不保留。
+Linux 构建采用 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev` 和 `libxrandr-dev`。交互检查包括 push/replace/back、布局与页面计数、不同访问的滚动位置、晚到内容、点击和 Space、焦点释放、跨页手势、错误 fallback 和恢复。具体步骤与 BRP 命令见[窗口调试](../guides/debugging.md)。
 
-Linux 示例选择 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev`。窗口交互验证 push/replace/back、布局计数保留、页面点击与 Space、旧焦点释放、跨页按住/释放、Build failure/fallback 和恢复。应用内 BRP 自动化见 [调试指南](../guides/debugging.md)。
-
-原生 `TabNavigationPlugin` / `InputDispatchPlugin` 不在示例接线中；键盘通过 Ready 后显式消费 gate。返回 adapter 在默认 lock 的 Bevy 0.19.1 下通过标准 `MouseButtonInput` / `KeyboardInput` 消息注入验证，窗口示例包含侧键接线。最小 Platform `android-back` 已通过 `aarch64-linux-android` 的 `cargo check`，未包含 Android 窗口后端。这些不代表物理侧键、Win32 系统指令或 Android APK/设备实测。Android manifest 兼容开关有官方文档依据，现代 callback / 预测手势不在范围内。引擎消息注入、目标编译、OS 事件与物理设备输入是不同证据，不能混写。
+窗口示例的键盘处理器在 `RouterInputSet::Ready` 后显式查询 gate；应用接入原生 Tab/Dispatch 时，还需验证其目标选择和派发路径。Android manifest 接线见[集成指南](../guides/integration.md#android-传统返回)。
 
 ## 性能夹具与发布产物
 
-CI 只检查性能夹具行为，不设耗时门禁：
+性能夹具先检查行为，CI 使用前三条命令；实例与稳态改动可补充后两条：
 
 ```sh
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
@@ -102,39 +122,31 @@ ROUTER_BENCH_MODE=instances cargo test -p bevy_ui_router --bench router_baseline
 ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-正式时间比较使用 [性能基线](../performance.md) 的优化构建方法，不能使用 smoke 的 debug 时间。
+正式耗时比较使用[性能指南](../performance.md)的优化构建方式，记录同机相同场景的结果。
 
-发布预检需要完整 checkout 和 Python 3.12+：
+打包检查使用完整 checkout、可用的 registry 和 Python 3.12+：
 
 ```sh
 cargo package --workspace
 python3 scripts/check-packaged-consumer.py
 ```
 
-第一步解压并验证六个库包；[产物 consumer](../../scripts/check-packaged-consumer.py) 只把 Router 依赖指向这些解压产物，核对实际来源后运行包内 BSN consumer。Bevy 来自官方 crates.io，consumer 固定 0.19.1。归档文件的规范化时间戳可能让共享 target 复用同版本旧编译产物；脚本刷新解压源码时间戳，确保实际编译本次包内容，并保留 registry 依赖缓存。标准打包需要可用的 registry；已有离线多包验证曾遇到 Cargo checksum 错误，不能用 `--no-verify` 将它转成通过。确需验证未提交改动时，先审阅实际 diff，再显式使用 `--allow-dirty` 并准确记录源码状态。
+`cargo package` 生成并验证六个库包。[打包 consumer](../../scripts/check-packaged-consumer.py) 解压这些 `.crate`，把 Router 依赖指向解压目录，核对实际包来源后运行包内 BSN 应用；Bevy 来自 crates.io，并固定为 `0.19.1`。脚本刷新解压源码的时间戳，使共享 target 重新编译本次包内容，继续复用 registry 依赖缓存。
+
+检查未提交改动时，先审阅 diff，再显式使用 `cargo package --workspace --allow-dirty` 并记录源码状态。包列表可用 `cargo package -p bevy_ui_router --list` 查看；逐包核对 README、源码、示例和测试所需文件，再运行上面的真实打包检查。
 
 ## 已有证据与未验证范围
 
-当前执行入口参数收窄后的树通过 workspace 全特性 1,423 项测试、ECS 无默认特性 653 项测试、workspace 全目标/全特性静态检查和格式检查；独立 consumer 在完整测试中实际运行。安装回归确认 Collect 与 Ready 均非独占系统；正常调度验证 Hover 的 Commands/observer 结果在 Ready 后可见，observer 发起的真实请求在 Collect 产生 action。
+下表概括仓库历史验证记录，便于选择后续检查。每次提交的实际结果以该次命令输出为准。
 
-已有稳态回归继续覆盖动态 native membership、完整 slot 边界、禁用重复 marker、retained/active 身份、focus、输入拒绝、公开资源 change detection 与后续访问滚动恢复；原生 focus 覆盖晚安装、外部初始化和原调度条件/顺序。稳定快照保持等值不写，终态后的诊断仍可更新。观察只在连续只读阶段复用，保留异步轮询、host 失效、正常滚动采样和写后复验。独立窗口全目标/全特性编译及 `steady` nested smoke 的既有证据绑定观察优化源码 `6a0ab58f704e878efd7494c5f66ba92ea3cf956f`；本轮未重跑窗口或打包，也未测量两处参数收窄的独立收益。已有计时归[性能说明](../performance.md)。
+| 环境或能力 | 已有记录 | 后续检查 |
+| --- | --- | --- |
+| 官方 Bevy `0.19.0` / `0.19.1` | workspace、公开旅程和独立 consumer 的相应回归；默认 lock 为 `0.19.1` | 更新依赖时运行对应版本检查 |
+| Headless Scene/UI | 导航、布局、picking、focus、保留、活动与滚动组合 | 按功能改动选择完整操作链 |
+| 打包产物 | 六个库包和解压后的 BSN consumer | 最终发布树重新打包并运行 consumer |
+| Linux/WSLg 窗口 | llvmpipe 软件渲染；BRP 输入和 renderer 截图覆盖导航、保留、滚动、焦点、手势、fallback | 窗口交互改动后按调试指南复测 |
+| Android | 最小 `android-back` 的 `aarch64-linux-android` 编译、Bevy 消息与调度测试 | APK、设备和系统返回行为待实测 |
+| Windows 原生、物理 GPU、硬件输入 | 待验证 | 在目标平台记录系统、设备、命令和交互结果 |
+| Rust 最低版本 | 依赖声明要求已核对 | 最低工具链运行待验证 |
 
-跨 search 复用源码 `a737b4d` 的公开回归覆盖 current/retained 命中及 Push/Replace/Back 与 fragment 的组合。扩展后的 nested 示例进一步验证应用任务安装内容、当前输入与显式滚动 ready，已实际运行并由独立 consumer 原样消费；对应变更通过全特性 ECS、公开保留/滚动/活动旅程、workspace 全目标/全特性静态检查和格式检查。窗口诊断字段通过独立 workspace 全目标/全特性编译与格式检查，未重跑窗口交互或打包。
-
-原生输入扩展候选的补丁与重建入口保存在提交 `8ac20ab`，可用 `git show 8ac20ab:scripts/native-input-candidate/README.md` 查询。候选曾通过 UI 协议、完整 ECS crate 与原生 Tab/dispatch、焦点、pointer、保留和滚动公开旅程；未完成独立下游装配、打包、窗口、硬件输入或性能验收。该方案需要引擎 patch，现已延期并退出工作树，结果不代表当前官方依赖树交付了原生自动接线。
-
-历史验收不能证明所有生产组合。route opt-in 与容量须独立配置；组合回归覆盖混用 Back/Push、淘汰后的后续普通导航、非目标缓存自身失效、暂缺布局后正常离场，以及部分清理中途 host loss 后的同 host 重新接纳与后续 fresh 导航。authority 隔离还须核对 native 内容根的 authored Visibility、Pickable 与应用局部状态保持。不能把跳过失败用例的检查称为全量通过。
-
-窗口源码 `042ee400892e83f8957307752586eb7e98a83c00` 已通过独立 workspace 格式、默认和全特性全目标静态检查，并在 Linux/WSLg、960×640、软件渲染、debug `ui-debug` 中完成组合验收。通过应用内 BRP 的真实 WindowEvent 与 typed messages，验证原父 Entity/计数返回新子且读取新输入、leaf 原 Entity/计数及不同 entry 位置、焦点与已开始手势撤权、replace/失败 history/fallback 后 fresh 恢复。fresh Delayed 返回时容器尚无而意图存在，先 ready 再 load 恢复；取消后 load 保持初值，应用主动滚动取消等待目标。renderer 截图另核对父/新子与晚容器恢复的最终呈现。
-
-父子独立库存源码 `05b373007e1d4fcc240cecdc9fab743a81323b60` 已通过 workspace 全特性、ECS 无默认特性、公开保留/滚动组合及独立 consumer；最后补入的滚动旅程与 nested 示例另经相关 facade 测试和实际运行。性能夹具源码 `dc3ef59e57434f2730fb7a5958e0f660d8294f7a` 通过格式、workspace 全目标/全特性静态检查及行为检查；两轮完整串行优化结果归[父子库存实测](../performance.md#父子库存实测)。
-
-滚动统一意图源码 `69615784830b3b4f425f6e7991fd4a503b31c26c` 已通过格式、workspace 全目标/全特性静态检查、未跳过用例的全特性测试、ECS 无默认特性及独立 consumer。nested 原样消费与实际运行在正常 UI 布局中验证 fresh 子页 Back 后 ready。该提交树执行 `cargo package --workspace --locked`，六个包均验证成功；产物 consumer 复编译解压 Router 源码，核对实际来源后运行公开 BSN 旅程成功。该轮窗口收口仅修改独立示例和文档，库源码仍为该验证树；未上传，最终发布树按后续变更复核。
-
-以下是截至 2026-09-28 的历史运行证据，不是此次文档整理重新运行的结果。固定来源为提交 `6de4233e2c636daa5892807b05af8a19d6e2cc0f` 中的 `docs/superpowers/plans/2026-09-07-router-mvp-implementation.md`（交付、官方版本与嵌套 Back 验证）和 `docs/current-architecture.md`（最终交付状态）；用 `git show <该提交>:<上述路径>` 查询，不恢复为当前计划。性能证据另见[数据身份](../data/performance/README.md)。
-
-已有本地 workspace/独立 consumer、headless Scene/UI/picking/focus、打包产物 consumer 和 Linux/WSLg 窗口交互证据。依赖声明支持官方 Bevy 0.19.x，0.19.0 与 0.19.1 已运行相应回归；默认 lock 与主要 consumer 固定 0.19.1。这不代表已验证未来 patch 版本。
-
-窗口证据来自 Linux/WSLg、llvmpipe 软件渲染；未运行 Windows 原生、最低 Rust 工具链、物理 GPU 加速与硬件设备输入。没有已证实的库级平台限制时，不增加与问题无关的平台矩阵。CI 配置存在不等于远端运行成功；本地成功不能冒充远端状态。
-
-验证结果绑定实际源码、命令、feature 和环境；失败与未运行项如实保留，不以历史测试总数作当前验收证据。发布版本和许可证尚待确定，打包检查不会上传包。
+旧运行日志通过 `git log -- docs/development/verification.md` 查询。新结果记录本次运行的成功、失败和待执行项；远端 CI 状态从实际 workflow run 查询。

@@ -1,7 +1,0 @@
-run_order,scope,scenario,parent_content_children,child_content_children,capacity,samples,mean_us,p50_us,p95_us,max_us,min_updates,max_updates,live_entities,inactive_parents,inactive_children,parent_factory_builds,child_factory_builds
-1,native_create,dependency_eviction_replace,128,128,2,32,21229.082,21208.221,21609.298,22075.086,3,3,573,1,1,32,32
-1,native_create,dependency_eviction_idle,128,128,2,32,168.220,168.276,170.843,171.150,1,1,573,1,1,0,0
-2,cleanup_settle,dependency_eviction_replace,128,128,2,32,22295.282,21509.965,24456.859,24499.859,3,3,573,1,1,32,32
-2,cleanup_settle,dependency_eviction_idle,128,128,2,32,171.991,171.459,175.759,180.676,1,1,573,1,1,0,0
-3,total,dependency_eviction_replace,128,128,2,32,21057.125,20916.515,21919.412,22532.634,3,3,573,1,1,32,32
-3,total,dependency_eviction_idle,128,128,2,32,172.224,172.059,176.984,178.492,1,1,573,1,1,0,0

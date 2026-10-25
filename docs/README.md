@@ -1,36 +1,34 @@
-# 文档与开发入口
+# 文档
 
-文档围绕后续功能开发组织：先确认需求和模块边界，再按主题读取合同、定位实现与验证。当前基线由多个层级共同组成；同一条规则有明确归属，不限制 spec 的文件数量。
+[English](README.en.md) | 简体中文
 
-## 从哪里开始
+初次使用可以先[运行示例](../README.md#运行示例)，再阅读[接入指南](guides/integration.md)。每篇使用和开发文档都提供中英文切换。
 
-| 目的 | 入口 | 职责 |
-| --- | --- | --- |
-| 了解核心需求与当前范围 | [产品概览](overview.md) | 产品要解决什么，当前交付到哪里 |
-| 理解系统关系和定位模块 | [架构总览](architecture/README.md) | crate 依赖、职责、状态维度和源码地图 |
-| 理解物理结构与执行顺序 | [运行机制](architecture/runtime.md) | frame/outlet 结构、导航时序、Bevy 调度 |
-| 修改跨层生命周期机制 | [生命周期执行协议](architecture/lifecycle.md) | action/owner 交接、准备分流与内部模块定位 |
-| 查阅当前行为和边界 | [专题合同](contracts/README.md) | 导航、Scene、生命周期、输入/focus，按变化原因划分 |
-| 开发或修改功能 | [开发指南](development/README.md) | 按功能定位合同、源码、测试；组织新设计与计划 |
-| 接入应用、运行示例 | [接入指南](guides/integration.md) | 实际装配步骤与可运行示例 |
-| 调试窗口交互 | [窗口调试](guides/debugging.md) | 应用内 BRP 输入、布局查询和 renderer 截图 |
-| 选择验证及发布检查 | [验证指南](development/verification.md) | 检查入口与已验证/未验证边界 |
-| 分析性能 | [性能基线](performance.md) | 计时方法、已有结果与测量局限 |
-| 理解设计原因和经验 | [工程经验](development/design-lessons.md) | 可复用因果与取舍；不另立产品要求 |
-| 确认发布与后续安排 | [路线图](roadmap.md) | 当前待办与选题依据；不复制合同 |
+| 我想…… | 从这里开始 |
+| --- | --- |
+| 了解 Router 解决什么问题 | [产品概览](overview.md) |
+| 将路由接入 Bevy 应用 | [接入指南](guides/integration.md) |
+| 调试窗口、导航和输入 | [调试指南](guides/debugging.md) |
+| 查询导航、Scene、生命周期和输入行为 | [行为合同](contracts/README.md) |
+| 理解模块分工与数据结构 | [架构总览](architecture/README.md) |
+| 跟踪一次导航如何执行 | [运行机制](architecture/runtime.md) |
+| 修改 owner 交接或失败清理 | [生命周期执行协议](architecture/lifecycle.md) |
+| 修复问题或实现功能 | [开发指南](development/README.md) |
+| 运行检查、验证发布产物 | [验证指南](development/verification.md) |
+| 测量导航和空闲更新成本 | [性能测量](performance.md) |
+| 理解关键设计选择 | [设计理由](development/design-lessons.md) |
+| 查看后续工作 | [路线图](roadmap.md) |
 
-首次了解项目可按“概览 → 架构 → 相关专题”阅读；修复或开发某项功能直接从开发指南进入，无需通读全部文档。
+## 正在开发
 
-## 当前基线与未来设计
+[路由过渡生命周期设计](changes/view-transitions/design.md)与[实施计划](changes/view-transitions/plan.md)记录当前开发工作。具体动画由应用/UI 层实现；现行行为以行为合同和公开 API 为准。
 
-概览定义范围，架构解释当前实现，专题合同定义现行行为；使用指南与验证提供操作和证据入口。明确的用户决策与 [AGENTS.md](../AGENTS.md) 的优先级保持不变。
+## 查阅 API 与历史
 
-未来功能可按职责建立多份设计/spec 和实施计划，具体组织见[开发指南](development/README.md#新增功能与文档演进)。未实施方案明确标记状态并独立存放，不因进入仓库而成为当前合同。设计落地后同步相关主题，不把新行为散落在补充日志中。
+在仓库根目录生成 API 文档：
 
-公共 API 的精确签名以源码/rustdoc 为准，示例引用实际编译运行的源文件。跨主题通过链接说明依赖，不复制整份协议或建立互相证明的 Markdown/API 清单。
+```sh
+cargo doc --workspace --all-features --no-deps --locked
+```
 
-## 历史与参考
-
-已完成阶段的 plan、review log、旧 Target/Matrix/Fixture/Allowlist/Golden/Profile 和过时研究已退出工作树。必要语义和经验归入对应主题；历史过程通过 `git log -- docs` 与 `git show <revision>:<path>` 追溯，不作为新开发的默认输入。
-
-[参考研究](reference/router-benchmarks.md)是有版本边界的材料，不定义当前需求；[性能数据](data/performance/README.md)保留原型、候选与比较质量，不冒充当前源码的新验收。文档描述独立、通用的 Bevy UI Router，不混入其它项目的状态。
+从 `target/doc/bevy_ui_router/index.html` 开始。使用示例链接到实际源码，开发指南按功能链接到实现与测试。已完成计划和实验过程通过 `git log -- docs` 追溯；保留的[性能数据](data/performance/README.md)带有源码和环境信息。
