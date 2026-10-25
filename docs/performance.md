@@ -37,7 +37,7 @@ ROUTER_BENCH_MODE=transitions cargo bench -p bevy_ui_router --bench router_basel
 
 两种运行均使用公开 driver 和完成命令。`ROUTER_BENCH_UI=1` 增加真实 UI layout、UiStack 和 picking 系统，并检查页面几何与相机有效；不创建 renderer。省略该开关可观察 Router 与基础调度。`ROUTER_BENCH_CONTENT=32|128|1024` 可限定内容规模，`ROUTER_BENCH_SHAPE=nested` 可检查共享父链。
 
-fresh 与预热后的缓存命中分别测量。64 次短导航预热请求淘汰与生命周期，随后预热空闲更新；每个正式样本固定执行 32 次动画 update 和 32 次结束后 update。关闭过渡的控制也执行相同 update 数量。`holding_update` 和 `idle_update` 是每批 update 的平均耗时，其余列为一次阶段耗时。发布计时在新路由生效时结束，持有退出的清理工作记入 release；只比较发布耗时不能推断导航总成本。
+fresh 与预热后的缓存命中分别测量。64 次短 Replace 导航预热请求淘汰与生命周期，随后预热空闲更新；每个正式样本固定执行 32 次动画 update 和 32 次结束后 update。关闭过渡的控制也执行相同 update 数量。`holding_update` 和 `idle_update` 是每批 update 的平均耗时，其余列为一次阶段耗时。发布计时在新路由生效时结束，持有退出的清理工作记入 release；只比较发布耗时不能推断导航总成本。
 
 窗口示例提供有限的自动采样模式：
 
@@ -82,7 +82,7 @@ Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::upda
 | 实体和请求数量 | 场景组完成后读取的稳定状态；failure 行在对应 recover 完成后读取 |
 | update 上限 | 每步 32 次更新的防挂起断言 |
 
-这是 headless CPU 侧测量，覆盖 Router 与基础调度。UI layout、原生 picking、窗口呈现、GPU 与 I/O 的成本通过相应应用场景另测。根 workspace 与独立窗口可能使用不同 executor/features，比较前记录实际构建配置。
+普通模式是 headless CPU 侧测量，覆盖 Router 与基础调度；`transitions` 的 UI 开关额外覆盖正常布局和输入候选投影，未注入 pointer 时不测实际命中。窗口提交另用上述窗口模式，GPU 执行、实际呈现和 I/O 需在对应环境单独测量。根 workspace 与独立窗口可能使用不同 executor/features，比较前记录实际构建配置。
 
 直接 BSN 对照保留 host/layout/outlet，测 Scene 构造、resolve/apply、旧页删除和普通 update。它用于观察引擎构建成本；Router 基准还包含 history、授权、隔离和恢复工作。
 
@@ -96,10 +96,10 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances` 和 `steady` 同样支持 `-- --test`。正式计时使用上面的 `cargo bench` 命令。
+`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
 
 ## 保存与阅读结果
 
 每次测量保存源码 revision、lock hash、Rust/Bevy 版本、机器与 OS、features、构建 profile、二进制 hash、命令及完整输出。保留干扰和离群值标记，配对比较使用相同内容预算与工作量。先确认实体及记录进入稳定容量，再调查需要 heap profile 的持续增长。
 
-[历史数据索引](data/performance/README.md)保留五组带完整源码身份的测量，便于检查夹具演进和数据格式。当前性能结论通过当前 checkout 重新运行获得；过去的候选补丁与逐阶段探针通过 Git 历史查询。
+[历史数据索引](data/performance/README.md)保留带完整源码身份的测量，便于检查夹具演进和数据格式。性能结论对应所列源码；评估当前 checkout 时重新运行，避免把历史数值视为当前保证。

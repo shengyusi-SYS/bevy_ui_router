@@ -37,7 +37,7 @@ ROUTER_BENCH_MODE=transitions cargo bench -p bevy_ui_router --bench router_basel
 
 Both variants use the public driver and completion commands. `ROUTER_BENCH_UI=1` adds real UI layout, UiStack, and picking systems, asserting valid page geometry and camera input, without a renderer. Omit it to observe Router and basic scheduling. `ROUTER_BENCH_CONTENT=32|128|1024` selects one content size; `ROUTER_BENCH_SHAPE=nested` exercises shared ancestor paths.
 
-Fresh creation and warmed cache hits are measured separately. Sixty-four short navigations warm request eviction and lifecycle paths, followed by idle updates. Each measured sample executes 32 animation updates and 32 post-finish updates; the disabled control performs the same update count. `holding_update` and `idle_update` are batch means per update; other phases measure one operation. Publication ends when the new route becomes active, while held-exit cleanup is charged to release. Publication alone cannot establish total navigation cost.
+Fresh creation and warmed cache hits are measured separately. Sixty-four short Replace navigations warm request eviction and lifecycle paths, followed by idle updates. Each measured sample executes 32 animation updates and 32 post-finish updates; the disabled control performs the same update count. `holding_update` and `idle_update` are batch means per update; other phases measure one operation. Publication ends when the new route becomes active, while held-exit cleanup is charged to release. Publication alone cannot establish total navigation cost.
 
 The window example provides finite automatic sampling:
 
@@ -82,7 +82,7 @@ The Router fixture installs TaskPool, Asset, and Scene runtime and advances thro
 | Entity and request counts | Stable state at the end of a scenario group; failure rows are read after their corresponding recovery |
 | Update limit | An assertion that each step settles within 32 updates |
 
-These headless CPU-side measurements cover Router and basic scheduling. Measure UI layout, native picking, window presentation, GPU, and I/O in their application scenarios. The root workspace and separate window application can use different executors/features, so record the actual build configuration before comparisons.
+Ordinary modes measure headless Router and basic scheduling. The `transitions` UI option additionally covers normal layout and input candidate projection; without injected pointers it does not measure actual hit testing. Use the window mode above for submission; GPU execution, actual presentation, and I/O require their corresponding environment. The root workspace and separate window application can use different executors/features, so record the actual build configuration before comparisons.
 
 The direct BSN control keeps the host/layout/outlet and measures Scene construction, resolve/apply, old-page deletion, and ordinary updates. It shows engine construction cost; Router benchmarks additionally perform history, authorization, isolation, and recovery work.
 
@@ -96,10 +96,10 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances` and `steady` also support `-- --test`. Use the `cargo bench` commands above for timing.
+`instances`, `steady`, and `transitions` also support `-- --test`. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
 
 ## Save and read results
 
 Record the source revision, lockfile hash, Rust/Bevy versions, machine and OS, features, build profile, binary hash, command, and complete output. Preserve interference and outlier annotations. Paired comparisons use equal content budgets and work. Establish stable entity and record counts before investigating sustained growth with a heap profiler.
 
-The [historical data index](data/performance/README.en.md) retains five measurements with full source identities for inspecting fixture evolution and output formats. Run the current checkout to obtain current performance results. Past candidate patches and phase probes remain in Git history.
+The [historical data index](data/performance/README.en.md) retains measurements with full source identities for inspecting fixture evolution and output formats. Results apply to their listed sources; rerun the current checkout rather than treating historical values as current guarantees.
