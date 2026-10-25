@@ -110,8 +110,11 @@ pub(crate) fn project_native_ui_input_stack(world: &mut World) {
         let Some(source) = world.get_resource::<UiStack>() else {
             return;
         };
+        let mut observation = super::RouterInputObservation::new(world);
         match rebuild_without(source, &mut projection.scratch, |entity| {
-            super::target_is_denied_router_input(world, entity)
+            observation
+                .as_mut()
+                .is_some_and(|observation| observation.target_is_denied(entity))
         }) {
             Ok(false) => return,
             Err(failure) => {

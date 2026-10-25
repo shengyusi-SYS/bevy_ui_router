@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
+mod boundary;
 pub(crate) mod native_ui_candidates;
+
+use boundary::{RouterInputObservation, target_is_denied_router_input};
 
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
@@ -921,45 +924,6 @@ pub(crate) fn filter_inactive_router_pointer_state_system(world: &mut World) {
     if !gate.revoked.is_empty() {
         gate.revoked.clear();
     }
-}
-
-fn target_is_denied_router_input(world: &World, target: Entity) -> bool {
-    world
-        .get_resource::<RouterInputGate>()
-        .is_some_and(|gate| !gate.allows_pointer(target))
-        && target_has_exact_router_boundary(world, target)
-}
-
-fn target_has_exact_router_boundary(world: &World, target: Entity) -> bool {
-    let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
-        return false;
-    };
-    let Some(quarantine) = world.get_resource::<QuarantineLeaseTable>() else {
-        return false;
-    };
-    let mut current = target;
-    let mut visited = HashSet::new();
-    while visited.insert(current) {
-        let claim = registry
-            .record(current)
-            .map(|record| record.claim())
-            .or_else(|| quarantine.record(current).map(|record| record.claim()))
-            .or_else(|| {
-                quarantine
-                    .unresolved_record(current)
-                    .map(|record| record.claim())
-            });
-        if claim.is_some_and(|claim| {
-            world.get::<RouteOwnershipSeal>(current) == Some(&RouteOwnershipSeal::new(claim.seal()))
-        }) {
-            return true;
-        }
-        let Some(parent) = world.get::<ChildOf>(current).map(ChildOf::parent) else {
-            return false;
-        };
-        current = parent;
-    }
-    false
 }
 
 pub(crate) fn input_ready_system() {}
