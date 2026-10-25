@@ -5281,6 +5281,100 @@ fn manifest_digest_count_and_batch_are_bound_into_the_token() {
 }
 
 #[test]
+fn post_commit_reservation_rejects_reordered_roots_and_returns_the_original_source() {
+    let mut engine = ready_engine_with_tree(reconciliation_tree());
+    engine.push(RouteLocation::new("/items/1")).unwrap();
+    settle_current(&mut engine);
+    engine.push(RouteLocation::new("/")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let current = engine.current.as_ref().unwrap();
+    let roots = current.cleanup_roots.clone();
+    assert!(roots.len() > 1);
+    let reservation = PostCommitCleanupReservation::new(
+        ticket.identity().clone(),
+        current.cleanup_batch,
+        roots.clone(),
+    );
+    let original_identity = reservation.identity().clone();
+    let mut reordered = roots.clone();
+    reordered.reverse();
+    let rejected_manifest =
+        CleanupManifestSeal::new(reordered, manifest_digest(0xE017), NONZERO_OBLIGATION_COUNT);
+    let (reservation, returned_manifest) = reservation
+        .seal(rejected_manifest.clone())
+        .expect_err("matching root counts do not authorize a different ordered source");
+    assert_eq!(reservation.identity(), &original_identity);
+    assert_eq!(returned_manifest, rejected_manifest);
+
+    let manifest = CleanupManifestSeal::new(
+        roots.clone(),
+        manifest_digest(0xE018),
+        NONZERO_OBLIGATION_COUNT,
+    );
+    let (cleanup, returned_roots) = reservation.seal(manifest.clone()).unwrap();
+    assert_eq!(cleanup.batch_identity(), &original_identity);
+    assert_eq!(returned_roots, roots);
+    assert_eq!(cleanup.obligation_count(), NONZERO_OBLIGATION_COUNT);
+
+    let sealed = engine.seal_commit(&ticket, manifest).unwrap();
+    assert_eq!(sealed.cleanup(), &cleanup);
+}
+
+#[test]
+fn history_publication_requires_the_exact_physical_seal_for_the_same_settlement() {
+    let mut engine = ready_engine();
+    engine.push(RouteLocation::new("/items/1")).unwrap();
+    settle_current(&mut engine);
+    engine.push(RouteLocation::new("/about")).unwrap();
+    let action = engine.action().unwrap();
+    let ticket = drive_to_commit(&mut engine, action);
+    let roots = engine.current.as_ref().unwrap().cleanup_roots.clone();
+    let sealed = engine
+        .seal_commit(
+            &ticket,
+            CleanupManifestSeal::new(
+                roots.clone(),
+                manifest_digest(0xE019),
+                NONZERO_OBLIGATION_COUNT,
+            ),
+        )
+        .unwrap();
+    let current = engine.current.as_ref().unwrap();
+    let history = sealed.publication.history.as_ref().unwrap();
+    let matches = |cleanup: &CleanupBatchToken| {
+        history.matches_sealed_projection(
+            sealed.evidence.history_execution.as_ref().unwrap(),
+            sealed.evidence.source_revision.unwrap(),
+            &current.location,
+            sealed.publication.state.active(),
+            current.branch.as_ref().unwrap().branch_fingerprint(),
+            &current.target_frames,
+            cleanup,
+        )
+    };
+    assert!(matches(sealed.cleanup()));
+
+    for (digest, count) in [
+        (manifest_digest(0xE01A), NONZERO_OBLIGATION_COUNT),
+        (manifest_digest(0xE019), NONZERO_OBLIGATION_COUNT + 1),
+    ] {
+        let different = CleanupBatchToken::sealed(
+            ticket.identity().clone(),
+            current.cleanup_batch,
+            &roots,
+            digest,
+            count,
+        );
+        assert_eq!(
+            different.batch_identity(),
+            sealed.cleanup().batch_identity()
+        );
+        assert!(!matches(&different));
+    }
+}
+
+#[test]
 fn nonzero_completion_is_aggregate_attestation_without_core_receipts() {
     let mut engine = ready_engine();
     engine.push(RouteLocation::new("/items/1")).unwrap();

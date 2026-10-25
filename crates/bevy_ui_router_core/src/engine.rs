@@ -16,6 +16,7 @@ use crate::branch::{FrozenErrorViewBinding, MatchedBranch, MatchedRoute, RoutePa
 use crate::branch_diff::BranchDiff;
 use crate::cleanup::{
     CleanupBatchToken, CleanupCompletion, CleanupManifestDigest, CleanupManifestSeal,
+    PostCommitCleanupReservation,
 };
 use crate::diagnostics::{DiagnosticEvent, ReportDisposition};
 use crate::fingerprint::{RouteBranchFingerprint, RouteBranchProvenance, RouteSearchFingerprint};
@@ -11478,13 +11479,22 @@ impl RouterEngine {
             // current remains intact on every preparation failure.
             current.cleanup_roots = plan.disposable_roots().to_vec();
         }
-        let cleanup = CleanupBatchToken::sealed(
+        let reservation = PostCommitCleanupReservation::new(
             current.identity.clone(),
             current.cleanup_batch,
-            &current.cleanup_roots,
-            seal.manifest_digest(),
-            seal.obligation_count(),
+            std::mem::take(&mut current.cleanup_roots),
         );
+        let (cleanup, cleanup_roots) = match reservation.seal(seal) {
+            Ok(sealed) => sealed,
+            Err((reservation, _manifest)) => {
+                // This is the independent clone_pre_retirement preparation.
+                // Restore its source container before rejecting; self.current,
+                // its lifecycle owner and history capability remain installed.
+                current.cleanup_roots = reservation.into_logical_roots();
+                return Err(CommitError::InvalidManifest);
+            }
+        };
+        current.cleanup_roots = cleanup_roots;
         let is_normal = matches!(&current.attempt, AttemptKind::Normal(_));
         let history_capability = if is_normal {
             match self.current_history_capability.take() {

@@ -108,35 +108,105 @@ impl CleanupManifestSeal {
     }
 }
 
+/// Stable task, host, transaction, batch and logical-root binding, independent of
+/// a particular physical manifest. This is a comparison value, not an owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CleanupBatchToken {
+pub(crate) struct CleanupBatchIdentity {
     identity: RootTaskIdentity,
     batch: CleanupBatchId,
     logical_roots_binding: u64,
+}
+
+impl CleanupBatchIdentity {
+    fn new(
+        identity: RootTaskIdentity,
+        batch: CleanupBatchId,
+        logical_roots: &[RouteFrameVersion],
+    ) -> Self {
+        Self {
+            identity,
+            batch,
+            logical_roots_binding: logical_roots_digest(logical_roots),
+        }
+    }
+}
+
+/// The concrete physical obligations sealed for a previously identified batch.
+/// Neither this projection nor the batch identity carries lifecycle ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanupBatchSeal {
     manifest_digest: CleanupManifestDigest,
     obligation_count: usize,
     binding: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanupBatchToken {
+    identity: CleanupBatchIdentity,
+    seal: CleanupBatchSeal,
+}
+
+/// An original post-commit batch reservation before its physical manifest is
+/// sealed. The exact roots remain available for comparison and are returned to
+/// the caller after sealing; a copied identity cannot recreate this reservation.
+/// The engine still requires the original work owner before binding its token.
+#[derive(Debug)]
+pub(crate) struct PostCommitCleanupReservation {
+    identity: CleanupBatchIdentity,
+    logical_roots: Vec<RouteFrameVersion>,
+}
+
+impl PostCommitCleanupReservation {
+    pub(crate) fn new(
+        identity: RootTaskIdentity,
+        batch: CleanupBatchId,
+        logical_roots: Vec<RouteFrameVersion>,
+    ) -> Self {
+        Self {
+            identity: CleanupBatchIdentity::new(identity, batch, &logical_roots),
+            logical_roots,
+        }
+    }
+
+    pub(crate) const fn identity(&self) -> &CleanupBatchIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn into_logical_roots(self) -> Vec<RouteFrameVersion> {
+        self.logical_roots
+    }
+
+    pub(crate) fn seal(
+        self,
+        manifest: CleanupManifestSeal,
+    ) -> Result<(CleanupBatchToken, Vec<RouteFrameVersion>), (Self, CleanupManifestSeal)> {
+        if self.logical_roots != manifest.logical_roots {
+            return Err((self, manifest));
+        }
+        let token = CleanupBatchToken::from_identity(
+            self.identity,
+            manifest.manifest_digest,
+            manifest.obligation_count,
+        );
+        Ok((token, self.logical_roots))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CleanupBatchSourceProjection {
-    identity: RootTaskIdentity,
-    batch: CleanupBatchId,
-    logical_roots_binding: u64,
-    manifest_digest: CleanupManifestDigest,
-    obligation_count: usize,
-    binding: u64,
+    identity: CleanupBatchIdentity,
+    seal: CleanupBatchSeal,
 }
 
 impl CleanupBatchSourceProjection {
     pub(crate) const fn binding_digest(&self) -> u64 {
-        self.binding
+        self.seal.binding
     }
 
     #[cfg(test)]
     pub(crate) fn testing_with_binding_digest(&self, binding: u64) -> Self {
         let mut projection = self.clone();
-        projection.binding = binding;
+        projection.seal.binding = binding;
         projection
     }
 }
@@ -149,72 +219,91 @@ impl CleanupBatchToken {
         manifest_digest: CleanupManifestDigest,
         obligation_count: usize,
     ) -> Self {
-        let logical_roots_binding = logical_roots_digest(logical_roots);
+        Self::from_identity(
+            CleanupBatchIdentity::new(identity, batch, logical_roots),
+            manifest_digest,
+            obligation_count,
+        )
+    }
+
+    fn from_identity(
+        identity: CleanupBatchIdentity,
+        manifest_digest: CleanupManifestDigest,
+        obligation_count: usize,
+    ) -> Self {
         let binding = token_binding(
-            &identity,
-            batch,
-            logical_roots_binding,
+            &identity.identity,
+            identity.batch,
+            identity.logical_roots_binding,
             manifest_digest,
             obligation_count,
         );
         Self {
             identity,
-            batch,
-            logical_roots_binding,
-            manifest_digest,
-            obligation_count,
-            binding,
+            seal: CleanupBatchSeal {
+                manifest_digest,
+                obligation_count,
+                binding,
+            },
         }
     }
 
     pub(crate) const fn identity(&self) -> &RootTaskIdentity {
-        &self.identity
+        &self.identity.identity
     }
 
     pub(crate) const fn batch(&self) -> CleanupBatchId {
-        self.batch
+        self.identity.batch
     }
 
     pub(crate) const fn manifest_digest(&self) -> CleanupManifestDigest {
-        self.manifest_digest
+        self.seal.manifest_digest
     }
 
     pub(crate) const fn obligation_count(&self) -> usize {
-        self.obligation_count
+        self.seal.obligation_count
+    }
+
+    pub(crate) const fn batch_identity(&self) -> &CleanupBatchIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn manifest_seal(&self) -> &CleanupBatchSeal {
+        &self.seal
+    }
+
+    pub(crate) fn into_parts(self) -> (CleanupBatchIdentity, CleanupBatchSeal) {
+        (self.identity, self.seal)
     }
 
     pub(crate) fn source_projection(&self) -> CleanupBatchSourceProjection {
         CleanupBatchSourceProjection {
             identity: self.identity.clone(),
-            batch: self.batch,
-            logical_roots_binding: self.logical_roots_binding,
-            manifest_digest: self.manifest_digest,
-            obligation_count: self.obligation_count,
-            binding: self.binding,
+            seal: self.seal.clone(),
         }
     }
 
     fn has_valid_binding(&self) -> bool {
-        self.binding
+        self.seal.binding
             == token_binding(
-                &self.identity,
-                self.batch,
-                self.logical_roots_binding,
-                self.manifest_digest,
-                self.obligation_count,
+                &self.identity.identity,
+                self.identity.batch,
+                self.identity.logical_roots_binding,
+                self.seal.manifest_digest,
+                self.seal.obligation_count,
             )
     }
 
     #[cfg(test)]
     pub(crate) fn testing_with_identity(&self, identity: RootTaskIdentity) -> Self {
         let mut token = self.clone();
-        token.identity = identity;
-        token.binding = token_binding(
-            &token.identity,
-            token.batch,
-            token.logical_roots_binding,
-            token.manifest_digest,
-            token.obligation_count,
+        token.identity.identity = identity;
+        token.seal.binding = token_binding(
+            &token.identity.identity,
+            token.identity.batch,
+            token.identity.logical_roots_binding,
+            token.seal.manifest_digest,
+            token.seal.obligation_count,
         );
         token
     }
@@ -222,30 +311,30 @@ impl CleanupBatchToken {
     #[cfg(test)]
     pub(crate) fn testing_with_batch(&self, batch: CleanupBatchId) -> Self {
         let mut token = self.clone();
-        token.batch = batch;
-        token.binding = token_binding(
-            &token.identity,
-            token.batch,
-            token.logical_roots_binding,
-            token.manifest_digest,
-            token.obligation_count,
+        token.identity.batch = batch;
+        token.seal.binding = token_binding(
+            &token.identity.identity,
+            token.identity.batch,
+            token.identity.logical_roots_binding,
+            token.seal.manifest_digest,
+            token.seal.obligation_count,
         );
         token
     }
 
     #[cfg(test)]
     pub(crate) const fn testing_identity(&self) -> &RootTaskIdentity {
-        &self.identity
+        &self.identity.identity
     }
 
     #[cfg(test)]
     pub(crate) const fn testing_batch(&self) -> CleanupBatchId {
-        self.batch
+        self.identity.batch
     }
 
     #[cfg(test)]
     pub(crate) const fn testing_binding(&self) -> u64 {
-        self.binding
+        self.seal.binding
     }
 }
 
@@ -290,7 +379,7 @@ impl CleanupCompletion {
 
     pub(crate) fn is_well_formed(&self) -> bool {
         self.token.has_valid_binding()
-            && self.settled_count == self.token.obligation_count
+            && self.settled_count == self.token.obligation_count()
             && (self.settled_count == 0) == self.completion_digest.is_canonical_empty()
             && self.binding
                 == completion_binding(&self.token, self.completion_digest, self.settled_count)
@@ -363,7 +452,7 @@ fn completion_binding(
     settled_count: usize,
 ) -> u64 {
     let mut digest = StructuredDigest::new(COMPLETION_DOMAIN);
-    digest.push(token.binding);
+    digest.push(token.seal.binding);
     digest.push(completion_digest.0);
     digest.push(settled_count as u64);
     digest.finish()

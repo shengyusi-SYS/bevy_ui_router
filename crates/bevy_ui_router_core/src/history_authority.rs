@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::HostVersion;
-use crate::cleanup::CleanupBatchToken;
+use crate::cleanup::{CleanupBatchIdentity, CleanupBatchSeal, CleanupBatchToken};
 use crate::fingerprint::{RouteBranchFingerprint, RouteSegmentReuseKey};
 use crate::frame::{FrameOrigin, LogicalChildSlotBinding, RouteFrameVersion};
 use crate::history::{HistorySnapshot, MemoryHistory};
@@ -1677,7 +1677,8 @@ pub(crate) struct PreparedPresentationBinding {
     presentation: ActivePresentation,
     matched: RouteBranchFingerprint,
     target_frames: Vec<RouteFrameVersion>,
-    cleanup: CleanupBatchToken,
+    settlement: CleanupBatchIdentity,
+    cleanup: CleanupBatchSeal,
 }
 
 impl PreparedPresentationBinding {
@@ -1688,11 +1689,13 @@ impl PreparedPresentationBinding {
         target_frames: Vec<RouteFrameVersion>,
         cleanup: CleanupBatchToken,
     ) -> Self {
+        let (settlement, cleanup) = cleanup.into_parts();
         Self {
             execution,
             presentation,
             matched,
             target_frames,
+            settlement,
             cleanup,
         }
     }
@@ -1768,7 +1771,8 @@ impl PreparedHistoryPublication {
             && self.presentation.presentation == *presentation
             && self.presentation.matched == *matched
             && self.presentation.target_frames == target_frames
-            && self.presentation.cleanup == *cleanup
+            && self.presentation.settlement == *cleanup.batch_identity()
+            && self.presentation.cleanup == *cleanup.manifest_seal()
             && self.next.projection.current() == Some(target)
     }
 
