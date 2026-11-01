@@ -6,6 +6,8 @@ Page navigation for Bevy UI. Organize pages by path, reuse shared layouts, and n
 
 Currently supports **Bevy 0.19**. Not yet published to crates.io.
 
+This project is developed entirely by GPT flagship models (to use up my remaining quota); my role is discussion, supervision, and feedback.
+
 ## Run the examples
 
 To try the existing features first, run the interactive example:
