@@ -37,6 +37,15 @@ cargo test --workspace --all-features --locked
 cargo test -p bevy_ui_router_ecs --no-default-features --locked
 ```
 
+开发声明、Commands 或动画适配时，可先运行对应旅程：
+
+```sh
+cargo test -p bevy_ui_router --features bsn --test public_usage --locked
+cargo test -p bevy_ui_router_ecs --features bsn,tween transition::tween --locked
+```
+
+这些定向检查不代替上表要求的完整 crate 和 consumer 验证。
+
 修改返回 adapter 时，运行单独输入源和组合路由测试：
 
 ```sh
@@ -75,11 +84,13 @@ gitleaks git . --redact --log-opts="--all --full-history" --report-format json -
 | Core 导航 | [Core tests](../../crates/bevy_ui_router_core/tests)、[公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) | 路由匹配、嵌套切换、参数/query/fragment、history、失败与恢复 |
 | View | [公共 API](../../crates/bevy_ui_router_view/tests/public_api.rs)、[独立 view consumer](../../crates/bevy_ui_router/tests/consumers/view.rs) | 路由输入和 renderer-neutral 绑定 |
 | ECS 生命周期 | [公共 API](../../crates/bevy_ui_router_ecs/tests/public_api.rs)、[导航测试](../../crates/bevy_ui_router_ecs/src/navigation_tests.rs)、[清理测试](../../crates/bevy_ui_router_ecs/src/cleanup_tests.rs) | host 注册、身份检查、准备、发布、局部清理和重新接纳 |
+| 推荐接入 | [公开使用旅程](../../crates/bevy_ui_router/tests/public_usage.rs)、[声明安装](../../crates/bevy_ui_router_ecs/src/bsn/install/tests.rs)、[Commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) | 嵌套声明、当前输入与可变 Query、延迟导航错误、initial 优先级与 host 重接、多 Router 隔离 |
 | BSN | [facade 测试](../../crates/bevy_ui_router/tests/bsn_facade_features.rs)、[独立 BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) | factory、Scene 应用、outlet 与内容归属 |
 | 平台返回 | [返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs)、[桌面 consumer](../../crates/bevy_ui_router/tests/consumers/desktop_back.rs)、[Android consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs) | 按窗口传递意图、过滤重复、双源通道、弹层优先与定向 Back |
 | 输入与焦点 | [pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | 活动命中、离场撤销、已开始手势和其它有效目标 |
 | 保留实例 | [保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) | 父子独立保留、原父/新子、容量淘汰、失效清理和后续导航 |
 | 路由过渡 | [过渡旅程](../../crates/bevy_ui_router/tests/route_transitions.rs)、[原生重叠输入](../../crates/bevy_ui_router_ecs/src/input/native_ui_candidates/tests.rs) | prepare/current 输入、首帧样式、enter-only、动态退出、父子保留、Back、连续导航、host 失效与重新接入 |
+| Tween 适配 | [适配旅程](../../crates/bevy_ui_router_ecs/src/transition/tween/tests.rs) | 发布后零起点、独立时钟、最后写入后的退出释放、取消停止写入与最终重绘 |
 | 滚动恢复 | [滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 真实布局、早晚容器、ready/cancel、二维裁剪、用户滚动优先、旧 ID，以及过渡与缓存淘汰中的多次访问恢复 |
 | 页面系统 | [活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 可变应用 Query、保留页失活/恢复、动态后代与精确父链 |
 | 集成边界 | [consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 各 feature 的可见 API、最小依赖和官方 Bevy 来源 |
@@ -95,9 +106,9 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-quick start 检查最小 Scene runtime 和请求结果。nested 使用真实 UI layout，组合共享布局、query 更新、应用任务、当前路由输入和显式滚动恢复。两者完成有限次更新后退出。
+quick start 检查声明安装、最小 Scene runtime 和初始页面。nested 使用真实 UI layout，组合共享布局、query 更新、应用任务、当前路由输入和显式滚动恢复。两者完成有限次更新后退出。
 
-窗口应用有独立 workspace，分别检查默认和调试 feature：
+窗口应用有独立 workspace，分别检查默认和全部可选 feature（包括 `ui-debug` 与 `tween`）：
 
 ```sh
 cargo fmt --manifest-path examples/windowed/Cargo.toml --all --check
@@ -106,7 +117,10 @@ cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
 cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
 ```
+
+Tween 示例用同一准备回调定义平移和缩放旋转，可切换退出持有、对比保留计数和 Back；手工 driver 示例展示直接使用生命周期接口的方式。具体合同见[过渡指南](../guides/transitions.md)。
 
 Linux 构建采用 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev` 和 `libxrandr-dev`。交互检查包括 push/replace/back、布局与页面计数、不同访问的滚动位置、晚到内容、点击和 Space、焦点释放、跨页手势、错误 fallback 和恢复。具体步骤与 BRP 命令见[窗口调试](../guides/debugging.md)。
 

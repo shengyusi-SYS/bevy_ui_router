@@ -19,6 +19,7 @@ flowchart TD
     ECS --> Core
     ECS --> View
     ECS -->|bsn bridge| BSN
+    ECS -->|tween| Tween["bevy_tween: timelines and interpolation"]
     BSN --> Core
     BSN --> View
     Platform --> Core
@@ -35,6 +36,10 @@ flowchart TD
 | Facade | Common APIs and feature combinations, usually imported with `bevy_ui_router::prelude::*` |
 
 The default `view` feature keeps the dependency graph Bevy-free. `ecs` includes `view`, and `bsn` includes `ecs`. BSN's `AppBsnExt` is implemented in the ECS bridge and re-exported by the facade. BSN is the current application renderer.
+
+The ECS BSN integration compiles `BsnRouter` declarations into the existing Core route tree, View registry, and factory bindings, removing manual assembly from ordinary applications. Commands navigation and one-shot initial navigation both enter through the original `RouterNavigation`. Current-input queries remain read-only and coexist with application Query and Commands.
+
+The optional `tween` feature includes `ecs` and integrates `bevy_tween`. Its adapter coordinates controllers with existing transition sessions; applications supply effects. Core, default features, and ordinary `bsn` integration do not depend on the animation library.
 
 `platform` is independent and also Bevy-free. `desktop-back` / `android-back` include `platform` and enable the required Bevy mouse / keyboard input. Applications select Router ECS/BSN, the window backend, and their Back handler separately. `devtools` is currently an empty feature.
 
@@ -72,6 +77,7 @@ These dimensions are observed separately and together describe a Router's state.
 | Core decisions and cross-crate handoff | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs), [integration.rs](../../crates/bevy_ui_router_core/src/integration.rs), [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs) |
 | Retained instances | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs); ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) and [instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) |
 | View registry and effects | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs), [effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |
+| Declarations and convenient navigation | [BSN declaration](../../crates/bevy_ui_router_ecs/src/bsn/declaration.rs), [install](../../crates/bevy_ui_router_ecs/src/bsn/install.rs), [navigation commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) |
 | Registration, scheduling, navigation, snapshots | [app_ext.rs](../../crates/bevy_ui_router_ecs/src/app_ext.rs), [plugin.rs](../../crates/bevy_ui_router_ecs/src/plugin.rs), [navigation.rs](../../crates/bevy_ui_router_ecs/src/navigation.rs), [snapshots.rs](../../crates/bevy_ui_router_ecs/src/snapshots.rs) |
 | Hosts, mounting, Scenes | [host.rs](../../crates/bevy_ui_router_ecs/src/host.rs), [mount.rs](../../crates/bevy_ui_router_ecs/src/mount.rs), [BSN contract](../../crates/bevy_ui_router_bsn/src/lib.rs), [ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs) |
 | Publication, failure, cleanup | [Lifecycle execution protocol](lifecycle.en.md#module-map) |

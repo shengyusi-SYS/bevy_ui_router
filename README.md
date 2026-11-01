@@ -33,7 +33,13 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml
 
 窗口可体验页面切换、返回、布局和页面计数、错误恢复、键盘交互与滚动。Linux 使用 X11；依赖安装和窗口操作见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)。
 
-应用自定义过渡示例提供平移、缩放旋转和连续导航取消，具体效果完全在应用中实现：
+可选 Tween 适配让应用只定义动画效果，由库协调开始、取消和完成：
+
+```sh
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
+```
+
+需要接入自己的动画系统时，手工 driver 示例提供平移、缩放旋转和连续导航取消：
 
 ```sh
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
@@ -50,13 +56,14 @@ bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = 
 
 本项目使用 Rust 2024 edition 和 Bevy 0.19，锁文件固定 Bevy 0.19.1。使用能够构建该版本 Bevy 的 Rust 工具链。
 
-从[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)开始，按顺序安装 Scene runtime、注册页面 factory、声明路由、挂载 host，再发送导航请求。完整可运行源码见[最小示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)。
+从[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)开始：用 `BsnRouter` 直接关联路由与页面 factory，设置 `initial` 并挂载应用 host；普通页面系统通过 `commands.router(handle).push("/items/42?tab=info")` 导航。完整可运行源码见[最小示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)。
 
 | Feature | 用途 |
 | --- | --- |
 | `view`（默认） | renderer-neutral 的视图描述和注册 |
 | `ecs` | Bevy 插件、host、导航、快照、活动状态和输入 gate |
 | `bsn` | 推荐的 Scene 集成，包含 `ecs` 和 `view` |
+| `tween` | 可选 `bevy_tween` 过渡协调，包含 `ecs`，具体效果由应用提供 |
 | `platform` | 平台导航接口 |
 | `desktop-back` / `android-back` | 鼠标后退侧键 / Android 传统返回键 |
 

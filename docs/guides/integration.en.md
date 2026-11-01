@@ -15,7 +15,7 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 
 | Example | Contents | Runtime |
 | --- | --- | --- |
-| [bsn_quick_start.rs](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) | Register Scenes, create a Router, navigate, and read results | Headless; exits when complete |
+| [bsn_quick_start.rs](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) | Declare pages, set the initial destination, and read results | Headless; exits when complete |
 | [bsn_nested.rs](../../crates/bevy_ui_router/examples/bsn_nested.rs) | Nested layouts, query updates, application async content, and scroll restoration | Headless with real UI layout; exits when complete |
 | [windowed](../../examples/windowed/) | Clickable pages, retained state, focus, and error recovery | Interactive window |
 | [transitions](../../examples/windowed/src/bin/transitions.rs) | Application animation, exit release, and successive navigation | Interactive window |
@@ -58,25 +58,59 @@ bevy_input_focus = { version = "0.19", default-features = false }
 bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
 ```
 
-## Set up the application
+## Declare pages and start
 
-1. Install Bevy plugins. A minimal headless application uses `TaskPoolPlugin`, `AssetPlugin`, and `ScenePlugin`. Visible UI also needs window, camera, UI/render, and input plugins.
-2. Register Scene factories with `AppBsnExt::register_bsn_view`, keeping each returned `ViewDriverKey`. A factory receives `&RouteViewInput` and returns a fresh Scene or `BsnBuildError`.
-3. Create a `RouteViewRegistry`. Use `RouteViewDescriptor` to bind each view key to its driver key.
-4. Declare routes, normal views, and error views with `RouteTree::builder`. Prepare a Router fallback view.
-5. Call `add_ui_router(RouterConfig::new(routes, views, fallback))` and keep the `RouterHandle`.
-6. Add `RouterHostRegistration::new(handle)` to an application-created `Node`. Advance one update and use `RouterSnapshots` to check that the host is available. The [lifecycle contract](../contracts/lifecycle.en.md) describes host topology.
-7. Navigate through `RouterNavigation::{push,replace,back}`. Keep the request ID and read its result through `RouterSnapshots`.
+Install the Bevy plugins your application needs first. A minimal headless application uses `TaskPoolPlugin`, `AssetPlugin`, and `ScenePlugin`; visible UI also needs window, camera, UI/render, and input plugins. Then associate paths with Scene factories through `page`, `layout`, and `index`:
 
-`register_bsn_view` and `add_ui_router` install the shared Router systems. You can also install `BevyUiRouterPlugin` beforehand. Driver keys are unique: duplicate registration returns an error immediately, and Router installation checks all view/driver bindings.
+```rust
+use bevy_app::App;
+use bevy_scene::bsn;
+use bevy_ui::Node;
+use bevy_ui_router::prelude::*;
 
-Scenes created in code still use Bevy's Asset/Scene runtime. If installation returns `MissingSceneRuntime`, install `AssetPlugin` and `ScenePlugin` first so that `AssetServer` and `Assets<ScenePatch>` are available.
+fn install_pages(app: &mut App) -> Result<RouterHandle, BsnRouterError> {
+    let router = app.add_bsn_router(
+        BsnRouter::new(
+            layout(|_| Ok(bsn! { Node DefaultOutlet })).children([
+                index(|_| Ok(bsn! { Node })),
+                page("items/:id", |_| Ok(bsn! { Node })),
+            ]),
+        )
+        .fallback(|_| Ok(bsn! { Node }))
+        .initial("/"),
+    )?;
+    app.world_mut()
+        .spawn((Node::default(), RouterHostRegistration::new(router)));
+    Ok(router)
+}
+```
 
-## Nest content and observe navigation
+The application controls host layout. `layout` consumes no path; `index` declares the default child at its parent's path. Use `page(...).children(...)` for a layout with a path. A single-page Router can use `BsnRouter::new(page(...))` directly, with no implicit layout. Child paths are relative to their parent; a leading `/` does not escape that parent.
 
-Add `DefaultOutlet` to the internal `Node` where a layout Scene should display its child page. Each layout currently uses one default outlet. Switching between sibling pages reuses their common parent layout, outlet, and component state. The application controls the host layout; Router manages its routed content. Place application controls that need an independent lifetime outside that content boundary. See the [Scene contract](../contracts/scene.en.md) for mounting rules.
+Factories receive the creation-time `&RouteViewInput` and return a fresh Scene or `BsnBuildError`. A `fallback` is required; `.error_view(factory)` declares a local error page on a route. Installation generates and validates the route tree and view/driver bindings together. Declaration errors identify the node, without requiring callers to create keys or unwrap every route.
 
-Pass the three parts of a location separately:
+`initial` is a one-time default destination. Router waits for its first ready host, then enqueues an ordinary Push. An explicit navigation successfully enqueued beforehand consumes the still-pending default. An initial enqueue failure reports a warning and ends that default attempt; re-registering a host never replays a consumed initial. Windowed applications then call `app.run()`; the quick start's bounded update loop is for headless verification.
+
+`add_bsn_router` installs Router systems; you may also install `BevyUiRouterPlugin` beforehand. If installation returns `MissingSceneRuntime`, install `AssetPlugin` and `ScenePlugin` first so `AssetServer` and `Assets<ScenePatch>` are available.
+
+Advanced integrations that organize their own registries can still use `register_bsn_view`, `RouteViewRegistry`, `RouteTree`, and `add_ui_router(RouterConfig)`. Both interfaces share validation and execution. Duplicate keys preserve the original registration and return an error. See the [Scene contract](../contracts/scene.en.md).
+
+## Navigate and observe results
+
+Ordinary interactions navigate through `Commands`, which can share a system with `RouteInputs` and application component queries:
+
+```rust
+use bevy_ecs::prelude::Commands;
+use bevy_ui_router::prelude::*;
+
+fn open_item(commands: &mut Commands, router: RouterHandle) {
+    commands.router(router).push("/items/42?sort=name#details");
+}
+```
+
+The same interface offers `.replace(destination)` and `.back()`. Bevy applies deferred commands before they enter the existing Router queue. These methods return no synchronous request ID and do not guarantee publication in the current update. Enqueue failures use Bevy's warning handler by default. Select a `bevy_ecs::error::ErrorHandler` with `.with_error_handler(handler)`; downcast its `BevyError` to `NavigationCommandError` to inspect the Router, operation, and original `NavigationEnqueueError`.
+
+Strings use `RouteLocation::from_address` to separate path, search, and fragment. It removes the separating `?`/`#` while retaining raw contents and the distinction between missing and empty values. It does not parse external URLs, decode escapes, or resolve against the current page. Explicit construction remains available:
 
 ```rust
 let location = RouteLocation::new("/items/42")
@@ -84,35 +118,27 @@ let location = RouteLocation::new("/items/42")
     .with_fragment("details");
 ```
 
-`new` receives the path. Search and fragment retain their supplied strings; the caller chooses whether those strings contain `?` or `#`. Matching and update behavior are covered by the [navigation contract](../contracts/navigation.en.md).
+`new` always receives only the path. Both setters retain their supplied strings, including any `?` or `#` prefix. Commands do not reparse a structured location. See the [navigation contract](../contracts/navigation.en.md) for matching and reuse rules.
 
-`Ok(request_id)` means the request was queued. A windowed application advances through `App::run`. A headless program can follow the quick start and wait for `RequestStatus::Succeeded` or `Failed` within a bounded update loop. `RouterSnapshots::request(handle, id)` returns `NotRetained` when a completed record has been evicted, or `Unknown` when no matching record exists or the ID belongs to another Router.
+Use `RouterNavigation::{push,replace,back}` when you need the immediate enqueue error or a request ID; `Ok(request_id)` only means the request was enqueued. Use Commands alongside current-page queries to avoid borrowing `RouteInputs` and `ResMut<RouterNavigation>` together. The platform Back handler below demonstrates the immediate interface.
 
-Schedule systems that need the current update's complete snapshots after `RouterScheduleSet::PublishSnapshots` in `Update`. After a page becomes active, its request can remain in `PostCommitCleanup` while departing content is removed. Read the displayed state and request completion state separately.
+`RouterSnapshots::request(handle, id)` provides `Succeeded`, `Failed`, and other request states. `NotRetained` means a completed record was evicted; `Unknown` means no matching record exists or the ID belongs to another Router. Schedule systems that need current snapshots after `RouterScheduleSet::PublishSnapshots` in `Update`. A request can remain in `PostCommitCleanup` after its page and history are published; read presentation and request completion separately.
+
+A layout Scene declares exactly one `DefaultOutlet` on the `Node` where its child belongs. Sibling navigation reuses common parent layouts, outlets, and component state. Place application controls with independent lifetimes outside the routed content boundary. See the [Scene](../contracts/scene.en.md) and [lifecycle](../contracts/lifecycle.en.md) contracts for mounting and hosts.
 
 ## Retain layouts and pages
 
-Enable retention for a layout or page with a normal parent route, and configure the Router's inactive capacity:
-
-```rust
-let page = RouteNodeOptions::new()
-    .with_view(page_view)
-    .with_keep_alive(true);
-routes.route_with_options(parent, RoutePattern::path(":id")?, page)?;
-let config = RouterConfig::new(routes.build()?, views, fallback)
-    .with_keep_alive_capacity(2);
-let router = app.add_ui_router(config)?;
-```
+Add `.keep_alive()` to a `page(...)` or `layout(...)` declaration, and set `.keep_alive_capacity(n)` on `BsnRouter`:
 
 | Setting | Purpose |
 | --- | --- |
-| `with_keep_alive(true)` | Retain this route's Entity and local state after departure. Off by default. Common layouts still reuse normally within the active branch. |
-| `with_keep_alive_capacity(n)` | Maximum number of inactive retained instances. Defaults to 0. Parent layouts and child pages count separately. |
-| `with_preserve_on_search(true)` | Allow reuse across query changes. Off by default. Active and retained instances follow the same rule, including parameter and identity checks. |
+| `BsnRoute::keep_alive()` | Allow this route's Entity and local state to remain after departure. Off by default. Common layouts still reuse normally within the active branch. |
+| `BsnRouter::keep_alive_capacity(n)` | Maximum number of inactive retained instances. Defaults to 0. Parent layouts and child pages count separately. |
+| `BsnRoute::preserve_on_search()` | Allow reuse across query changes. Off by default. Active and retained instances follow the same rule, including parameter and identity checks. |
 
-The first two settings enable retention together. Each retained instance is bound to its original normal parent instance and outlet/slot. The parent may be active or retained. A root mounted directly under the host has no such parent, so it is cleaned up on departure. Removing or evicting a parent also removes retained instances that depend on it.
+Departure retention needs three conditions: **the route opts in, Router capacity is nonzero, and the original normal parent instance and outlet/slot scope remain valid**. The parent can be active or retained. A root directly under the host has no such parent and is cleaned up on departure. Removing or evicting a parent also removes its dependent retained instances. Capacity 0 can deliberately disable retention globally.
 
-Configure parent and child routes separately. When only a layout is retained, returning to it selects or creates the child from the target route. To reuse several levels across a query change, enable `preserve_on_search` at each level. Router rebuilds from the first node with a different identity or a disabled setting. If search and fragment change together, the deepest frame's fragment rebuild rule also applies. See [navigation](../contracts/navigation.en.md) for capacity, LRU, and history-entry behavior.
+Configure parents and children separately. Returning to a retained layout selects or creates the child from the target route. To reuse several levels across a query change, enable `preserve_on_search` at each level. Router rebuilds from the first node with a different identity or a disabled setting. If search and fragment change together, the deepest frame's fragment rebuild rule also applies. See [navigation](../contracts/navigation.en.md) for capacity, LRU, and history-entry behavior.
 
 ## Load content and reactivate pages
 
@@ -121,7 +147,7 @@ Pages can load data with ordinary Bevy systems and tasks:
 1. The factory creates the page structure. Its `RouteViewInput` describes the route at creation time.
 2. Once the page is active, read the current location with `RouteInputs::current` and start or update tasks using the application's data identifiers.
 3. Tasks return data or handles. Application systems check the matching page and data version before changing the World. The application decides whether to continue or cancel work after departure.
-4. Reactivating a retained page uses the original Entity and component state, keeping the result of the existing factory call. Page systems can use `RouteActivity` to decide whether to run this update.
+4. Reactivating a retained page keeps its original Entity and component state without calling the factory again. `RouteInputs::current` only returns current inputs for active content; use `RouteActivity` when only a boolean is needed.
 5. When content is ready for scroll restoration, mark the current restoration intent ready.
 
 The [nested example](../../crates/bevy_ui_router/examples/bsn_nested.rs) combines these steps. Activity, current input, and input eligibility queries are explained below.
@@ -157,7 +183,7 @@ fn allow_restore(
 
 `PageState` is an application component. `scope` can be any content Entity within the current active frame, so the query works before the container exists. `restore.position()` is the saved two-dimensional position in logical pixels for that visit.
 
-Cancel with `commands.cancel_route_scroll(restore.id())`. When handling user scrolling, use the container's `RouteScroll::key()` to find and cancel a waiting restoration. This also records the user's intention when the container is already at an edge and its numeric position stays unchanged. Ready triggers one restoration; later content growth follows ordinary layout. Each Back operation has its own restoration ID.
+Cancel with `commands.cancel_route_scroll(restore.id())`. When handling user scrolling, use the container's `RouteScroll::key()` to find and cancel a waiting restoration. This also records the user's intention when the container is already at an edge and its numeric position stays unchanged. Ready triggers one restoration; later content growth follows ordinary layout. Each Back operation has its own restoration ID. The command carries the ID queried here rather than finding the current intent again when it executes.
 
 Order systems as follows:
 
@@ -172,17 +198,9 @@ Install normal UI layout and provide a valid camera/render target. Read navigati
 
 ## Connect input and focus
 
-`RouteActivity` helps decide whether page systems should run. `RouteInputs` provides current route information. Both are available from the facade/prelude and can share a system with the application's mutable component queries:
+`RouteInputs::current` already checks activity, so an ordinary page does not also need `RouteActivity`. It is available from the facade/prelude and can share a system with mutable application component queries and Commands:
 
 ```rust
-fn update_pages(activity: RouteActivity, mut pages: Query<(Entity, &mut PageState)>) {
-    for (entity, mut page) in &mut pages {
-        if activity.is_active(entity) {
-            page.update();
-        }
-    }
-}
-
 fn update_route_labels(inputs: RouteInputs, mut labels: Query<(Entity, &mut Text)>) {
     for (entity, mut text) in &mut labels {
         if let Some(input) = inputs.current(entity)
@@ -195,11 +213,11 @@ fn update_route_labels(inputs: RouteInputs, mut labels: Query<(Entity, &mut Text
 
 app.add_systems(
     Update,
-    (update_pages, update_route_labels).after(RouterScheduleSet::PublishSnapshots),
+    update_route_labels.after(RouterScheduleSet::PublishSnapshots),
 );
 ```
 
-The application defines `PageState` and its `update` method. Query current inputs each update so reused layouts and reactivated pages see the new location. Write text only when it changes to reduce `Changed<Text>` notifications.
+Use `RouteActivity::is_active(entity)` when only activity is needed. Query current inputs each update so reused layouts and reactivated pages see the new location. Write text only when it changes to reduce `Changed<Text>` notifications. The [public usage journey](../../crates/bevy_ui_router/tests/public_usage.rs) combines parameter reads, application state updates, and navigation.
 
 `RouteInputRef::params()` returns the owning frame's own parameters; `location()` includes the full path/search/fragment. Error frames provide `failure()` and `origin()`, while a normal prefix has `failure() == None`. The fallback has `route() == None` and empty parameters. Inactive content or content with an invalid owner returns `None`. Copy values needed across World changes or `await`. See the [activity contract](../contracts/input-focus.en.md) and [standalone consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs).
 

@@ -8,7 +8,6 @@ See the [overview](overview.en.md) for available features and the [behavior cont
 
 | Work | Deliverable |
 | --- | --- |
-| Simpler router integration | [Design and plan](changes/public-usage/design.en.md): unified page declarations, Commands navigation, initial pages, examples, and optional animation integration |
 | Public documentation | English and Chinese user and developer guides, runnable examples, file cleanup, and privacy checks |
 | Release preparation | MIT OR Apache-2.0 dual licensing is selected; choose the release version, then validate the final packages with an independent consumer |
 

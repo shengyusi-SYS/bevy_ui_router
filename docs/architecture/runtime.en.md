@@ -33,18 +33,27 @@ Router structures and Scene creation allocations are registered for ownership be
 
 ## Normal navigation
 
-Enqueuing navigation returns a request ID. Later `Update` passes advance it in order, possibly across several updates.
+Immediate navigation returns a request ID. Commands navigation enqueues only when Bevy applies deferred commands, without a synchronous ID. Later `Update` passes advance requests in order, possibly across several updates. A configured initial location enters the same queue after the first Ready state; successful explicit navigation consumes the unsubmitted default.
 
 ```mermaid
 sequenceDiagram
     participant App as Application
+    participant Commands as Bevy Commands
     participant Nav as ECS orchestration
     participant Core as Core RouterEngine
     participant Scene as BSN factory / Scene
     participant World as ECS World
-    App->>Nav: push / replace / back
+    alt Commands entry
+        App->>Commands: router(handle).push / replace / back
+        Commands->>Nav: ApplyDeferred: actually enqueue
+    else Immediate entry
+        App->>Nav: push / replace / back
+    end
     Nav->>Core: enqueue
-    Core-->>App: request ID (returned through ECS)
+    Core-->>Nav: request ID
+    opt Immediate call
+        Nav-->>App: request ID
+    end
     Nav->>Core: get action, freeze instance selection
     loop Target chain, parent to child
         alt Current / Retained
@@ -105,6 +114,8 @@ flowchart TB
         Cleanup --> Publish["RouterScheduleSet::PublishSnapshots"]
     end
     subgraph PostUpdate
+        Tween["optional RouteTween: advance, interpolate, settle"] --> UiPrepare["UiSystems::Prepare"]
+        UiPrepare --> Content
         Content["UiSystems::Content"] --> Prepare["RouterScrollSet::Prepare"]
         Prepare --> Layout["UiSystems::Layout"]
         Layout --> Scroll["revalidate, settle, and sample scroll"]
@@ -121,6 +132,8 @@ Applications use these public ordering points:
 - `RouterScrollSet::Prepare` runs after `UiSystems::Content` and before `UiSystems::Layout`, writing restoration requests for that update.
 
 The other lifecycle sets in the diagram are crate-private and orchestrated by ECS. Plugins and App extensions share idempotent installation.
+
+Optional `RouteTweenPlugin` advances `bevy_tween` controllers before UI Prepare using a separate time context, starting at presented. After official interpolation applies the final pose, the adapter removes the corresponding controllers and requests release or completion through the original transition session. Cancellation removes writers synchronously. Applications may also use their own Tween plugins. Navigation submitted after PublishSnapshots can publish in a later update; a Commands call is not a synchronous page switch.
 
 Input eligibility refreshes before the picking Backend. While an exit is visible, its native UI candidates are temporarily excluded and the complete stack is restored after Backend, allowing the new page to receive hits. Inactive targets are then filtered between hover generation and interactions. Publication revokes leaving targets' historical hover, press, click, drag, and focus in the same call. Applications integrate target filtering for native TabNavigation/InputDispatch; see the [integration guide](../guides/integration.en.md).
 

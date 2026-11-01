@@ -10,6 +10,8 @@ Core decides routes, requests, history, and logical lifecycle. ECS performs phys
 
 Modules follow stable protocols and owners; orchestration combines phases and resource borrows. Validation can be shared when its purpose, accepted entity roles, and failure handling agree. Reusing Bevy's Scene, layout, and input pipelines keeps Router focused on routing.
 
+Simpler setup compiles declarations into the existing route tree and installation path, and forwards Commands to the existing navigation entry point. Animation adapters reuse third-party timelines and centralize their handoff to routing lifecycle; applications still define effects. This reduces caller setup knowledge while preserving a single source of routing decisions.
+
 ## Visits, instances, and physical responsibility
 
 A history entry represents a visit, an instance preserves entities and local state, and an owner holds execution responsibility. One instance can serve several visits, so scroll records belong to entries. Build input is a snapshot of one execution; reused instances obtain current input through `RouteInputs`.
@@ -42,7 +44,7 @@ Applications use `RouteActivity` to decide whether page systems keep working. Ac
 
 Revocation handles current and previous hover, press/click/drag state, and focus while preserving other valid targets. Focus candidates also preserve operation order: later set/clear operations replace earlier candidates, even when the final value is equal.
 
-Separating read-only status display from mutable navigation orchestration into explicitly ordered systems makes Bevy resource borrowing easier to follow.
+Page systems can combine read-only `RouteInputs`, mutable application queries, and Commands navigation without splitting one user action across systems. Use mutable `RouterNavigation` when an immediate request ID or synchronous enqueue-error handling is needed, arranging compatible resource borrows and scheduling.
 
 ## Future native input integration
 

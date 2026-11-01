@@ -19,6 +19,7 @@ flowchart TD
     ECS --> Core
     ECS --> View
     ECS -->|bsn bridge| BSN
+    ECS -->|tween| Tween["bevy_tween：时间线与插值"]
     BSN --> Core
     BSN --> View
     Platform --> Core
@@ -35,6 +36,10 @@ flowchart TD
 | Facade | 常用 API 和 feature 组合，通常通过 `bevy_ui_router::prelude::*` 使用 |
 
 默认 `view` feature 保持纯 Rust 依赖。`ecs` 包含 `view`，`bsn` 包含 `ecs`；BSN 的 `AppBsnExt` 在 ECS bridge 实现，再由 facade 导出。当前应用使用 BSN renderer。
+
+`BsnRouter` 声明在 ECS 的 BSN 接入模块中编译为现有 Core 路由树、View registry 和 factory bindings；应用不必逐项组装它们。Commands 导航与一次性 initial 都通过原 `RouterNavigation` 入队。当前输入查询保持只读，可与应用 Query 和 Commands 共存。
+
+`tween` 包含 `ecs`，按需接入 `bevy_tween`。适配模块管理动画控制器与原过渡 session 的时机，应用提供具体效果；Core、默认 feature 和普通 `bsn` 接入不依赖动画库。
 
 `platform` 独立开启，保持纯 Rust 依赖。`desktop-back` / `android-back` 包含 `platform`，分别启用需要的 Bevy mouse / keyboard 输入。应用自行选择 Router ECS/BSN、窗口后端和返回处理器。`devtools` 当前是空 feature。
 
@@ -72,6 +77,7 @@ owner 是负责某段物理内容的唯一凭据，随 active、retained 和 cle
 | Core 决策与跨 crate 交接 | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs)、[integration.rs](../../crates/bevy_ui_router_core/src/integration.rs)、[history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs) |
 | 实例保留 | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 与 [instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) |
 | View registry 与 effect | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs)、[effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |
+| 公开声明与便捷导航 | [BSN declaration](../../crates/bevy_ui_router_ecs/src/bsn/declaration.rs)、[install](../../crates/bevy_ui_router_ecs/src/bsn/install.rs)、[navigation commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) |
 | 注册、调度、导航、快照 | [app_ext.rs](../../crates/bevy_ui_router_ecs/src/app_ext.rs)、[plugin.rs](../../crates/bevy_ui_router_ecs/src/plugin.rs)、[navigation.rs](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[snapshots.rs](../../crates/bevy_ui_router_ecs/src/snapshots.rs) |
 | host、挂载与 Scene | [host.rs](../../crates/bevy_ui_router_ecs/src/host.rs)、[mount.rs](../../crates/bevy_ui_router_ecs/src/mount.rs)、[BSN 合同](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs) |
 | 发布、失败和清理 | [生命周期执行协议](lifecycle.md#修改时定位哪些模块) |

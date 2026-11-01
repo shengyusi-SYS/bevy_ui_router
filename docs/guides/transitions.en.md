@@ -2,11 +2,54 @@
 
 [中文](transitions.md) | [English](transitions.en.md)
 
-Router installs no transition driver by default. Register an application `RouteTransitionDriver` with `RouterConfig::with_transition_driver`; the application chooses effects, clocks, easing, overlap layout, and whether to retain an outgoing visual. Import these types and `RouteTransitionCommandsExt` from `bevy_ui_router::prelude::*`.
+Router installs no transition driver by default. Applications choose effects, easing, durations, and overlap layout. The optional Tween adapter coordinates controller startup, cancellation, and completion; custom animation systems implement the `RouteTransitionDriver` described below. Import these types from `bevy_ui_router::prelude::*`.
 
 The current presentation-surface integration targets native Bevy UI / BSN pages.
 
-## Run the example
+## Use the Tween adapter
+
+Enable Router features `bsn,tween` and add `bevy_tween = { version = "0.13", default-features = false }`. Install `RouteTweenPlugin::default()`; the application still provides `TimePlugin` (included in `DefaultPlugins`). Run the complete example:
+
+```sh
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
+```
+
+The [window entry point](../../examples/windowed/src/bin/tween_transitions.rs) uses unified declarations, Commands, and retained counters. Its [application effects](../../examples/windowed/src/bin/tween_transitions/effects.rs) provide slide, scale/rotation, and enter-only modes without application sessions, timers, or completion callbacks.
+
+Configure `.transition_driver(RouteTweenDriver::new(prepare_effect))` on `BsnRouter`. The application supplies one preparation callback, for example:
+
+```rust
+use std::time::Duration;
+use bevy_tween::{combinator::tween, prelude::*};
+
+fn prepare_effect(
+    world: &mut World,
+    context: &RouteTransitionContext,
+    tracks: &mut RouteTweenTracks,
+) {
+    for target in context.entering().iter().filter(|target| target.is_outermost()) {
+        let surface = target.surface();
+        world.get_mut::<UiTransform>(surface).unwrap().translation = Val2::px(24.0, 0.0);
+        tracks.enter(tween(
+            Duration::from_millis(240),
+            EaseKind::CubicOut,
+            surface.into_target().with_closure(|value: &mut UiTransform, progress, _| {
+                value.translation = Val2::px(24.0 * (1.0 - progress), 0.0);
+            }),
+        ));
+    }
+}
+```
+
+`enter` and `exit` accept finite timelines built with the dependency's `tween`, `sequence`, or `parallel` combinators. Adding an exit track holds the outgoing page. The adapter releases it after all exit writers complete and finishes the session after all tracks complete. No tracks means no transition. Every writer targeting a leaving surface belongs to an exit track.
+
+The adapter starts at zero after route publication using `Time<Real>`. It applies interpolation before UI Prepare and removes controllers after the final write. Cancellation stops writers synchronously; successive navigation follows the original queue. Reactive windows receive redraw requests during animation and when the final completion request is submitted.
+
+The adapter supports `EaseKind` / `EaseClosure` and boxed component interpolation, with `UiTransform`, `Node`, and `ZIndex` registered by default. Register other application-content components with `RouteTweenPlugin::default().with_component::<T>()`, using `with_closure` or a boxed interpolator. The adapter does not register typed interpolators, resource/asset tweens, or tween events; use a manual driver for those integrations. Controllers occupy independent entities and preserve existing surface-write boundaries; additional application resource side effects remain application-owned.
+
+When also using `DefaultTweenPlugins`, install `RouteTweenPlugin` first so its private time context can be registered with the upstream debug plugin. If upstream debug was installed earlier, timing remains independent, but it may misreport the unknown context; the adapter preserves existing application debug configuration. Custom clocks or specialized completion policies also use the manual driver below.
+
+## Run the manual driver example
 
 From the repository root:
 
@@ -32,9 +75,10 @@ Click a page counter before navigating to compare retained state with fresh crea
 Register one application driver per Router:
 
 ```rust
-let config = RouterConfig::new(routes.build()?, views, fallback)
-    .with_transition_driver(MyTransitionDriver);
-let router = app.add_ui_router(config)?;
+let declaration = BsnRouter::new(root)
+    .fallback(error_page)
+    .transition_driver(MyTransitionDriver);
+let router = app.add_bsn_router(declaration)?;
 ```
 
 `MyTransitionDriver` implements `RouteTransitionDriver`. Callbacks run synchronously and receive `&mut World` to access application state:

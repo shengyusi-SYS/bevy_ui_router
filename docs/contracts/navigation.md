@@ -12,9 +12,11 @@ matcher 选择完整匹配分支，按整条分支累计的 specificity 依次�
 
 pattern 的静态段精确匹配，`:name` 匹配一个段，末尾 `*name` 捕获剩余段且允许为空；index 仅在没有剩余段时匹配，pathless 不消耗段。pattern 去除前导 `/`，内部空段和非根尾随 `/` 非法。capture 名须非空、只含 ASCII 字母数字或下划线，同 pattern 不得重名。params 按 route-local 作用域传递，各层读取自身参数。
 
-`RouteLocation` 的 path 规范化为唯一前导 `/`、去除空段和非根尾随 `/`；它不解析完整 URL，不从 path 分离 `?`/`#`、不做 URL decoding，也不消解 `.`/`..`。search 与 fragment 分别通过 `with_search` / `with_fragment` 传入并原样保存。
+`RouteLocation::new(path)` 只处理 path：规范化为唯一前导 `/`、去除空段和非根尾随 `/`，不分离其中的 `?`/`#`。`with_search` / `with_fragment` 原样保存传入值。
 
-search 按缺省/存在及原始字符串精确比较：`None`、空串、是否带 `?`、键值顺序、重复值顺序和百分号编码的差别均不等价，不做 query 参数归一化。fragment 同样比较原始可选字符串；`#` 前缀不会自动去除。
+`RouteLocation::from_address` 以及 `From<&str>` / `From<String>` 是内部地址入口：第一个 `#` 分出 fragment，其前第一个 `?` 分出 search，去掉这两个分隔符后沿用原 path 规范化。`/items?` 的 search 是空串，`/items` 的 search 是 None。它不做 URL decoding、不消解 `.`/`..`、不解释外部 URL 的 scheme/authority，也不使用当前页面作为基址；`?tab=info` 指向根路径。结构化 location 不会再次解析。
+
+search 按缺省/存在及原始字符串精确比较：`None`、空串、是否带 `?`、键值顺序、重复值顺序和百分号编码的差别均不等价，不做 query 参数归一化。fragment 同样比较存储的原始可选字符串。
 
 | 导航变化 | view/lifecycle 行为 |
 | --- | --- |
@@ -26,11 +28,11 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 
 新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留布局和命中的库存实例不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用通过 `RouteInputs::current(Entity)` 读取所属 active frame 的本次已发布输入。
 
-`RouteNodeOptions::with_preserve_on_search(true)` 显式允许该节点在 raw search 变化时复用，默认 false。它同时用于当前 prefix 和下述库存命中，不归一化 query，也不忽略 params、route/view/slot/key 或父 scope 身份。各层独立选择；父布局开启不使默认子页自动复用。同时改变 search 和 fragment 时，若整链原可复用，仍保留祖先并替换最深 frame、推进其 generation。需要读取新 query 的保留内容使用 `RouteInputs::current`。
+`BsnRoute::preserve_on_search()`（或底层 `RouteNodeOptions::with_preserve_on_search(true)`）显式允许该节点在 raw search 变化时复用，默认 false。它同时用于当前 prefix 和下述库存命中，不归一化 query，也不忽略 params、route/view/slot/key 或父 scope 身份。各层独立选择；父布局开启不使默认子页自动复用。同时改变 search 和 fragment 时，若整链原可复用，仍保留祖先并替换最深 frame、推进其 generation。需要读取新 query 的保留内容使用 `RouteInputs::current`。
 
 `RouteInputRef` 提供 `route()`、`params()`、`location()`、`origin()`、`failure()` 五个只读 getters；search/fragment 经 `location()` 读取。每层 params 仅属于该 route，完整 location 属于本次 presentation。normal frame 的 failure 为 None；route-error frame 使用错误边界 route/local params 和原 failure，正常前缀不继承 failure；router fallback 的 route 为 None、params 为空、failure 为原失败。error/fallback location 使用失败请求位置，成功 history 保持原值。
 
-每次 publication 同时切换目标各层输入，包括 preserved 和缓存命中的内容。pending/stale/rejected 工作不改旧 active 输入，非活动内容不能读取当前值；发布后即可读取新值，不等请求 terminal。结构 no-op 不为输入更新增加物理写入。Entity 查询范围与借用边界见[页面活动查询](input-focus.md#页面活动查询)。
+`RouteInputs::current` 已包含活动资格判断；读取当前输入无需先调用 `RouteActivity`。每次 publication 同时切换目标各层输入，包括 preserved 和缓存命中的内容。pending/stale/rejected 工作不改旧 active 输入，非活动内容不能读取当前值；发布后即可读取新值，不等请求 terminal。结构 no-op 不为输入更新增加物理写入。Entity 查询范围与借用边界见[页面活动查询](input-focus.md#页面活动查询)。
 
 active error presentation 不走 normal 等价导航优化。复用判定包含路由树来源（provenance）、route/slot/explicit key 等完整身份。
 
@@ -38,7 +40,7 @@ active error presentation 不走 normal 等价导航优化。复用判定包含�
 
 ## 实例保留
 
-`RouteNodeOptions::with_keep_alive(true)` 为 route 显式启用保留；`RouterConfig::with_keep_alive_capacity(n)` 限制每个 Router 的非活动实例数，默认 0。active 实例不占容量，未 opt-in 或容量为 0 时沿用 fresh/cleanup 路径。
+`BsnRoute::keep_alive()` 为 route 显式启用保留，`BsnRouter::keep_alive_capacity(n)` 限制每个 Router 的非活动实例数，默认 0；分别等价于底层 `RouteNodeOptions::with_keep_alive(true)` 和 `RouterConfig::with_keep_alive_capacity(n)`。active 实例不占容量，未 opt-in 或容量为 0 时沿用 fresh/cleanup 路径。
 
 normal 页面和布局可分别保留，exact parent frame/generation、outlet、slot binding 与 host incarnation 必须有效；父实例可以 active 或 retained。直接挂在 host 根部、没有 normal 父 frame 的页面，以及 error/fallback、失败或 quarantine 内容不进入库存。单条目标链、default outlet 和同 Router/host 的范围保持。
 
@@ -58,13 +60,19 @@ history entry 标识一次访问，缓存标识页面实例。不同 entry 可�
 
 ## 请求、history 与 presentation
 
+`RouterNavigation::{push,replace,back}` 是即时入队入口，返回真实 request ID 或 `NavigationEnqueueError`。`commands.router(handle)` 提供延迟 Push/Replace/Back，在 Bevy 应用 Commands 时调用同一入口；它可与 `RouteInputs`、应用组件 Query 在同一系统中使用，不持有可变导航资源借用。
+
+Commands 的字符串目标转换为 `RouteLocation::from_address`；传入结构化 location 则保留原值。它不返回同步 request ID，也不保证本轮发布。入队失败默认调用 Bevy warning handler，`.with_error_handler(handler)` 允许应用选择处理器。`NavigationCommandError` 保留 Router、`NavigationKind` 和原 `NavigationEnqueueError`；被拒绝的入队没有 request ID，已入队请求的执行失败仍从 snapshots 观察。
+
+`BsnRouter::initial(location)`（或 `RouterConfig::with_initial_location`）保存一次性默认位置。首次 host Ready 时，通过原 Push 入口提交；此前成功入队的显式 Push/Replace/Back 消费尚未提交的默认意图，失败的显式入队不消费。默认意图尝试入队一次，失败报告 warning；已入队后服从原队列顺序，完成或失败都不自动重试，host 重接不重放。没有配置 initial 时，Ready 可以尚无页面。
+
 同 Router 的命令按内部 sequence 串行处理。push/replace 在入队时确定 requested location；back 在轮到运行时冻结前一个成功 history entry，避免排队期间的旧目标成为执行权限。
 
 - push 成功追加 entry，并截断 forward 分支。
 - replace 成功以新身份替换当前 entry；空 history 时建立首项。
 - back 成功才移动 cursor；失败保持 cursor 和原 history。
 
-入队时已发布 `can_back=false`，同步返回 `NoBackEntry`，不生成 request。已成功入队但执行时无目标，请求失败为 `BackTargetUnavailable`，不调用 view，不改变 UI/history。
+入队时已发布 `can_back=false`，即时入口返回 `NoBackEntry`，不生成 request；Commands 经自己的错误 handler 报告同一结果。已成功入队但执行时无目标，请求失败为 `BackTargetUnavailable`，不调用 view，不改变 UI/history。
 
 normal success 统一发布 route presentation 与 history。error view/fallback 可以成为可见 presentation，但原导航仍失败，history 不推进。未启用滚动恢复的等价 location 保持零物理写，不取消 push/replace/back 的 history 语义。
 

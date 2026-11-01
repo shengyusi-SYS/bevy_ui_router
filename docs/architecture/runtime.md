@@ -33,18 +33,27 @@ Router 自建结构和 Scene 创建期实体先登记 ownership，再写 compone
 
 ## 正常导航时序
 
-导航入队返回 request id，后续 `Update` 按顺序推进，可跨多轮完成。
+即时导航入队返回 request id；Commands 入口在 Bevy 应用延迟命令时才实际入队，不同步返回 ID。后续 `Update` 按顺序推进，可跨多轮完成。配置的 initial 在首次 Ready 后进入同一队列；成功显式导航取消尚未入队的默认位置。
 
 ```mermaid
 sequenceDiagram
     participant App as 应用
+    participant Commands as Bevy Commands
     participant Nav as ECS 编排
     participant Core as Core RouterEngine
     participant Scene as BSN factory / Scene
     participant World as ECS World
-    App->>Nav: push / replace / back
+    alt Commands 入口
+        App->>Commands: router(handle).push / replace / back
+        Commands->>Nav: ApplyDeferred：实际入队
+    else 即时入口
+        App->>Nav: push / replace / back
+    end
     Nav->>Core: 入队
-    Core-->>App: request id（经 ECS 返回）
+    Core-->>Nav: request id
+    opt 即时调用
+        Nav-->>App: request id
+    end
     Nav->>Core: 获取 action，冻结实例选择
     loop 目标链从父到子
         alt Current / Retained
@@ -105,6 +114,8 @@ flowchart TB
         Cleanup --> Publish["RouterScheduleSet::PublishSnapshots"]
     end
     subgraph PostUpdate
+        Tween["可选 RouteTween：推进、插值、完成"] --> UiPrepare["UiSystems::Prepare"]
+        UiPrepare --> Content
         Content["UiSystems::Content"] --> Prepare["RouterScrollSet::Prepare"]
         Prepare --> Layout["UiSystems::Layout"]
         Layout --> Scroll["复验归属，结算并采样滚动"]
@@ -121,6 +132,8 @@ flowchart TB
 - `RouterScrollSet::Prepare` 位于 `UiSystems::Content` 后、`UiSystems::Layout` 前，写入本轮恢复请求。
 
 图中其余生命周期 set 为 crate-private，由 ECS 编排。插件和 App extensions 共用幂等安装逻辑。
+
+可选 `RouteTweenPlugin` 在 UI Prepare 前使用独立时间上下文推进 `bevy_tween` 控制器，从 presented 时刻开始计时。官方插值写完最后一帧后移除对应控制器，再通知原过渡释放或完成；取消同步移除写入者。应用可同时使用自己的 Tween 插件。页面系统在 PublishSnapshots 后提交的导航可能在后续更新发布，不能把 Commands 调用视为同步页面切换。
 
 输入在 picking Backend 前刷新资格；有可见退出页时暂时排除其原生 UI 候选，Backend 后恢复完整栈，避免旧页阻挡新页命中。随后在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[接入指南](../guides/integration.md)。
 

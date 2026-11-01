@@ -33,7 +33,13 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml
 
 The window demonstrates navigation, back, layout and page counters, error recovery, keyboard interaction, and scrolling. On Linux it uses X11; see the [integration guide](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md) for build dependencies and controls.
 
-The application transition example provides slide, scale/rotation, and cancellation during queued navigation. Effects live entirely in application code:
+The optional Tween adapter lets applications define effects while the library coordinates start, cancellation, and completion:
+
+```sh
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
+```
+
+For custom animation systems, the manual driver example provides slide, scale/rotation, and cancellation during queued navigation:
 
 ```sh
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
@@ -50,13 +56,14 @@ bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = 
 
 The project uses Rust edition 2024 and Bevy 0.19. The lockfile pins Bevy 0.19.1. Use a Rust toolchain capable of building that Bevy version.
 
-Follow the [integration guide](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md) to install the Scene runtime, register page factories, define routes, mount a host, and send navigation requests. The [quick-start source](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs) is a complete runnable example.
+Follow the [integration guide](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md): associate routes and factories directly with `BsnRouter`, configure `initial`, and mount an application-owned host. Ordinary page systems navigate with `commands.router(handle).push("/items/42?tab=info")`. The [quick-start source](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs) is a complete runnable example.
 
 | Feature | Purpose |
 | --- | --- |
 | `view` (default) | Renderer-neutral view descriptions and registration |
 | `ecs` | Bevy plugin, hosts, navigation, snapshots, activity, and input gate |
 | `bsn` | Recommended Scene integration; includes `ecs` and `view` |
+| `tween` | Optional `bevy_tween` transition coordination; includes `ecs`, with application-defined effects |
 | `platform` | Platform navigation interfaces |
 | `desktop-back` / `android-back` | Mouse back button / Android legacy back key |
 

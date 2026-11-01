@@ -37,6 +37,15 @@ All-feature and minimal-feature checks serve different purposes. When changing o
 cargo test -p bevy_ui_router_ecs --no-default-features --locked
 ```
 
+While developing declarations, Commands, or tween integration, start with their focused journeys:
+
+```sh
+cargo test -p bevy_ui_router --features bsn --test public_usage --locked
+cargo test -p bevy_ui_router_ecs --features bsn,tween transition::tween --locked
+```
+
+These focused checks do not replace the full crate and consumer checks required by the table above.
+
 When changing Back adapters, test each source independently and the combined navigation path:
 
 ```sh
@@ -75,11 +84,13 @@ gitleaks git . --redact --log-opts="--all --full-history" --report-format json -
 | Core navigation | [Core tests](../../crates/bevy_ui_router_core/tests), [public navigation journeys](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) | Matching, nested navigation, parameters/query/fragment, history, failure, and recovery |
 | View | [Public API](../../crates/bevy_ui_router_view/tests/public_api.rs), [standalone view consumer](../../crates/bevy_ui_router/tests/consumers/view.rs) | Route inputs and renderer-neutral binding |
 | ECS lifecycle | [Public API](../../crates/bevy_ui_router_ecs/tests/public_api.rs), [navigation tests](../../crates/bevy_ui_router_ecs/src/navigation_tests.rs), [cleanup tests](../../crates/bevy_ui_router_ecs/src/cleanup_tests.rs) | Host registration, identity checks, preparation, publication, local cleanup, and readmission |
+| Recommended setup | [Public usage journeys](../../crates/bevy_ui_router/tests/public_usage.rs), [declaration installation](../../crates/bevy_ui_router_ecs/src/bsn/install/tests.rs), [Commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) | Nested declarations, current inputs with mutable queries, deferred navigation errors, initial priority and host re-registration, independent Routers |
 | BSN | [Facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs), [standalone BSN consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs) | Factories, applying Scenes, outlets, and content ownership |
 | Platform Back | [Back journeys](../../crates/bevy_ui_router/tests/platform_back.rs), [desktop consumer](../../crates/bevy_ui_router/tests/consumers/desktop_back.rs), [Android consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs) | Per-window intent, repeat filtering, shared source channel, overlay priority, and targeted Back |
 | Input and focus | [Pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs), [focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs) | Active hits, departure revocation, started gestures, and other valid targets |
 | Retained instances | [Retention journeys](../../crates/bevy_ui_router/tests/retained_navigation.rs) | Independent parent/child retention, retained parent with a new child, eviction, invalidation cleanup, and subsequent navigation |
 | Route transitions | [Transition journeys](../../crates/bevy_ui_router/tests/route_transitions.rs), [native overlapping input](../../crates/bevy_ui_router_ecs/src/input/native_ui_candidates/tests.rs) | prepare/current inputs, initial styles, enter-only, dynamic exits, nested retention, Back, queued navigation, host loss/readmission |
+| Tween adapter | [Adapter journeys](../../crates/bevy_ui_router_ecs/src/transition/tween/tests.rs) | Zero start after publication, independent clock, exit release after the final write, stopping writers on cancellation, and final redraw |
 | Scroll restoration | [Scroll journeys](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | Real layout, early/late containers, ready/cancel, two-dimensional clamping, user scrolling priority, stale IDs, and repeated visits with transitions and cache eviction |
 | Page systems | [Activity journeys](../../crates/bevy_ui_router/tests/public_activity.rs) | Mutable application queries, retained-page deactivation/reactivation, dynamic descendants, and exact parent chains |
 | Integration boundaries | [Consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs), [dependency contract](../../crates/bevy_ui_router/tests/dependency_contract.rs) | Visible APIs for each feature, minimal dependencies, and official Bevy sources |
@@ -95,9 +106,9 @@ cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
 cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
 ```
 
-The quick start checks minimal Scene runtime and request results. The nested example uses real UI layout and combines shared layouts, query updates, application tasks, current route inputs, and explicit scroll restoration. Both exit after a finite set of updates.
+The quick start checks declaration installation, minimal Scene runtime, and the initial page. The nested example uses real UI layout and combines shared layouts, query updates, application tasks, current route inputs, and explicit scroll restoration. Both exit after a finite set of updates.
 
-The windowed application has its own workspace. Check its default and debug features separately:
+The windowed application has its own workspace. Check defaults and all optional features separately, including `ui-debug` and `tween`:
 
 ```sh
 cargo fmt --manifest-path examples/windowed/Cargo.toml --all --check
@@ -106,7 +117,10 @@ cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
 cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked
 cargo run --locked --manifest-path examples/windowed/Cargo.toml
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
 ```
+
+The Tween example defines slide and scale/rotation effects through one preparation callback, with exit-hold switching, retained counters, and Back. The manual driver example demonstrates direct lifecycle integration. See the [transition guide](../guides/transitions.en.md) for the contract.
 
 The Linux build uses X11. CI installs `libxkbcommon-dev`, `libx11-dev`, `libxi-dev`, `libxcursor-dev`, and `libxrandr-dev`. Interaction checks cover push/replace/back, layout and page counters, positions for separate visits, delayed content, clicks and Space, focus release, gestures across navigation, error fallback, and recovery. See [window debugging](../guides/debugging.en.md) for steps and BRP commands.
 

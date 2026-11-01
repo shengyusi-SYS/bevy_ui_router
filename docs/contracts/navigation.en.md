@@ -12,9 +12,11 @@ Equal top-ranked candidates with different leaves return `MatchConflict`. For ex
 
 Static segments match exactly. `:name` matches one segment; a final `*name` captures the remaining segments, including an empty remainder. Index routes match only when no segments remain; pathless routes consume none. Patterns strip leading `/`; interior empty segments and non-root trailing `/` are invalid. Capture names must be nonempty ASCII letters, digits, or underscores and unique within the pattern. Params are local to each route; ancestor params remain in their own route scope.
 
-`RouteLocation` normalizes the path to one leading `/`, removes empty segments, and removes non-root trailing `/`. Pass search and fragment separately with `with_search` / `with_fragment`. It treats the path as a path string: full URLs, `?`/`#` separation, URL decoding, and `.`/`..` resolution belong to the caller.
+`RouteLocation::new(path)` only handles the path: it normalizes to one leading `/`, removes empty segments and non-root trailing `/`, and does not separate `?`/`#`. `with_search` / `with_fragment` retain their supplied values unchanged.
 
-Search compares optional raw strings exactly. Missing, empty, `?` prefixes, key order, repeated-value order, and percent encoding all matter. Fragment uses the same raw optional-string comparison and preserves a supplied `#` prefix.
+`RouteLocation::from_address` and `From<&str>` / `From<String>` accept an internal address. The first `#` separates the fragment, and the first `?` before it separates search. These delimiters are removed, then the existing path normalization applies. `/items?` has empty search; `/items` has no search. This does not decode escapes, resolve `.`/`..`, interpret external URL schemes/authorities, or use the current page as a base: `?tab=info` addresses the root path. Structured locations are not reparsed.
+
+Search compares optional raw strings exactly. Missing, empty, `?` prefixes, key order, repeated-value order, and percent encoding all matter. Fragment uses the same comparison of stored optional raw strings.
 
 | Navigation change | View/lifecycle behavior |
 | --- | --- |
@@ -26,11 +28,11 @@ Search compares optional raw strings exactly. Missing, empty, `?` prefixes, key 
 
 A fresh or rebuilt view receives an immutable `RouteViewInput` factory snapshot. Preserved layouts and retained hits keep their local state and skip the factory. Applications read this publication's inputs with `RouteInputs::current(Entity)`.
 
-`RouteNodeOptions::with_preserve_on_search(true)` opts a node into reuse across raw search changes; the default is false. It applies to both current-prefix reuse and retained hits while keeping params, route/view/slot/key, and parent-scope identity checks. Each level opts in separately. When search and fragment both change and the whole chain would otherwise be reusable, ancestors remain and the deepest frame rebuilds with a new generation. Preserved content reads new search values through `RouteInputs::current`.
+`BsnRoute::preserve_on_search()` (or the lower-level `RouteNodeOptions::with_preserve_on_search(true)`) opts a node into reuse across raw search changes; the default is false. It applies to both current-prefix reuse and retained hits while keeping params, route/view/slot/key, and parent-scope identity checks. Each level opts in separately. When search and fragment both change and the whole chain would otherwise be reusable, ancestors remain and the deepest frame rebuilds with a new generation. Preserved content reads new search values through `RouteInputs::current`.
 
 `RouteInputRef` has five read-only getters: `route()`, `params()`, `location()`, `origin()`, and `failure()`. Search/fragment are available through `location()`. Params belong to the local route; the full location belongs to the current presentation. Normal frames have no failure. A route-error frame uses the boundary route, its local params, and the original failure; normal ancestors keep no failure. Router fallback has no route, empty params, and the original failure. Error/fallback location is the failed request's location.
 
-Publication switches all target inputs together, including preserved and retained content. Pending, stale, or rejected work leaves active inputs unchanged. Inactive content returns no current inputs. New inputs are available immediately after publication, before request termination. Structural no-ops add no physical writes for input updates. See [activity queries](input-focus.en.md#page-activity-queries) for entity scope and borrowing.
+`RouteInputs::current` already checks activity; reading current inputs does not require a separate `RouteActivity` call. Publication switches all target inputs together, including preserved and retained content. Pending, stale, or rejected work leaves active inputs unchanged. Inactive content returns no current inputs. New inputs are available immediately after publication, before request termination. Structural no-ops add no physical writes for input updates. See [activity queries](input-focus.en.md#page-activity-queries) for entity scope and borrowing.
 
 Active error presentations use the normal execution path instead of the equivalent-normal-navigation shortcut. Reuse checks include route-tree provenance and route/slot/explicit-key identity.
 
@@ -38,7 +40,7 @@ Sources: [matcher](../../crates/bevy_ui_router_core/src/matcher.rs), [branch dif
 
 ## Retained instances
 
-`RouteNodeOptions::with_keep_alive(true)` enables retention for a route. `RouterConfig::with_keep_alive_capacity(n)` limits inactive instances per Router; its default is 0. Active instances consume no capacity. Routes without the option, or with zero capacity, use fresh creation and cleanup.
+`BsnRoute::keep_alive()` enables retention for a route. `BsnRouter::keep_alive_capacity(n)` limits inactive instances per Router; its default is 0. These correspond to the lower-level `RouteNodeOptions::with_keep_alive(true)` and `RouterConfig::with_keep_alive_capacity(n)`. Active instances consume no capacity. Routes without the option, or with zero capacity, use fresh creation and cleanup.
 
 Normal pages and layouts can opt in separately. Their exact parent frame/generation, outlet, slot binding, and host incarnation must remain valid; the parent may be active or retained. Pages directly under the host without a normal parent frame, error/fallback content, failed content, and quarantined content stay outside the inventory. Retention uses one target chain, default outlets, and the same Router/host scope.
 
@@ -58,13 +60,19 @@ A history entry identifies a visit; retention identifies a page instance. Multip
 
 ## Requests, history, and presentation
 
+`RouterNavigation::{push,replace,back}` enqueues immediately, returning a real request ID or `NavigationEnqueueError`. `commands.router(handle)` provides deferred Push/Replace/Back, invoking that same entry point when Bevy applies Commands. It can coexist with `RouteInputs` and application component queries in one system without borrowing the mutable navigation resource.
+
+Commands convert string destinations through `RouteLocation::from_address`; structured locations retain their values. The methods return no synchronous request ID and do not guarantee publication in the current update. Enqueue failures call Bevy's warning handler by default; `.with_error_handler(handler)` selects an application handler. `NavigationCommandError` retains the Router, `NavigationKind`, and original `NavigationEnqueueError`. Rejected enqueue attempts have no request ID; execution failures after admission remain visible in snapshots.
+
+`BsnRouter::initial(location)` (or `RouterConfig::with_initial_location`) stores a one-time default destination. It uses the existing Push entry point at the first ready host. A successfully enqueued explicit Push/Replace/Back consumes a pending default; a rejected explicit enqueue does not. The default makes one enqueue attempt and reports any rejection as a warning. Once enqueued, it follows the original queue order; neither completion nor failure automatically retries it, and host re-registration does not replay it. Without initial configuration, a ready Router can have no page.
+
 Commands within one Router run in internal sequence order. Push/Replace fix their requested location at enqueue time. Back freezes its previous successful entry when execution begins.
 
 - Successful Push appends an entry and truncates the forward branch.
 - Successful Replace substitutes a new entry identity, or creates the first entry when history is empty.
 - Successful Back moves the cursor. Failure keeps the cursor and history unchanged.
 
-If the published `can_back` is false at enqueue time, Back returns `NoBackEntry` immediately and creates no request. If an enqueued Back has no target when it executes, it fails with `BackTargetUnavailable`, skips the view, and leaves UI/history unchanged.
+If the published `can_back` is false at enqueue time, the immediate interface returns `NoBackEntry` and creates no request; Commands report the same result through their error handler. If an enqueued Back has no target when it executes, it fails with `BackTargetUnavailable`, skips the view, and leaves UI/history unchanged.
 
 Normal success publishes the route presentation and history together. An error view or fallback can become visible while the original navigation remains failed and history stays unchanged. Equivalent locations without scroll restoration use zero physical writes while preserving Push/Replace/Back history semantics.
 
