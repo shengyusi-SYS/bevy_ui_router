@@ -1,11 +1,31 @@
-name: CI
+name: Rust CI
 
 on:
   push:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - '.github/workflows/ci.yml'
   pull_request:
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -18,33 +38,16 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
-      - name: Check documentation links
-        run: python3 scripts/check-docs.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Install window example build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev
       - name: Check formatting
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path examples/windowed/Cargo.toml --all --check
-      # The public consumer and dependency gates resolve offline, including all targets.
-      - name: Fetch locked dependencies
+      - name: Fetch workspace dependencies
         run: cargo fetch --locked
       - name: Check all targets and features
         run: cargo check --workspace --all-targets --all-features --locked
       - name: Test workspace and public consumers
         run: cargo test --workspace --all-features --locked
-      - name: Smoke test performance fixtures (no timing gate)
-        run: |
-          cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
-          ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-          ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-      # Resolve and build separately so graphical features do not enter headless tests.
-      - name: Fetch window example dependencies
-        run: cargo fetch --manifest-path examples/windowed/Cargo.toml --locked
-      - name: Check window example and opt-in debug bridge
-        run: |
-          cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
-          cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked

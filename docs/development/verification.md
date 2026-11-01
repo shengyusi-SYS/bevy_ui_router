@@ -29,7 +29,9 @@ cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-features --locked
 ```
 
-These are the main checks in [CI](../../.github/workflows/ci.yml). Standalone consumers resolve dependencies offline in their own workspaces; `cargo fetch` prepares the registry and dependency cache. Assign one validation owner to run Cargo/rustc sequentially against a shared target directory.
+[Rust CI](../../.github/workflows/ci.yml) runs these checks when Rust source, dependencies, or build configuration changes. [Documentation CI](../../.github/workflows/docs.yml) only checks documentation links. Automatic runs cover pushes to main and pull requests.
+
+Standalone consumers resolve their own dependencies online and generate lockfiles, then build and run with `--locked`; fetching the repository dependencies does not replace downstream resolution. Assign one validation owner to run Cargo/rustc sequentially against a shared target directory.
 
 CI uses `--locked` to reproduce the committed dependency snapshot; see [integration](../guides/integration.md#bevy-version-requirements) for version requirements. Standalone consumers generate their own lockfiles from the `0.19` range instead of reusing the repository's Bevy selection. When maintaining the dependency snapshot, use `cargo update` to resolve compatible updates, then run the relevant checks.
 
@@ -117,13 +119,13 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween
 
 The Tween example defines slide and scale/rotation effects through one preparation callback, with exit-hold switching, retained counters, and Back. The manual driver example demonstrates direct lifecycle integration. See the [transition guide](../guides/transitions.md) for the contract.
 
-The Linux build uses X11. CI installs `libxkbcommon-dev`, `libx11-dev`, `libxi-dev`, `libxcursor-dev`, and `libxrandr-dev`. Interaction checks cover push/replace/back, layout and page counters, positions for separate visits, delayed content, clicks and Space, focus release, gestures across navigation, error fallback, and recovery. See [window debugging](../guides/debugging.md) for steps and BRP commands.
+The Linux build uses X11. The manual window check installs `libxkbcommon-dev`, `libx11-dev`, `libxi-dev`, `libxcursor-dev`, and `libxrandr-dev`. Interaction checks cover push/replace/back, layout and page counters, positions for separate visits, delayed content, clicks and Space, focus release, gestures across navigation, error fallback, and recovery. See [window debugging](../guides/debugging.md) for steps and BRP commands.
 
 The example's keyboard handler explicitly queries the gate after `RouterInputSet::Ready`. Applications integrating native Tab/Dispatch also need to verify target selection and dispatch. Android manifest setup is in the [system Back guide](../guides/platform-back.md#android-traditional-back).
 
 ## Performance fixtures and packages
 
-First check benchmark behavior. CI runs the first three commands; instance and steady-state changes can also use the last two:
+Run window compilation and performance fixtures manually through [Extended checks](../../.github/workflows/extended.yml) in Actions. They are excluded from daily automatic CI. The performance job runs the first three commands below to check behavior, not timing; instance and steady-state changes can also use the last two:
 
 ```sh
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test

@@ -29,7 +29,9 @@ cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-features --locked
 ```
 
-这些是 [CI](../../.github/workflows/ci.yml) 的主检查。独立 consumer 在自己的 workspace 中离线解析依赖，`cargo fetch` 提前准备 registry 和依赖缓存。共享 target 由一位验证负责人顺序运行 Cargo/rustc。
+[Rust CI](../../.github/workflows/ci.yml) 在 Rust 源码、依赖或构建配置变化时执行这些检查；[文档 CI](../../.github/workflows/docs.yml) 只检查文档链接。自动运行覆盖 main 推送和 PR。
+
+独立 consumer 联网解析自己的依赖并生成 lockfile，随后用 `--locked` 编译运行；仓库的 `cargo fetch` 不替代下游解析。共享 target 由一位验证负责人顺序运行 Cargo/rustc。
 
 CI 的 `--locked` 复现已提交的依赖快照；版本要求见[接入指南](../guides/integration.zh-CN.md#bevy-版本要求)。独立 consumer 使用 `0.19` 范围重新生成自己的 lockfile，不复用仓库的 Bevy 选择。维护依赖快照时用 `cargo update` 解析兼容更新，再运行相应检查。
 
@@ -117,13 +119,13 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween
 
 Tween 示例用同一准备回调定义平移和缩放旋转，可切换退出持有、对比保留计数和 Back；手工 driver 示例展示直接使用生命周期接口的方式。具体合同见[过渡指南](../guides/transitions.zh-CN.md)。
 
-Linux 构建采用 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev` 和 `libxrandr-dev`。交互检查包括 push/replace/back、布局与页面计数、不同访问的滚动位置、晚到内容、点击和 Space、焦点释放、跨页手势、错误 fallback 和恢复。具体步骤与 BRP 命令见[窗口调试](../guides/debugging.zh-CN.md)。
+Linux 构建采用 X11；手动窗口检查安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev` 和 `libxrandr-dev`。交互检查包括 push/replace/back、布局与页面计数、不同访问的滚动位置、晚到内容、点击和 Space、焦点释放、跨页手势、错误 fallback 和恢复。具体步骤与 BRP 命令见[窗口调试](../guides/debugging.zh-CN.md)。
 
 窗口示例的键盘处理器在 `RouterInputSet::Ready` 后显式查询 gate；应用接入原生 Tab/Dispatch 时，还需验证其目标选择和派发路径。Android manifest 接线见[系统返回指南](../guides/platform-back.zh-CN.md#android-传统返回)。
 
 ## 性能夹具与发布产物
 
-性能夹具先检查行为，CI 使用前三条命令；实例与稳态改动可补充后两条：
+窗口编译和性能夹具通过 Actions 的 [Extended checks](../../.github/workflows/extended.yml) 手动选择运行，不参与日常自动 CI。性能任务执行下面前三条命令，检查行为而非性能耗时；实例与稳态改动可补充后两条：
 
 ```sh
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test

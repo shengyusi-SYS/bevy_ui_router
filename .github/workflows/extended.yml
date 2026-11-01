@@ -1,0 +1,61 @@
+name: Extended checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Checks to run
+        type: choice
+        default: all
+        options:
+          - all
+          - window
+          - performance
+
+permissions:
+  contents: read
+
+jobs:
+  performance:
+    if: inputs.scope == 'all' || inputs.scope == 'performance'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Smoke test performance fixtures (no timing gate)
+        run: |
+          cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
+          ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+          ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+  window:
+    if: inputs.scope == 'all' || inputs.scope == 'window'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Install window build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev
+      - name: Fetch window dependencies
+        run: cargo fetch --manifest-path examples/windowed/Cargo.toml --locked
+      - name: Check window example and opt-in integrations
+        run: |
+          cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --locked
+          cargo check --manifest-path examples/windowed/Cargo.toml --all-targets --all-features --locked

@@ -120,14 +120,14 @@ impl Consumer {
     }
 
     fn prepare(&self) {
-        self.success(&["generate-lockfile", "--offline"]);
+        // Resolve like a new downstream application, independently of the repository lock.
+        self.success(&["generate-lockfile"]);
     }
 
     fn run(&self, renderer_neutral: bool) {
         self.prepare();
         let mut tree_args = vec![
             "tree",
-            "--offline",
             "--locked",
             "--edges",
             "normal,build",
@@ -162,12 +162,12 @@ impl Consumer {
                 "test support leaked into the independent consumer: {line}"
             );
         }
-        self.success(&["run", "--offline", "--locked", "--quiet"]);
+        self.success(&["run", "--locked", "--quiet"]);
     }
 
     fn rejects(&self, code: &str, symbol: &str) {
         self.prepare();
-        let output = self.cargo(&["check", "--offline", "--locked", "--message-format=json"]);
+        let output = self.cargo(&["check", "--locked", "--message-format=json"]);
         assert!(
             !output.status.success(),
             "{} unexpectedly compiled",
