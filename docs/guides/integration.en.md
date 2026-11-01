@@ -60,9 +60,15 @@ bevy_internal = { version = "0.19", default-features = false, features = ["bevy_
 
 ## Bevy version requirements
 
-Bevy dependencies use the ordinary `version = "0.19"` requirement: `>=0.19.0, <0.20.0`. Cargo selects compatible patch releases. Upgrading between Bevy `0.x` minor releases requires a separate migration; version ranges follow [Cargo default requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements).
+Starting with Bevy 0.19, this library follows the ecosystem's version-mapping approach: each newly supported Bevy minor release gets a corresponding Router release series. Applications select the Router version matching their Bevy version. The compatibility table retains historical mappings, following the pattern used by [bevy_egui](https://github.com/mvlabat/bevy_egui#bevy-support-table).
 
-The repository's `Cargo.lock` and example commands using `--locked` reproduce this checkout's builds without pinning downstream dependencies. Applications resolve dependencies through their own manifests and lockfiles. Cargo handles mirrors, vendoring, Git/path dependencies, and `[patch]`; this library does not add scans or prohibitions for those configurations.
+| Bevy | Router |
+| --- | --- |
+| `0.19` | Current source, not yet published |
+
+Bevy `0.20` migration work is recorded in the [roadmap](../roadmap.en.md#bevy-020-migration-not-started) and is deferred. This mapping applies to Bevy integrations; Core/View do not depend on Bevy.
+
+Each release series uses an ordinary Cargo requirement for its Bevy minor version. The current requirement is `version = "0.19"`; Cargo selects compatible patch releases according to its [default requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements). The repository's `Cargo.lock` and example commands using `--locked` reproduce repository builds. Consumers resolve dependencies through their own manifests and lockfiles, using standard Cargo source configuration.
 
 ## Declare pages and start
 

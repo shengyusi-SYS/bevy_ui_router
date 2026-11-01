@@ -54,7 +54,7 @@ Use a local dependency pointing to your checkout:
 bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = ["bsn"] }
 ```
 
-The project uses Rust edition 2024 and the Bevy `version = "0.19"` compatibility range, allowing patch updates. See [integration](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md#bevy-version-requirements) for version and Cargo configuration details.
+This library uses Rust edition 2024. Its compatibility policy maps Bevy versions from 0.19 onward to corresponding Router release series. The current source targets Bevy 0.19; see [integration](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md#bevy-version-requirements) for the compatibility table and Cargo details.
 
 Follow the [integration guide](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md): associate routes and factories directly with `BsnRouter`, configure `initial`, and mount an application-owned host. Ordinary page systems navigate with `commands.router(handle).push("/items/42?tab=info")`. The [quick-start source](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs) is a complete runnable example.
 

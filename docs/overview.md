@@ -38,6 +38,6 @@ Bevy UI Router 把页面组织、切换和返回集中到一个路由系统。�
 
 推荐通过 `bevy_ui_router` 的 `bsn` feature 接入 Bevy UI。Core 管理路由决策，View 提供与渲染器无关的视图合同，ECS 执行实体变更，BSN 构建 Scene，Platform 传递平台返回意图。默认 `view` feature 和 Core/View 使用独立于 Bevy 的类型。
 
-当前支持 Bevy `0.19` 兼容系列，允许补丁版本更新；版本要求见[接入指南](guides/integration.md#bevy-版本要求)，工具和平台验证范围见[验证指南](development/verification.md)。
+应用按[接入指南中的版本对应表](guides/integration.md#bevy-版本要求)选择 Router 版本；工具和平台验证范围见[验证指南](development/verification.md)。
 
 浏览器 URL/history、异步 Scene 加载、typed routes 和多出口等后续方向见[路线图](roadmap.md)。开始使用时，阅读[接入指南](guides/integration.md)；查询具体规则时，阅读[行为合同](contracts/README.md)。

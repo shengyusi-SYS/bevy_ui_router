@@ -15,6 +15,17 @@
 
 ## 后续方向
 
+### Bevy 0.20 适配（待启动）
+
+按[版本对应策略](guides/integration.md#bevy-版本要求)支持 Bevy 0.19 及后续次版本。0.20 已完成兼容性评估，暂不升级；实施时完成以下工作：
+
+- 将 Bevy 迁至 `0.20` 系列、`bevy_tween` 迁至 `0.14` 系列，同步独立 consumer 和窗口示例，核对工具链要求。
+- 迁移 Query 迭代、pointer 事件、observer 泛型、BSN 表达式及受影响的 Template、裁剪和 AutoFocus 测试。
+- 将 `PointerCaptureMap` 纳入既有页面撤权流程，保留其它有效目标的捕获，回归切页后的正常命中。
+- 完成相关 crate、公开旅程、独立 consumer 和示例验证；重点复核焦点、滚动与动画调度，复测既有动画基准，并更新兼容表和使用文档。
+
+### 其它方向
+
 原生 Tab 导航与输入分发自动接入路由活动资格，需要 Bevy/UI 提供适合的公开扩展入口。该方向同时包括焦点准入和当前焦点桥的替换。现有应用可继续通过 `RouterInputGate` 接入键盘和手柄处理器。
 
 其它方向包括浏览器 URL/history、异步 Scene 加载、typed route/search、多出口、其它 renderer 和公开实例逐出接口。每项工作先明确应用场景、期望行为和验证方法，再进入实施计划。

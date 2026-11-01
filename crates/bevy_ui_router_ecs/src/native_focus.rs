@@ -1,5 +1,5 @@
-//! A fixed-version InputFocus queue adapter. Observations never confer lifecycle
-//! authority: only the original native frame owner may consume a pending intent.
+//! An InputFocus queue adapter with reflected-field validation. Observations never
+//! confer lifecycle authority: only the original native frame owner may consume a pending intent.
 
 use crate::{
     components::RouteOwnershipSeal,

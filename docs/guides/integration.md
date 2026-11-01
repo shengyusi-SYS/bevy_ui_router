@@ -60,9 +60,15 @@ bevy_internal = { version = "0.19", default-features = false, features = ["bevy_
 
 ## Bevy 版本要求
 
-Bevy 依赖使用普通的 `version = "0.19"`，即 `>=0.19.0, <0.20.0`，由 Cargo 选择兼容补丁版本。Bevy 的 `0.x` 次版本升级需要单独适配；版本范围遵循 [Cargo 默认要求](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements)。
+本库从 Bevy 0.19 起，按生态常见的版本对应方式支持后续 Bevy 次版本：适配新次版本时提供对应的 Router 发布系列，应用选择与自身 Bevy 匹配的 Router 版本。兼容表保留历史版本对应关系，形式参考 [bevy_egui](https://github.com/mvlabat/bevy_egui#bevy-support-table)。
 
-仓库 `Cargo.lock` 和示例命令中的 `--locked` 用于复现本仓库构建，不固定消费方版本；应用通过自己的 manifest 和 lockfile 解析依赖。镜像、vendoring、Git/path 和 `[patch]` 等来源选择交给 Cargo，本库不额外扫描或禁止这些配置。
+| Bevy | Router |
+| --- | --- |
+| `0.19` | 当前源码，尚未发布 |
+
+Bevy `0.20` 的适配工作已记入[路线图](../roadmap.md#bevy-020-适配待启动)，暂未实施。版本对应适用于 Bevy 集成；Core/View 不依赖 Bevy。
+
+各发布系列使用对应 Bevy 次版本的普通 Cargo 范围。当前为 `version = "0.19"`，由 Cargo 按[默认版本要求](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements)选择兼容补丁版本。仓库 `Cargo.lock` 和示例的 `--locked` 用于复现仓库构建；消费方通过自己的 manifest 和 lockfile 解析依赖，来源配置使用 Cargo 标准机制。
 
 ## 声明页面并启动
 
