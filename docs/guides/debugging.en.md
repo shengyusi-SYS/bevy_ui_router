@@ -1,10 +1,47 @@
-# Window debugging
+# Navigation and window debugging
 
 [中文](debugging.md) | [English](debugging.en.md)
 
-The [windowed example](../../examples/windowed/src/main.rs) exposes a Bevy Remote Protocol (BRP) endpoint for sending input, inspecting layout and state, and saving rendered screenshots. Input is handled inside the application, keeping the system pointer and keyboard focus in place.
+Start with public snapshots to locate routing problems, then inspect window layout and input as needed. Ordinary applications can read navigation state without starting a debug service.
 
-## Start and inspect
+## Diagnose navigation first
+
+Read the current update's result after `RouterScheduleSet::PublishSnapshots`. Call this helper on demand from a diagnostic action, error handler, or state change rather than printing the same records every frame:
+
+```rust
+use bevy_ui_router::prelude::*;
+
+fn inspect_router(snapshots: &RouterSnapshots, router: RouterHandle) {
+    let Some(snapshot) = snapshots.get(router) else { return };
+    eprintln!("availability={:?}, location={:?}, phase={:?}, cleanup={:?}",
+        snapshot.availability(), snapshot.active().location(),
+        snapshot.pending_phase(), snapshot.cleanup());
+    if let Some(failure) = snapshot.active().failure() {
+        eprintln!("active error: {failure:?}");
+    }
+    for event in snapshot.diagnostics().events() {
+        eprintln!("{:?}: {:?}", event.kind(), event.redacted_message());
+    }
+}
+```
+
+| Symptom | Check first |
+| --- | --- |
+| Installation returns `MissingSceneRuntime` | Install `AssetPlugin` and `ScenePlugin` before adding Router; the minimal example also installs `TaskPoolPlugin` |
+| The initial page never appears | Check `.initial(...)`, a host with the correct `RouterHostRegistration`, and ongoing App updates; `AwaitingHost` means Router is still waiting for a host |
+| The snapshot has the expected location but the screen is empty | Check application host/page sizes, visibility, camera/render target, and UI renderer |
+| Commands navigation gives no request ID | Commands return no synchronous ID; enqueue failures log a warning by default. Use `RouterNavigation` for the immediate enqueue result, then snapshots for execution results |
+| Navigation fails | Inspect the request's `RequestStatus::Failed`, `trace()`, and `diagnostics()` for the failure source; a displayed error page also exposes `active().failure()` |
+| The page changed but the request remains in `PostCommitCleanup` | The page and history are published, but cleanup or a held transition exit is pending; inspect `cleanup()` and whether the animation releases its exit targets |
+| Back cannot run | `NoBackEntry` means there is no earlier successful entry; the application chooses feedback or a host exit action |
+| Page state is recreated | Check retention opt-in, capacity, the original parent/outlet, and parameter/query/fragment reuse rules; see [retention](integration.en.md#retain-layouts-and-pages) |
+| Scroll is not restored | First confirm a successful Back and a saved position for that visit, then inspect `RouteScrollRestorations::pending`, container keys, layout/camera, and ready/cancel state; see [scroll restoration](integration.en.md#restore-scroll-positions) |
+
+With a request ID returned by `RouterNavigation`, use `snapshots.request(router, id)`: `Found` exposes `status()`, `trace()`, and `diagnostics()`; `NotRetained` means the completed record was evicted; `Unknown` means this Router has no matching request. `running_request()` only identifies a running request and becomes None after it terminates.
+
+## Start and inspect a window
+
+The [windowed example](../../examples/windowed/src/main.rs) exposes a Bevy Remote Protocol (BRP) endpoint for sending input, inspecting layout and state, and saving rendered screenshots. Input is handled inside the application, keeping the system pointer and keyboard focus in place.
 
 From the repository root:
 

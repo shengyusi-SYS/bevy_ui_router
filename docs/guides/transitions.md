@@ -14,7 +14,7 @@ Router 默认不安装过渡 driver。应用决定效果、缓动、时长和叠
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
 ```
 
-[窗口入口](../../examples/windowed/src/bin/tween_transitions.rs)使用统一路由声明、Commands 和保留计数。[应用效果](../../examples/windowed/src/bin/tween_transitions/effects.rs)提供平移、缩放旋转和进入动画模式，不维护 session、计时器或结束回调。
+[窗口入口](../../examples/windowed/src/bin/tween_transitions.rs)使用统一路由声明、Commands 和保留计数。[应用效果](../../examples/windowed/src/bin/tween_transitions/effects.rs)提供平移、缩放旋转和进入动画模式，不维护 session、计时器或结束回调。 窗口按钮显示当前效果和退出动画模式；点击切换后，下一次导航使用新设置。
 
 在 `BsnRouter` 上配置 `.transition_driver(RouteTweenDriver::new(prepare_effect))`。应用只需一个准备回调，例如：
 

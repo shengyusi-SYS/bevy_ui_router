@@ -71,7 +71,7 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            update_counters.after(RouterScheduleSet::PublishSnapshots),
+            (update_counters, update_effect_labels).after(RouterScheduleSet::PublishSnapshots),
         )
         .add_observer(click)
         .run();
@@ -99,7 +99,7 @@ fn page_scene(title: &'static str, color: Color) -> impl Scene {
     }
 }
 
-fn setup(mut commands: Commands, demo: Res<Demo>) {
+fn setup(mut commands: Commands, demo: Res<Demo>, effects: Res<Effects>) {
     commands.spawn(Camera2d);
     commands
         .spawn((
@@ -133,6 +133,7 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
                     ("Switch effect", Action::Effect),
                     ("Toggle exit", Action::Hold),
                 ] {
+                    let label = effect_label(&action, &effects).unwrap_or(text);
                     bar.spawn((
                         Button,
                         action,
@@ -142,9 +143,17 @@ fn setup(mut commands: Commands, demo: Res<Demo>) {
                         },
                         BackgroundColor(Color::srgb(0.14, 0.19, 0.28)),
                     ))
-                    .with_child((Text::new(text), Pickable::IGNORE));
+                    .with_child((Text::new(label), Pickable::IGNORE));
                 }
             });
+            root.spawn((
+                Text::new("Click an option to change it. Changes apply to the next navigation."),
+                TextFont {
+                    font_size: FontSize::Px(16.0),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ));
             root.spawn((
                 Node {
                     width: Val::Percent(100.0),
@@ -181,6 +190,42 @@ fn click(
     } else if inputs.current(click.entity).is_some() {
         if let Ok(mut counter) = counters.get_mut(click.entity) {
             counter.0 += 1;
+        }
+    }
+}
+
+fn effect_label(action: &Action, effects: &Effects) -> Option<&'static str> {
+    match action {
+        Action::Effect => Some(if effects.scale_rotate {
+            "Effect: scale + rotate"
+        } else {
+            "Effect: slide"
+        }),
+        Action::Hold => Some(if effects.hold_exit {
+            "Exit: animated"
+        } else {
+            "Exit: immediate"
+        }),
+        _ => None,
+    }
+}
+
+fn update_effect_labels(
+    effects: Res<Effects>,
+    actions: Query<(&Action, &Children)>,
+    mut text: Query<&mut Text>,
+) {
+    if !effects.is_changed() {
+        return;
+    }
+    for (action, children) in &actions {
+        let Some(label) = effect_label(action, &effects) else {
+            continue;
+        };
+        for child in children {
+            if let Ok(mut text) = text.get_mut(*child) {
+                text.set_if_neq(Text::new(label));
+            }
         }
     }
 }

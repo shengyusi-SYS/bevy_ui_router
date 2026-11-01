@@ -1,5 +1,40 @@
+//! Page navigation, shared layouts, history, and state retention for Bevy UI.
+//!
+//! # Start here
+//!
+//! Enable **`bsn`** for the recommended Bevy Scene integration, then import
+//! [`prelude`]. Declare pages with `page`, `layout`, and `index`; install a
+//! `BsnRouter` with `AppBsnExt::add_bsn_router`, and attach its handle to an
+//! application-owned UI container using `RouterHostRegistration`.
+//! Use `initial` for the first page and `commands.router(handle)` for subsequent
+//! Push, Replace, and Back operations. `RouteInputs` reads the current context of
+//! active content, including reused layouts and reactivated pages.
+//!
+//! The application supplies Bevy's asset/Scene runtime, UI layout, window, camera,
+//! and page content. See the [integration guide] for a complete manifest and setup,
+//! or run the [quick start] without a window. The [debugging guide] covers missing
+//! pages, failed requests, retention, and scroll restoration.
+//!
+//! # Feature selection
+//!
+//! - `bsn`: Scene declarations and page navigation; includes `ecs` and `view`.
+//! - `tween`: optional transition coordination with application-defined effects.
+//! - `desktop-back` / `android-back`: optional platform Back input adapters.
+//! - `view` (default): renderer-neutral view descriptions and registration.
+//! - `ecs`: Bevy execution for applications assembling their own view drivers.
+//! - `platform`: platform navigation contracts. [`core`] is always available.
+//!
+//! Published documentation is configured to include all features. Enable the
+//! relevant features in your application manifest. For local documentation, use
+//! `cargo doc -p bevy_ui_router --all-features --no-deps`.
+//!
+//! [integration guide]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md
+//! [quick start]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs
+//! [debugging guide]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/debugging.en.md
+
 #![forbid(unsafe_code)]
 
+/// Renderer-independent route matching, history, lifecycle, and diagnostics.
 pub mod core {
     pub use bevy_ui_router_core::back::{BackCapabilitySnapshot, BackIntent, BackPolicy};
     pub use bevy_ui_router_core::branch::{MatchedBranch, MatchedRoute, RouteParams};
@@ -44,6 +79,7 @@ pub mod core {
 }
 
 #[cfg(feature = "view")]
+/// Renderer-neutral view descriptions and registration (`view` feature).
 pub mod view {
     pub use bevy_ui_router_view::{
         RouteViewDescriptor, RouteViewRegistry, RouteViewRegistryError, ViewBuildEffect,
@@ -52,6 +88,7 @@ pub mod view {
 }
 
 #[cfg(feature = "ecs")]
+/// Bevy execution, navigation commands, current inputs, scrolling, and transitions.
 pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
@@ -70,6 +107,7 @@ pub mod ecs {
 }
 
 #[cfg(feature = "bsn")]
+/// Recommended Scene declarations: start with [`BsnRouter`](bsn::BsnRouter), [`layout`](bsn::layout), and [`page`](bsn::page).
 pub mod bsn {
     pub use bevy_ui_router_bsn::{BsnBuildError, BsnSceneFactory, DefaultOutlet};
     pub use bevy_ui_router_ecs::{
@@ -78,10 +116,12 @@ pub mod bsn {
 }
 
 #[cfg(feature = "platform")]
+/// Platform navigation intents and optional desktop/Android input adapters.
 pub mod platform {
     pub use bevy_ui_router_platform::*;
 }
 
+/// Common imports, enabled according to the crate's selected features.
 pub mod prelude {
     #[cfg(feature = "tween")]
     pub use bevy_ui_router_ecs::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};

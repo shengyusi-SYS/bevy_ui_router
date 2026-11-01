@@ -1,10 +1,47 @@
-# 窗口调试
+# 导航与窗口调试
 
 [中文](debugging.md) | [English](debugging.en.md)
 
-[窗口示例](../../examples/windowed/src/main.rs)提供 Bevy Remote Protocol（BRP）调试入口，可以向示例窗口发送输入、读取布局和状态、保存渲染截图。输入在应用内处理，系统鼠标和键盘焦点保持原位。
+先用公开快照定位路由问题，再按需要检查窗口布局和输入。普通应用无需启动调试服务即可读取导航状态。
 
-## 启动和观察
+## 先定位导航问题
+
+在 `RouterScheduleSet::PublishSnapshots` 之后读取本轮结果。下面的函数供应用在诊断按钮、错误处理或状态变化时按需调用，避免每帧重复输出：
+
+```rust
+use bevy_ui_router::prelude::*;
+
+fn inspect_router(snapshots: &RouterSnapshots, router: RouterHandle) {
+    let Some(snapshot) = snapshots.get(router) else { return };
+    eprintln!("availability={:?}, location={:?}, phase={:?}, cleanup={:?}",
+        snapshot.availability(), snapshot.active().location(),
+        snapshot.pending_phase(), snapshot.cleanup());
+    if let Some(failure) = snapshot.active().failure() {
+        eprintln!("active error: {failure:?}");
+    }
+    for event in snapshot.diagnostics().events() {
+        eprintln!("{:?}: {:?}", event.kind(), event.redacted_message());
+    }
+}
+```
+
+| 现象 | 先检查什么 |
+| --- | --- |
+| 安装报 `MissingSceneRuntime` | 在添加 Router 前安装 `AssetPlugin` 和 `ScenePlugin`；最小示例还安装 `TaskPoolPlugin` |
+| 首屏没有出现 | 是否配置 `.initial(...)`、是否创建携带正确 `RouterHostRegistration` 的 host、App 是否持续更新；`AwaitingHost` 表示仍在等待 host |
+| 快照已有目标位置，但画面为空 | 检查应用的 host/页面布局尺寸、可见性、camera/render target 和 UI renderer |
+| Commands 导航没有请求 ID | Commands 不返回同步 ID；入队失败默认输出 warning。需要立即处理入队结果时使用 `RouterNavigation`；随后从快照观察执行结果 |
+| 导航失败 | 用请求的 `RequestStatus::Failed`、`trace()`、`diagnostics()` 查看失败来源；当前显示错误页时也可读 `active().failure()` |
+| 页面已切换，请求仍在 `PostCommitCleanup` | 页面与 history 已发布，但离场清理或过渡退出仍在等待；检查 `cleanup()` 与动画是否释放退出目标 |
+| Back 无法执行 | `NoBackEntry` 表示没有更早的成功记录；由应用决定此时的界面反馈或退出动作 |
+| 页面状态被重建 | 核对 route 的保留开关、容量、原父实例/出口是否存续，以及参数、query/fragment 的复用规则；见[保留说明](integration.md#布局与页面保留) |
+| 滚动没有恢复 | 先确认 Back 成功且该次访问有记录，再查看 `RouteScrollRestorations::pending`、容器 key、布局/camera 与 ready/取消状态；见[滚动恢复](integration.md#滚动恢复) |
+
+持有 `RouterNavigation` 返回的请求 ID 时，用 `snapshots.request(router, id)` 查询：`Found` 可读取 `status()`、`trace()` 和 `diagnostics()`；`NotRetained` 表示完成记录已被淘汰，`Unknown` 表示该 Router 中没有对应请求。`running_request()` 只表示正在执行的请求，终结后会变为 None。
+
+## 启动和观察窗口
+
+[窗口示例](../../examples/windowed/src/main.rs)提供 Bevy Remote Protocol（BRP）调试入口，可以发送输入、读取布局和状态、保存渲染截图。输入在应用内处理，系统鼠标和键盘焦点保持原位。
 
 在仓库根目录启动：
 

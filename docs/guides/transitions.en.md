@@ -14,7 +14,7 @@ Enable Router features `bsn,tween` and add `bevy_tween = { version = "0.13", def
 cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
 ```
 
-The [window entry point](../../examples/windowed/src/bin/tween_transitions.rs) uses unified declarations, Commands, and retained counters. Its [application effects](../../examples/windowed/src/bin/tween_transitions/effects.rs) provide slide, scale/rotation, and enter-only modes without application sessions, timers, or completion callbacks.
+The [window entry point](../../examples/windowed/src/bin/tween_transitions.rs) uses unified declarations, Commands, and retained counters. Its [application effects](../../examples/windowed/src/bin/tween_transitions/effects.rs) provide slide, scale/rotation, and enter-only modes without application sessions, timers, or completion callbacks. Buttons display the current effect and exit-animation mode; changes apply to the next navigation.
 
 Configure `.transition_driver(RouteTweenDriver::new(prepare_effect))` on `BsnRouter`. The application supplies one preparation callback, for example:
 

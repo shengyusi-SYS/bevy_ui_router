@@ -115,13 +115,11 @@ fn main() {
                     Name::new(format!("{name}-scroll")) RouteScroll::new("list")
                     BackgroundColor(Color::srgb(0.06, 0.10, 0.16))
                     Children [(Node {
-                        width: Val::Percent(100.0), height: Val::Px(720.0), flex_shrink: 0.0,
+                        width: Val::Percent(100.0), min_height: Val::Px(720.0), flex_shrink: 0.0,
                         padding: UiRect::all(Val::Px(12.0)),
-                        flex_direction: FlexDirection::Column, justify_content: JustifyContent::SpaceBetween,
+                        flex_direction: FlexDirection::Column,
                     } Pickable::IGNORE Children [
-                        (Text({format!("{name} list / top")}) Pickable::IGNORE),
-                        (Text({format!("{name} list / middle")}) Pickable::IGNORE),
-                        (Text({format!("{name} list / bottom")}) Pickable::IGNORE)
+                        (Text({list_text(name)}) Pickable::IGNORE)
                     ])])
                 ]
             })
@@ -466,22 +464,16 @@ fn restore(
                             .spawn((
                                 Node {
                                     width: Val::Percent(100.0),
-                                    height: Val::Px(720.0),
+                                    min_height: Val::Px(720.0),
                                     flex_shrink: 0.0,
                                     padding: UiRect::all(Val::Px(12.0)),
                                     flex_direction: FlexDirection::Column,
-                                    justify_content: JustifyContent::SpaceBetween,
                                     ..default()
                                 },
                                 Pickable::IGNORE,
                             ))
                             .with_children(|content| {
-                                for label in ["top", "middle", "bottom"] {
-                                    content.spawn((
-                                        Text::new(format!("delayed list / {label}")),
-                                        Pickable::IGNORE,
-                                    ));
-                                }
+                                content.spawn((Text::new(list_text("delayed")), Pickable::IGNORE));
                             });
                     });
             });
@@ -499,16 +491,31 @@ fn restore(
     }
 }
 
+// Numbered rows keep scroll movement visible throughout the list.
+fn list_text(name: &str) -> String {
+    (1..=30)
+        .map(|row| format!("{name} / row {row:02}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // This is application input behavior; RouteScroll only opts into history storage.
 fn scroll(
     event: On<Pointer<Scroll>>,
     gate: Res<RouterInputGate>,
-    mut positions: Query<&mut ScrollPosition, With<RouteScroll>>,
+    restorations: RouteScrollRestorations,
+    mut positions: Query<(&RouteScroll, &mut ScrollPosition)>,
+    mut commands: Commands,
 ) {
     let target = event.event_target();
-    if gate.allows_pointer(target)
-        && let Ok(mut position) = positions.get_mut(target)
+    if event.y != 0.0
+        && gate.allows_pointer(target)
+        && let Ok((marker, mut position)) = positions.get_mut(target)
     {
+        // Even at a scroll boundary, user input supersedes a pending restore.
+        if let Some(pending) = restorations.pending(target, marker.key()) {
+            commands.cancel_route_scroll(pending.id());
+        }
         let unit = match event.unit {
             MouseScrollUnit::Line => 32.0,
             MouseScrollUnit::Pixel => 1.0,
@@ -582,7 +589,7 @@ fn update_status(
         }
     }
     let location = snapshot.active().location().map_or_else(
-        || "No active route".to_owned(),
+        || format!("No active route ({:?})", snapshot.availability()),
         |location| {
             format!(
                 "{} | search {:?} | fragment {:?}",
