@@ -4,6 +4,8 @@
 
 This page helps contributors follow an action from Core through ECS to completion or failure. User-visible behavior belongs to the [lifecycle contract](../contracts/lifecycle.en.md); entity structure and scheduling are covered by [runtime behavior](runtime.en.md). A holder is an internal container that keeps the original owner and execution progress.
 
+Structural manifests record component presence relevant to routing structure. Bevy-derived `CalculatedClip`, `Inherited<ComputedUiTargetCamera>`, and `Inherited<ComputedUiRenderTargetInfo>` may change during normal UI updates and are excluded from structural equality; preregistration and observation use the same projection. Staging and detachment separately freeze and revalidate the UI inheritance facts they depend on. Registry claims, owners, seals, lifecycles, and relationships remain exact.
+
 ## Actions and physical ownership handoffs
 
 Core [engine](../../crates/bevy_ui_router_core/src/engine.rs) chooses the next action, and [integration](../../crates/bevy_ui_router_core/src/integration.rs) provides cross-crate handoffs. ECS [navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs) keeps owners and physical progress across updates in `RouterEntry`. Core's logical projection and ECS entity structure are validated independently.

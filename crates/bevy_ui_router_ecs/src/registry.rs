@@ -274,19 +274,28 @@ pub(crate) struct ComponentManifest {
 }
 
 impl ComponentManifest {
-    /// Structural component presence excludes only Bevy 0.19.1's transient
-    /// clipping result. The official UI system adds/removes CalculatedClip as
-    /// authored display/overflow changes; it is not ownership or role evidence.
+    /// Structural presence excludes Bevy's derived clipping and inherited UI
+    /// camera/render-target results. Official UI systems may add or remove
+    /// these between navigation steps; they are not ownership or role evidence.
+    /// Staging separately freezes UI inheritance where its values authorize writes.
     /// Keep this iterator allocation-free for resident publication consumers.
     pub(crate) fn observed_component_ids<'a>(
         world: &World,
         components: &'a [ComponentId],
     ) -> impl Iterator<Item = ComponentId> + Clone + 'a {
-        let clip = world.components().component_id::<bevy_ui::CalculatedClip>();
+        let derived = [
+            world.components().component_id::<bevy_ui::CalculatedClip>(),
+            world
+                .components()
+                .component_id::<bevy_app::Inherited<bevy_ui::ComputedUiTargetCamera>>(),
+            world
+                .components()
+                .component_id::<bevy_app::Inherited<bevy_ui::ComputedUiRenderTargetInfo>>(),
+        ];
         components
             .iter()
             .copied()
-            .filter(move |id| Some(*id) != clip)
+            .filter(move |id| !derived.contains(&Some(*id)))
     }
 
     pub(crate) fn new(ids: impl IntoIterator<Item = ComponentId>) -> Self {

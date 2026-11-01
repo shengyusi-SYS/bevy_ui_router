@@ -753,7 +753,7 @@ fn child_slot_relationship_drift_is_rejected_and_inert() {
 }
 
 #[test]
-fn child_slot_relationship_runtime_ui_closure_is_registered_exactly() {
+fn child_slot_relationship_keeps_derived_ui_out_of_structural_manifest() {
     let (mut world, _candidate, _top_slot, _engine, frame, _local_index, grant) =
         realized_parent_with_outlet();
     world
@@ -766,14 +766,24 @@ fn child_slot_relationship_runtime_ui_closure_is_registered_exactly() {
         });
 
     let staged = stage_child_slot(&mut world, &frame, &RouteSlotKey::default(), &grant)
-        .expect("known UI propagation components must be included in the locked manifest");
+        .expect("UI propagation must preserve the structural manifest");
     let record = world
         .resource::<RouteEntityRegistry>()
         .record(staged.slot())
         .expect("staged slot remains registered");
     assert!(record.manifest().matches(&world, staged.slot()));
     assert!(
-        record.manifest().component_ids().contains(
+        world
+            .get::<Inherited<ComputedUiTargetCamera>>(staged.slot())
+            .is_some()
+    );
+    assert!(
+        world
+            .get::<Inherited<ComputedUiRenderTargetInfo>>(staged.slot())
+            .is_some()
+    );
+    assert!(
+        !record.manifest().component_ids().contains(
             &world
                 .components()
                 .component_id::<Inherited<ComputedUiTargetCamera>>()
@@ -781,7 +791,7 @@ fn child_slot_relationship_runtime_ui_closure_is_registered_exactly() {
         )
     );
     assert!(
-        record.manifest().component_ids().contains(
+        !record.manifest().component_ids().contains(
             &world
                 .components()
                 .component_id::<Inherited<ComputedUiRenderTargetInfo>>()
@@ -1418,7 +1428,7 @@ fn canonical_absent_rejected_slot_preserves_unknown_parent_as_unresolved() {
 }
 
 #[test]
-fn invalid_child_mount_preflight_cannot_advance_runtime_manifest() {
+fn invalid_child_mount_preflight_preserves_registry_manifest() {
     let (mut world, _candidate, _top_slot, mut engine, parent, _local_index, grant) =
         realized_parent_with_outlet();
     let staged = stage_child_slot(&mut world, &parent, &RouteSlotKey::default(), &grant).unwrap();
@@ -1452,7 +1462,7 @@ fn invalid_child_mount_preflight_cannot_advance_runtime_manifest() {
         child_task.view_request_sequence(),
         ContentPlan::new().accept(),
     )
-    .expect_err("invalid lifecycle must fail before the runtime manifest CAS");
+    .expect_err("invalid lifecycle must fail before realization");
     let (error, residual) = failure.into_parts();
 
     assert_eq!(error, crate::presentation::RealizationError::InvalidMount);

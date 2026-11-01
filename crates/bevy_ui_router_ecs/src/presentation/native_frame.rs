@@ -540,23 +540,7 @@ fn realize_native_with_mount(
     frame: RouteFrameVersion,
     prepared: crate::bsn::PreparedBsnScene,
 ) -> Result<RealizedFrame, NativeFrameFailure> {
-    let runtime_components = runtime_ui_component_ids(world);
-    let mount_ready = validate_mount_binding_allowing_additions(
-        world,
-        &host_candidate,
-        &mount,
-        &frame,
-        &runtime_components,
-    )
-    .and_then(|()| {
-        synchronize_manifest_allowing_additions(
-            world,
-            mount.slot(),
-            mount.slot_claim(),
-            &runtime_components,
-        )
-    })
-    .and_then(|()| validate_mount_binding(world, &host_candidate, &mount, &frame));
+    let mount_ready = validate_mount_binding(world, &host_candidate, &mount, &frame);
     if let Err(error) = mount_ready {
         return Err(NativeFrameFailure::before_mount(error, prepared));
     }
@@ -628,8 +612,6 @@ fn realize_native_with_mount(
     let relationship_ids = [
         world.register_component::<ChildOf>(),
         world.register_component::<Children>(),
-        runtime_components[0],
-        runtime_components[1],
     ];
     let shell_sync = synchronize_manifest_allowing_from_expected(
         world,

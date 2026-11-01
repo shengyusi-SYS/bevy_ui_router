@@ -230,6 +230,59 @@ fn initial_waits_for_its_host_and_does_not_replay_after_reregistration() {
 }
 
 #[test]
+fn startup_host_accepts_ui_inheritance_from_the_first_post_update() {
+    use bevy_app::{HierarchyPropagatePlugin, PostUpdate, Propagate, Startup};
+    use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera};
+
+    let mut app = app();
+    app.add_plugins((
+        HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(PostUpdate),
+        HierarchyPropagatePlugin::<ComputedUiRenderTargetInfo>::new(PostUpdate),
+    ));
+    let router = app
+        .add_bsn_router(declaration().initial("/items/1"))
+        .unwrap();
+    app.add_systems(Startup, move |mut commands: Commands| {
+        commands
+            .spawn((
+                Node::default(),
+                Propagate(ComputedUiTargetCamera::default()),
+                Propagate(ComputedUiRenderTargetInfo::default()),
+            ))
+            .with_children(|parent| {
+                parent.spawn((Node::default(), RouterHostRegistration::new(router)));
+            });
+    });
+    // Admission happens in Update, before Bevy first propagates the UI facts.
+    app.update();
+    let host = only::<RouterHostRegistration>(&mut app);
+    assert!(
+        app.world()
+            .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(host)
+            .is_some()
+    );
+    settle(&mut app, router, "/items/1");
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .push(router, "/other".into())
+        .unwrap();
+    settle(&mut app, router, "/other");
+    app.world_mut()
+        .resource_mut::<RouterNavigation>()
+        .back(router)
+        .unwrap();
+    settle(&mut app, router, "/items/1");
+    let snapshot = app
+        .world()
+        .resource::<RouterSnapshots>()
+        .get(router)
+        .unwrap();
+    assert_eq!(snapshot.availability(), &RouterAvailability::Ready);
+    assert_eq!(snapshot.history().len(), 2);
+    assert_eq!(snapshot.history().cursor(), Some(0));
+}
+
+#[test]
 fn independent_declarations_do_not_share_factories_or_fallbacks() {
     let mut app = app();
     let first = app

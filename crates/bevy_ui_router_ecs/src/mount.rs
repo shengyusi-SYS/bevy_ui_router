@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use bevy_app::Inherited;
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::{
     component::ComponentId,
@@ -9,7 +8,7 @@ use bevy_ecs::{
 };
 use bevy_input_focus::InputFocus;
 use bevy_picking::Pickable;
-use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val};
+use bevy_ui::{Node, Val};
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     ids::RouteSlotId,
@@ -1445,19 +1444,8 @@ fn advance_relationship_batch(
     let child_of = world.register_component::<ChildOf>();
     let relationship_probe = world.register_component::<ChildSlotRelationshipProbe>();
     let children = world.register_component::<Children>();
-    let runtime_ui_components = child_slot_relationship_runtime_ui_component_ids(world);
-    let required_slot =
+    let expected_slot =
         manifest_with_required(world, &old_slot, vec![child_of, relationship_probe]);
-    let authorized_slot = manifest_with_required(
-        world,
-        &old_slot,
-        vec![
-            child_of,
-            relationship_probe,
-            runtime_ui_components[0],
-            runtime_ui_components[1],
-        ],
-    );
     let expected_anchor = manifest_with_required(world, &old_anchor, vec![children]);
     world
         .entity_mut(slot.slot)
@@ -1469,19 +1457,8 @@ fn advance_relationship_batch(
     expected_children.push(slot.slot);
     let actual_slot = ComponentManifest::from_world(world, slot.slot);
     let actual_anchor = ComponentManifest::from_world(world, slot.anchor);
-    let Some(expected_slot) = actual_slot.filter(|actual| {
-        required_slot
-            .component_ids()
-            .iter()
-            .all(|id| actual.component_ids().contains(id))
-            && actual
-                .component_ids()
-                .iter()
-                .all(|id| authorized_slot.component_ids().contains(id))
-    }) else {
-        return false;
-    };
-    if actual_anchor.as_ref() != Some(&expected_anchor)
+    if actual_slot.as_ref() != Some(&expected_slot)
+        || actual_anchor.as_ref() != Some(&expected_anchor)
         || children_of(world, slot.anchor) != expected_children
         || world.get::<ChildOf>(slot.slot).map(ChildOf::parent) != Some(slot.anchor)
         || !validate_stage_registry(world, slot, &old_slot)
@@ -1509,13 +1486,6 @@ fn advance_relationship_batch(
         && physical_anchor_manifest_is_current(world, &slot.anchor_binding, &expected_anchor)
         && children_of(world, slot.anchor) == expected_children
         && world.get::<ChildOf>(slot.slot).map(ChildOf::parent) == Some(slot.anchor)
-}
-
-fn child_slot_relationship_runtime_ui_component_ids(world: &mut World) -> [ComponentId; 2] {
-    [
-        world.register_component::<Inherited<ComputedUiTargetCamera>>(),
-        world.register_component::<Inherited<ComputedUiRenderTargetInfo>>(),
-    ]
 }
 
 fn current_exact_manifest(world: &World, slot: &ProvisionalChildSlot) -> Option<ComponentManifest> {
@@ -1547,7 +1517,7 @@ fn manifest_with_required(
             break;
         }
     }
-    ComponentManifest::new(ids)
+    ComponentManifest::new(ComponentManifest::observed_component_ids(world, &ids))
 }
 
 fn validate_stage_registry(
@@ -1698,7 +1668,7 @@ fn child_slot_authorized_manifest(world: &World) -> ComponentManifest {
             explicit.extend(required.iter_ids());
         }
     }
-    ComponentManifest::new(explicit)
+    ComponentManifest::new(ComponentManifest::observed_component_ids(world, &explicit))
 }
 
 fn children_of(world: &World, entity: Entity) -> Vec<Entity> {

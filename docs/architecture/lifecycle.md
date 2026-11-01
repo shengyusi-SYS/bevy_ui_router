@@ -4,6 +4,8 @@
 
 本页帮助开发者追踪一项 action 从 Core 到 ECS，再到完成或失败的过程。用户行为归[生命周期合同](../contracts/lifecycle.md)，实体结构与调度见[运行机制](runtime.md)。文中的 holder 是保存原 owner 与执行进度的内部容器。
 
+结构 manifest 只记录路由结构所需的组件存在性。Bevy 派生的 `CalculatedClip`、`Inherited<ComputedUiTargetCamera>` 和 `Inherited<ComputedUiRenderTargetInfo>` 可在正常 UI 更新中变化，不参与结构相等性；所有预登记与实际观察使用同一投影。暂存和 detach 若依赖这些信息，分别冻结并复验自己的 UI 继承事实，registry claim、owner、seal、lifecycle 与关系校验保持精确。
+
 ## Action 与物理责任交接
 
 Core [engine](../../crates/bevy_ui_router_core/src/engine.rs) 决定下一项 action，[integration](../../crates/bevy_ui_router_core/src/integration.rs) 提供跨 crate 交接。ECS [navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs) 的 `RouterEntry` 保存跨 update 的 owner 和物理进度。Core 的逻辑 projection 与 ECS 的实体结构分别验证。

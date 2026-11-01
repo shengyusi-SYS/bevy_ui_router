@@ -1398,7 +1398,7 @@ impl PreparedProvisionalStaging {
         candidate: &ValidatedHostCandidate,
     ) -> Result<Self, HostCandidateCapacityEvidence> {
         let ui_inheritance = FrozenHostUiInheritance::capture(world, candidate.host);
-        let manifest = try_provisional_top_slot_manifest(world, ui_inheritance)
+        let manifest = try_provisional_top_slot_manifest(world)
             .map_err(|_| staging_capacity_evidence(world, candidate, 1))?;
         let registry_manifest = manifest.try_clone().map_err(|_| {
             staging_capacity_evidence(world, candidate, manifest.component_ids().len())
@@ -2648,10 +2648,7 @@ pub(crate) fn validated_host_candidate_is_current(
     candidate_is_current(world, candidate)
 }
 
-fn try_provisional_top_slot_manifest(
-    world: &mut World,
-    ui_inheritance: FrozenHostUiInheritance,
-) -> Result<ComponentManifest, ()> {
+fn try_provisional_top_slot_manifest(world: &mut World) -> Result<ComponentManifest, ()> {
     let explicit = [
         world.register_component::<Visibility>(),
         world.register_component::<Pickable>(),
@@ -2663,14 +2660,6 @@ fn try_provisional_top_slot_manifest(
         world.register_component::<Node>(),
         world.register_component::<ChildOf>(),
     ];
-    let derived = [
-        ui_inheritance
-            .inherits_camera()
-            .then(|| world.register_component::<bevy_app::Inherited<ComputedUiTargetCamera>>()),
-        ui_inheritance
-            .inherits_render_target()
-            .then(|| world.register_component::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>()),
-    ];
     let required_count = explicit
         .iter()
         .filter_map(|component| world.get_required_components_by_id(*component))
@@ -2678,21 +2667,15 @@ fn try_provisional_top_slot_manifest(
         .sum::<usize>();
     let mut complete = Vec::new();
     complete
-        .try_reserve_exact(
-            explicit
-                .len()
-                .saturating_add(required_count)
-                .saturating_add(derived.iter().flatten().count()),
-        )
+        .try_reserve_exact(explicit.len().saturating_add(required_count))
         .map_err(|_| ())?;
     complete.extend_from_slice(&explicit);
-    complete.extend(derived.into_iter().flatten());
     for component in explicit {
         if let Some(required) = world.get_required_components_by_id(component) {
             complete.extend(required.iter_ids());
         }
     }
-    ComponentManifest::try_new(complete)
+    ComponentManifest::try_new(ComponentManifest::observed_component_ids(world, &complete))
 }
 
 fn validate_provisional_slot(

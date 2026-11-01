@@ -1686,63 +1686,57 @@ pub(crate) struct FrozenBackNoTargetHostEdgeDelta {
 
 /// Bevy's two UI propagation observers remove these derived components when
 /// ChildOf is removed, except when the entity supplies its own Propagate source.
-/// Freeze only components already present; this never permits runtime additions.
+/// Their presence is frozen separately from the structural component manifest.
+/// The authorized detach preserves source-owned inheritance and cannot add it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DetachedUiInheritance {
-    removed: [Option<ComponentId>; 2],
+    prior_presence: [bool; 2],
+    expected_presence: Option<[bool; 2]>,
 }
 
 impl DetachedUiInheritance {
     fn capture(world: &World, entity: Entity) -> Self {
+        let presence = Self::presence(world, entity);
+        let own_source = [
+            world
+                .get::<bevy_app::Propagate<ComputedUiTargetCamera>>(entity)
+                .is_some(),
+            world
+                .get::<bevy_app::Propagate<ComputedUiRenderTargetInfo>>(entity)
+                .is_some(),
+        ];
         Self {
-            removed: [
-                (world
-                    .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(entity)
-                    .is_some()
-                    && world
-                        .get::<bevy_app::Propagate<ComputedUiTargetCamera>>(entity)
-                        .is_none())
-                .then(|| {
-                    world
-                        .components()
-                        .component_id::<bevy_app::Inherited<ComputedUiTargetCamera>>()
-                })
-                .flatten(),
-                (world
-                    .get::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(entity)
-                    .is_some()
-                    && world
-                        .get::<bevy_app::Propagate<ComputedUiRenderTargetInfo>>(entity)
-                        .is_none())
-                .then(|| {
-                    world
-                        .components()
-                        .component_id::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>()
-                })
-                .flatten(),
-            ],
+            prior_presence: presence,
+            expected_presence: Some(std::array::from_fn(|index| {
+                presence[index] && own_source[index]
+            })),
         }
     }
 
-    fn removes(self, component: ComponentId) -> bool {
-        self.removed.contains(&Some(component))
+    fn presence(world: &World, entity: Entity) -> [bool; 2] {
+        [
+            world
+                .get::<bevy_app::Inherited<ComputedUiTargetCamera>>(entity)
+                .is_some(),
+            world
+                .get::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(entity)
+                .is_some(),
+        ]
     }
 
     fn is_applied(self, world: &World, entity: Entity) -> bool {
-        self.removed.iter().flatten().all(|component| {
-            world
-                .get_entity(entity)
-                .is_ok_and(|entity| !entity.contains_id(*component))
+        self.expected_presence.is_none_or(|expected| {
+            world.get_entity(entity).is_ok() && Self::presence(world, entity) == expected
         })
     }
 }
 
 /// A retained Node detached by this cleanup becomes a UI root. The UI plugin
-/// may later add these four derived components. This projection is used only by
+/// may later add these two propagation sources. This projection is used only by
 /// read-only admission; the receipt and every mutation manifest remain exact.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FrozenRetainedUiRootAdditions {
-    component_ids: [Option<ComponentId>; 4],
+    component_ids: [Option<ComponentId>; 2],
 }
 
 impl FrozenRetainedUiRootAdditions {
@@ -1753,13 +1747,7 @@ impl FrozenRetainedUiRootAdditions {
         let mut component_ids = [
             world
                 .components()
-                .component_id::<bevy_app::Inherited<ComputedUiTargetCamera>>(),
-            world
-                .components()
                 .component_id::<bevy_app::Propagate<ComputedUiTargetCamera>>(),
-            world
-                .components()
-                .component_id::<bevy_app::Inherited<ComputedUiRenderTargetInfo>>(),
             world
                 .components()
                 .component_id::<bevy_app::Propagate<ComputedUiRenderTargetInfo>>(),
@@ -6889,13 +6877,7 @@ fn observed_manifest_matches_relationship_projection(
     allow_child_of: bool,
     ui_detachment: DetachedUiInheritance,
 ) -> bool {
-    if !ui_detachment.is_applied(world, entity)
-        || ui_detachment
-            .removed
-            .iter()
-            .flatten()
-            .any(|component| !frozen.component_ids().contains(component))
-    {
+    if !ui_detachment.is_applied(world, entity) {
         return false;
     }
     let Ok(entity) = world.get_entity(entity) else {
@@ -6917,7 +6899,7 @@ fn observed_manifest_matches_relationship_projection(
             .iter()
             .copied()
             .filter(|component| !actual.clone().any(|actual| actual == *component))
-            .all(|component| allowed_relationship(component) || ui_detachment.removes(component))
+            .all(allowed_relationship)
 }
 
 fn manifest_contains_required_allowing_children(
@@ -7208,38 +7190,19 @@ impl PreparedAuthorityHostEdge {
 
     fn project_attempt(&self, attempt: &CleanupAttempt) -> Option<CleanupAttempt> {
         let mut projected = attempt.clone();
-        let Self::Existing {
-            index,
-            detach,
-            ui_detachment,
-            ..
-        } = self
-        else {
+        let Self::Existing { index, detach, .. } = self else {
             return Some(projected);
         };
         if *detach {
-            let (
-                _,
-                CleanupEvidence::Exact {
-                    actual_parent,
-                    normalized_manifest,
-                    ..
-                },
-            ) = projected
-                .evidence
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == *index)?
+            let (_, CleanupEvidence::Exact { actual_parent, .. }) =
+                projected
+                    .evidence
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == *index)?
             else {
                 return None;
             };
             *actual_parent = None;
-            *normalized_manifest = ComponentManifest::new(
-                normalized_manifest
-                    .component_ids()
-                    .iter()
-                    .copied()
-                    .filter(|component| !ui_detachment.removes(*component)),
-            );
         }
         Some(projected)
     }
@@ -15733,7 +15696,6 @@ fn authority_projected_manifest(
     let children = world.components().component_id::<Children>();
     let pickable = world.components().component_id::<Pickable>();
     let removes_host_edge = host_edge.removes_child_of(entity);
-    let ui_detachment = host_edge.ui_detachment_for(entity);
     let retains_children_component = world.get::<Children>(entity).is_some_and(|children| {
         children
             .iter()
@@ -15745,7 +15707,6 @@ fn authority_projected_manifest(
             .iter()
             .copied()
             .filter(|component| !(removes_host_edge && Some(*component) == child_of))
-            .filter(|component| !ui_detachment.removes(*component))
             .filter(|component| Some(*component) != children || retains_children_component)
             .chain(
                 pickable

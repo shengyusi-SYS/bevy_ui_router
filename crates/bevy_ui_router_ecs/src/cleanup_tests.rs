@@ -66,7 +66,9 @@ fn authorized_ui_detachment_accepts_only_frozen_observer_removals() {
     let (mut app, target) = ui_inheritance_detachment_fixture(false, true);
     let before = ComponentManifest::from_world(app.world(), target).unwrap();
     let detachment = DetachedUiInheritance::capture(app.world(), target);
-    assert_eq!(detachment.removed.iter().flatten().count(), 2);
+    assert_eq!(detachment.prior_presence, [true, true]);
+    assert_eq!(detachment.expected_presence, Some([false, false]));
+    assert!(!detachment.is_applied(app.world(), target));
 
     app.world_mut().entity_mut(target).remove::<ChildOf>();
     app.world_mut().flush();
@@ -79,14 +81,14 @@ fn authorized_ui_detachment_accepts_only_frozen_observer_removals() {
         detachment,
     ));
     assert!(
-        !observed_manifest_differs_only_by_allowed_relationships(
+        observed_manifest_differs_only_by_allowed_relationships(
             app.world(),
             target,
             &before,
             false,
             true,
         ),
-        "derived removal must require the frozen authorized detach"
+        "structural projection excludes derived UI facts; the detach snapshot checks them"
     );
 }
 
@@ -95,7 +97,8 @@ fn authorized_ui_detachment_preserves_the_entities_own_propagate_source() {
     let (mut app, target) = ui_inheritance_detachment_fixture(true, true);
     let before = ComponentManifest::from_world(app.world(), target).unwrap();
     let detachment = DetachedUiInheritance::capture(app.world(), target);
-    assert_eq!(detachment.removed.iter().flatten().count(), 1);
+    assert_eq!(detachment.prior_presence, [true, true]);
+    assert_eq!(detachment.expected_presence, Some([true, false]));
 
     app.world_mut().entity_mut(target).remove::<ChildOf>();
     app.world_mut().flush();
@@ -206,14 +209,14 @@ fn retained_ui_root_additions_fixture() -> (
         .id();
     app.update();
     let before = ComponentManifest::from_world(app.world(), target).unwrap();
-    let detachment = DetachedUiInheritance::capture(app.world(), target);
     let child_of = app.world().components().component_id::<ChildOf>();
-    let projected =
-        ComponentManifest::new(
-            before.component_ids().iter().copied().filter(|component| {
-                Some(*component) != child_of && !detachment.removes(*component)
-            }),
-        );
+    let projected = ComponentManifest::new(
+        before
+            .component_ids()
+            .iter()
+            .copied()
+            .filter(|component| Some(*component) != child_of),
+    );
     let additions = FrozenRetainedUiRootAdditions::capture(app.world(), target, &projected);
     app.world_mut().entity_mut(target).remove::<ChildOf>();
     app.world_mut().flush();

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+#[cfg(test)]
 use bevy_app::Inherited;
 use bevy_camera::visibility::Visibility;
 use bevy_color::Color;
@@ -16,9 +17,9 @@ use bevy_picking::{
     events::PointerState,
     hover::{HoverMap, PickingInteraction, PreviousHoverMap},
 };
-use bevy_ui::{
-    BackgroundColor, ComputedNode, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, Val,
-};
+use bevy_ui::{BackgroundColor, ComputedNode, Node, Val};
+#[cfg(test)]
+use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera};
 use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     integration::{
@@ -2602,22 +2603,6 @@ fn realize_frame_with_binding_deferred(
     plan: AcceptedContentPlan,
 ) -> Result<RealizedFrame, DeferredRealizationFailure> {
     let mount_slot = mount.slot();
-    let runtime_components = runtime_ui_component_ids(world);
-    validate_mount_binding_allowing_additions(
-        world,
-        &host_candidate,
-        &mount,
-        &frame,
-        &runtime_components,
-    )
-    .map_err(DeferredRealizationFailure::before_complete_frame)?;
-    synchronize_manifest_allowing_additions(
-        world,
-        mount_slot,
-        mount.slot_claim(),
-        &runtime_components,
-    )
-    .map_err(DeferredRealizationFailure::before_complete_frame)?;
     validate_mount_binding(world, &host_candidate, &mount, &frame)
         .map_err(DeferredRealizationFailure::before_complete_frame)?;
     let mount_manifest_before_children = world
@@ -2630,17 +2615,6 @@ fn realize_frame_with_binding_deferred(
         .get::<Children>(mount_slot)
         .map(|children| children.iter().copied().collect::<Vec<_>>())
         .unwrap_or_default();
-    let inherited_runtime_components = world
-        .resource::<RouteEntityRegistry>()
-        .record(mount_slot)
-        .expect("validated mount slot remains registered")
-        .manifest()
-        .component_ids()
-        .iter()
-        .copied()
-        .filter(|id| runtime_components.contains(id))
-        .collect::<Vec<_>>();
-
     let mut realized = Vec::with_capacity(plan.entries().len() + 2);
     let shell = allocate_registered(
         world,
@@ -2648,7 +2622,6 @@ fn realize_frame_with_binding_deferred(
         RealizedRole::Shell,
         mount_slot,
         true,
-        &inherited_runtime_components,
     )
     .map_err(DeferredRealizationFailure::before_complete_frame)?;
     let shell_entity = shell.entity;
@@ -2661,7 +2634,6 @@ fn realize_frame_with_binding_deferred(
         RealizedRole::ContentTarget,
         shell_entity,
         !plan.roots().is_empty(),
-        &inherited_runtime_components,
     ) {
         Ok(content_target) => content_target,
         Err(error) => {
@@ -2704,28 +2676,21 @@ fn realize_frame_with_binding_deferred(
             .relationships()
             .iter()
             .any(|(parent, _)| *parent == entry.local_index());
-        let mut registered = match register_allocated(
-            world,
-            entity,
-            owner,
-            role,
-            parent,
-            has_children,
-            &inherited_runtime_components,
-        ) {
-            Ok(registered) => registered,
-            Err(error) => {
-                let residual = partial_realized_frame(
-                    frame,
-                    host_candidate,
-                    mount,
-                    mount_children_before,
-                    shell_entity,
-                    realized,
-                );
-                return Err(DeferredRealizationFailure::with_residual(error, residual));
-            }
-        };
+        let mut registered =
+            match register_allocated(world, entity, owner, role, parent, has_children) {
+                Ok(registered) => registered,
+                Err(error) => {
+                    let residual = partial_realized_frame(
+                        frame,
+                        host_candidate,
+                        mount,
+                        mount_children_before,
+                        shell_entity,
+                        realized,
+                    );
+                    return Err(DeferredRealizationFailure::with_residual(error, residual));
+                }
+            };
         registered.solid_rect = match entry.kind() {
             RealizedContentKind::SolidRect(rect) => Some(rect),
             RealizedContentKind::Empty => None,
@@ -3155,18 +3120,9 @@ fn allocate_registered(
     role: RealizedRole,
     parent: Entity,
     has_children: bool,
-    runtime_components: &[ComponentId],
 ) -> Result<RealizedEntity, RealizationError> {
     let entity = world.spawn_empty().id();
-    register_allocated(
-        world,
-        entity,
-        owner,
-        role,
-        parent,
-        has_children,
-        runtime_components,
-    )
+    register_allocated(world, entity, owner, role, parent, has_children)
 }
 
 fn register_allocated(
@@ -3176,9 +3132,8 @@ fn register_allocated(
     role: RealizedRole,
     parent: Entity,
     has_children: bool,
-    runtime_components: &[ComponentId],
 ) -> Result<RealizedEntity, RealizationError> {
-    let manifest = realization_manifest(world, role, has_children, runtime_components);
+    let manifest = realization_manifest(world, role, has_children);
     let claim = {
         let mut registry = world.resource_mut::<RouteEntityRegistry>();
         match registry.register(entity, owner, manifest, EntityLifecycle::PreparedInert) {
@@ -3299,7 +3254,6 @@ fn realization_manifest(
     world: &mut World,
     role: RealizedRole,
     has_children: bool,
-    runtime_components: &[ComponentId],
 ) -> ComponentManifest {
     let mut explicit = vec![
         world.register_component::<Node>(),
@@ -3322,16 +3276,16 @@ fn realization_manifest(
     if has_children {
         explicit.push(world.register_component::<Children>());
     }
-    explicit.extend(runtime_components.iter().copied());
     let mut complete = explicit.clone();
     for component in explicit {
         if let Some(required) = world.get_required_components_by_id(component) {
             complete.extend(required.iter_ids());
         }
     }
-    ComponentManifest::new(complete)
+    ComponentManifest::new(ComponentManifest::observed_component_ids(world, &complete))
 }
 
+#[cfg(test)]
 fn runtime_ui_component_ids(world: &mut World) -> [ComponentId; 2] {
     [
         world.register_component::<Inherited<ComputedUiTargetCamera>>(),
@@ -3440,7 +3394,8 @@ fn assert_manifest_is_exact(world: &World, entity: Entity, explicit: Vec<Compone
         "locked Bevy archetype drifted for {entity:?}"
     );
     assert_eq!(
-        registry, expected,
+        registry,
+        ComponentManifest::observed_component_ids(world, &expected).collect::<Vec<_>>(),
         "registry manifest drifted for {entity:?}"
     );
 }
