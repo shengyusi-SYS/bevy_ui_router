@@ -151,6 +151,8 @@ python3 scripts/check-packaged-consumer.py
 
 `cargo package` 生成并验证六个库包。[打包 consumer](../../scripts/check-packaged-consumer.py) 解压这些 `.crate`，把 Router 依赖指向解压目录，核对实际包来源后运行包内 BSN 应用；Bevy 按 `0.19` 兼容范围独立解析。脚本刷新解压源码的时间戳，使共享 target 重新编译本次包内容，继续复用 registry 依赖缓存。
 
+保留上述联网打包命令。Cargo `1.98.1` 和 `1.99.0-nightly (eb98b54bc)` 的 `package --workspace --offline` 已在无外部依赖的双 crate 工程中复现临时 registry 的 `no hash listed` 错误，索引内校验和存在且与包一致；同一 nightly 去掉 `--offline` 后，最小工程及本项目六包内置校验通过。相关上游症状见 [Cargo #14396](https://github.com/rust-lang/cargo/issues/14396)，具体内部触发分支尚未确认。严格离线时，`--no-verify` 生成包再运行打包 consumer 是独立产物验证，不能记作 Cargo 内置校验通过。
+
 检查未提交改动时，先审阅 diff，再显式使用 `cargo package --workspace --allow-dirty` 并记录源码状态。包列表可用 `cargo package -p bevy_ui_router --list` 查看；逐包核对 README、源码、示例和测试所需文件，再运行上面的真实打包检查。
 
 ## 已有证据与未验证范围

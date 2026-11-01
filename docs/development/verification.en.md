@@ -151,6 +151,8 @@ python3 scripts/check-packaged-consumer.py
 
 `cargo package` creates and verifies the six library packages. The [packaged consumer](../../scripts/check-packaged-consumer.py) extracts these `.crate` archives, points Router dependencies to the extracted directories, checks their actual sources, and runs the BSN application included in the package. Bevy resolves independently within the `0.19` compatibility range. The script refreshes extracted source timestamps so a shared target recompiles the current package contents while retaining the registry dependency cache.
 
+Keep the online packaging command above. Cargo `1.98.1` and `1.99.0-nightly (eb98b54bc)` reproduce a temporary-registry `no hash listed` error with `package --workspace --offline` in a two-crate workspace with no external dependencies, even though the index checksum exists and matches the archive. With the same nightly, removing `--offline` passes built-in verification for both that fixture and this project's six packages. See [Cargo #14396](https://github.com/rust-lang/cargo/issues/14396) for a related upstream symptom; the exact internal trigger remains unconfirmed. When strictly offline, generating archives with `--no-verify` and running the packaged consumer provides independent artifact validation, not a passing Cargo built-in verification.
+
 To check uncommitted changes, review the diff, explicitly use `cargo package --workspace --allow-dirty`, and record the source state. Inspect a package's file list with `cargo package -p bevy_ui_router --list`. Review each package's README, source, examples, and required test files, then run the full package checks above.
 
 ## Existing evidence and remaining coverage
