@@ -389,7 +389,7 @@ pub(super) fn commit_projectionless_branch(
 pub(super) fn prepare_projectionless_branch(
     world: &mut World,
     entry: &mut RouterEntry,
-    mut pending: PendingCommit,
+    pending: PendingCommit,
     work: &mut Option<ProjectionlessPublicationWork>,
 ) -> Result<(), PendingCommit> {
     if pending.ticket.is_some()

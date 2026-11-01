@@ -21,6 +21,10 @@ pub(crate) struct NativeFrameContent {
     pub(crate) root: Entity,
     pub(crate) focus_owner: Option<crate::native_focus::NativeFocusOwner>,
     // Retain resolve dependencies through apply and unfinished physical settlement.
+    #[allow(
+        dead_code,
+        reason = "Strong asset handles keep resolved dependencies alive while the frame exists."
+    )]
     dependencies: Vec<UntypedHandle>,
     cleanup: Option<NativeCleanupPreparation>,
 }
@@ -35,13 +39,37 @@ struct NativeCleanupPreparation {
 #[derive(Clone, Debug)]
 pub(crate) enum NativeCleanupPreparationError {
     Capacity {
+        #[allow(
+            dead_code,
+            reason = "Retains native cleanup evidence for error diagnostics and settlement."
+        )]
         requested: usize,
     },
+    #[allow(
+        dead_code,
+        reason = "Retains native cleanup evidence for error diagnostics and settlement."
+    )]
     Content(crate::frame_local::FrameLocalError),
+    #[allow(
+        dead_code,
+        reason = "Retains native cleanup evidence for error diagnostics and settlement."
+    )]
     MissingEntity(Entity),
     Projection {
+        #[allow(
+            dead_code,
+            reason = "Retains native cleanup evidence for error diagnostics and settlement."
+        )]
         root: Entity,
+        #[allow(
+            dead_code,
+            reason = "Retains native cleanup evidence for error diagnostics and settlement."
+        )]
         expected: Vec<(Entity, Option<Entity>, Vec<Entity>)>,
+        #[allow(
+            dead_code,
+            reason = "Retains native cleanup evidence for error diagnostics and settlement."
+        )]
         observed: Vec<(Entity, Option<Entity>, Vec<Entity>)>,
     },
 }
@@ -480,34 +508,6 @@ pub(crate) fn realize_native_root(
 ) -> Result<RealizedFrame, NativeFrameFailure> {
     let mount = FrameMountBinding::host_top(top_slot, top_slot_claim, host_candidate.host());
     realize_native_with_mount(world, host_candidate, mount, frame, prepared)
-}
-
-pub(crate) fn realize_native_child(
-    world: &mut World,
-    parent: &RealizedFrame,
-    mounted: &MountedChildSlot,
-    task: &FrameTask,
-    prepared: crate::bsn::PreparedBsnScene,
-) -> Result<RealizedFrame, NativeFrameFailure> {
-    if !matches!(task.mount_target(), FrameMountTarget::ChildOutlet { parent: task_parent, outlet } if task_parent == *parent.frame() && outlet == *mounted.outlet())
-        || parent.frame() != mounted.parent()
-        || task.frame().slot() != mounted.slot_id()
-        || parent.outlet(mounted.outlet()).is_none_or(|outlet| {
-            outlet.anchor() != mounted.anchor() || outlet.anchor_claim() != mounted.anchor_claim()
-        })
-    {
-        return Err(NativeFrameFailure::before_mount(
-            RealizationError::InvalidMount,
-            prepared,
-        ));
-    }
-    realize_native_with_mount(
-        world,
-        parent.host_candidate.clone(),
-        FrameMountBinding::from_mounted_child_slot(mounted),
-        task.frame().clone(),
-        prepared,
-    )
 }
 
 pub(crate) fn realize_native_reconciliation_child(

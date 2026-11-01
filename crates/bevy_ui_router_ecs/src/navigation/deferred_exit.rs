@@ -31,6 +31,10 @@ pub(super) struct DeferredExit {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Deferred exit failures retain their exact source and original failure chain for authority settlement"
+)]
 pub(super) enum DeferredExitFailure {
     HostAuthority,
     MissingResources(RequiredResourceSet),
@@ -59,6 +63,10 @@ pub(super) enum DeferredExitFailure {
 /// release. The coordinator routes AuthorityRequired outcomes to the original
 /// deferred authority holder; successful exits have entered ordinary cleanup.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The stored adapter settlement keeps the originating projection and all per-router outcomes"
+)]
 pub(crate) struct NativeUiProjectionFailureSettlement {
     pub(crate) projection: Arc<NativeUiInputProjectionFailure>,
     pub(crate) outcomes: Vec<(RouterHandle, DeferredExitDrive)>,

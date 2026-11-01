@@ -29,6 +29,10 @@ pub(super) struct ProtocolResidual {
     pub(super) invalidation: Vec<RetainedInvalidationEvidence>,
 }
 
+#[allow(
+    dead_code,
+    reason = "The rejected retained attempt keeps its exact lifecycle failure rather than retrying it"
+)]
 pub(super) enum Rejection {
     PhysicalSource,
     AuthorityLost(RetainedInvalidationEvidence),

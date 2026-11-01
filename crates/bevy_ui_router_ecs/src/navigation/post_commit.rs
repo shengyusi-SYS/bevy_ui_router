@@ -30,11 +30,19 @@ enum RetiredHostEdgePhysicalTerminal {
     EdgeAlreadyAbsent,
 }
 
+#[allow(
+    dead_code,
+    reason = "Physical settlement proofs remain owned through Core completion and host retirement"
+)]
 struct RetiredHostEdgePhysicalProof {
     terminal: RetiredHostEdgePhysicalTerminal,
     binding: u64,
 }
 
+#[allow(
+    dead_code,
+    reason = "Physical settlement proofs remain owned through Core completion and host retirement"
+)]
 enum PostCommitAnyPhysicalProof {
     Cleanup(PostCommitPhysicalSettlementProof),
     HostEdge(RetiredHostEdgePhysicalProof),
@@ -75,6 +83,10 @@ pub(super) struct ActivePostCommitCompoundOwner {
     physical: PostCommitCompoundPhysicalOwner,
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) struct PostCommitSettlementRecordInert {
     attempt: bevy_ui_router_core::integration::TrustedPostCommitSettlementAttempt,
     proof: PostCommitAnyPhysicalProof,
@@ -89,6 +101,10 @@ pub(super) enum RetiredHostEdgeFreezePermanentEvidence {
     RelationshipCycle,
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) enum PostCommitPreAcceptInertEvidence {
     ReceiptObservationMismatch,
     Original(PostCommitOriginalFreezePermanentEvidence),
@@ -106,6 +122,10 @@ pub(super) enum PostCommitPreAcceptInertEvidence {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) struct PostCommitPreAcceptPhysicalOwner {
     original: CleanupLedger,
     original_freeze: Option<FrozenOriginalCleanupLedgerTransfer>,
@@ -113,6 +133,10 @@ pub(super) struct PostCommitPreAcceptPhysicalOwner {
     edge: Option<FrozenRetiredHostEdge>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) enum PostCommitCompoundHolder {
     DeferredExitAccepted(Box<Option<super::deferred_exit_authority::AcceptedExit>>),
     DeferredExitRejected {
@@ -164,6 +188,10 @@ pub(super) enum PostCommitCompoundHolder {
     Inert(ActivePostCommitCompoundOwner),
 }
 
+#[allow(
+    dead_code,
+    reason = "Physical settlement proofs remain owned through Core completion and host retirement"
+)]
 pub(super) struct SettledRetiredHostEvidence {
     host: RetiredHostBinding,
     edge: FrozenRetiredHostEdge,
@@ -474,12 +502,20 @@ fn bind_post_commit_settlement_plan(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) enum PostCommitPlanBindFailure {
     Plan(PostCommitSettlementPlanMismatchEvidence),
     Authority(crate::cleanup::PreparedAuthorityLedgerBindingMismatch),
     Isolation(PostCommitInputIsolationFailure),
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) enum PostCommitAcceptedInertEvidence {
     Receiver(PostCommitReceiverMismatchView),
     Retained(IntegrationError),
@@ -493,6 +529,10 @@ impl PostCommitAcceptedInertEvidence {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-commit rejection retains the original cleanup owners and exact failure evidence"
+)]
 pub(super) enum PostCommitBoundInertEvidence {
     Binding(PostCommitPlanBindFailure),
     Receiver(PostCommitReceiverMismatchView),

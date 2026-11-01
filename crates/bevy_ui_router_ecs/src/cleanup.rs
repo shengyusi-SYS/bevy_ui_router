@@ -556,7 +556,7 @@ fn apply_authority_residual_postwrite_drift(_world: &mut World) {}
 
 fn allocate_ledger_domain(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1).filter(|_| current != 0)
         })
         .ok()
@@ -798,6 +798,10 @@ struct FrozenCleanupQuarantineDetachment {
 struct CleanupQuarantineDetachmentMergeConflict {
     existing: FrozenCleanupQuarantineDetachment,
     newer: FrozenCleanupQuarantineDetachment,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     kind: CleanupQuarantineDetachmentMergeConflictKind,
 }
 
@@ -839,7 +843,15 @@ fn detachment_edges_intrinsic_conflict(
 #[derive(Debug)]
 struct FrozenCleanupMountParentDrift {
     expected: CleanupMountParentSettlement,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     observed_parent: FrozenFailureCleanupObservedEntity,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     observed_removed_child: FrozenFailureCleanupObservedEntity,
 }
 
@@ -851,6 +863,10 @@ enum CleanupSettlementPermanentCause {
     },
     DetachmentState {
         expected: FrozenCleanupQuarantineDetachment,
+        #[allow(
+            dead_code,
+            reason = "Retains exact cleanup failure evidence and ownership until settlement."
+        )]
         consumed_projection_matches: bool,
         unconsumed_mount_parent_drifts: Vec<FrozenCleanupMountParentDrift>,
     },
@@ -863,6 +879,10 @@ pub(crate) struct CleanupSettlementPermanentEvidence {
     manifest_digest: u64,
     obligation_count: usize,
     cause: Box<CleanupSettlementPermanentCause>,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     observed: Vec<FrozenFailureCleanupObservedEntity>,
 }
 
@@ -1268,49 +1288,6 @@ impl FrozenCleanupQuarantineDetachment {
         self.edges.append(&mut newer.edges);
     }
 
-    fn matches_exact(&self, world: &World) -> bool {
-        let registry = world.resource::<RouteEntityRegistry>();
-        self.protected_after.iter().all(|expected| {
-            match self
-                .edges
-                .iter()
-                .find(|edge| edge.parent.physical == expected.entity)
-            {
-                Some(edge) => expected.matches_projection(
-                    world,
-                    &registry,
-                    expected.parent,
-                    &edge.parent.children_after,
-                    !edge.parent.children_after.is_empty(),
-                    edge.parent
-                        .bookkeeping_claim()
-                        .map(|_| &edge.parent_next_manifest),
-                    edge.parent_physical_manifest_after
-                        .matches_without_materialization(world, expected.entity),
-                ),
-                None => expected.matches_exact(world, &registry),
-            }
-        }) && self.targets_after.iter().all(|expected| {
-            match self
-                .edges
-                .iter()
-                .find(|edge| edge.child_claim.entity() == expected.entity)
-            {
-                Some(edge) => expected.matches_projection(
-                    world,
-                    &registry,
-                    None,
-                    &expected.children,
-                    expected.children_component_present,
-                    expected.registry_manifest.as_ref(),
-                    edge.child_manifest_after
-                        .matches_without_materialization(world, expected.entity),
-                ),
-                None => expected.matches_exact(world, &registry),
-            }
-        })
-    }
-
     fn matches(&self, world: &World) -> bool {
         let registry = world.resource::<RouteEntityRegistry>();
         self.edges.iter().all(|edge| {
@@ -1548,10 +1525,12 @@ impl FrozenFailureCleanupObservedEntity {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_present(&self) -> bool {
         self.present
     }
 
+    #[cfg(test)]
     pub(crate) const fn registry_claim(&self) -> Option<&ExactRegistryClaim> {
         self.registry_claim.as_ref()
     }
@@ -1865,6 +1844,10 @@ pub(crate) struct IdleHostRetainedAdmissionEvidence {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Debug includes every observed fact in the admission evidence digest."
+)]
 struct IdleHostRetainedTargetObservation {
     entity: FrozenBackNoTargetAuthorityEntity,
     visibility: Option<Visibility>,
@@ -2591,6 +2574,7 @@ impl FailedBoundaryExpectation {
     }
 }
 
+#[cfg(feature = "bsn")]
 fn observe_failed_outlet_binding(
     world: &World,
     registry: &RouteEntityRegistry,
@@ -2830,6 +2814,7 @@ impl FrozenCleanupManifest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_frame(
         world: &World,
         registry: &RouteEntityRegistry,
@@ -2854,6 +2839,7 @@ impl FrozenCleanupManifest {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_current_frame(
         world: &World,
         registry: &RouteEntityRegistry,
@@ -3333,6 +3319,7 @@ impl FrozenCleanupManifest {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_authority_settlement(
         world: &World,
         registry: &RouteEntityRegistry,
@@ -3938,6 +3925,7 @@ pub(crate) fn failed_prepared_rejected_topology_facts_for_test(
 }
 
 impl<'a> FailedPreparedTopology<'a> {
+    #[cfg(test)]
     fn build(
         world: &World,
         registry: &RouteEntityRegistry,
@@ -6939,6 +6927,7 @@ fn mount_slot_values_match(world: &World, entity: Entity, visibility: Visibility
             .is_some_and(RouterInputBarrier::denies_all)
 }
 
+#[cfg(test)]
 fn mounted_slot_obligation(
     _world: &World,
     registry: &RouteEntityRegistry,
@@ -7647,6 +7636,7 @@ impl PreparedCleanupLedgerProjection {
         self.obligation_count
     }
 
+    #[cfg(test)]
     pub(crate) const fn receipt_count(self) -> usize {
         self.receipt_count
     }
@@ -7887,6 +7877,10 @@ impl PreparedCleanupLedger {
 }
 
 enum CleanupStopReason {
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     Refreeze(FailureCleanupSettlementRefreezeEvidence),
     Settlement(CleanupSettlementPermanentEvidence),
     AttemptRevisionExhausted,
@@ -8855,10 +8849,12 @@ pub(crate) struct BackNoTargetZeroCompletionSourceIdentity {
 }
 
 impl BackNoTargetZeroCompletionSourceIdentity {
+    #[cfg(test)]
     pub(crate) const fn ledger_domain(self) -> u64 {
         self.ledger_domain
     }
 
+    #[cfg(test)]
     pub(crate) const fn capacity(self) -> BackNoTargetInstalledCapacitySource {
         self.capacity
     }
@@ -8929,10 +8925,12 @@ pub(crate) struct BackNoTargetZeroCompletionObservedFacts {
 }
 
 impl BackNoTargetZeroCompletionObservedFacts {
+    #[cfg(test)]
     pub(crate) const fn dedicated_batch(self) -> BackNoTargetDedicatedBatchObservation {
         self.dedicated_batch
     }
 
+    #[cfg(test)]
     pub(crate) const fn completion_digest(self) -> Option<u64> {
         self.completion_digest
     }
@@ -8946,14 +8944,17 @@ pub(crate) struct BackNoTargetZeroCompletionPreparationEvidence {
 }
 
 impl BackNoTargetZeroCompletionPreparationEvidence {
+    #[cfg(test)]
     pub(crate) const fn source_identity(self) -> BackNoTargetZeroCompletionSourceIdentity {
         self.source
     }
 
+    #[cfg(test)]
     pub(crate) const fn expected(self) -> BackNoTargetZeroCompletionFacts {
         self.expected
     }
 
+    #[cfg(test)]
     pub(crate) const fn observed(self) -> BackNoTargetZeroCompletionObservedFacts {
         self.observed
     }
@@ -8996,6 +8997,7 @@ pub(crate) struct BackNoTargetZeroCompletionPreparationFailure {
 }
 
 impl BackNoTargetZeroCompletionPreparationFailure {
+    #[cfg(test)]
     pub(crate) const fn evidence(&self) -> BackNoTargetZeroCompletionPreparationEvidence {
         self.evidence
     }
@@ -9136,7 +9138,9 @@ impl PreparedLeavingAssembly {
                 return None;
             }
         }
-        let mut contained_sources: Vec<(Entity, Entity)> = Vec::new();
+        let contained_sources: Vec<(Entity, Entity)> = Vec::new();
+        #[cfg(feature = "bsn")]
+        let mut contained_sources = contained_sources;
         #[cfg(feature = "bsn")]
         for frame in frames {
             let targets = crate::presentation::native_frame::contained_cleanup_targets(frame);
@@ -9260,7 +9264,15 @@ pub(crate) enum CleanupOwner {
 }
 
 pub(crate) struct IdleHostAuthorityCleanupOwner {
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     active: Option<RealizedBranch>,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     retained: Vec<crate::instance::InstancePayload>,
     pub(crate) host: RetiredHostBinding,
 }
@@ -9288,9 +9300,25 @@ pub(crate) enum AuthorityCleanupFailureKind {
 #[derive(Debug)]
 pub(crate) struct AuthorityCleanupFailure {
     pub(crate) kind: AuthorityCleanupFailureKind,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     expected: Option<CleanupAttempt>,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     observed: Vec<(usize, CleanupEvidence)>,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     manifest_digest: u64,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     obligation_count: usize,
 }
 
@@ -9371,6 +9399,10 @@ impl IdleHostResidualObservation {
 
 pub(crate) struct FailedPreparedCleanupOwner {
     branch: FailedPreparedBranch,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     preflight: Option<LifecyclePreflightEvidence>,
 }
 
@@ -9391,7 +9423,15 @@ pub(crate) struct CompletedFailedPreparedOwner {
 }
 
 pub(crate) struct AuthoritySettlementOwner {
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     active: Option<RealizedBranch>,
+    #[allow(
+        dead_code,
+        reason = "Retains exact cleanup failure evidence and ownership until settlement."
+    )]
     retained: Vec<crate::instance::InstancePayload>,
     pending: AuthoritySettlementPendingOwner,
     host: RetiredHostBinding,
@@ -9470,14 +9510,6 @@ impl PreparedBackNoTargetAuthorityCleanupLedger {
 }
 
 impl BackNoTargetAuthorityCleanupOwner {
-    pub(crate) fn active(&self) -> &RealizedBranch {
-        &self.active
-    }
-
-    pub(crate) fn host(&self) -> &RetiredHostBinding {
-        &self.host
-    }
-
     pub(crate) fn into_parts(self) -> (RealizedBranch, RetiredHostBinding) {
         (self.active, self.host)
     }
@@ -9689,23 +9721,6 @@ impl CleanupLedger {
         })
     }
 
-    pub(crate) fn activate_idle_host_authority(
-        prepared: PreparedCleanupLedger,
-        active: Option<RealizedBranch>,
-        host: RetiredHostBinding,
-        host_children: Vec<Entity>,
-        partition: FrozenBackNoTargetAuthorityPartition,
-    ) -> Self {
-        Self::activate_idle_host_authority_with_retained(
-            prepared,
-            active,
-            host,
-            host_children,
-            partition,
-            Vec::new(),
-        )
-    }
-
     pub(crate) fn activate_idle_host_authority_with_retained(
         prepared: PreparedCleanupLedger,
         active: Option<RealizedBranch>,
@@ -9882,6 +9897,7 @@ impl CleanupLedger {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn activate_failed(
         prepared: PreparedCleanupLedger,
         failed: FailedPreparedBranch,
@@ -9919,23 +9935,6 @@ impl CleanupLedger {
     ) -> Self {
         let owner = (!leaving.is_empty()).then_some(CleanupOwner::Leaving(leaving));
         Self::activate_owner(prepared, owner)
-    }
-
-    pub(crate) fn activate_authority_settlement(
-        prepared: PreparedCleanupLedger,
-        active: RealizedBranch,
-        pending: FailedPreparedBranch,
-        host: RetiredHostBinding,
-        host_children: Vec<Entity>,
-    ) -> Self {
-        Self::activate_authority_settlement_with_retained(
-            prepared,
-            active,
-            pending,
-            host,
-            host_children,
-            Vec::new(),
-        )
     }
 
     pub(crate) fn activate_authority_settlement_with_retained(
@@ -10452,6 +10451,7 @@ impl CleanupLedger {
             )
     }
 
+    #[cfg(test)]
     pub(crate) fn cleanup_settlement_permanent_evidence(
         &self,
     ) -> Option<&CleanupSettlementPermanentEvidence> {
@@ -15891,6 +15891,7 @@ fn focus_is_released(world: &World, closure: &[Entity]) -> bool {
             .is_none_or(|focused| !closure.contains(&focused))
 }
 
+#[cfg(test)]
 fn manifest_digest(obligations: &[CleanupObligation]) -> u64 {
     frozen_manifest_digest(obligations, &[])
 }

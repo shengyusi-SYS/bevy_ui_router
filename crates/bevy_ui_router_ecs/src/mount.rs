@@ -13,9 +13,9 @@ use bevy_ui_router_core::{
     frame::RouteFrameVersion,
     ids::RouteSlotId,
     integration::{
-        FailureCleanupPrepareOutcome, FailureCleanupRequest, IntegrationError, MountGrant,
-        MountReceiptProof, MountRegistrationBeginError, MountRegistrationPermit,
-        MountRegistrationSession, RouterEngine, mount_grant_matches_target,
+        FailureCleanupRequest, IntegrationError, MountGrant, MountReceiptProof,
+        MountRegistrationBeginError, MountRegistrationPermit, MountRegistrationSession,
+        RouterEngine, mount_grant_matches_target,
     },
     slot::RouteSlotKey,
 };
@@ -399,11 +399,16 @@ impl ChildSlotResidual {
 
 #[derive(Debug)]
 pub(crate) struct ChildSlotStageFailure {
+    #[allow(
+        dead_code,
+        reason = "Preserves the precise stage failure in Debug diagnostics."
+    )]
     kind: ChildSlotStageErrorKind,
     residual: Option<ChildSlotResidual>,
 }
 
 impl ChildSlotStageFailure {
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> ChildSlotStageErrorKind {
         self.kind
     }
@@ -452,6 +457,7 @@ impl std::fmt::Debug for ChildSlotConfirmationFailure {
 }
 
 impl ChildSlotConfirmationFailure {
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> ChildSlotConfirmationErrorKind {
         self.kind
     }

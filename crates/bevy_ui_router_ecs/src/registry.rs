@@ -138,7 +138,7 @@ const fn unresolved_preparation_fault_injected() -> bool {
 
 fn allocate_registry_domain(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1).filter(|_| current != 0)
         })
         .ok()

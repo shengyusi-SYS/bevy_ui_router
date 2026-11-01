@@ -114,7 +114,7 @@ struct ContentSession(u64);
 
 fn allocate_content_session(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1).filter(|_| current != 0)
         })
         .ok()

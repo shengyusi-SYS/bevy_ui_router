@@ -905,7 +905,6 @@ pub(crate) enum EnqueueRejected {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackCapacityRetireDisposition {
     Target,
-    Contradiction,
     AuthorityLost,
     Permanent,
 }
@@ -918,7 +917,15 @@ pub(crate) enum BackCapacityRetireError {
 }
 
 enum BackCapacityRetirementReason {
+    #[allow(
+        dead_code,
+        reason = "Retains the original owner and retirement evidence through failure settlement."
+    )]
     EnqueueRejected(EnqueueRejected),
+    #[allow(
+        dead_code,
+        reason = "Retains the original owner and retirement evidence through failure settlement."
+    )]
     Bound(BackCapacityRetireDisposition),
 }
 
@@ -997,6 +1004,10 @@ enum BackCapacityCommitTransition<'issuer> {
 
 pub(crate) struct ExactBackCapacityCommitGuard<'issuer, 'owner, Owner: ?Sized> {
     transition: BackCapacityCommitTransition<'issuer>,
+    #[allow(
+        dead_code,
+        reason = "Retains the original owner and retirement evidence through failure settlement."
+    )]
     owner: &'owner Owner,
 }
 
@@ -1136,8 +1147,20 @@ pub(crate) struct EcsCleanupCapacityReservation {
 }
 
 pub(crate) struct BackCapacityEnqueueRetireResidual {
+    #[allow(
+        dead_code,
+        reason = "Retains the original owner and retirement evidence through failure settlement."
+    )]
     pub(crate) owner: EcsCleanupCapacityReservation,
+    #[allow(
+        dead_code,
+        reason = "Retains the original owner and retirement evidence through failure settlement."
+    )]
     pub(crate) rejection: EnqueueRejected,
+    #[allow(
+        dead_code,
+        reason = "Retains the original owner and retirement evidence through failure settlement."
+    )]
     pub(crate) retire_error: BackCapacityRetireError,
 }
 

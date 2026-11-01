@@ -477,6 +477,7 @@ pub(crate) struct CoreNormalCleanupCompletionFacts {
 }
 
 impl CoreNormalCleanupCompletionFacts {
+    #[cfg(test)]
     pub(crate) const fn new(
         batch: CleanupBatchProjection,
         manifest_digest: CleanupManifestDigest,
@@ -500,6 +501,7 @@ pub(crate) struct CoreAuthorityCleanupCompletionFacts {
 }
 
 impl CoreAuthorityCleanupCompletionFacts {
+    #[cfg(test)]
     pub(crate) const fn new(
         batch: CleanupBatchProjection,
         completion_digest: CleanupCompletionDigest,
@@ -520,6 +522,7 @@ pub(crate) struct CoreRetiredHostEdgeCompletionFacts {
 }
 
 impl CoreRetiredHostEdgeCompletionFacts {
+    #[cfg(test)]
     pub(crate) const fn new(
         expected: CoreRetiredHostAuthorityExpectedProjection,
         physical_digest: u64,
@@ -1323,6 +1326,7 @@ pub(crate) struct PostCommitCompoundCompletionInputs {
 }
 
 impl PostCommitCompoundCompletionInputs {
+    #[cfg(test)]
     pub(crate) const fn new(
         normal: CleanupCompletion,
         normal_facts: CoreNormalCleanupCompletionFacts,

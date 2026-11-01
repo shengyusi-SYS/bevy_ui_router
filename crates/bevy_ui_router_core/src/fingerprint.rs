@@ -166,6 +166,10 @@ impl RouteBranchFingerprint {
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RouteBranchProvenance(String);
 
+#[allow(
+    deprecated,
+    reason = "Keep standalone Core compatible with toolchains before Atomic::try_update stabilized in Rust 1.95."
+)]
 fn allocate_tree_source(counter: &AtomicU64) -> Option<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

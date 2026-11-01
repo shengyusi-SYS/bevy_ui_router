@@ -17,7 +17,9 @@ use bevy_picking::{
     events::PointerState,
     hover::{HoverMap, PickingInteraction, PreviousHoverMap},
 };
-use bevy_ui::{BackgroundColor, ComputedNode, Node, Val};
+#[cfg(feature = "bsn")]
+use bevy_ui::ComputedNode;
+use bevy_ui::{BackgroundColor, Node, Val};
 #[cfg(test)]
 use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera};
 use bevy_ui_router_core::{
@@ -132,7 +134,7 @@ impl OutletBinding {
         &self,
         world: &World,
         parent: &RouteFrameVersion,
-        require_outlet: bool,
+        _require_outlet: bool,
         allow_additions: bool,
     ) -> bool {
         match self {
@@ -147,8 +149,8 @@ impl OutletBinding {
                 .and_then(|registry| registry.record(root.entity()))
                 .is_some_and(|record| record.claim() == *root)
                 && native_frame::collect_content(world, parent, root.entity()).is_ok_and(|content| content.contains(anchor)
-                    && (!require_outlet || content.iter().filter(|entity| world.get::<bevy_ui_router_bsn::DefaultOutlet>(**entity).is_some()).count() == 1))
-                && (!require_outlet || world.get::<Node>(*anchor).is_some()
+                    && (!_require_outlet || content.iter().filter(|entity| world.get::<bevy_ui_router_bsn::DefaultOutlet>(**entity).is_some()).count() == 1))
+                && (!_require_outlet || world.get::<Node>(*anchor).is_some()
                     && world.get::<bevy_ui_router_bsn::DefaultOutlet>(*anchor).is_some()),
         }
     }
@@ -1429,9 +1431,6 @@ impl PreparedRetainedFrameActivation {
     pub(crate) const fn mount(&self) -> &FrameMountBinding {
         &self.mount
     }
-    pub(crate) fn matches_frame(&self, frame: &RealizedFrame) -> bool {
-        self.mount == frame.mount && self.prior_mount_children == frame.prior_mount_children
-    }
 }
 
 pub(crate) struct PreparedFrameMountRebase {
@@ -2515,6 +2514,7 @@ pub(crate) fn realize_frame_deferred(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn realize_child_frame_deferred(
     world: &mut World,
     parent: &RealizedFrame,
@@ -3400,6 +3400,7 @@ fn assert_manifest_is_exact(world: &World, entity: Entity, explicit: Vec<Compone
     );
 }
 
+#[cfg(feature = "bsn")]
 fn synchronize_manifest_allowing_additions(
     world: &mut World,
     entity: Entity,
@@ -3436,6 +3437,7 @@ fn synchronize_manifest_allowing_additions(
         .ok_or(RealizationError::PostWriteDrift)
 }
 
+#[cfg(test)]
 fn synchronize_manifest_allowing(
     world: &mut World,
     entity: Entity,

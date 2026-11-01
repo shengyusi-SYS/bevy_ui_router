@@ -201,18 +201,6 @@ impl RouteFrameIdentity {
     pub const fn generation(&self) -> RouteGeneration {
         self.generation
     }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn with_next_generation(&self) -> Self {
-        Self::new(
-            self.router,
-            self.host,
-            self.slot,
-            self.route,
-            self.frame,
-            self.generation.next(),
-        )
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,13 +254,6 @@ impl RouteFrameRecord {
     pub(crate) fn with_status(&self, status: RouteFrameStatus) -> Self {
         let mut next = self.clone();
         next.status = status;
-        next
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn with_next_generation(&self) -> Self {
-        let mut next = self.clone();
-        next.identity = self.identity.with_next_generation();
         next
     }
 }
@@ -360,17 +341,6 @@ impl ActiveFrameBaseline {
             branch_index: record.branch_index(),
         }
     }
-
-    fn matches_record(&self, record: &RouteFrameRecord) -> bool {
-        let identity = record.identity();
-        self.identity.router() == identity.router()
-            && self.identity.host() == identity.host()
-            && self.identity.slot() == identity.slot()
-            && self.identity.route() == identity.route()
-            && self.identity.frame() == identity.frame()
-            && self.identity.generation() == identity.generation()
-            && self.branch_index == record.branch_index()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -389,16 +359,6 @@ impl ActiveBranchBaseline {
                 .map(ActiveFrameBaseline::from_record)
                 .collect(),
         }
-    }
-
-    fn matches_branch(&self, branch: &RouteFrameBranch) -> bool {
-        self.branch_fingerprint == *branch.branch_fingerprint()
-            && self.frames.len() == branch.frames().len()
-            && self
-                .frames
-                .iter()
-                .zip(branch.frames())
-                .all(|(baseline, current)| baseline.matches_record(current))
     }
 
     pub(crate) const fn branch_fingerprint(&self) -> &RouteBranchFingerprint {
@@ -1576,14 +1536,7 @@ impl FrameReconciliationPlan {
         &self.target_fingerprint
     }
 
-    pub(crate) fn matches_current_active(&self, current_active: Option<&RouteFrameBranch>) -> bool {
-        match (&self.baseline_branch, current_active) {
-            (None, None) => true,
-            (Some(_), None) | (None, Some(_)) => false,
-            (Some(baseline), Some(current)) => baseline.matches_branch(current),
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn nearest_error_boundary_for(&self, route: RouteId) -> Option<&ErrorBoundaryKey> {
         self.error_boundaries.get(&route).and_then(Option::as_ref)
     }

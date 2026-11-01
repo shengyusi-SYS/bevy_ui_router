@@ -62,6 +62,10 @@ pub(crate) struct NativeFailureOwner {
     pub(crate) source: NativeFailureSource,
     pub(crate) error: NativeFailureError,
     settlement: Option<NativeSceneSettlement>,
+    #[allow(
+        dead_code,
+        reason = "Strong asset handles keep resolved dependencies alive during failure settlement."
+    )]
     dependencies: Vec<UntypedHandle>,
     focus_error: Option<crate::native_focus::NativeFocusError>,
 }

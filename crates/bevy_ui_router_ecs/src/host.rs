@@ -4240,7 +4240,7 @@ pub(crate) mod tests {
                 }
             });
         let protected = world.spawn((AppSentinel, Node::default())).id();
-        let host = world
+        let _host = world
             .spawn((Node::default(), RouterHostRegistration::new(router())))
             .id();
         let mut revisions = HostCandidateRevisionState::default();

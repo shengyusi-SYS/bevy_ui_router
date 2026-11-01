@@ -544,10 +544,6 @@ impl SealedMountNewStagingAllowance {
         self.anchor
     }
 
-    pub(crate) const fn anchor_claim(&self) -> &ExactRegistryClaim {
-        self.anchor_binding.source_claim()
-    }
-
     pub(crate) const fn anchor_binding(&self) -> &crate::presentation::OutletBinding {
         &self.anchor_binding
     }
@@ -704,24 +700,8 @@ impl SealedReconciliationSlotRole {
         self.anchor_binding.source_claim()
     }
 
-    pub(crate) const fn anchor_binding(&self) -> &crate::presentation::OutletBinding {
-        &self.anchor_binding
-    }
-
     pub(crate) const fn kind(&self) -> ReconciliationSlotRoleKind {
         self.kind
-    }
-
-    fn matches_mount_new_slot(&self, slot: &MountedChildSlot) -> bool {
-        self.kind == ReconciliationSlotRoleKind::MountNew
-            && self.current() == EntityLifecycle::PreparedInert
-            && self.next == Some(EntityLifecycle::Active)
-            && self.claim == *slot.slot_claim()
-            && self.parent == *slot.parent()
-            && self.outlet == *slot.outlet()
-            && self.slot == slot.slot_id()
-            && self.anchor == slot.anchor()
-            && self.anchor_binding == *slot.anchor_binding()
     }
 }
 
@@ -949,6 +929,10 @@ pub(crate) struct ReconciliationSpliceOutcome {
     preserved: RealizedBranch,
     entering: RealizedBranch,
     leaving: RealizedBranch,
+    #[allow(
+        dead_code,
+        reason = "Keeps sealed slot responsibilities alive until the splice is consumed."
+    )]
     slot_roles: Vec<SealedReconciliationSlotRole>,
     retained: Vec<RetainedLeafProjection>,
     retained_payloads: Vec<PreparedInstanceExtraction>,
@@ -990,18 +974,22 @@ impl RejectedReconciliationOwners {
 }
 
 impl ReconciliationSpliceOutcome {
+    #[cfg(test)]
     pub(crate) const fn preserved(&self) -> &RealizedBranch {
         &self.preserved
     }
 
+    #[cfg(test)]
     pub(crate) const fn entering(&self) -> &RealizedBranch {
         &self.entering
     }
 
+    #[cfg(test)]
     pub(crate) const fn leaving(&self) -> &RealizedBranch {
         &self.leaving
     }
 
+    #[cfg(test)]
     pub(crate) fn slot_roles(&self) -> &[SealedReconciliationSlotRole] {
         &self.slot_roles
     }
@@ -1102,9 +1090,6 @@ impl<'a> ReconciliationSpliceView<'a> {
             })
             .flat_map(InstancePayload::child_slots)
             .chain(self.entering.child_slots.iter())
-    }
-    pub(crate) fn retained(self) -> &'a [RetainedLeafProjection] {
-        self.retained
     }
 
     pub(crate) fn validate_entering(
@@ -1933,6 +1918,7 @@ fn slot_aliases_match_transitions(
 }
 
 impl SealedExistingReconciliation {
+    #[cfg(test)]
     fn prepare(
         branch: RealizedBranch,
         existing: ReconciliationExistingProjection,
@@ -2028,14 +2014,17 @@ impl SealedExistingReconciliation {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn preserved(&self) -> &RealizedBranch {
         &self.preserved
     }
 
+    #[cfg(test)]
     pub(crate) const fn leaving(&self) -> &RealizedBranch {
         &self.leaving
     }
 
+    #[cfg(test)]
     pub(crate) fn slot_roles(&self) -> &[SealedReconciliationSlotRole] {
         &self.slot_roles
     }
@@ -3366,6 +3355,7 @@ impl RealizedBranch {
         self.frames[index].apply_mount_rebase(prepared);
     }
 
+    #[cfg(test)]
     pub(crate) fn interactive_entities(&self) -> Vec<bevy_ecs::prelude::Entity> {
         self.frames
             .iter()
@@ -3607,6 +3597,7 @@ impl RealizedBranch {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_single_frame(mut self) -> Result<Option<RealizedFrame>, Self> {
         if !self.child_slots.is_empty() || self.frames.len() > 1 {
             return Err(self);
@@ -3614,6 +3605,7 @@ impl RealizedBranch {
         Ok(self.frames.pop())
     }
 
+    #[cfg(test)]
     pub(crate) fn from_single_frame(frame: RealizedFrame) -> Self {
         Self {
             frames: vec![frame],
@@ -3714,6 +3706,7 @@ impl PendingCommit {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn frame(&self) -> Option<&RealizedFrame> {
         self.branch.first_frame()
     }

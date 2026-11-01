@@ -51,10 +51,6 @@ impl RouteMatcher {
         self.tree.max_branch_depth()
     }
 
-    pub(crate) const fn root_route(&self) -> RouteId {
-        self.tree.root()
-    }
-
     fn visit(
         &self,
         route: RouteId,

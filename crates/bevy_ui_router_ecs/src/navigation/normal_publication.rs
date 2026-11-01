@@ -218,7 +218,9 @@ pub(super) fn publish_normal_work(
     // The complete Core partition is frozen before any retained capability
     // moves. The ordinary, default-disabled path keeps its original protocol.
     let retention = world.resource_scope(
-        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+        |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            #[cfg(feature = "bsn")]
+            let world = _world;
             let entry = navigation
                 .entries
                 .iter_mut()

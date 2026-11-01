@@ -552,7 +552,7 @@ impl HostAdmissionIssuer {
         self.next_sequence = u64::MAX;
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn testing_exhaust_grant_epoch_counter(&mut self) {
         self.next_epoch = u64::MAX;
     }
@@ -660,6 +660,10 @@ impl RetiredHostAuthorityProjection {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "Keep standalone Core compatible with toolchains before Atomic::try_update stabilized in Rust 1.95."
+)]
 fn allocate_issuer(counter: &AtomicU64) -> Result<AdmissionIssuerId, IdExhaustion> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

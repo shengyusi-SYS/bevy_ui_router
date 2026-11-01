@@ -70,7 +70,6 @@ use crate::engine::{
     CoreBackTargetPermanentTerminalSourceProjection, CoreBackTargetPhysicalReceiverRef,
     CoreBoundPostCommitSettlementPlan,
     CoreHostConfirmationSource as InnerCoreHostConfirmationSource,
-    CoreNormalCleanupCompletionFacts,
     CorePendingHostAdmissionProjection as InnerCorePendingHostAdmissionProjection,
     CorePostCommitAuthorityBeginPermanentEvidence, CorePostCommitAuthorityBeginRetryEvidence,
     CorePostCommitAuthorityPreparationSource, CorePostCommitAuthorityTransferOwner,
@@ -2815,6 +2814,10 @@ pub struct FailureCleanupZeroTerminalOwner {
 
 #[doc(hidden)]
 pub struct FailureCleanupZeroTerminalMismatchView {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact rejected zero-obligation terminal evidence in the opaque SPI wrapper."
+    )]
     inner: CoreFailureCleanupZeroTerminalMismatchProjection,
 }
 
@@ -2861,11 +2864,19 @@ pub enum FailureCleanupCompletionDisposition {
 
 #[doc(hidden)]
 pub struct FailureCleanupCompletionReceiverMismatchView {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact completion receiver mismatch alongside the returned owner."
+    )]
     inner: CoreFailureCleanupCompletionReceiverMismatchProjection,
 }
 
 #[doc(hidden)]
 pub struct FailureCleanupCompletionPreparationMismatchView {
+    #[allow(
+        dead_code,
+        reason = "Retains the original completion preparation mismatch without exposing raw evidence constructors."
+    )]
     inner: CoreFailureCleanupCompletionPreparationMismatchProjection,
 }
 
@@ -3935,69 +3946,29 @@ impl PostCommitSettlementExpectedView {
 
 #[doc(hidden)]
 pub struct AuthorityCleanupCompletionFacts {
+    #[allow(
+        dead_code,
+        reason = "Preserves the opaque completion-facts SPI representation without exposing raw constructors."
+    )]
     inner: CoreAuthorityCleanupCompletionFacts,
-}
-
-impl AuthorityCleanupCompletionFacts {
-    pub(crate) fn new(
-        batch: PostCommitCleanupBatchView,
-        completion_digest: u64,
-        settled_count: usize,
-    ) -> Self {
-        Self {
-            inner: CoreAuthorityCleanupCompletionFacts::new(
-                batch.inner,
-                CleanupCompletionDigest::from_opaque(completion_digest),
-                settled_count,
-            ),
-        }
-    }
 }
 
 #[doc(hidden)]
 pub struct RetiredHostEdgeCompletionFacts {
+    #[allow(
+        dead_code,
+        reason = "Preserves the opaque retired-host completion-facts SPI representation without exposing raw constructors."
+    )]
     inner: CoreRetiredHostEdgeCompletionFacts,
-}
-
-impl RetiredHostEdgeCompletionFacts {
-    pub(crate) fn new(expected: RetiredHostAuthorityExpectedView, physical_digest: u64) -> Self {
-        Self {
-            inner: CoreRetiredHostEdgeCompletionFacts::new(expected.inner, physical_digest),
-        }
-    }
 }
 
 #[doc(hidden)]
 pub struct PostCommitCompoundCompletionInputs {
+    #[allow(
+        dead_code,
+        reason = "Retains the original derived completion inputs when the trusted compound bridge rejects its owner."
+    )]
     inner: CorePostCommitCompoundCompletionInputs,
-}
-
-impl PostCommitCompoundCompletionInputs {
-    pub(crate) fn new(
-        normal: CleanupCompletion,
-        normal_batch: PostCommitCleanupBatchView,
-        authority_expected: AuthorityCleanupCompletionFacts,
-        authority: AuthorityCleanupCompletionFacts,
-        host_edge: RetiredHostEdgeCompletionFacts,
-        settlement: PostCommitSettlementTraceView,
-    ) -> Self {
-        let normal_facts = CoreNormalCleanupCompletionFacts::new(
-            normal_batch.inner,
-            CleanupManifestDigest::from_opaque(normal.manifest_digest),
-            CleanupCompletionDigest::from_opaque(normal.completion_digest),
-            normal.settled_count,
-        );
-        Self {
-            inner: CorePostCommitCompoundCompletionInputs::new(
-                normal.inner,
-                normal_facts,
-                authority_expected.inner,
-                authority.inner,
-                host_edge.inner,
-                settlement.inner,
-            ),
-        }
-    }
 }
 
 #[doc(hidden)]
@@ -4727,6 +4698,10 @@ pub struct BackTargetDriverTerminalOwner {
 
 #[doc(hidden)]
 pub struct BackTargetDriverTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact driver-terminal proof for the physical owner receiving this evidence."
+    )]
     inner: CoreBackTargetDriverTerminalProjection,
 }
 
@@ -4805,18 +4780,38 @@ pub struct PreparedPostCommitContinuationOwner {
 
 #[doc(hidden)]
 pub struct BackTargetCommitRetainedInputOwner {
+    #[allow(
+        dead_code,
+        reason = "Keeps the original rejected commit continuation owned until its enclosing failure is released."
+    )]
     continuation: PreparedPostCommitContinuationOwner,
+    #[allow(
+        dead_code,
+        reason = "Retains the frozen cleanup manifest paired with the rejected continuation."
+    )]
     manifest: CleanupManifest,
+    #[allow(
+        dead_code,
+        reason = "Retains the original retained-input rejection evidence beside its linear owner."
+    )]
     evidence: CoreBackTargetCommitRetainedInputProjection,
 }
 
 #[doc(hidden)]
 pub struct BackTargetCommitFailureCleanupOwner {
+    #[allow(
+        dead_code,
+        reason = "Keeps the original commit-failure cleanup owner intact inside the opaque failure outcome."
+    )]
     inner: CoreBackTargetCommitFailureCleanup,
 }
 
 #[doc(hidden)]
 pub struct BackTargetCommitRejectedPublicationOwner {
+    #[allow(
+        dead_code,
+        reason = "Keeps the original rejected publication owner intact inside the opaque failure outcome."
+    )]
     inner: CoreBackTargetCommitRejectedPublication,
 }
 
@@ -4925,16 +4920,28 @@ pub enum BackTargetPermanentCleanupMismatchEvidence {
 
 #[doc(hidden)]
 pub struct BackTargetPermanentCleanupReceiverMismatchView {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact permanent-cleanup receiver mismatch beside the returned owner."
+    )]
     inner: CoreBackTargetPermanentCleanupReceiverMismatchProjection,
 }
 
 #[doc(hidden)]
 pub struct BackTargetPermanentCompletionFactsMismatchView {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact rejected completion facts beside the returned cleanup owner."
+    )]
     inner: CoreBackTargetPermanentCompletionFactsMismatchProjection,
 }
 
 #[doc(hidden)]
 pub struct BackTargetPermanentCleanupTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact permanent-cleanup terminal proof for the physical completion receiver."
+    )]
     inner: CoreBackTargetPermanentCleanupTerminalProjection,
 }
 
@@ -5851,11 +5858,19 @@ pub enum BackNoTargetAuthorityCleanupMismatchEvidence {
 
 #[doc(hidden)]
 pub struct CoreBackNoTargetAuthorityCompletionFactsMismatchProjection {
+    #[allow(
+        dead_code,
+        reason = "Retains the original no-target authority completion mismatch beside its returned owner."
+    )]
     inner: InnerBackNoTargetAuthorityCompletionFactsMismatchProjection,
 }
 
 #[doc(hidden)]
 pub struct BackNoTargetAuthorityTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact no-target authority terminal proof for the physical completion receiver."
+    )]
     inner: CoreBackNoTargetAuthorityTerminalProjection,
 }
 
@@ -5906,6 +5921,7 @@ pub struct BackNoTargetCleanupBatchView {
 }
 
 impl BackNoTargetCleanupBatchView {
+    #[cfg(test)]
     pub(crate) fn matches_resolution_evidence(&self, evidence: &BackResolutionEvidence) -> bool {
         self.inner.matches_resolution_evidence(evidence)
     }
@@ -5968,6 +5984,10 @@ pub struct BackNoTargetCleanupCompletionOwner {
 
 #[doc(hidden)]
 pub struct BackNoTargetTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact no-target cleanup terminal proof for the physical completion receiver."
+    )]
     inner: CoreBackNoTargetTerminalProjection,
 }
 
@@ -5985,6 +6005,7 @@ pub struct PreparedBackNoTargetPublication {
     inner: crate::engine::CorePreparedBackNoTargetPublication,
 }
 
+#[cfg(test)]
 impl PreparedBackNoTargetPublication {
     pub(crate) fn batch(&self) -> BackNoTargetCleanupBatchView {
         BackNoTargetCleanupBatchView {
@@ -6906,46 +6927,6 @@ impl RouterEngine {
             CorePostCommitSettlementRecordOutcome::AttestationMismatch { .. } => {
                 unreachable!("the trusted wrapper binds only the private Core permit")
             }
-        }
-    }
-
-    #[doc(hidden)]
-    pub(crate) fn prepare_post_commit_compound_completion(
-        &mut self,
-        batch: PostCommitCompoundBatchOwner,
-        inputs: PostCommitCompoundCompletionInputs,
-    ) -> PostCommitCompoundCompletionPreparationOutcome {
-        let PostCommitCompoundBatchOwner {
-            inner: batch,
-            normal_manifest_digest,
-            normal_obligation_count,
-            authority_manifest_digest,
-            authority_obligation_count,
-        } = batch;
-        match self
-            .inner
-            .prepare_post_commit_compound_completion(batch, inputs.inner)
-        {
-            CorePostCommitCompoundCompletionPreparationOutcome::Prepared(inner) => {
-                PostCommitCompoundCompletionPreparationOutcome::Prepared(
-                    PostCommitCompoundCompletionOwner { inner },
-                )
-            }
-            CorePostCommitCompoundCompletionPreparationOutcome::Mismatch {
-                batch,
-                inputs,
-                evidence,
-            } => PostCommitCompoundCompletionPreparationOutcome::Mismatch {
-                batch: PostCommitCompoundBatchOwner {
-                    inner: batch,
-                    normal_manifest_digest,
-                    normal_obligation_count,
-                    authority_manifest_digest,
-                    authority_obligation_count,
-                },
-                inputs: PostCommitCompoundCompletionInputs { inner: inputs },
-                evidence: PostCommitCompoundMismatchEvidence { inner: evidence },
-            },
         }
     }
 

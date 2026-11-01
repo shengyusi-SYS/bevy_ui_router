@@ -113,14 +113,6 @@ pub(crate) enum PostCommitAuthorityFreezeFailure {
 }
 
 impl FrozenOriginalCleanupLedgerTransfer {
-    pub(crate) const fn batch_manifest_digest(&self) -> u64 {
-        self.batch_manifest_digest
-    }
-
-    pub(crate) const fn batch_obligation_count(&self) -> usize {
-        self.batch_obligation_count
-    }
-
     pub(crate) fn indices(&self) -> &[FrozenOriginalCleanupIndex] {
         &self.indices
     }
@@ -187,18 +179,6 @@ impl FrozenOriginalCleanupLedgerTransfer {
 
     pub(crate) const fn ledger_domain(&self) -> u64 {
         self.ledger_domain
-    }
-
-    pub(crate) const fn next_attempt(&self) -> u64 {
-        self.next_attempt
-    }
-
-    pub(crate) const fn superseded_attempt_revision(&self) -> Option<u64> {
-        self.superseded_attempt_revision
-    }
-
-    pub(crate) const fn completion_digest(&self) -> Option<u64> {
-        self.completion_digest
     }
 
     pub(crate) fn refreeze(
@@ -892,8 +872,20 @@ pub(crate) enum PreparedAuthorityLedgerBindingMismatch {
 }
 
 pub(crate) struct PostCommitPhysicalSettlementProof {
+    #[allow(
+        dead_code,
+        reason = "Receipt-bound settlement proof is carried by ownership, not reread after preparation."
+    )]
     entity: Option<Entity>,
+    #[allow(
+        dead_code,
+        reason = "Receipt-bound settlement proof is carried by ownership, not reread after preparation."
+    )]
     disposition: Option<CleanupDisposition>,
+    #[allow(
+        dead_code,
+        reason = "Receipt-bound settlement proof is carried by ownership, not reread after preparation."
+    )]
     binding: u64,
 }
 
@@ -1713,22 +1705,6 @@ impl PreparedPostCommitAuthorityLedger {
         }
         self.partition
             .refreeze(world, &[], None, false, &original_removed)
-    }
-
-    pub(crate) fn bind_batch(
-        self,
-        batch: PostCommitCleanupBatchView,
-    ) -> Result<PreparedAuthorityLedgerBinding, (Self, PreparedAuthorityLedgerBindingMismatch)>
-    {
-        if batch.manifest_digest() != self.manifest_digest
-            || batch.obligation_count() != self.obligation_count
-        {
-            return Err((self, PreparedAuthorityLedgerBindingMismatch::WrongBatch));
-        }
-        Ok(PreparedAuthorityLedgerBinding {
-            prepared: self,
-            batch,
-        })
     }
 
     pub(crate) fn bind_verified_batch(

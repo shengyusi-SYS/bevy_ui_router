@@ -251,14 +251,18 @@ enum AuthoritySettlementSource<'a> {
 fn begin_authority_settlement_from_source(
     world: &mut World,
     entry: &mut RouterEntry,
-    mut active: RealizedBranch,
-    mut pending: PendingCommit,
+    active: RealizedBranch,
+    pending: PendingCommit,
     logical_roots_override: Option<Vec<RouteFrameVersion>>,
     source: AuthoritySettlementSource<'_>,
     invalidation: Option<
         &mut Option<bevy_ui_router_core::integration::RetainedInvalidationContinuation>,
     >,
 ) -> AuthoritySettlementBeginOutcome {
+    #[cfg(feature = "bsn")]
+    let mut active = active;
+    #[cfg(feature = "bsn")]
+    let mut pending = pending;
     let Some(host) = entry.host.as_ref() else {
         return AuthoritySettlementBeginOutcome::ProtocolContradiction {
             active,
@@ -1379,11 +1383,13 @@ fn prepare_failed_branch_authority_isolation_with_retained(
             .into_iter()
             .flat_map(|failure| failure.entities()),
     );
-    let mut preparation = if let Some(targets) = frozen_targets {
+    let preparation = if let Some(targets) = frozen_targets {
         prepare_frozen_authority_isolation(world, stored_claims, targets, 0)
     } else {
         prepare_authority_isolation_targets(world, stored_claims, gate_targets, 0)
     };
+    #[cfg(feature = "bsn")]
+    let mut preparation = preparation;
     #[cfg(feature = "bsn")]
     if let Some(failure) = branch.native_failure() {
         let isolation = match &mut preparation {
@@ -1455,7 +1461,7 @@ pub(super) fn fail_closed_cleanup_settlement_permanent(
 pub(super) fn fail_closed_cleanup_ledger_protocol(
     world: &mut World,
     entry: &mut RouterEntry,
-    mut ledger: CleanupLedger,
+    ledger: CleanupLedger,
     kind: Option<AuthorityProtocolResidualKind>,
 ) -> Result<(), CleanupLedger> {
     let preparation = if let Some(branch) = ledger.failure_owner_branch() {

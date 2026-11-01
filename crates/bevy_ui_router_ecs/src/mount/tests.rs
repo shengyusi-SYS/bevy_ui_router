@@ -11,8 +11,8 @@ use bevy_picking::Pickable;
 use bevy_ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node};
 use bevy_ui_router_core::{
     integration::{
-        CleanupManifest, EngineAction, IntegrationError, MountGrant, MountMutationArtifact,
-        MountRequest, RouterEngine, ViewFailureKind,
+        CleanupManifest, EngineAction, FailureCleanupPrepareOutcome, IntegrationError, MountGrant,
+        MountMutationArtifact, MountRequest, RouterEngine, ViewFailureKind,
     },
     prelude::{
         FrameOrigin, NavigationPhase, RequestStatus, RouteLocation, RouteSlotKey, RouteViewKey,

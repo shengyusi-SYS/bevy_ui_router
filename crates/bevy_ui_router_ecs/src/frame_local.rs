@@ -36,6 +36,7 @@ pub(crate) enum FrameLocalError {
     ForeignChildSlot(Entity),
 }
 
+#[cfg(test)]
 pub(crate) fn collect_frame_local_entities(
     world: &World,
     frame: &RouteFrameVersion,
@@ -51,6 +52,7 @@ enum ManifestPolicy {
     Observed,
 }
 
+#[cfg(test)]
 fn collect_frame_local_entities_with_policy(
     world: &World,
     frame: &RouteFrameVersion,
@@ -431,14 +433,6 @@ pub(crate) fn validate_mixed_fresh_entering(
     validate_branch_descendants(world, fresh).map(|_| ())
 }
 
-pub(crate) fn validate_committed_branch(
-    world: &World,
-    branch: &RealizedBranch,
-    leaving: bool,
-) -> Result<Vec<Entity>, FrameLocalError> {
-    validate_committed_branch_with_entering(world, branch, leaving, None, None, None)
-}
-
 pub(crate) fn validate_active_branch_with_entering(
     world: &World,
     branch: &RealizedBranch,
@@ -480,6 +474,7 @@ impl ActiveFrameObservation<'_> {
         self.frame
     }
 
+    #[cfg(test)]
     pub(crate) fn managed_content_entities(&self) -> &[Entity] {
         &self.managed
     }

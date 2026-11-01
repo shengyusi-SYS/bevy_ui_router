@@ -77,16 +77,6 @@ impl PreparedRetainedChange {
             })
     }
 
-    pub(crate) fn activated<'a>(
-        &'a self,
-        leaves: &'a RetainedLeaves,
-    ) -> impl Iterator<Item = (&'a RetainedLeafProjection, &'a InstancePayload)> {
-        self.activated.iter().map(move |index| {
-            let entry = &leaves.entries[*index];
-            (&entry.projection, &entry.payload)
-        })
-    }
-
     /// Cache membership is frozen through the accepted handoff. Rejection
     /// restores these same capabilities without moving any physical payload.
     pub(crate) fn take_owners(&mut self, leaves: &mut RetainedLeaves) -> Vec<RetainedLeafOwner> {
@@ -254,6 +244,7 @@ impl RetainedLeaves {
         self.entries.iter().map(|entry| &entry.payload)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

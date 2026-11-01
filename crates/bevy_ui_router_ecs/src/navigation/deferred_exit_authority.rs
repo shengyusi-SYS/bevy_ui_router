@@ -10,6 +10,10 @@ use crate::cleanup::{DeferredExitManifestError, PreparedLeavingAssembly};
 use crate::transition::{self, TransitionCancelReason};
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The exit residual retains the exact failed authority preparation evidence"
+)]
 pub(super) enum ExitAuthorityFailure {
     RequiredRegistryMissing,
     EntryOwnerMissing,
@@ -22,7 +26,6 @@ pub(super) enum ExitAuthorityFailure {
     HostEdge(RetiredHostEdgeFreezePermanentEvidence),
     Isolation(authority_isolation::PostCommitInputIsolationFailure),
     Core(r3_core::ExitAuthorityBeginErrorKind),
-    Residual(r3_core::ExitResidualErrorKind),
 }
 
 /// The original Core AuthorityAccepted source and every physical owner are

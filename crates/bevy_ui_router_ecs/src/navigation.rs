@@ -1,3 +1,11 @@
+#[cfg(test)]
+use crate::cleanup::PreparedCleanupLedgerProjection;
+#[cfg(test)]
+use bevy_ui_router_core::integration::{
+    BackTargetPermanentRequestFailureKind, BackTargetPermanentTerminalFailureKind,
+    BackTargetPermanentTerminalOperation, CleanupManifestView, FailureCleanupPrepareOutcome,
+};
+
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -43,17 +51,15 @@ use bevy_ui_router_core::{
         BackTargetPermanentBeginPermanentEvidence, BackTargetPermanentCleanupBatchOwner,
         BackTargetPermanentCleanupCompletionOutcome, BackTargetPermanentCleanupCompletionOwner,
         BackTargetPermanentCleanupMismatchEvidence, BackTargetPermanentOwner,
-        BackTargetPermanentRequestFailureKind, BackTargetPermanentTerminalFailureKind,
-        BackTargetPermanentTerminalOperation, BackTargetPhysicalOwnerRef,
-        BackTargetPreparationAcceptance, BackTargetStart, BeginAuthoritySettlementErrorKind,
-        CleanupManifest, CleanupManifestView, CommitTicket, EngineAction, EnqueueBackErrorKind,
-        FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError,
+        BackTargetPhysicalOwnerRef, BackTargetPreparationAcceptance, BackTargetStart,
+        BeginAuthoritySettlementErrorKind, CleanupManifest, CommitTicket, EngineAction,
+        EnqueueBackErrorKind, FailedAuthoritySettlementTrigger, FailedAuthorityTriggerError,
         FailureCleanupCompletionDisposition, FailureCleanupCompletionOwner,
         FailureCleanupCompletionPreparationMismatchView,
         FailureCleanupCompletionReceiverMismatchView, FailureCleanupPermanentAuthorityOwner,
         FailureCleanupPermanentAuthorityPhysical, FailureCleanupPermanentOutcome,
         FailureCleanupPermanentOwner, FailureCleanupPhysicalPrepareMismatch,
-        FailureCleanupPhysicalPrepareOutcome, FailureCleanupPrepareOutcome, FailureCleanupRequest,
+        FailureCleanupPhysicalPrepareOutcome, FailureCleanupRequest,
         FailureCleanupZeroPhysicalMismatchView, FailureCleanupZeroTerminalMismatchView,
         FailureCleanupZeroTerminalOutcome, FailureCleanupZeroTerminalOwner, FrameMountTarget,
         HistoryAdmissionStamp, HistoryAdmissionWorldSeal, HistoryExecutionBindingView, HostLease,
@@ -112,9 +118,8 @@ use crate::{
         PostCommitAuthoritySettlementFailure, PostCommitOriginalFreezeFailure,
         PostCommitOriginalFreezePermanentEvidence, PostCommitPhysicalSettlementProof,
         PreparedBackNoTargetAuthorityCleanupLedger, PreparedBackNoTargetZeroCompletion,
-        PreparedCleanupLedger, PreparedCleanupLedgerProjection, PreparedPostCommitAuthorityLedger,
-        RouterCleanupObservation, TargetPreparationPermanentCompletionDomain,
-        TargetPreparationPermanentCompletionFacts,
+        PreparedCleanupLedger, PreparedPostCommitAuthorityLedger, RouterCleanupObservation,
+        TargetPreparationPermanentCompletionDomain, TargetPreparationPermanentCompletionFacts,
         TargetPreparationPermanentCompletionPreparationEvidence,
         TargetPreparationPermanentHostEdge, TargetPreparationPermanentReceiptObservationEvidence,
         TargetPreparationPermanentSettlementBoundaryEvidence,
@@ -164,7 +169,6 @@ use crate::{
         DeferredRealizationFailure, FrameLifecycle, FrameMountBinding, RealizedFrame,
         expected_children, frame_is_isolated_for_settlement, isolate_frame_for_settlement,
         isolate_frame_for_settlement_guarded, prepare_presentation_mutation,
-        prepare_presentation_with_pointer_revocation, realize_child_frame_deferred,
         realize_frame_deferred, realize_reconciliation_child_frame_deferred, validate_active_frame,
         validate_realized_frame,
     },
@@ -177,7 +181,7 @@ use crate::{
 
 fn allocate_navigation_domain(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1).filter(|_| current != 0)
         })
         .ok()
@@ -578,6 +582,10 @@ struct R1FailureCleanupPermanentAuthorityPair {
     core: FailureCleanupPermanentAuthorityOwner,
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 enum FailureCleanupPermanentStableInertOwner {
     PrepareMismatch(FailureCleanupPhysicalPrepareMismatch<FailureCleanupPhysicalPayload>),
     CoreMismatch(FailureCleanupPermanentOwner<FailureCleanupPhysicalPayload>),
@@ -747,6 +755,10 @@ pub(crate) struct BackTargetDriverPhysicalPartitionSource {
     frozen: BackTargetDriverPhysicalPartitionProjection,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 pub(crate) struct BackTargetDriverPostReportRefreezeSource {
     frozen: BackTargetDriverPhysicalPartitionProjection,
 }
@@ -776,6 +788,10 @@ enum BackTargetDriverPhysicalIndeterminateReason {
     TargetProtectedOverlap,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 enum BackTargetDriverPhysicalIndeterminateObservation {
     PairingMismatch(PreparationReceiverMismatchView),
     Freeze(BackTargetDriverPhysicalIndeterminateReason),
@@ -790,10 +806,18 @@ enum BackTargetDriverPhysicalIndeterminateObservation {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 pub(crate) struct FrozenBackTargetDriverPhysicalIndeterminateEvidence {
     observation: BackTargetDriverPhysicalIndeterminateObservation,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 pub(crate) struct FrozenBackTargetDriverZeroPhysicalProof {
     source: BackTargetDriverPhysicalPartitionProjection,
 }
@@ -818,6 +842,10 @@ impl BackTargetDriverUnverifiedPhysicalOwner {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 pub(crate) struct FrozenBackTargetDriverPhysicalPartitionProof {
     source: BackTargetDriverPhysicalPartitionProjection,
     manifest: FrozenCleanupManifest,
@@ -852,6 +880,10 @@ impl BackTargetDriverReportablePhysicalOwner {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 pub(crate) struct BackTargetDriverPhysicalIndeterminateOwner {
     original: BackTargetDriverUnverifiedPhysicalOwner,
     evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
@@ -871,6 +903,10 @@ pub(crate) struct PendingBackTargetDriverAwaitingReport {
     message: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetDriverReceiverMismatch {
     driving: PendingBackTargetDriving,
     task: RootFrameTask,
@@ -880,6 +916,10 @@ pub(crate) struct PendingBackTargetDriverReceiverMismatch {
     mismatch: PreparationReceiverMismatchView,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetDriverPhysicalIndeterminate {
     driving: PendingBackTargetDriving,
     task: RootFrameTask,
@@ -888,6 +928,10 @@ pub(crate) struct PendingBackTargetDriverPhysicalIndeterminate {
     message: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedReportInput {
     driving: PendingBackTargetDriving,
     task: RootFrameTask,
@@ -895,11 +939,19 @@ pub(crate) struct PendingBackTargetAppliedReportInput {
     report: BackTargetAppliedReport,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedReportMismatch {
     owner: PendingBackTargetAppliedReportInput,
     mismatch: PreparationReceiverMismatchView,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedStagingMismatch {
     previous: Option<BackTargetDriverStagingOwner>,
     pending: PendingCommit,
@@ -908,18 +960,30 @@ pub(crate) struct PendingBackTargetAppliedStagingMismatch {
     evidence: BackTargetDriverStagingMismatchEvidence,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedReportAttempt {
     pending: PendingCommit,
     task: RootFrameTask,
     report: BackTargetAppliedReport,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedStagingConflict {
     existing: PendingBackTargetAppliedStagingMismatch,
     incoming: PendingBackTargetAppliedReportAttempt,
     evidence: BackTargetDriverStagingMismatchEvidence,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedMountRequestPairingMismatch {
     driving: PendingBackTargetDriving,
     request: MountRequest,
@@ -933,11 +997,19 @@ pub(crate) struct PendingBackTargetAppliedCommit {
     pending: PendingCommit,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedCommitPairingMismatch {
     owner: PendingBackTargetAppliedCommit,
     mismatch: PreparationReceiverMismatchView,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetAppliedCommitPermanent {
     owner: PendingBackTargetAppliedCommit,
     evidence: LifecyclePreflightEvidence,
@@ -950,6 +1022,10 @@ struct BackTargetDriverFailureReported {
     outcome: BackTargetDriverFailureCoreOutcome,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetDriverConsumeMismatch {
     source: BackTargetDriverPostReportRefreezeSource,
     history: HistoryExecutionBindingView,
@@ -958,6 +1034,10 @@ pub(crate) struct PendingBackTargetDriverConsumeMismatch {
     mismatch: PreparationReceiverMismatchView,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetDriverPhysicalMismatch {
     source: BackTargetDriverPostReportRefreezeSource,
     history: HistoryExecutionBindingView,
@@ -966,6 +1046,11 @@ pub(crate) struct PendingBackTargetDriverPhysicalMismatch {
     evidence: BackTargetDriverPhysicalMismatchEvidence,
 }
 
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetDriverPostReportPhysicalIndeterminate {
     source: BackTargetDriverPostReportRefreezeSource,
     history: HistoryExecutionBindingView,
@@ -974,12 +1059,21 @@ pub(crate) struct PendingBackTargetDriverPostReportPhysicalIndeterminate {
     evidence: FrozenBackTargetDriverPhysicalIndeterminateEvidence,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) enum PendingBackTargetDriverFailure {
     PhysicalIndeterminate(PendingBackTargetDriverPhysicalIndeterminate),
     AwaitingReport(PendingBackTargetDriverAwaitingReport),
     ReceiverMismatch(PendingBackTargetDriverReceiverMismatch),
     ConsumeMismatch(PendingBackTargetDriverConsumeMismatch),
     PhysicalMismatch(PendingBackTargetDriverPhysicalMismatch),
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Tests classify historical post-report failures through the production physical proof"
+    )]
     PostReportPhysicalIndeterminate(PendingBackTargetDriverPostReportPhysicalIndeterminate),
 }
 
@@ -1049,17 +1143,20 @@ pub(crate) struct PendingPreparedBackTargetCommit {
     manifest: CleanupManifest,
 }
 
-pub(crate) enum PreparationRetryEvidence {
-    RetryableCapacity(LifecyclePreflightEvidence),
-    UnfinalizedBoundaryFacts(LifecyclePreflightEvidence),
-}
-
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) enum PreparationPermanentEvidence {
     PhysicalPreparationContradiction(LifecyclePreflightEvidence),
     #[cfg(feature = "bsn")]
     NativeCleanup(crate::presentation::native_frame::NativeCleanupPreparationError),
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) struct PreparationPermanentOwner<Owner> {
     owner: Owner,
     evidence: PreparationPermanentEvidence,
@@ -1113,8 +1210,16 @@ pub(crate) struct FrozenTargetPreparationPermanentHostEdge {
 pub(crate) enum FrozenTargetPreparationPermanentBranch {
     Classifier {
         physical: BackTargetClassifiedPhysicalOwner,
+        #[allow(
+            dead_code,
+            reason = "The classifier failure remains attached to the frozen physical branch"
+        )]
         evidence: PreparationPermanentEvidence,
     },
+    #[allow(
+        dead_code,
+        reason = "Tests exercise ready-plan failure settlement through the shared production cleanup machinery"
+    )]
     ReadyPlan {
         physical: PreparedBackTargetPhysicalOwner,
         normal_frozen_manifest: FrozenCleanupManifest,
@@ -1174,6 +1279,10 @@ pub(crate) struct IsolatedTargetPreparationPermanentLedger {
     completion_domain: Option<TargetPreparationPermanentCompletionDomain>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 struct PreparedIsolatedTargetPreparationPermanentCompletion {
     ledger: CleanupLedger,
     validation: FrozenTargetPreparationPermanentPhysicalManifest,
@@ -1250,6 +1359,10 @@ pub(crate) enum TargetPreparationPermanentLedgerHolder {
     Active(ActiveTargetPreparationPermanentLedger),
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) enum TargetPreparationPermanentInertEvidence {
     Physical(LifecyclePreflightEvidence),
     ReceiptPreparationRejected(TargetPreparationPermanentSettlementBoundaryEvidence),
@@ -1263,6 +1376,10 @@ pub(crate) enum TargetPreparationPermanentInertEvidence {
     CompletionPreparationRejected(TargetPreparationPermanentCompletionPreparationEvidence),
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) struct TargetPreparationPermanentRepairRefreezeEvidence {
     entity: bevy_ecs::entity::Entity,
     expected: ProjectionlessObservedProjection,
@@ -1366,17 +1483,29 @@ enum TargetPreparationPermanentSettlementRefreezeFailure {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) struct TargetPreparationPermanentSettlementRefreezeEvidence {
     source: TargetPreparationPermanentSettlementRefreezeSource,
     stage: TargetPreparationPermanentTransitionStage,
     failure: TargetPreparationPermanentSettlementRefreezeFailure,
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) struct TargetPreparationPermanentSettlementPrewriteEvidence {
     source: TargetPreparationPermanentSettlementRefreezeSource,
     failure: TargetPreparationPermanentSettlementRefreezeFailure,
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) struct PreparedTargetPreparationPermanentPhysicalCompletion {
     cleanup: TargetPreparationPermanentCleanupOwner,
     prepared: PreparedIsolatedTargetPreparationPermanentCompletion,
@@ -1426,6 +1555,10 @@ pub(crate) enum PendingTargetPreparationPermanentCleanup {
     TestOccupied,
 }
 
+#[allow(
+    dead_code,
+    reason = "Permanent preparation retains the original owner and exact boundary evidence without retrying it"
+)]
 pub(crate) enum BackTargetPermanentDispatchOutcome {
     Dispatched,
     EntryMismatch {
@@ -1451,6 +1584,7 @@ pub(crate) enum BackTargetPermanentDispatchOutcome {
     },
 }
 
+#[cfg(test)]
 pub(crate) enum BackTargetClassifierPermanentPreparationOutcome {
     Prepared(TargetPreparationPermanentDisposition),
     PhysicalMismatch {
@@ -1463,6 +1597,7 @@ pub(crate) enum BackTargetClassifierPermanentPreparationOutcome {
     },
 }
 
+#[cfg(test)]
 pub(crate) enum BackTargetReadyPlanPermanentPreparationOutcome {
     Prepared(TargetPreparationPermanentDisposition),
     PhysicalMismatch {
@@ -1475,6 +1610,10 @@ pub(crate) enum BackTargetReadyPlanPermanentPreparationOutcome {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) enum PendingBackTargetClassification {
     Active(TargetPreparationOwner),
     PairingMismatch {
@@ -1486,10 +1625,6 @@ pub(crate) enum PendingBackTargetClassification {
         evidence: LifecyclePreflightEvidence,
     },
     ReadyAwaitingAcceptance(BackTargetReadyAcceptanceOwner),
-    ReadyPlanRetry {
-        owner: BackTargetReadyAcceptanceOwner,
-        evidence: PreparationRetryEvidence,
-    },
     ReadyPlanPermanent(PreparationPermanentOwner<BackTargetReadyAcceptanceOwner>),
     ReadyAcceptanceMismatch {
         owner: BackTargetReadyAcceptanceOwner,
@@ -1552,13 +1687,13 @@ pub(crate) enum PendingBackTargetClassification {
         evidence: LifecyclePreflightEvidence,
     },
     AuthorityLostDispatchBlocked(BackTargetPermanentDispatchOutcome),
-    Retry {
-        owner: TargetPreparationOwner,
-        evidence: PreparationRetryEvidence,
-    },
     Permanent(PreparationPermanentOwner<TargetPreparationOwner>),
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) enum PendingBackTargetCommitFailure {
     PairingMismatch {
         owner: PendingPreparedBackTargetCommit,
@@ -1575,6 +1710,10 @@ pub(crate) enum PendingBackTargetCommitFailure {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) enum PendingBackTargetResumeBlocked {
     Start {
         start: BackTargetStart,
@@ -1619,6 +1758,10 @@ pub(crate) enum PendingBackTargetResumeBlocked {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) enum BackTargetDriverStagingOwner {
     ResumeBlocked(PendingBackTargetResumeBlocked),
     Driving(PendingBackTargetDriving),
@@ -1645,11 +1788,19 @@ pub(crate) enum BackTargetDriverStagingMismatchObservation {
     TestDrift,
 }
 
+#[allow(
+    dead_code,
+    reason = "Frozen Back physical evidence is retained with its owner rather than reconstructed after rejection"
+)]
 pub(crate) struct BackTargetDriverStagingMismatchEvidence {
     observed: BackTargetDriverStagingMismatchObservation,
     pairing: Option<PreparationReceiverMismatchView>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) struct PendingBackTargetDriverStagingMismatch {
     previous: Option<BackTargetDriverStagingOwner>,
     physical: BackTargetDriverUnverifiedPhysicalOwner,
@@ -1659,6 +1810,10 @@ pub(crate) struct PendingBackTargetDriverStagingMismatch {
     evidence: BackTargetDriverStagingMismatchEvidence,
 }
 
+#[allow(
+    dead_code,
+    reason = "Original Back owners and mismatch evidence remain together while the attempt is inert"
+)]
 pub(crate) enum PendingBackTargetExecution {
     ResumeBlocked(PendingBackTargetResumeBlocked),
     Driving(PendingBackTargetDriving),
@@ -1829,16 +1984,28 @@ struct FailureCleanupCompletionInertOwner {
     mismatch: FailureCleanupCompletionMismatchView,
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 struct PreparedHostAdmissionOperationFailure {
     pub(crate) evidence: bevy_ui_router_core::integration::HostAdmissionUnavailableEvidence,
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 struct HostAdmissionOperationPreStagingSource {
     pub(crate) prepared: PreparedHostAdmissionOperationFailure,
     pub(crate) owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
     pub(crate) installation: PreparedEcsHostCandidateSource,
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 enum HostAdmissionFailureHolder {
     TraceCapacityInert {
         owner: bevy_ui_router_core::integration::HostAdmissionUnavailablePreStagingOwner,
@@ -1924,6 +2091,10 @@ struct PendingHostConfirmation {
     rejection: PreparedHostCandidateRejection,
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 struct ProvisionalHostAdmissionFailure {
     prepared: r3_core::PreparedHostAdmissionUnavailableCause<R3HostAdmissionUnavailableEvidence>,
     grant: r3_core::SourceBoundHostGrant,
@@ -1933,6 +2104,10 @@ struct ProvisionalHostAdmissionFailure {
     stable_inert: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 struct ConfirmingHostAdmissionInert {
     owner: r3_core::CorePreparedHostConfirmation<PreparedProvisionalHostInstallation>,
     evidence: r3_core::HostAdmissionConfirmationFailureEvidence,
@@ -1943,6 +2118,10 @@ struct ConfirmingHostAdmissionInert {
     claim: ExactRegistryClaim,
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 enum HostAdmissionPublicationInert {
     CauseBindGranted {
         grant: r3_core::SourceBoundHostGrant,
@@ -1979,6 +2158,10 @@ enum HostAdmissionPublicationInert {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Host admission failures hold the original grant, physical ownership and rejection evidence together"
+)]
 struct ProvisionalHostAdmissionTerminal {
     candidate: PreparedEcsHostCandidateSource,
     terminal: ProvisionalHostSettlementTerminal,
@@ -2013,6 +2196,10 @@ struct TestingHostConfirmationWholeOwnerProjection {
     receiver: Option<TestingHostConfirmationReceiverEvidenceProjection>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 enum FailureCleanupCompletionMismatchView {
     Preparation(FailureCleanupCompletionPreparationMismatchView),
     Completion(FailureCleanupCompletionReceiverMismatchView),
@@ -2117,12 +2304,20 @@ pub(crate) enum BackNoTargetInstalledInertEvidence {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) struct SettledBackNoTargetCleanup {
     prepared: PreparedBackNoTargetZeroCompletion,
     completion: BackNoTargetCleanupCompletionOwner,
     mismatch: PreparationReceiverMismatchView,
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) enum PendingBackNoTargetCompletion {
     Installed(InstalledBackNoTargetCleanup),
     Settled(SettledBackNoTargetCleanup),
@@ -2178,6 +2373,10 @@ impl BackNoTargetAuthorityLedgerHolder {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) struct PreparedBackNoTargetAuthorityPhysicalCompletion {
     source: FrozenBackNoTargetAuthoritySource,
     retirement: BackCapacityRetirementEvidence,
@@ -2194,6 +2393,10 @@ pub(crate) enum BackNoTargetAuthorityInertEvidence {
     CompletionFactsUnavailable,
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) struct SettledBackNoTargetAuthorityCleanup {
     prepared: PreparedBackNoTargetAuthorityPhysicalCompletion,
     completion: BackNoTargetAuthorityCleanupCompletionOwner,
@@ -2209,6 +2412,10 @@ pub(crate) enum BackNoTargetAuthorityBeginInertEvidence {
     ActiveLedgerOnRejection,
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) enum BackNoTargetAuthorityBeginInertPhysical {
     Installed(InstalledBackNoTargetAuthorityCleanup),
     Completing(PreparedBackNoTargetAuthorityPhysicalCompletion),
@@ -2217,6 +2424,10 @@ pub(crate) enum BackNoTargetAuthorityBeginInertPhysical {
     CompletionInert(Box<BackNoTargetAuthorityCompletionInert>),
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) enum BackNoTargetAuthorityBeginInertCause {
     NotDispatched,
     ReceiverMismatch(PreparationReceiverMismatchView),
@@ -2224,6 +2435,10 @@ pub(crate) enum BackNoTargetAuthorityBeginInertCause {
     Permanent(BackNoTargetAuthorityBeginPermanentEvidence),
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) struct BackNoTargetAuthorityBeginInert {
     begin: BackNoTargetAuthorityBeginOwner,
     physical: Option<BackNoTargetAuthorityBeginInertPhysical>,
@@ -2237,6 +2452,10 @@ pub(crate) enum BackNoTargetAuthorityCompletionInertEvidence {
     WrongPhase,
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) enum BackNoTargetAuthorityCompletionInertPhysical {
     Installed(InstalledBackNoTargetAuthorityCleanup),
     Completing(PreparedBackNoTargetAuthorityPhysicalCompletion),
@@ -2245,6 +2464,10 @@ pub(crate) enum BackNoTargetAuthorityCompletionInertPhysical {
     PriorCompletionInert(Box<BackNoTargetAuthorityCompletionInert>),
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 pub(crate) struct BackNoTargetAuthorityCompletionInert {
     completion: BackNoTargetAuthorityCleanupCompletionOwner,
     mismatch: BackNoTargetAuthorityCleanupMismatchEvidence,
@@ -2260,6 +2483,10 @@ pub(crate) enum PendingBackNoTargetAuthorityCleanup {
     CompletionInert(BackNoTargetAuthorityCompletionInert),
 }
 
+#[allow(
+    dead_code,
+    reason = "Rejected cleanup retains its linear completion owner and mismatch evidence"
+)]
 enum PendingBackNoTargetPreparation {
     PhysicalIndeterminate {
         owner: BackPreparationOwner,
@@ -2468,12 +2695,12 @@ impl ProvenEmptyAttemptOwnerInventory {
 }
 
 pub(crate) struct ProvenEmptyAuthorizedTargets {
-    private: (),
+    _private: (),
 }
 
 impl ProvenEmptyAuthorizedTargets {
     const fn new() -> Self {
-        Self { private: () }
+        Self { _private: () }
     }
 
     const fn is_empty(&self) -> bool {
@@ -2481,6 +2708,10 @@ impl ProvenEmptyAuthorizedTargets {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The zero-target proof owns its validated source facts; consumers cannot reconstruct it"
+)]
 pub(crate) struct ProvenEmptyProjection {
     host: ProjectionlessHostProjection,
     request: NavigationRequestId,
@@ -3080,6 +3311,10 @@ fn freeze_back_no_target_registered_extra(
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 enum BackNoTargetPhysicalIndeterminateReason {
     MissingRegistry,
     MissingHost,
@@ -3115,11 +3350,19 @@ enum BackNoTargetPhysicalIndeterminateReason {
     AuthorityGraph(BackNoTargetAuthorityGraphEvidence),
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) struct BackNoTargetPhysicalIndeterminateEvidence {
     request: NavigationRequestId,
     reason: BackNoTargetPhysicalIndeterminateReason,
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 enum BackNoTargetAuthorityPermanentEvidence {
     Manifest(AuthoritySettlementManifestError),
     Partition {
@@ -3139,6 +3382,10 @@ enum BackNoTargetAuthorityPermanentEvidence {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) struct BackNoTargetAuthorityPermanentOwner {
     owner: BackPreparationOwner,
     source: FrozenBackNoTargetAuthoritySource,
@@ -4473,6 +4720,10 @@ pub(crate) fn classify_back_no_target(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) enum BackNoTargetAuthoritySettlementDispatchOutcome {
     Dispatched,
     Inert,
@@ -4981,6 +5232,10 @@ pub(crate) struct BackNoTargetSourceDriftPermanentOwner {
     capacity: NoTargetCapacityPermit,
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) enum BackNoTargetSourceDriftPermanentSettlementOutcome {
     Settled {
         retirement: BackCapacityRetirementEvidence,
@@ -4996,6 +5251,10 @@ pub(crate) enum BackNoTargetSourceDriftPermanentSettlementOutcome {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) enum BackNoTargetBeginOutcome {
     Begun(BackPreparationOwner),
     Permanent(BackNoTargetSourceDriftPermanentOwner),
@@ -5009,11 +5268,19 @@ pub(crate) enum BackNoTargetBeginOutcome {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) struct BoundBackContradictionResolution {
     owner: VerifiedBackResolutionContradiction,
     reservation: BoundBackCapacityReservation,
 }
 
+#[allow(
+    dead_code,
+    reason = "No-target failure retains the frozen physical source, original authority and terminal evidence"
+)]
 pub(crate) enum BoundBackResolutionHandoff {
     Target(BoundBackTargetResolution),
     NoTarget(BoundBackNoTargetResolution),
@@ -5259,6 +5526,10 @@ struct ProjectionlessContinuationProjection {
     observed: ProjectionlessObservedProjection,
 }
 
+#[allow(
+    dead_code,
+    reason = "Source drift and residual rejection evidence stays attached to the original failed attempt"
+)]
 struct ProjectionlessSourceDriftEvidence {
     expected: ProjectionlessContinuationProjection,
     observed: ProjectionlessContinuationProjection,
@@ -5289,13 +5560,17 @@ pub(crate) struct AuthorityProtocolResidualOwner {
     pub(crate) host: Option<RetiredHostBinding>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bsn"))]
 impl AuthorityProtocolResidualOwner {
     pub(crate) fn retained_cleanup_settlement_ledger(&self) -> Option<&CleanupLedger> {
         self.cleanup_settlement_ledger.as_ref()
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Source drift and residual rejection evidence stays attached to the original failed attempt"
+)]
 enum AuthorityProtocolResidualKind {
     DeferredExit(Box<deferred_exit_authority::ExitResidual>),
     #[cfg(feature = "bsn")]
@@ -7885,17 +8160,17 @@ fn install_failure_cleanup_permanent(
             // manifest; the Core classification above performs no World writes.
             #[cfg(feature = "bsn")]
             let native_residuals = &mut entry.native_residuals;
-            match entry.engine.complete_failure_cleanup_zero_terminal(
-                owner,
-                zero,
-                |mut physical| {
+            match entry
+                .engine
+                .complete_failure_cleanup_zero_terminal(owner, zero, |_physical| {
+                    #[cfg(feature = "bsn")]
+                    let mut physical = _physical;
                     #[cfg(feature = "bsn")]
                     complete_native_failure_transfer(
                         native_residuals,
                         physical.branch.take_native_failure(),
                     );
-                },
-            ) {
+                }) {
                 FailureCleanupZeroTerminalOutcome::Terminal => {}
                 FailureCleanupZeroTerminalOutcome::Mismatch {
                     zero,
@@ -10443,6 +10718,10 @@ pub(crate) enum ReconciliationPreparationDecision {
     #[cfg(feature = "bsn")]
     NativeCleanupRetry {
         owner: TargetPreparationOwner,
+        #[allow(
+            dead_code,
+            reason = "The blocked preparation retains the preflight observation"
+        )]
         evidence: crate::presentation::native_frame::NativeCleanupPreparationError,
     },
     Ready(BackTargetReadyAcceptanceOwner),
@@ -10775,9 +11054,11 @@ pub(crate) fn classify_back_target(
             )
         }
         ReconciliationPreflightOutcome::Ready {
-            mut splice,
+            splice,
             focus_leaving,
         } => {
+            #[cfg(feature = "bsn")]
+            let mut splice = splice;
             #[cfg(feature = "bsn")]
             if let Err(error) = splice.prepare_native_cleanup(world) {
                 let owner = TargetPreparationOwner {
@@ -10898,6 +11179,10 @@ pub(crate) fn classify_back_target(
 
 struct FrozenBackTargetPreparationPermanentPhysicalFacts {
     physical: FrozenTargetPreparationPermanentPhysicalManifest,
+    #[allow(
+        dead_code,
+        reason = "The physical facts retain the original frozen cleanup manifest"
+    )]
     normal_frozen_manifest: FrozenCleanupManifest,
     ecs_manifest: FrozenCleanupManifest,
     scope: PreparationBoundaryScopeView,
@@ -11165,6 +11450,7 @@ fn refreeze_back_target_authority_loss(
     })
 }
 
+#[cfg(test)]
 fn freeze_back_target_preparation_permanent_physical(
     world: &World,
     entry: &RouterEntry,
@@ -11747,6 +12033,7 @@ fn accept_classified_back_target_pending_rejected(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_back_target_classifier_permanent(
     world: &World,
     entry: &mut RouterEntry,
@@ -11873,6 +12160,7 @@ pub(crate) fn prepare_back_target_classifier_permanent(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_back_target_ready_plan_permanent(
     world: &World,
     entry: &mut RouterEntry,
@@ -12169,6 +12457,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn dispatch_prepared_back_target_permanent(
     world: &World,
     entry: &mut RouterEntry,
@@ -12520,7 +12809,7 @@ fn observe_back_target_driver_physical_partition(
     world: &World,
     entry: &RouterEntry,
     task: BackTargetDriverTaskPhysicalProjection,
-    physical: Option<&BackTargetDriverUnverifiedPhysicalOwner>,
+    _physical: Option<&BackTargetDriverUnverifiedPhysicalOwner>,
 ) -> Result<BackTargetDriverPhysicalPartitionProjection, BackTargetDriverPhysicalIndeterminateReason>
 {
     let host = entry
@@ -12558,7 +12847,7 @@ fn observe_back_target_driver_physical_partition(
     if target_claims.iter().any(|claim| {
         #[cfg(feature = "bsn")]
         if let Some(failure) =
-            physical.and_then(BackTargetDriverUnverifiedPhysicalOwner::native_failure)
+            _physical.and_then(BackTargetDriverUnverifiedPhysicalOwner::native_failure)
         {
             if failure.source.report == task.report
                 && failure.source.frame == task.frame
@@ -12687,20 +12976,6 @@ fn observe_back_target_driver_physical_partition(
         observed_active_claims,
         protected,
     })
-}
-
-pub(crate) fn freeze_back_target_driver_physical_partition_source(
-    world: &World,
-    entry: &RouterEntry,
-    driving: &PendingBackTargetDriving,
-    task: &RootFrameTask,
-) -> Result<
-    BackTargetDriverPhysicalPartitionSource,
-    FrozenBackTargetDriverPhysicalIndeterminateEvidence,
-> {
-    freeze_back_target_driver_physical_partition_source_with_owner(
-        world, entry, driving, task, None,
-    )
 }
 
 fn freeze_back_target_driver_physical_partition_source_with_owner(
@@ -13096,15 +13371,6 @@ pub(crate) fn classify_back_target_driver_physical(
     world: &World,
     entry: &RouterEntry,
     source: &BackTargetDriverPhysicalPartitionSource,
-    owner: BackTargetDriverUnverifiedPhysicalOwner,
-) -> BackTargetDriverPhysicalClassification {
-    classify_back_target_driver_frozen_physical(world, entry, &source.frozen, owner)
-}
-
-fn reclassify_back_target_driver_post_report(
-    world: &World,
-    entry: &RouterEntry,
-    source: &BackTargetDriverPostReportRefreezeSource,
     owner: BackTargetDriverUnverifiedPhysicalOwner,
 ) -> BackTargetDriverPhysicalClassification {
     classify_back_target_driver_frozen_physical(world, entry, &source.frozen, owner)
@@ -16202,6 +16468,7 @@ fn settle_projectionless_fail_close(
     }
 }
 
+#[cfg(test)]
 fn focus_targets_for_commit(
     replaces_active: bool,
     active_descendants: Vec<bevy_ecs::entity::Entity>,
@@ -19715,7 +19982,9 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
                 &failed.branch,
                 &selected,
             )
-            .and_then(|mut manifest| {
+            .and_then(|manifest| {
+                #[cfg(feature = "bsn")]
+                let mut manifest = manifest;
                 #[cfg(feature = "bsn")]
                 if let Some(slot) =
                     exact_current_task_outlet(&entry.engine, &failed, entry.active.as_ref())
@@ -19966,10 +20235,9 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
             }
             return;
         }
-        let PendingFailedBranch {
-            terminal,
-            mut branch,
-        } = failed;
+        let PendingFailedBranch { terminal, branch } = failed;
+        #[cfg(feature = "bsn")]
+        let mut branch = branch;
         let (request, preflight_evidence) = match terminal {
             PendingFailedBranchTerminal::Task {
                 task,
@@ -20151,9 +20419,11 @@ fn settle_branch_cleanup(world: &mut World, entry: &mut RouterEntry) {
         #[cfg(feature = "bsn")]
         let native_residuals = &mut entry.native_residuals;
         match entry.engine.complete_authority_cleanup(completion, || {
-            let mut owner = ledger
+            let _owner = ledger
                 .take_authority_settlement_owner()
                 .expect("authority publication retains its composed owner");
+            #[cfg(feature = "bsn")]
+            let mut owner = _owner;
             #[cfg(feature = "bsn")]
             complete_native_failure_transfer(native_residuals, owner.take_native_failure());
         }) {

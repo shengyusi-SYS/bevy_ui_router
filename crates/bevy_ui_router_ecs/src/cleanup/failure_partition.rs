@@ -72,10 +72,7 @@ pub(crate) struct FailureCleanupSourceProjection {
 }
 
 impl FailureCleanupSourceProjection {
-    pub(crate) fn observe(host: Option<&HostBinding>, active: Option<&RealizedBranch>) -> Self {
-        Self::observe_with_prepared(host, active, None)
-    }
-
+    #[cfg(test)]
     pub(crate) fn observe_with_prepared(
         host: Option<&HostBinding>,
         active: Option<&RealizedBranch>,
@@ -196,16 +193,19 @@ pub(crate) struct FailureCleanupSettlementRefreezeEvidence {
 }
 
 impl FailureCleanupSettlementRefreezeEvidence {
+    #[cfg(test)]
     pub(crate) const fn stage(&self) -> FailureCleanupTransitionStage {
         self.stage
     }
 
+    #[cfg(test)]
     pub(crate) const fn failure(&self) -> &FailureCleanupPartitionRefreezeFailure {
         &self.failure
     }
 }
 
 impl FrozenCleanupManifest {
+    #[cfg(test)]
     pub(crate) fn freeze_failure_cleanup_partition(
         &self,
         world: &World,
@@ -216,6 +216,7 @@ impl FrozenCleanupManifest {
         self.freeze_failure_cleanup_partition_retaining(world, registry, active, None, host)
     }
 
+    #[cfg(test)]
     pub(crate) fn freeze_failure_cleanup_partition_retaining(
         &self,
         world: &World,

@@ -64,6 +64,10 @@ impl IdleHostTerminal {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Host-loss settlement retains the terminal failure and admission source evidence"
+)]
 enum IdleHostPhysicalTerminal {
     Settled {
         host: RetiredHostBinding,
@@ -219,6 +223,10 @@ pub(super) struct IdleHostAdmissionFailure {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Host-loss settlement retains the terminal failure and admission source evidence"
+)]
 pub(super) enum IdleHostAdmissionFailedFact {
     Retained(crate::cleanup::IdleHostRetainedAdmissionEvidence),
     Input {

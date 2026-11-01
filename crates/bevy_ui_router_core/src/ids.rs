@@ -253,6 +253,7 @@ impl ReservedAttemptIds {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReservationCounter {
+    #[cfg(any(test, feature = "test-support"))]
     Request,
     Transaction,
     FrameTask,
@@ -584,6 +585,10 @@ impl CoreIdAllocator {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(
+    deprecated,
+    reason = "Keep standalone Core compatible with toolchains before Atomic::try_update stabilized in Rust 1.95."
+)]
 fn allocate_world_domain(counter: &AtomicU64) -> Result<WorldDomainId, IdExhaustion> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

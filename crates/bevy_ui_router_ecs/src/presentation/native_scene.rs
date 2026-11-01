@@ -39,29 +39,33 @@ pub(crate) struct NativeSceneAdoption {
     root: ExactRegistryClaim,
     /// A validation snapshot only. Dynamic input and cleanup must rebuild this
     /// closure from the live root rather than treating the vector as ownership.
+    #[allow(
+        dead_code,
+        reason = "Preserves Scene adoption and allocation evidence for diagnostics and tests."
+    )]
     current_containment: Vec<Entity>,
     dependencies: Vec<UntypedHandle>,
 }
 
 impl NativeSceneAdoption {
+    #[cfg(test)]
     pub(crate) const fn frame(&self) -> &RouteFrameVersion {
         &self.frame
     }
 
+    #[cfg(test)]
     pub(crate) const fn shell_claim(&self) -> &ExactRegistryClaim {
         &self.shell
     }
 
+    #[cfg(test)]
     pub(crate) const fn root_claim(&self) -> &ExactRegistryClaim {
         &self.root
     }
 
+    #[cfg(test)]
     pub(crate) fn current_containment(&self) -> &[Entity] {
         &self.current_containment
-    }
-
-    pub(crate) fn into_dependencies(self) -> Vec<UntypedHandle> {
-        self.dependencies
     }
 
     pub(super) fn into_parts(
@@ -168,6 +172,7 @@ impl NativeSceneSettlement {
     pub(crate) fn into_residual(self) -> Option<NativeSceneResidual> {
         self.residual
     }
+    #[cfg(test)]
     pub(crate) fn removed(&self) -> &[SettledNativeSceneAllocation] {
         &self.removed
     }
@@ -176,6 +181,7 @@ impl NativeSceneSettlement {
         self.residual.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_clean(&self) -> bool {
         self.residual.is_none()
     }
@@ -183,9 +189,21 @@ impl NativeSceneSettlement {
 
 #[derive(Debug)]
 pub(crate) struct SettledNativeSceneAllocation {
+    #[allow(
+        dead_code,
+        reason = "Preserves Scene adoption and allocation evidence for diagnostics and tests."
+    )]
     role: NativeSceneAllocationRole,
     claim: ExactRegistryClaim,
+    #[allow(
+        dead_code,
+        reason = "Preserves Scene adoption and allocation evidence for diagnostics and tests."
+    )]
     actual_parent: Option<Entity>,
+    #[allow(
+        dead_code,
+        reason = "Preserves Scene adoption and allocation evidence for diagnostics and tests."
+    )]
     observed_manifest: Option<ComponentManifest>,
 }
 
@@ -258,14 +276,17 @@ impl NativeSceneResidual {
             &allocation.claim == claim && allocation.residual_identity_is_exact(world)
         })
     }
+    #[cfg(test)]
     pub(crate) const fn isolation(&self) -> NativeSceneResidualIsolation {
         self.isolation
     }
 
+    #[cfg(test)]
     pub(crate) fn allocations(&self) -> &[NativeSceneResidualAllocation] {
         &self.allocations
     }
 
+    #[cfg(test)]
     pub(crate) fn protected_entities(&self) -> &[Entity] {
         &self.protected_entities
     }

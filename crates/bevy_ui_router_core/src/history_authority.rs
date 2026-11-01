@@ -474,6 +474,10 @@ enum CoreBackTargetPermanentTerminalCauseProjection {
 
 #[doc(hidden)]
 pub struct BackTargetPermanentTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact permanent Back terminal proof for the receiving integration owner."
+    )]
     inner: CoreBackTargetPermanentTerminalProjection,
 }
 
@@ -552,6 +556,10 @@ struct CoreBackNoTargetSourceDriftTerminalProjection {
 
 #[doc(hidden)]
 pub struct BackNoTargetSourceDriftTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the frozen source-drift terminal proof without exposing mutable history authority."
+    )]
     inner: CoreBackNoTargetSourceDriftTerminalProjection,
 }
 
@@ -564,6 +572,10 @@ struct CoreBackContradictionTerminalProjection {
 
 #[doc(hidden)]
 pub struct BackContradictionTerminalEvidence {
+    #[allow(
+        dead_code,
+        reason = "Retains the exact history-contradiction terminal proof for the receiving integration owner."
+    )]
     inner: CoreBackContradictionTerminalProjection,
 }
 
@@ -610,6 +622,10 @@ impl CoreIssuedWorldSeal {
     ) -> Result<Self, ClaimHistoryAdmissionWorldError> {
         static NEXT_HISTORY_WORLD_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+        #[allow(
+            deprecated,
+            reason = "Keep standalone Core compatible with toolchains before Atomic::try_update stabilized in Rust 1.95."
+        )]
         let identity = NEXT_HISTORY_WORLD_IDENTITY
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|_| current != 0)
@@ -1659,6 +1675,10 @@ pub(crate) struct FrozenBackDestination {
 pub(crate) enum BackPreview {
     Target(BackDestination),
     NoTarget(FrozenHistorySource),
+    #[expect(
+        dead_code,
+        reason = "The sealed Back protocol keeps contradiction distinct; canonical history currently produces only target or no-target previews."
+    )]
     Contradiction(BackPreviewContradiction),
 }
 
@@ -1689,6 +1709,7 @@ enum PresentationDispositionSeal {
 }
 
 impl PreparedPresentationBinding {
+    #[cfg(test)]
     pub(crate) fn new(
         execution: HistoryExecutionBindingProjection,
         presentation: ActivePresentation,

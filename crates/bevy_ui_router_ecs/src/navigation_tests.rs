@@ -81,10 +81,9 @@ use bevy_ui_router_core::integration::{
     HostAdmissionUnavailablePreStagingOwner, TestingReservationCounter, ViewReportIdentity,
 };
 use bevy_ui_router_core::prelude::{
-    ActivePresentationKind, DiagnosticEventKind, DiagnosticSeverity, FrameOrigin, MemoryHistory,
-    NavigationFailureKind, NavigationPhase, NavigationTraceEventKind, ReportDisposition,
-    RequestStatus, RouteNodeOptions, RoutePattern, RouteTree, RouteViewKey, RouterAvailability,
-    RouterUnavailableReason,
+    ActivePresentationKind, DiagnosticEventKind, FrameOrigin, MemoryHistory, NavigationFailureKind,
+    NavigationPhase, NavigationTraceEventKind, RequestStatus, RouteNodeOptions, RoutePattern,
+    RouteTree, RouteViewKey, RouterAvailability, RouterUnavailableReason,
 };
 use bevy_ui_router_view::{RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey};
 
@@ -15712,7 +15711,7 @@ fn assert_back_target_applied_staging_mismatch_zero_write(
     };
 
     app.world_mut().resource_scope(
-            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = navigation
                     .entries
                     .iter_mut()
@@ -15965,7 +15964,7 @@ fn back_target_applied_report_existing_mismatch_is_bounded_and_zero_write() {
     };
 
     app.world_mut().resource_scope(
-        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+        |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             let entry = navigation
                 .entries
                 .iter_mut()
@@ -16085,7 +16084,7 @@ fn stage_real_back_target_applied_commit(
     collect_navigation_system(app.world_mut());
     drive_navigation_system(app.world_mut());
     app.world_mut().resource_scope(
-        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+        |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             let entry = navigation
                 .entries
                 .iter_mut()
@@ -16151,9 +16150,12 @@ impl ClassifierPermanentSourceProjection {
             .collect::<Vec<_>>();
         allowed_write_targets.sort_by_key(|entity| entity.to_bits());
         allowed_write_targets.dedup();
-        let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) = permanent
-        else {
-            panic!("expected physical preparation contradiction")
+        let evidence = match permanent {
+            PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) => evidence,
+            #[cfg(feature = "bsn")]
+            PreparationPermanentEvidence::NativeCleanup(_) => {
+                panic!("expected physical preparation contradiction")
+            }
         };
         Self {
             history: history.clone(),
@@ -18179,7 +18181,7 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
             .testing_duplicate()
     };
     app.world_mut().resource_scope(
-        |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+        |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
             let entry = navigation
                 .entries
                 .iter_mut()
@@ -18448,7 +18450,7 @@ fn stale_back_report_receipt_and_publication_are_zero_write() {
     assert_current_exact(&app);
 
     app.world_mut().resource_scope(
-            |world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
+            |_world, mut navigation: bevy_ecs::change_detection::Mut<RouterNavigation>| {
                 let entry = navigation
                     .entries
                     .iter_mut()
@@ -18713,10 +18715,12 @@ fn stage_real_back_target_ready_plan_permanent(
         };
         owner
     };
-    let PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) =
-        &ready_plan_owner.evidence
-    else {
-        panic!("expected physical preparation contradiction")
+    let evidence = match &ready_plan_owner.evidence {
+        PreparationPermanentEvidence::PhysicalPreparationContradiction(evidence) => evidence,
+        #[cfg(feature = "bsn")]
+        PreparationPermanentEvidence::NativeCleanup(_) => {
+            panic!("expected physical preparation contradiction")
+        }
     };
     assert_eq!(
         (

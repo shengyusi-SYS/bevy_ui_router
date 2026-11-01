@@ -545,14 +545,14 @@ fn prepare_physical_isolation<'w>(
         Option<&mut bevy_ui::Node>,
     )>();
     let mut entities = Vec::with_capacity(targets.len());
-    for (entity, visibility, pickable, barrier, node) in query.iter_many_unique_mut(world, targets)
+    for (_entity, visibility, pickable, barrier, node) in query.iter_many_unique_mut(world, targets)
     {
         #[cfg(feature = "bsn")]
-        if native_content.contains(&entity) {
+        if native_content.contains(&_entity) {
             continue;
         }
         #[cfg(feature = "bsn")]
-        let shell_node = native_shells.contains(&entity).then_some(node).flatten();
+        let shell_node = native_shells.contains(&_entity).then_some(node).flatten();
         #[cfg(not(feature = "bsn"))]
         let shell_node = {
             let _ = node;
