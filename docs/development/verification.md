@@ -20,7 +20,7 @@
 
 ## 自动检查入口
 
-使用支持 Bevy `0.19` 的 Rust 工具链；当前 `bevy_ecs 0.19.1` 声明最低 Rust `1.95.0`，项目采用 2024 edition。安装 rustfmt 后执行：
+使用满足实际解析依赖的 `rust-version` 要求的 Rust 工具链；项目采用 2024 edition。安装 rustfmt 后执行：
 
 ```sh
 cargo fetch --locked
@@ -30,6 +30,8 @@ cargo test --workspace --all-features --locked
 ```
 
 这些是 [CI](../../.github/workflows/ci.yml) 的主检查。独立 consumer 在自己的 workspace 中离线解析依赖，`cargo fetch` 提前准备 registry 和依赖缓存。共享 target 由一位验证负责人顺序运行 Cargo/rustc。
+
+CI 的 `--locked` 复现已提交的依赖快照；版本要求见[接入指南](../guides/integration.md#bevy-版本要求)。独立 consumer 使用 `0.19` 范围重新生成自己的 lockfile，不复用仓库的 Bevy 选择。维护依赖快照时用 `cargo update` 解析兼容更新，再运行相应检查。
 
 全特性与最小 feature 各有检查用途。修改 ECS 的可选 BSN 接线时，补充基础 ECS 路径：
 
@@ -93,7 +95,7 @@ gitleaks git . --redact --log-opts="--all --full-history" --report-format json -
 | Tween 适配 | [适配旅程](../../crates/bevy_ui_router_ecs/src/transition/tween/tests.rs) | 发布后零起点、独立时钟、最后写入后的退出释放、取消停止写入与最终重绘 |
 | 滚动恢复 | [滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | 真实布局、早晚容器、ready/cancel、二维裁剪、用户滚动优先、旧 ID，以及过渡与缓存淘汰中的多次访问恢复 |
 | 页面系统 | [活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs) | 可变应用 Query、保留页失活/恢复、动态后代与精确父链 |
-| 集成边界 | [consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 各 feature 的可见 API、最小依赖和官方 Bevy 来源 |
+| 集成边界 | [consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖合同](../../crates/bevy_ui_router/tests/dependency_contract.rs) | 各 feature 的可见 API、最小依赖和依赖方向 |
 
 内部测试覆盖具体写入窗口和故障条件，公开旅程串起推荐入口与正常调度。开发中同时关注两层，让局部修改和用户操作保持一致。
 
@@ -147,7 +149,7 @@ cargo package --workspace
 python3 scripts/check-packaged-consumer.py
 ```
 
-`cargo package` 生成并验证六个库包。[打包 consumer](../../scripts/check-packaged-consumer.py) 解压这些 `.crate`，把 Router 依赖指向解压目录，核对实际包来源后运行包内 BSN 应用；Bevy 来自 crates.io，并固定为 `0.19.1`。脚本刷新解压源码的时间戳，使共享 target 重新编译本次包内容，继续复用 registry 依赖缓存。
+`cargo package` 生成并验证六个库包。[打包 consumer](../../scripts/check-packaged-consumer.py) 解压这些 `.crate`，把 Router 依赖指向解压目录，核对实际包来源后运行包内 BSN 应用；Bevy 按 `0.19` 兼容范围独立解析。脚本刷新解压源码的时间戳，使共享 target 重新编译本次包内容，继续复用 registry 依赖缓存。
 
 检查未提交改动时，先审阅 diff，再显式使用 `cargo package --workspace --allow-dirty` 并记录源码状态。包列表可用 `cargo package -p bevy_ui_router --list` 查看；逐包核对 README、源码、示例和测试所需文件，再运行上面的真实打包检查。
 
@@ -157,7 +159,7 @@ python3 scripts/check-packaged-consumer.py
 
 | 环境或能力 | 已有记录 | 后续检查 |
 | --- | --- | --- |
-| 官方 Bevy `0.19.0` / `0.19.1` | workspace、公开旅程和独立 consumer 的相应回归；默认 lock 为 `0.19.1` | 更新依赖时运行对应版本检查 |
+| Bevy `0.19` 系列 | 历史记录覆盖 `0.19.0` / `0.19.1` 的 workspace、公开旅程和独立 consumer 回归 | 依赖更新后按变更范围验证实际解析结果 |
 | Headless Scene/UI | 导航、布局、picking、focus、保留、活动与滚动组合 | 按功能改动选择完整操作链 |
 | 打包产物 | 六个库包和解压后的 BSN consumer | 最终发布树重新打包并运行 consumer |
 | Linux/WSLg 窗口 | llvmpipe 软件渲染；BRP 输入和 renderer 截图覆盖导航、保留、滚动、焦点、手势、fallback 和应用自定义过渡 | 窗口交互改动后按调试指南复测 |

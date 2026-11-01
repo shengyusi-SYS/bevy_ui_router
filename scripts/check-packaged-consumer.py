@@ -54,7 +54,7 @@ def main():
             f'bevy_ui_router = {{ version = "={facade["version"]}", default-features = false, features = ["bsn", "platform"] }}\n'
         )
         for dependency in ("bevy_app", "bevy_asset", "bevy_ecs", "bevy_scene", "bevy_ui"):
-            manifest += f'{dependency} = {{ version = "=0.19.1", default-features = false }}\n'
+            manifest += f'{dependency} = {{ version = "0.19", default-features = false }}\n'
         manifest += "[patch.crates-io]\n"
         for name, directory in extracted.items():
             manifest += f'{name} = {{ path = {json.dumps(str(directory))} }}\n'

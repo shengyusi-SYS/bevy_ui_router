@@ -1,4 +1,4 @@
-// Runs in a separate workspace with only the facade and official Bevy crates.
+// Runs in a separate workspace with only the facade and its Bevy dependencies.
 // All Router progress uses ordinary App::update and stable public snapshots.
 use std::sync::{
     Arc, Mutex,

@@ -49,7 +49,7 @@ bevy_scene = { version = "0.19", default-features = false }
 bevy_ui = { version = "0.19", default-features = false }
 ```
 
-在 `router-demo` 中执行 `cargo run`。项目使用 Rust 2024 edition 和 Bevy `0.19`；仓库锁定版本为 `0.19.1`。工具链与检查命令见[验证指南](../development/verification.md)。
+在 `router-demo` 中执行 `cargo run`。项目使用 Rust 2024 edition，工具链与检查命令见[验证指南](../development/verification.md)。
 
 复制嵌套示例时，再添加它使用的布局、相机与输入依赖：
 
@@ -57,6 +57,12 @@ bevy_ui = { version = "0.19", default-features = false }
 bevy_input_focus = { version = "0.19", default-features = false }
 bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
 ```
+
+## Bevy 版本要求
+
+Bevy 依赖使用普通的 `version = "0.19"`，即 `>=0.19.0, <0.20.0`，由 Cargo 选择兼容补丁版本。Bevy 的 `0.x` 次版本升级需要单独适配；版本范围遵循 [Cargo 默认要求](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements)。
+
+仓库 `Cargo.lock` 和示例命令中的 `--locked` 用于复现本仓库构建，不固定消费方版本；应用通过自己的 manifest 和 lockfile 解析依赖。镜像、vendoring、Git/path 和 `[patch]` 等来源选择交给 Cargo，本库不额外扫描或禁止这些配置。
 
 ## 声明页面并启动
 

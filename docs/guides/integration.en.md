@@ -49,7 +49,7 @@ bevy_scene = { version = "0.19", default-features = false }
 bevy_ui = { version = "0.19", default-features = false }
 ```
 
-Run `cargo run` in `router-demo`. The project uses Rust edition 2024 and Bevy `0.19`; the repository lockfile selects `0.19.1`. Toolchain details and check commands are in the [verification guide](../development/verification.en.md).
+Run `cargo run` in `router-demo`. The project uses Rust edition 2024. Toolchain details and check commands are in the [verification guide](../development/verification.en.md).
 
 For the nested example, also add its layout, camera, and input dependencies:
 
@@ -57,6 +57,12 @@ For the nested example, also add its layout, camera, and input dependencies:
 bevy_input_focus = { version = "0.19", default-features = false }
 bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
 ```
+
+## Bevy version requirements
+
+Bevy dependencies use the ordinary `version = "0.19"` requirement: `>=0.19.0, <0.20.0`. Cargo selects compatible patch releases. Upgrading between Bevy `0.x` minor releases requires a separate migration; version ranges follow [Cargo default requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements).
+
+The repository's `Cargo.lock` and example commands using `--locked` reproduce this checkout's builds without pinning downstream dependencies. Applications resolve dependencies through their own manifests and lockfiles. Cargo handles mirrors, vendoring, Git/path dependencies, and `[patch]`; this library does not add scans or prohibitions for those configurations.
 
 ## Declare pages and start
 

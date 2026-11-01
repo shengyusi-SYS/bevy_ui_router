@@ -54,7 +54,7 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transition
 bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = ["bsn"] }
 ```
 
-本项目使用 Rust 2024 edition 和 Bevy 0.19，锁文件固定 Bevy 0.19.1。使用能够构建该版本 Bevy 的 Rust 工具链。
+本项目使用 Rust 2024 edition，Bevy 依赖采用 `version = "0.19"` 兼容范围，允许补丁版本更新。版本与 Cargo 配置说明见[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md#bevy-版本要求)。
 
 从[接入指南](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md)开始：用 `BsnRouter` 直接关联路由与页面 factory，设置 `initial` 并挂载应用 host；普通页面系统通过 `commands.router(handle).push("/items/42?tab=info")` 导航。完整可运行源码见[最小示例](https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs)。
 

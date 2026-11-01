@@ -39,7 +39,6 @@ bevy_picking = { version = "0.19", default-features = false }
 bevy_scene = { version = "0.19", default-features = false }
 bevy_ui = { version = "0.19", default-features = false }
 serde_json = "1"
-toml = "1.1.2"
 
 [[example]]
 name = "bsn_quick_start"

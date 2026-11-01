@@ -1,8 +1,7 @@
-#[allow(dead_code)]
-#[path = "support/dependency_policy.rs"]
-mod dependency_policy;
+#[path = "support/dependency_graph.rs"]
+mod dependency_graph;
 
-use dependency_policy::{is_bevy_package, lock_violations, manifest_violations};
+use dependency_graph::is_bevy_dependency;
 use serde_json::Value as Json;
 use std::{
     fs,
@@ -10,7 +9,6 @@ use std::{
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
-use toml::Value;
 
 struct Consumer {
     directory: PathBuf,
@@ -45,30 +43,25 @@ impl Consumer {
             .unwrap()
             .as_nanos();
         let directory = base.join(format!("{}-{stamp}-{name}", std::process::id()));
-        let path = Value::String(facade.to_str().expect("UTF-8 workspace path").to_owned());
+        let path = serde_json::to_string(facade.to_str().expect("UTF-8 workspace path")).unwrap();
         let bsn = features.contains(&"bsn");
         let desktop_back = features.contains(&"desktop-back");
         let android_back = features.contains(&"android-back");
-        let features = Value::Array(
-            features
-                .iter()
-                .map(|feature| Value::String((*feature).into()))
-                .collect(),
-        );
+        let features = serde_json::to_string(features).unwrap();
         let mut manifest = format!(
             "[package]\nname = 'facade-consumer-{name}'\nversion = '0.0.0'\nedition = '2024'\n\n[workspace]\nresolver = '3'\n\n[dependencies]\nbevy_ui_router = {{ path = {path}, default-features = {defaults}, features = {features} }}\n",
         );
         if ecs {
             for dependency in ["bevy_app", "bevy_ecs", "bevy_ui"] {
                 manifest.push_str(&format!(
-                    "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
+                    "{dependency} = {{ version = '0.19', default-features = false }}\n"
                 ));
             }
         }
         if bsn {
             for dependency in ["bevy_asset", "bevy_scene"] {
                 manifest.push_str(&format!(
-                    "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
+                    "{dependency} = {{ version = '0.19', default-features = false }}\n"
                 ));
             }
         }
@@ -76,7 +69,7 @@ impl Consumer {
             if !ecs {
                 for dependency in ["bevy_app", "bevy_ecs"] {
                     manifest.push_str(&format!(
-                        "{dependency} = {{ version = '=0.19.1', default-features = false }}\n"
+                        "{dependency} = {{ version = '0.19', default-features = false }}\n"
                     ));
                 }
             }
@@ -87,16 +80,15 @@ impl Consumer {
                 (false, false) => unreachable!(),
             };
             manifest.push_str(&format!(
-                "bevy_input = {{ version = '=0.19.1', default-features = false, features = {input_features} }}\n",
+                "bevy_input = {{ version = '0.19', default-features = false, features = {input_features} }}\n",
             ));
         }
         if native_ui {
             manifest.push_str(
-                "bevy_input_focus = { version = '=0.19.1', default-features = false }\n\
-                 bevy_internal = { version = '=0.19.1', default-features = false, features = ['bevy_window', 'bevy_camera', 'bevy_ui', 'bevy_picking'] }\n",
+                "bevy_input_focus = { version = '0.19', default-features = false }\n\
+                 bevy_internal = { version = '0.19', default-features = false, features = ['bevy_window', 'bevy_camera', 'bevy_ui', 'bevy_picking'] }\n",
             );
         }
-        assert!(manifest_violations(&toml::from_str(&manifest).unwrap()).is_empty());
         fs::create_dir_all(directory.join("src")).unwrap();
         fs::write(directory.join("Cargo.toml"), manifest).unwrap();
         fs::write(directory.join("src/main.rs"), source).unwrap();
@@ -129,11 +121,6 @@ impl Consumer {
 
     fn prepare(&self) {
         self.success(&["generate-lockfile", "--offline"]);
-        let lock = fs::read_to_string(self.directory.join("Cargo.lock")).unwrap();
-        assert_eq!(
-            lock_violations(&toml::from_str(&lock).unwrap()),
-            Vec::<String>::new()
-        );
     }
 
     fn run(&self, renderer_neutral: bool) {
@@ -151,7 +138,7 @@ impl Consumer {
             "{p}|{f}",
         ];
         // Cross-target neutrality matters for Core/View. An ECS run only needs
-        // its host graph; its lock is still checked for every target's Bevy packages.
+        // its host graph.
         if renderer_neutral {
             tree_args.extend(["--target", "all"]);
         }
@@ -162,7 +149,7 @@ impl Consumer {
             let name = line.split_whitespace().next().unwrap();
             if renderer_neutral {
                 assert!(
-                    !is_bevy_package(name)
+                    !is_bevy_dependency(name)
                         && !matches!(name, "bevy_ui_router_ecs" | "bevy_ui_router_bsn"),
                     "unexpected renderer dependency: {line}"
                 );

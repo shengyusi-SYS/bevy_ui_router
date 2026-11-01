@@ -20,7 +20,7 @@ Observe results through production entry points. To construct special conditions
 
 ## Automated checks
 
-Use a Rust toolchain that supports Bevy `0.19`. The current `bevy_ecs 0.19.1` declares Rust `1.95.0` as its minimum, and this project uses edition 2024. Install rustfmt, then run:
+Use a Rust toolchain satisfying the `rust-version` requirements of the resolved dependencies. This project uses edition 2024. Install rustfmt, then run:
 
 ```sh
 cargo fetch --locked
@@ -30,6 +30,8 @@ cargo test --workspace --all-features --locked
 ```
 
 These are the main checks in [CI](../../.github/workflows/ci.yml). Standalone consumers resolve dependencies offline in their own workspaces; `cargo fetch` prepares the registry and dependency cache. Assign one validation owner to run Cargo/rustc sequentially against a shared target directory.
+
+CI uses `--locked` to reproduce the committed dependency snapshot; see [integration](../guides/integration.en.md#bevy-version-requirements) for version requirements. Standalone consumers generate their own lockfiles from the `0.19` range instead of reusing the repository's Bevy selection. When maintaining the dependency snapshot, use `cargo update` to resolve compatible updates, then run the relevant checks.
 
 All-feature and minimal-feature checks serve different purposes. When changing optional BSN wiring in ECS, also test the base ECS path:
 
@@ -93,7 +95,7 @@ gitleaks git . --redact --log-opts="--all --full-history" --report-format json -
 | Tween adapter | [Adapter journeys](../../crates/bevy_ui_router_ecs/src/transition/tween/tests.rs) | Zero start after publication, independent clock, exit release after the final write, stopping writers on cancellation, and final redraw |
 | Scroll restoration | [Scroll journeys](../../crates/bevy_ui_router/tests/scroll_restoration.rs) | Real layout, early/late containers, ready/cancel, two-dimensional clamping, user scrolling priority, stale IDs, and repeated visits with transitions and cache eviction |
 | Page systems | [Activity journeys](../../crates/bevy_ui_router/tests/public_activity.rs) | Mutable application queries, retained-page deactivation/reactivation, dynamic descendants, and exact parent chains |
-| Integration boundaries | [Consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs), [dependency contract](../../crates/bevy_ui_router/tests/dependency_contract.rs) | Visible APIs for each feature, minimal dependencies, and official Bevy sources |
+| Integration boundaries | [Consumer harness](../../crates/bevy_ui_router/tests/facade_consumers.rs), [dependency contract](../../crates/bevy_ui_router/tests/dependency_contract.rs) | Visible APIs for each feature, minimal dependencies, and dependency direction |
 
 Internal tests cover precise write windows and failure conditions. Public journeys connect recommended entry points with normal scheduling. Use both layers to keep local changes aligned with user operations.
 
@@ -147,7 +149,7 @@ cargo package --workspace
 python3 scripts/check-packaged-consumer.py
 ```
 
-`cargo package` creates and verifies the six library packages. The [packaged consumer](../../scripts/check-packaged-consumer.py) extracts these `.crate` archives, points Router dependencies to the extracted directories, checks their actual sources, and runs the BSN application included in the package. Bevy comes from crates.io and is pinned to `0.19.1`. The script refreshes extracted source timestamps so a shared target recompiles the current package contents while retaining the registry dependency cache.
+`cargo package` creates and verifies the six library packages. The [packaged consumer](../../scripts/check-packaged-consumer.py) extracts these `.crate` archives, points Router dependencies to the extracted directories, checks their actual sources, and runs the BSN application included in the package. Bevy resolves independently within the `0.19` compatibility range. The script refreshes extracted source timestamps so a shared target recompiles the current package contents while retaining the registry dependency cache.
 
 To check uncommitted changes, review the diff, explicitly use `cargo package --workspace --allow-dirty`, and record the source state. Inspect a package's file list with `cargo package -p bevy_ui_router --list`. Review each package's README, source, examples, and required test files, then run the full package checks above.
 
@@ -157,7 +159,7 @@ This table summarizes historical verification recorded in the repository and hel
 
 | Environment or capability | Existing record | Next checks |
 | --- | --- | --- |
-| Official Bevy `0.19.0` / `0.19.1` | Corresponding workspace, public-journey, and standalone-consumer regressions; the default lock selects `0.19.1` | Run the relevant version checks when updating dependencies |
+| Bevy `0.19` series | Historical workspace, public-journey, and standalone-consumer regressions cover `0.19.0` / `0.19.1` | Validate the resolved dependencies according to the scope of each update |
 | Headless Scene/UI | Combined navigation, layout, picking, focus, retention, activity, and scrolling | Select complete journeys for the changed behavior |
 | Package archives | Six library packages and the extracted BSN consumer | Repackage the final release tree and run its consumer |
 | Linux/WSLg window | llvmpipe software rendering; BRP input and renderer screenshots cover navigation, retention, scrolling, focus, gestures, fallback, and application transitions | Repeat the debugging steps after interaction changes |

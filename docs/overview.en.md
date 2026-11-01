@@ -38,6 +38,6 @@ Application data loads through ordinary Bevy tasks and systems. Tasks return dat
 
 For Bevy UI, start with the `bsn` feature of `bevy_ui_router`. Core makes routing decisions, View defines renderer-neutral contracts, ECS changes entities, BSN constructs Scenes, and Platform carries platform back intents. The default `view` feature and Core/View use types independent of Bevy.
 
-The dependency series is official Bevy 0.19, with 0.19.1 in the lockfile. See [verification](development/verification.en.md) for toolchain and platform coverage.
+The supported Bevy compatibility series is `0.19`, allowing patch updates. See [integration](guides/integration.en.md#bevy-version-requirements) for version requirements and [verification](development/verification.en.md) for toolchain and platform coverage.
 
 The [roadmap](roadmap.en.md) also covers browser URL/history integration, asynchronous Scene loading, typed routes, and multiple outlets. Start with [integration](guides/integration.en.md), or consult the [behavior contracts](contracts/README.en.md) for detailed rules.
