@@ -1,54 +1,54 @@
-# 输入与焦点合同
+# Input and focus contract
 
-[中文](input-focus.md) | [English](input-focus.en.md)
+[中文](input-focus.zh-CN.md) | [English](input-focus.md)
 
-Router 让已发布页面接收输入，并在内容离场时撤销手势与焦点。应用的输入处理、页面后台工作和窗口返回分别使用下列接口。执行顺序见[运行机制](../architecture/runtime.md#bevy-调度与输入)，发布规则见[生命周期](lifecycle.md)。
+Router gives published pages input access and revokes gestures and focus when content leaves. Application input handlers, page background work, and window Back actions use the interfaces below. See [runtime behavior](../architecture/runtime.md#bevy-scheduling-and-input) for ordering and [lifecycle](lifecycle.md) for publication.
 
-## 输入资格、pointer 与 focus
+## Input eligibility, pointer, and focus
 
-标准 UI pointer 使用原生 picking；目标定向 keyboard/gamepad handler 在 `PreUpdate` 的 `RouterInputSet::Ready` 后读取 `RouterInputGate`。应用在 `Refresh` 前提交动态拓扑变化，新增和移出内容会在下一 Ready 边界更新资格。gate 保存该边界的权限快照。
+Standard UI pointer input uses native picking. Target-addressed keyboard/gamepad handlers read `RouterInputGate` after `RouterInputSet::Ready` in `PreUpdate`. Submit dynamic topology changes before `Refresh`; added and removed content updates eligibility at the next Ready boundary. The gate stores the permissions snapshot for that boundary.
 
-原生 UI 资格根据 `ComputedNode` 和 authored visibility 判断，允许几何由控件计算、没有 `Node` 的内容，例如 `ScrollbarThumb`。所属 scope、发布和非活动撤权规则保持一致。
+Native UI eligibility uses `ComputedNode` and authored visibility, allowing controls whose geometry is calculated without a `Node`, such as `ScrollbarThumb`. Scope, publication, and inactive revocation rules remain the same.
 
-生命周期切换在同次 publication/隔离内撤权，包括 active→retained。hidden、pending、leaving、failed、retained/residual 内容退出集成输入和 active focus；其它有效目标继续工作。
+Lifecycle switches revoke access in the same publication/isolation call, including active→retained. Hidden, pending, leaving, failed, retained, and residual content lose integrated input and active focus; other valid targets keep working.
 
-pointer 撤权清除目标的当前/前次 hover、press/click/drag 和祖先缓存，保留其它目标状态。真实 hover 生成后、dispatch 前再次过滤非活动 owned scope，因此已开始的旧手势也随离场取消。
+Pointer revocation clears the target's current/previous hover, press/click/drag, and ancestor caches while preserving other targets. Inactive owned scopes are filtered again after real hover generation and before dispatch, cancelling gestures that began before departure.
 
-原生 `TabNavigationPlugin`/`InputDispatchPlugin` 的目标过滤需要应用接入。应用自定义派发、原始设备读取和直接 World 修改也由应用安排。
+Applications integrate target filtering for native `TabNavigationPlugin`/`InputDispatchPlugin`. Applications also arrange their custom dispatch, raw device reads, and direct World changes.
 
-pending Scene 的 `InputFocus::set`/AutoFocus 保存为候选。原 owner 成功发布且目标仍属于该 source 的可获焦 active 内容时，同次 publication 兑现最后有效候选。
+A pending Scene's `InputFocus::set`/AutoFocus is stored as a candidate. The last valid candidate is applied during publication when its original owner publishes successfully and the target still belongs to that source's focus-eligible active content.
 
-后发合法 set/clear 优先，包括同值 set、已空时 clear；后发 pending 候选也替代前一个。候选失败、stale、取消、隐藏或移出 source 时丢弃。无显式意图时保持现有焦点策略，重新激活缓存也等待新意图。无操作的可变借用不算一次 focus 操作。
+Later valid set/clear operations take precedence, including setting the same value or clearing an already empty focus. A later pending candidate also replaces the earlier one. Failure, staleness, cancellation, hiding, or leaving the source discards the candidate. Without an explicit intent, the existing focus policy remains; reactivated retained content also waits for a new intent. An unused mutable borrow does not count as a focus operation.
 
-焦点处理保留应用原 queue、cause 和延后事件顺序；从未 active 的 pending/failed 目标被排除在延后 FocusGained/Lost 派发之外。
+Focus handling preserves the application's queue, cause, and deferred-event ordering. Pending/failed targets that were never active are excluded from deferred FocusGained/Lost dispatch.
 
-## 页面活动查询
+## Page activity queries
 
-`RouteActivity::is_active(Entity)` 帮助应用决定页面 timer、查询或后台工作是否执行。它核对已发布 active assignment、最近登记边界的 exact claim、host registration incarnation 和当前 containment。cached、pending、leaving、failed、quarantine 及无关应用 host 返回 false。
+`RouteActivity::is_active(Entity)` helps applications decide whether to run a page timer, query, or background task. It checks the published active assignment, the nearest registered boundary's exact claim, host registration incarnation, and current containment. Cached, pending, leaving, failed, quarantined, and unrelated application-host targets return false.
 
-`RouteInputs::current(Entity)` 使用相同的 active-frame 解析，返回借用的 `RouteInputRef`，无有效活动归属时返回 None。两者要求 Core 为 Ready 且 exact frame 在逻辑 active 集合中。最近的已登记边界失效或非活动时直接拒绝；其它 Router 的有效内容按自己的 scope 查询。
+`RouteInputs::current(Entity)` uses the same active-frame resolution and returns a borrowed `RouteInputRef`, or None without valid active ownership. Both require Core to be Ready and the exact frame to remain in its logical active set. An invalid or inactive nearest registered boundary rejects the query immediately. Valid content in other Routers resolves through its own scope.
 
-普通页面后代和非交互 Entity 都可以查询，目标无需额外路由组件。两个 SystemParam 只读 Router 元数据和相关层级，可与应用 `Query<(Entity, &mut T)>` 共用。在 `RouterScheduleSet::PublishSnapshots` 后可读取本轮发布结果。输入引用只在当前 SystemParam 借用期有效，跨 World mutation 或 await 前复制所需普通数据。字段含义见[导航合同](navigation.md#匹配与-location-更新)。
+Ordinary page descendants and non-interactive entities can be queried without extra routing components. Both SystemParams read Router metadata and relevant hierarchy, so they work alongside application `Query<(Entity, &mut T)>` parameters. Run after `RouterScheduleSet::PublishSnapshots` to see this update's publication. Input references live only for the SystemParam borrow; copy the plain data you need before World mutation or await. See [navigation](navigation.md#matching-and-location-updates) for field meanings.
 
-activity 与可见性、输入资格分别判断。应用通过它控制自己的系统和后台工作；输入处理仍使用 gate。隐藏缓存中的系统、observer 和其他应用逻辑继续按应用自身调度执行。
+Activity, visibility, and input eligibility are separate checks. Applications use activity to control their systems and background work; input handlers still use the gate. Systems, observers, and other application logic in hidden retained content continue according to the application's scheduling.
 
-实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[activity](../../crates/bevy_ui_router_ecs/src/activity.rs)、[当前输入](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) 和 [调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。
+Sources: [input](../../crates/bevy_ui_router_ecs/src/input.rs), [native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs), [activity](../../crates/bevy_ui_router_ecs/src/activity.rs), [current inputs](../../crates/bevy_ui_router_ecs/src/route_inputs.rs), and [scheduling](../../crates/bevy_ui_router_ecs/src/plugin.rs).
 
-## 窗口级返回输入
+## Window-level Back input
 
-facade 或 Platform 的 `desktop-back` / `android-back` features 提供 `DesktopBackInputPlugin` / `AndroidBackInputPlugin`。两者在 `PreUpdate`、Bevy `InputSystems` 之后的 `PlatformBackInputSet` 中产生 `PlatformBackRequested { window }`。
+The facade or Platform `desktop-back` / `android-back` features provide `DesktopBackInputPlugin` / `AndroidBackInputPlugin`. Both emit `PlatformBackRequested { window }` in `PlatformBackInputSet`, after Bevy `InputSystems` in `PreUpdate`.
 
-| 来源 | 转换为返回消息的输入 |
+| Source | Input converted to a Back request |
 | --- | --- |
-| 桌面鼠标 | `MouseButtonInput` 的 `Back + Pressed` |
-| Android 传统按键 | `KeyboardInput` 逻辑键 `BrowserBack` / `GoBack`，`Pressed` 且 `repeat == false` |
+| Desktop mouse | `MouseButtonInput` with `Back + Pressed` |
+| Traditional Android key | `KeyboardInput` with logical `BrowserBack` / `GoBack`, `Pressed`, and `repeat == false` |
 
-每个来源保留原窗口与自身消息顺序；多个来源之间使用实际调度顺序。Released、其它键和 Android 重复按键被忽略，原始输入继续供其它 reader 使用。
+Each source preserves its original window and message order. Multiple sources follow actual scheduling order. Released, other keys, and repeated Android keys are ignored; original input remains available to other readers.
 
-应用用一个处理器选择 window→RouterHandle 映射、本地 UI 优先级和无 history 时的动作，再调用 `RouterNavigation::back(router)` 处理入队结果。返回属于窗口级意图，可以在任意鼠标位置触发。`BackPolicy` 等类型供应用表达策略；实际决策由这个处理器执行。
+Use one application handler to choose the window→RouterHandle mapping, local UI priority, and the action when history is empty. It then calls `RouterNavigation::back(router)` and handles the enqueue result. Back is a window-level intent and can fire at any pointer location. Types such as `BackPolicy` help express policy; the handler carries out the decision.
 
-推荐把处理器放在同一 `PreUpdate` 的 `.after(PlatformBackInputSet)`，让获准的返回进入后续 `Update` 导航。`MessageReader` 各自有游标，因此本地处理和 Router 派发应放在同一条决策路径。应用保存安装得到的 handle 并明确关联窗口。`DesktopBackRequested` / `DesktopBackInputSet` 是共享类型的兼容名称。
+Place the handler in the same `PreUpdate` with `.after(PlatformBackInputSet)` so accepted requests enter the following `Update` navigation pass. Each `MessageReader` has its own cursor, so local handling and Router dispatch belong in one decision path. Save the installed handle and explicitly associate it with a window. `DesktopBackRequested` / `DesktopBackInputSet` are compatibility names for the shared types.
 
-插件幂等注册原始与返回消息通道。设备输入由应用已有的 Bevy 后端提供，也可注入标准消息测试。各 feature 只启用所需 mouse 或 keyboard 输入；应用自行安装 Router ECS、Scene、窗口和平台运行插件。
+Plugins register raw and Back message channels idempotently. Device input comes from the application's Bevy backend; tests can inject standard messages. Features enable only the needed mouse or keyboard input. Applications select Router ECS, Scene, window, and platform runtime plugins separately.
 
-Android adapter 使用传统按键消息；现代 callback 与预测返回手势属于后续能力。Bevy 消息中没有 Android 取消标志，应用需明确处理无 history 时的退出策略。Android manifest 兼容开关见[系统返回指南](../guides/platform-back.md#android-传统返回)。
+The Android adapter uses traditional key messages; modern callbacks and predictive Back gestures are future capabilities. Bevy messages have no Android cancellation flag, so applications explicitly choose their exit behavior when history is empty. See the [system Back guide](../guides/platform-back.md#android-traditional-back) for the Android manifest compatibility setting.

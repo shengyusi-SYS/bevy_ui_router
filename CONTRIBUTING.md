@@ -1,13 +1,13 @@
-# 参与贡献
+# Contributing
 
-[English](CONTRIBUTING.en.md) | 简体中文
+English | [简体中文](CONTRIBUTING.zh-CN.md)
 
-欢迎提交问题、改进文档和代码。可以使用中文或英文交流。
+Contributions to issues, documentation, and code are welcome. You can use English or Chinese.
 
-报告问题时，请附上 Bevy 与 Rust 版本、启用的 features、操作系统、最小复现步骤，以及预期和实际结果。报告窗口或输入问题时，说明窗口后端和输入方式。分享日志前移除凭据、本机个人路径和应用私有数据。
+When reporting a problem, include the Bevy and Rust versions, enabled features, operating system, a minimal reproduction, and the expected and actual behavior. For window or input issues, also name the window backend and input method. Remove credentials, personal machine paths, and private application data before sharing logs.
 
-开始修改前，阅读[开发指南](docs/development/README.md)，按功能找到对应合同、源码和测试。提交说明写清用户会看到的变化及验证结果；更新对应的中英文文档。简单文档修正可以直接提交。
+Start with the [development guide](docs/development/README.md) to find the relevant contract, implementation, and tests. Describe the user-visible change and validation results in your contribution, and update both language versions of the affected documentation. Small documentation fixes can be submitted directly.
 
-完整检查命令和按风险选择验证的方法见[验证指南](docs/development/verification.md)。工作区协作约定见 [AGENTS.md](AGENTS.md)。
+See [verification](docs/development/verification.md) for commands and checks appropriate to each type of change. Workspace collaboration rules are in [AGENTS.md](AGENTS.md).
 
-仓库内文档互链使用相对当前文件的路径（如 `docs/guides/integration.md`、`../README.md`），外部网站保留完整 URL。使用指南按实际操作顺序写，特殊配置放在对应进阶小节。
+Link to repository files relative to the current document (for example, `docs/guides/integration.md` or `../README.md`); keep full URLs for external sites. Write usage guides in operation order, with specialized configuration in the relevant advanced section.

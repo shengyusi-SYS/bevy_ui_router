@@ -1,50 +1,50 @@
-# 功能开发入口
+# Feature development
 
-[中文](README.md) | [English](README.en.md)
+[中文](README.zh-CN.md) | [English](README.md)
 
-从下面的功能地图找到相关合同、实现和测试。系统关系见[架构总览](../architecture/README.md)，执行顺序见[运行机制](../architecture/runtime.md)，完整命令见[验证指南](verification.md)。
+Use the feature map below to find the relevant contracts, implementation, and tests. The [architecture overview](../architecture/README.md) explains module relationships, [runtime guide](../architecture/runtime.md) explains execution order, and [verification guide](verification.md) lists commands.
 
-## 按改动定位
+## Find the code for a change
 
-| 开发主题 | 行为说明 | 主要实现 | 验证入口 |
+| Topic | Behavior | Main implementation | Verification |
 | --- | --- | --- | --- |
-| 声明安装、初始页面与 Commands 导航 | [集成指南](../guides/integration.md)、[导航合同](../contracts/navigation.md) | ECS [声明](../../crates/bevy_ui_router_ecs/src/bsn/declaration.rs)、[安装](../../crates/bevy_ui_router_ecs/src/bsn/install.rs)、[Commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) | [公开使用旅程](../../crates/bevy_ui_router/tests/public_usage.rs)、[声明安装测试](../../crates/bevy_ui_router_ecs/src/bsn/install/tests.rs) |
-| 路径匹配、参数、query/fragment、共同前缀复用 | [导航](../contracts/navigation.md#匹配与-location-更新) | Core [matcher](../../crates/bevy_ui_router_core/src/matcher.rs)、[branch diff](../../crates/bevy_ui_router_core/src/branch_diff.rs) | Core 测试、[公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) |
-| push/replace/back、history、快照 | [导航与观察](../contracts/navigation.md) | Core [engine](../../crates/bevy_ui_router_core/src/engine.rs)、[history](../../crates/bevy_ui_router_core/src/history.rs)，ECS [navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[snapshots](../../crates/bevy_ui_router_ecs/src/snapshots.rs) | [公开导航旅程](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs)，包括重建后的嵌套 Back |
-| 布局与页面保留、容量、LRU | [实例保留](../contracts/navigation.md#实例保留)、[保留实例生命周期](../contracts/lifecycle.md#非活动实例与长期-owner) | Core [retained](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained](../../crates/bevy_ui_router_ecs/src/retained.rs)、[retained miss](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) | [Core 保留测试](../../crates/bevy_ui_router_core/src/integration_retained_tests.rs)、[公开保留旅程](../../crates/bevy_ui_router/tests/retained_navigation.rs) |
-| 按访问恢复滚动 | [滚动恢复](../contracts/navigation.md#按访问恢复滚动) | Core [history authority](../../crates/bevy_ui_router_core/src/history_authority.rs)，ECS [scroll](../../crates/bevy_ui_router_ecs/src/scroll.rs) | [真实布局与滚动旅程](../../crates/bevy_ui_router/tests/scroll_restoration.rs) |
-| 页面系统活动资格与当前输入 | [页面活动](../contracts/input-focus.md#页面活动查询)、[导航](../contracts/navigation.md) | ECS [activity](../../crates/bevy_ui_router_ecs/src/activity.rs)、[route inputs](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) | [活动旅程](../../crates/bevy_ui_router/tests/public_activity.rs)、[独立 BSN 应用](../../crates/bevy_ui_router/tests/consumers/bsn.rs) |
-| Scene factory、插件装配、default outlet | [Scene 与挂载](../contracts/scene.md) | [BSN](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs)、[native Scene](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs)、[mount](../../crates/bevy_ui_router_ecs/src/mount.rs) | [BSN facade 测试](../../crates/bevy_ui_router/tests/bsn_facade_features.rs)、[独立 BSN 应用](../../crates/bevy_ui_router/tests/consumers/bsn.rs) |
-| host、身份、发布、失败恢复与清理 | [生命周期合同](../contracts/lifecycle.md)、[执行协议](../architecture/lifecycle.md) | Core [integration](../../crates/bevy_ui_router_core/src/integration.rs)，ECS [registry](../../crates/bevy_ui_router_ecs/src/registry.rs)、[navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[cleanup](../../crates/bevy_ui_router_ecs/src/cleanup.rs) | 完整受影响 crate、[native 回归](../../crates/bevy_ui_router_ecs/src/navigation/native_tests.rs)、公开旅程和独立应用 |
-| 桌面鼠标与 Android 传统返回 | [窗口返回](../contracts/input-focus.md#窗口级返回输入) | Platform [back input](../../crates/bevy_ui_router_platform/src/back_input.rs) 和两个输入源，应用的返回处理器 | [返回旅程](../../crates/bevy_ui_router/tests/platform_back.rs)、最小依赖应用、窗口示例编译 |
-| pointer、keyboard/gamepad gate、focus | [输入与焦点](../contracts/input-focus.md)、[调度](../architecture/runtime.md#bevy-调度与输入) | ECS [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[plugin](../../crates/bevy_ui_router_ecs/src/plugin.rs) | [原生 pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs)、[原生 focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs)、窗口交互 |
-| facade、features、依赖、示例与包内容 | [共同边界](../contracts/README.md#共同职责边界)、[Scene 注册](../contracts/scene.md#注册与运行装配) | [facade](../../crates/bevy_ui_router/src/lib.rs)、[manifest](../../crates/bevy_ui_router/Cargo.toml)、[App extension](../../crates/bevy_ui_router_ecs/src/app_ext.rs) | [独立应用](../../crates/bevy_ui_router/tests/facade_consumers.rs)、[依赖检查](../../crates/bevy_ui_router/tests/dependency_contract.rs)、示例及打包 consumer |
-| 路由过渡 | [过渡指南](../guides/transitions.md)、[生命周期](../contracts/lifecycle.md) | Core [exit](../../crates/bevy_ui_router_core/src/engine/exit.rs)、ECS [transition](../../crates/bevy_ui_router_ecs/src/transition.rs)、[Tween 适配](../../crates/bevy_ui_router_ecs/src/transition/tween.rs) 与 [退出处置](../../crates/bevy_ui_router_ecs/src/navigation/deferred_exit.rs) | [公开过渡旅程](../../crates/bevy_ui_router/tests/route_transitions.rs)、[Tween 适配测试](../../crates/bevy_ui_router_ecs/src/transition/tween/tests.rs)、真实 picking 与窗口效果 |
-| 性能 | [性能指南](../performance.md)与对应功能合同 | 根据 profile 定位实际热点 | 同机 benchmark 比较和对应行为测试 |
+| Declaration installation, initial pages, and Commands navigation | [Integration](../guides/integration.md), [navigation contract](../contracts/navigation.md) | ECS [declarations](../../crates/bevy_ui_router_ecs/src/bsn/declaration.rs), [installation](../../crates/bevy_ui_router_ecs/src/bsn/install.rs), [Commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) | [Public usage journeys](../../crates/bevy_ui_router/tests/public_usage.rs), [installation tests](../../crates/bevy_ui_router_ecs/src/bsn/install/tests.rs) |
+| Path matching, parameters, query/fragment, and common-prefix reuse | [Navigation](../contracts/navigation.md) | Core [matcher](../../crates/bevy_ui_router_core/src/matcher.rs), [branch diff](../../crates/bevy_ui_router_core/src/branch_diff.rs) | Core tests, [public navigation journeys](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs) |
+| push/replace/back, history, and snapshots | [Navigation and observation](../contracts/navigation.md) | Core [engine](../../crates/bevy_ui_router_core/src/engine.rs), [history](../../crates/bevy_ui_router_core/src/history.rs); ECS [navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs), [snapshots](../../crates/bevy_ui_router_ecs/src/snapshots.rs) | [Public navigation journeys](../../crates/bevy_ui_router/tests/public_navigation_journeys.rs), including nested Back after rebuilding |
+| Layout/page retention, capacity, and LRU | [Retention](../contracts/navigation.md), [retained lifecycle](../contracts/lifecycle.md) | Core [retained](../../crates/bevy_ui_router_core/src/engine/retained.rs); ECS [retained](../../crates/bevy_ui_router_ecs/src/retained.rs), [retained miss](../../crates/bevy_ui_router_ecs/src/navigation/retained_miss.rs) | [Core retention tests](../../crates/bevy_ui_router_core/src/integration_retained_tests.rs), [public retention journeys](../../crates/bevy_ui_router/tests/retained_navigation.rs) |
+| Scroll restoration per visit | [Scroll restoration](../contracts/navigation.md) | Core [history authority](../../crates/bevy_ui_router_core/src/history_authority.rs); ECS [scroll](../../crates/bevy_ui_router_ecs/src/scroll.rs) | [Real layout and scroll journeys](../../crates/bevy_ui_router/tests/scroll_restoration.rs) |
+| Page activity and current inputs | [Page activity](../contracts/input-focus.md), [navigation](../contracts/navigation.md) | ECS [activity](../../crates/bevy_ui_router_ecs/src/activity.rs), [route inputs](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) | [Activity journeys](../../crates/bevy_ui_router/tests/public_activity.rs), [standalone BSN application](../../crates/bevy_ui_router/tests/consumers/bsn.rs) |
+| Scene factories, plugin setup, and default outlets | [Scenes and mounting](../contracts/scene.md) | [BSN](../../crates/bevy_ui_router_bsn/src/lib.rs), [ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs), [native Scene](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs), [mount](../../crates/bevy_ui_router_ecs/src/mount.rs) | [BSN facade tests](../../crates/bevy_ui_router/tests/bsn_facade_features.rs), [standalone BSN application](../../crates/bevy_ui_router/tests/consumers/bsn.rs) |
+| Hosts, identity, publication, failure recovery, and cleanup | [Lifecycle contract](../contracts/lifecycle.md), [execution protocol](../architecture/lifecycle.md) | Core [integration](../../crates/bevy_ui_router_core/src/integration.rs); ECS [registry](../../crates/bevy_ui_router_ecs/src/registry.rs), [navigation](../../crates/bevy_ui_router_ecs/src/navigation.rs), [cleanup](../../crates/bevy_ui_router_ecs/src/cleanup.rs) | Full affected crates, [native regressions](../../crates/bevy_ui_router_ecs/src/navigation/native_tests.rs), public journeys, and standalone applications |
+| Route transitions | [Transition guide](../guides/transitions.md), [lifecycle](../contracts/lifecycle.md) | Core [exit](../../crates/bevy_ui_router_core/src/engine/exit.rs), ECS [transition](../../crates/bevy_ui_router_ecs/src/transition.rs), [Tween adapter](../../crates/bevy_ui_router_ecs/src/transition/tween.rs), and [exit disposition](../../crates/bevy_ui_router_ecs/src/navigation/deferred_exit.rs) | [Public transition journeys](../../crates/bevy_ui_router/tests/route_transitions.rs), [Tween adapter tests](../../crates/bevy_ui_router_ecs/src/transition/tween/tests.rs), real picking, and window effects |
+| Desktop mouse and Android traditional Back | [Window-level Back](../contracts/input-focus.md) | Platform [Back input](../../crates/bevy_ui_router_platform/src/back_input.rs), its two input sources, and the application's Back handler | [Back journeys](../../crates/bevy_ui_router/tests/platform_back.rs), minimal-dependency applications, and windowed example compilation |
+| Pointer, keyboard/gamepad gates, and focus | [Input and focus](../contracts/input-focus.md), [scheduling](../architecture/runtime.md) | ECS [input](../../crates/bevy_ui_router_ecs/src/input.rs), [native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs), [plugin](../../crates/bevy_ui_router_ecs/src/plugin.rs) | [Native pointer](../../crates/bevy_ui_router/tests/bsn_native_input.rs), [native focus](../../crates/bevy_ui_router/tests/bsn_native_focus.rs), and window interaction |
+| Facade, features, dependencies, examples, and package contents | [Shared boundaries](../contracts/README.md), [Scene registration](../contracts/scene.md) | [Facade](../../crates/bevy_ui_router/src/lib.rs), [manifest](../../crates/bevy_ui_router/Cargo.toml), [App extension](../../crates/bevy_ui_router_ecs/src/app_ext.rs) | [Standalone applications](../../crates/bevy_ui_router/tests/facade_consumers.rs), [dependency checks](../../crates/bevy_ui_router/tests/dependency_contract.rs), examples, and Cargo package verification |
+| Performance | [Performance guide](../performance.md) and the affected feature contract | Profile the actual workload to locate hotspots | Same-machine benchmark comparisons and corresponding behavior tests |
 
-跨层改动沿着行为读取相关主题。例如，导航复用会影响 Scene 重建、frame 身份和焦点；outlet 变动会影响挂载与失败清理。测试选择见[按变更风险选择检查](verification.md#按变更风险选择检查)。
+For cross-layer changes, follow the affected behavior through related topics. Navigation reuse affects Scene rebuilding, frame identity, and focus; outlet changes affect mounting and failure cleanup. Choose tests using the [verification guide](verification.md).
 
-## 新增功能与文档演进
+## Develop features and maintain documentation
 
-从用户问题、期望行为和当前实现缺口开始，说明需要调整的模块和合同。复杂功能可放在 `docs/changes/<feature>/design.md` 与 `plan.md`：设计说明行为、边界和理由，计划安排交付顺序、检查和审查。简单修复直接更新相关代码、测试和文档。
+Start with the user problem, expected behavior, and gap in the current implementation. Identify the modules and contracts that need to change. Complex features can use `docs/changes/<feature>/design.md` and `plan.md`: the design explains behavior, boundaries, and reasons; the plan orders delivery, checks, and review. Small fixes update the relevant code, tests, and documentation directly.
 
-未完成的设计在页首标注状态和影响范围，并链接当前合同。当前推进的主题见[路线图](../roadmap.md)。输入扩展等设计取舍见[工程经验](design-lessons.md)。
+Mark unfinished designs with their status and scope at the top, and link their current contracts. The [roadmap](../roadmap.md) lists active topics. Read [design lessons](design-lessons.md) for decisions about input extensions and other tradeoffs.
 
-功能完成后，将内容更新到对应位置：
+When a feature is complete, update its content in the appropriate place:
 
-| 内容 | 维护位置 |
+| Content | Maintained in |
 | --- | --- |
-| 产品能力与适用场景 | [产品概览](../overview.md) |
-| 用户可见行为与跨层约定 | [专题合同](../contracts/README.md) |
-| 模块关系与执行机制 | [架构](../architecture/README.md) |
-| 装配步骤、交互和排障 | [集成](../guides/integration.md)与[调试](../guides/debugging.md) |
-| 检查命令和平台记录 | [验证指南](verification.md) |
-| 可复用的原因与取舍 | [工程经验](design-lessons.md) |
+| Product capabilities and use cases | [Overview](../overview.md) |
+| User-visible behavior and cross-layer agreements | [Contracts](../contracts/README.md) |
+| Module relationships and execution | [Architecture](../architecture/README.md) |
+| Setup, interaction, and troubleshooting | [Integration](../guides/integration.md) and [debugging](../guides/debugging.md) |
+| Check commands and platform records | [Verification](verification.md) |
+| Reusable reasoning and tradeoffs | [Design lessons](design-lessons.md) |
 
-每条规则在所属主题维护，中英文同步更新。已完成计划和过程日志通过 Git 历史查询，让默认文档树聚焦当前行为和正在开展的工作。
+Maintain each rule in its owning topic and update both languages together. Use Git history for completed plans and progress logs, keeping the main documentation focused on current behavior and active work.
 
-## 修改前后的核对
+## Check before and after a change
 
-修改前跟踪真实调用路径，找出覆盖相关用户行为的测试。修改后检查受影响的完整操作链：例如一次导航应包括请求入队、页面显示、离场清理和后续导航。对失败路径，同时检查当前内容、输入/焦点及请求最终状态。
+Before editing, trace the real call path and find tests that cover the affected user behavior. Afterwards, check the complete operation: a navigation journey includes queueing a request, displaying a page, cleaning up departing content, and navigating again. For failure paths, inspect displayed content, input/focus, and the request's final state together.
 
-运行相称的格式、编译和测试检查；文档修改执行链接和发布内容检查，命令见[验证指南](verification.md)。报告使用的命令、feature、源码状态和环境，并注明尚待执行的项目。共享工作区和提交纪律见 [AGENTS.md](../../AGENTS.md)。
+Run formatting, compilation, and tests suited to the change. For documentation, run link checks using the [verification guide](verification.md). Report commands, features, source state, and environment, along with checks still to run. Shared-workspace and commit rules are in [AGENTS.md](../../AGENTS.md).

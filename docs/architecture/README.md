@@ -1,88 +1,88 @@
-# 架构总览
+# Architecture
 
-[中文](README.md) | [English](README.en.md)
+[中文](README.zh-CN.md) | [English](README.md)
 
-Bevy UI Router 将“决定显示什么”和“在 World 中执行切换”分开。Core 决定路由、访问记录和生命周期，ECS 执行实体创建、切换与清理。应用通过 facade 接入。产品能力见[概览](../overview.md)，行为规则见[专题合同](../contracts/README.md)。
+Bevy UI Router separates choosing what to show from applying that choice to the World. Core decides routes, history, and lifecycle; ECS creates, switches, and cleans up entities. Applications use the facade. See the [overview](../overview.md) for capabilities and the [contracts](../contracts/README.md) for behavior.
 
-## Crate 与依赖
+## Crates and dependencies
 
-箭头表示 Cargo 依赖方向，标注 feature 的连接按需启用。
+Arrows show Cargo dependencies. Feature labels mark optional connections.
 
 ```mermaid
 flowchart TD
-    Facade["bevy_ui_router"] --> Core["Core：路由与生命周期"]
-    Facade -->|view 默认| View["View：渲染无关的视图合同"]
-    Facade -->|ecs| ECS["ECS：实体执行与输入"]
-    Facade -->|bsn| BSN["BSN：Scene factory"]
-    Facade -->|platform| Platform["Platform：平台输入"]
+    Facade["bevy_ui_router"] --> Core["Core: routing and lifecycle"]
+    Facade -->|view default| View["View: renderer-neutral contracts"]
+    Facade -->|ecs| ECS["ECS: entity execution and input"]
+    Facade -->|bsn| BSN["BSN: Scene factories"]
+    Facade -->|platform| Platform["Platform: platform input"]
     View --> Core
     ECS --> Core
     ECS --> View
     ECS -->|bsn bridge| BSN
-    ECS -->|tween| Tween["bevy_tween：时间线与插值"]
+    ECS -->|tween| Tween["bevy_tween: timelines and interpolation"]
     BSN --> Core
     BSN --> View
     Platform --> Core
     Platform -->|desktop-back / android-back| BevyInput["Bevy app / ECS / input"]
 ```
 
-| Crate | 职责 |
+| Crate | Responsibility |
 | --- | --- |
-| Core | location、匹配、分支差异、请求顺序、frame/generation、history、实例保留和恢复决策；无外部依赖 |
-| View | view/driver key、registry、descriptor 和只读 effect/input；仅依赖 Core |
-| ECS | host/slot/frame 绑定、Scene 执行、发布准备、清理、保留内容、滚动、输入和活动查询 |
-| BSN | 生成新 Scene 的 factory、构建错误和 default outlet 声明 |
-| Platform | 中立 Back 类型，以及可选的鼠标和 Android 传统 Back 消息转换 |
-| Facade | 常用 API 和 feature 组合，通常通过 `bevy_ui_router::prelude::*` 使用 |
+| Core | Locations, matching, branch differences, request ordering, frame/generation, history, instance retention, and recovery decisions; no external dependencies |
+| View | View/driver keys, registry, descriptors, and read-only effects/inputs; depends only on Core |
+| ECS | Host/slot/frame bindings, Scene execution, publication preparation, cleanup, retained content, scrolling, input, and activity queries |
+| BSN | Factories that produce fresh Scenes, build errors, and default outlet declarations |
+| Platform | Neutral Back types and optional mouse or traditional Android Back input conversion |
+| Facade | Common APIs and feature combinations, usually imported with `bevy_ui_router::prelude::*` |
 
-默认 `view` feature 保持纯 Rust 依赖。`ecs` 包含 `view`，`bsn` 包含 `ecs`；BSN 的 `AppBsnExt` 在 ECS bridge 实现，再由 facade 导出。当前应用使用 BSN renderer。
+The default `view` feature keeps the dependency graph Bevy-free. `ecs` includes `view`, and `bsn` includes `ecs`. BSN's `AppBsnExt` is implemented in the ECS bridge and re-exported by the facade. BSN is the current application renderer.
 
-`BsnRouter` 声明在 ECS 的 BSN 接入模块中编译为现有 Core 路由树、View registry 和 factory bindings；应用不必逐项组装它们。Commands 导航与一次性 initial 都通过原 `RouterNavigation` 入队。当前输入查询保持只读，可与应用 Query 和 Commands 共存。
+The ECS BSN integration compiles `BsnRouter` declarations into the existing Core route tree, View registry, and factory bindings, removing manual assembly from ordinary applications. Commands navigation and one-shot initial navigation both enter through the original `RouterNavigation`. Current-input queries remain read-only and coexist with application Query and Commands.
 
-`tween` 包含 `ecs`，按需接入 `bevy_tween`。适配模块管理动画控制器与原过渡 session 的时机，应用提供具体效果；Core、默认 feature 和普通 `bsn` 接入不依赖动画库。
+The optional `tween` feature includes `ecs` and integrates `bevy_tween`. Its adapter coordinates controllers with existing transition sessions; applications supply effects. Core, default features, and ordinary `bsn` integration do not depend on the animation library.
 
-`platform` 独立开启，保持纯 Rust 依赖。`desktop-back` / `android-back` 包含 `platform`，分别启用需要的 Bevy mouse / keyboard 输入。应用自行选择 Router ECS/BSN、窗口后端和返回处理器。`devtools` 当前是空 feature。
+`platform` is independent and also Bevy-free. `desktop-back` / `android-back` include `platform` and enable the required Bevy mouse / keyboard input. Applications select Router ECS/BSN, the window backend, and their Back handler separately. `devtools` is currently an empty feature.
 
-## 访问、实例与责任
+## Visits, instances, and ownership
 
-三个概念分别回答“回到哪次访问”“复用哪个页面”和“谁管理实体”。
+These concepts answer three different questions: which visit to return to, which page to reuse, and who manages its entities.
 
 ```mermaid
 flowchart LR
-    E1["history entry A₁"] --> S1["A₁ 的滚动记录"]
-    E2["history entry A₂"] --> S2["A₂ 的滚动记录"]
-    E1 -.-> P["页面实例 A：Entity 与局部状态"]
+    E1["history entry A₁"] --> S1["scroll record for A₁"]
+    E2["history entry A₂"] --> S2["scroll record for A₂"]
+    E1 -.-> P["page instance A: Entity and local state"]
     E2 -.-> P
-    O["物理责任 owner"] --> P
+    O["physical owner"] --> P
 ```
 
-Core 管理 history 和保留决策，ECS 按 entry key 保存滚动位置并持有实体内容。不同访问可以复用同一实例，仍各有自己的滚动记录。
+Core manages history and retention decisions. ECS stores scroll positions by entry key and holds entity content. Different visits can reuse one instance while keeping separate scroll records.
 
-owner 是负责某段物理内容的唯一凭据，随 active、retained 和 cleanup 交接移动。请求完成后，保留实例由独立长期 owner 管理。完整生命周期还包含 pending、待清理内容和已隔离残留；active branch 只描述当前呈现。详细规则见[导航](../contracts/navigation.md)和[生命周期](../contracts/lifecycle.md#非活动实例与长期-owner)。
+An owner is the unique capability responsible for physical content. It moves between active, retained, and cleanup holders. Once a request completes, an independent long-lived owner manages any retained instance. The full lifecycle also includes pending content, cleanup work, and isolated residuals; the active branch describes only the current presentation. See [navigation](../contracts/navigation.md) and [lifecycle](../contracts/lifecycle.md#inactive-instances-and-long-lived-owners).
 
-## 状态与源码入口
+## State and source map
 
-以下状态分别观察，组合起来描述 Router 的现状。
+These dimensions are observed separately and together describe a Router's state.
 
-| 维度 | 公开值 | 含义 |
+| Dimension | Public values | Meaning |
 | --- | --- | --- |
-| 可用性 | `AwaitingHost`、`Ready`、`RecoveringAuthority`、`Unavailable` | 是否已绑定 host、能否执行导航；Ready 时也可能尚无页面 |
-| 当前呈现 | `None`、`Route`、`Error` | 当前页面或错误页面 |
-| 请求 | `Queued`、`Running(phase)`、`Succeeded`、`Failed` | 单次命令进度；页面切换后可能仍在清理 |
-| 清理 | `CleanupSummary` | 前台待处理责任、隔离数量和最近处置结果 |
+| Availability | `AwaitingHost`, `Ready`, `RecoveringAuthority`, `Unavailable` | Host binding and ability to run navigation; Ready may have no page yet |
+| Presentation | `None`, `Route`, `Error` | The current page or error page |
+| Request | `Queued`, `Running(phase)`, `Succeeded`, `Failed` | Command progress; cleanup can continue after a visible switch |
+| Cleanup | `CleanupSummary` | Pending foreground work, isolated counts, and the latest disposition |
 
-| 功能 | 源码入口 |
+| Area | Source |
 | --- | --- |
-| 路由树、匹配、分支差异 | [route_tree.rs](../../crates/bevy_ui_router_core/src/route_tree.rs)、[matcher.rs](../../crates/bevy_ui_router_core/src/matcher.rs)、[branch_diff.rs](../../crates/bevy_ui_router_core/src/branch_diff.rs) |
-| Core 决策与跨 crate 交接 | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs)、[integration.rs](../../crates/bevy_ui_router_core/src/integration.rs)、[history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs) |
-| 实例保留 | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs)，ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) 与 [instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) |
-| View registry 与 effect | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs)、[effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |
-| 公开声明与便捷导航 | [BSN declaration](../../crates/bevy_ui_router_ecs/src/bsn/declaration.rs)、[install](../../crates/bevy_ui_router_ecs/src/bsn/install.rs)、[navigation commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) |
-| 注册、调度、导航、快照 | [app_ext.rs](../../crates/bevy_ui_router_ecs/src/app_ext.rs)、[plugin.rs](../../crates/bevy_ui_router_ecs/src/plugin.rs)、[navigation.rs](../../crates/bevy_ui_router_ecs/src/navigation.rs)、[snapshots.rs](../../crates/bevy_ui_router_ecs/src/snapshots.rs) |
-| host、挂载与 Scene | [host.rs](../../crates/bevy_ui_router_ecs/src/host.rs)、[mount.rs](../../crates/bevy_ui_router_ecs/src/mount.rs)、[BSN 合同](../../crates/bevy_ui_router_bsn/src/lib.rs)、[ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs) |
-| 发布、失败和清理 | [生命周期执行协议](lifecycle.md#修改时定位哪些模块) |
-| 滚动与当前页面信息 | [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs)、[activity.rs](../../crates/bevy_ui_router_ecs/src/activity.rs)、[route_inputs.rs](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) |
-| 输入与焦点 | [input.rs](../../crates/bevy_ui_router_ecs/src/input.rs)、[native_focus.rs](../../crates/bevy_ui_router_ecs/src/native_focus.rs) |
-| 窗口返回 | [back_input.rs](../../crates/bevy_ui_router_platform/src/back_input.rs)；应用处理器通过公开 `RouterNavigation::back` 导航 |
+| Route tree, matching, branch differences | [route_tree.rs](../../crates/bevy_ui_router_core/src/route_tree.rs), [matcher.rs](../../crates/bevy_ui_router_core/src/matcher.rs), [branch_diff.rs](../../crates/bevy_ui_router_core/src/branch_diff.rs) |
+| Core decisions and cross-crate handoff | [engine.rs](../../crates/bevy_ui_router_core/src/engine.rs), [integration.rs](../../crates/bevy_ui_router_core/src/integration.rs), [history_authority.rs](../../crates/bevy_ui_router_core/src/history_authority.rs) |
+| Retained instances | Core [retained.rs](../../crates/bevy_ui_router_core/src/engine/retained.rs); ECS [retained.rs](../../crates/bevy_ui_router_ecs/src/retained.rs) and [instance.rs](../../crates/bevy_ui_router_ecs/src/instance.rs) |
+| View registry and effects | [registry.rs](../../crates/bevy_ui_router_view/src/registry.rs), [effect.rs](../../crates/bevy_ui_router_view/src/effect.rs) |
+| Declarations and convenient navigation | [BSN declaration](../../crates/bevy_ui_router_ecs/src/bsn/declaration.rs), [install](../../crates/bevy_ui_router_ecs/src/bsn/install.rs), [navigation commands](../../crates/bevy_ui_router_ecs/src/navigation_commands.rs) |
+| Registration, scheduling, navigation, snapshots | [app_ext.rs](../../crates/bevy_ui_router_ecs/src/app_ext.rs), [plugin.rs](../../crates/bevy_ui_router_ecs/src/plugin.rs), [navigation.rs](../../crates/bevy_ui_router_ecs/src/navigation.rs), [snapshots.rs](../../crates/bevy_ui_router_ecs/src/snapshots.rs) |
+| Hosts, mounting, Scenes | [host.rs](../../crates/bevy_ui_router_ecs/src/host.rs), [mount.rs](../../crates/bevy_ui_router_ecs/src/mount.rs), [BSN contract](../../crates/bevy_ui_router_bsn/src/lib.rs), [ECS bridge](../../crates/bevy_ui_router_ecs/src/bsn.rs) |
+| Publication, failure, cleanup | [Lifecycle execution protocol](lifecycle.md#module-map) |
+| Scrolling and current page information | [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs), [activity.rs](../../crates/bevy_ui_router_ecs/src/activity.rs), [route_inputs.rs](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) |
+| Input and focus | [input.rs](../../crates/bevy_ui_router_ecs/src/input.rs), [native_focus.rs](../../crates/bevy_ui_router_ecs/src/native_focus.rs) |
+| Window Back input | [back_input.rs](../../crates/bevy_ui_router_platform/src/back_input.rs); the application handler navigates through public `RouterNavigation::back` |
 
-matcher 递归遍历不可变路由树并比较候选。实体结构、导航过程和系统顺序见[运行机制](runtime.md)；修改功能时从[开发指南](../development/README.md)选择对应测试。
+The matcher recursively walks an immutable route tree and compares candidates. See [runtime behavior](runtime.md) for entity structure and system ordering, and the [development guide](../development/README.md) for tests by feature.

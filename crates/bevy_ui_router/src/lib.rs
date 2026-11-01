@@ -28,9 +28,9 @@
 //! relevant features in your application manifest. For local documentation, use
 //! `cargo doc -p bevy_ui_router --all-features --no-deps`.
 //!
-//! [integration guide]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.en.md
+//! [integration guide]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/integration.md
 //! [quick start]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/crates/bevy_ui_router/examples/bsn_quick_start.rs
-//! [debugging guide]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/debugging.en.md
+//! [debugging guide]: https://github.com/shengyusi-SYS/bevy_ui_router/blob/main/docs/guides/debugging.md
 
 #![forbid(unsafe_code)]
 

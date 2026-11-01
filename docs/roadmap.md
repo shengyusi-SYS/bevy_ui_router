@@ -1,37 +1,35 @@
-# 路线图
+# Roadmap
 
-[English](roadmap.en.md) | 简体中文
+English | [简体中文](roadmap.zh-CN.md)
 
-当前能力见[产品概览](overview.md)，具体行为见[行为合同](contracts/README.md)。本页记录后续工作。
+See the [overview](overview.md) for available features and the [behavior contracts](contracts/README.md) for detailed semantics. This page tracks upcoming work.
 
-## 正在进行
+## In progress
 
-| 工作 | 交付内容 |
+| Work | Deliverable |
 | --- | --- |
-| 公开文档 | 中英文使用与开发指南、可运行示例入口、文件和隐私检查 |
-| 发布准备 | 双许可证已确定为 MIT OR Apache-2.0；确定发布版本后，验证最终打包产物与独立消费方 |
+| Public documentation | English and Chinese user and developer guides, runnable examples, file cleanup, and privacy checks |
+| Release preparation | MIT OR Apache-2.0 dual licensing is selected; choose the release version, then validate the final packages with an independent consumer |
 
-具体动画效果由应用/UI 层实现。项目采用 MIT OR Apache-2.0 双许可证；发布版本留待维护者确定，当前接入方式是仓库本地依赖。
+Applications and UI code implement animation effects. The project uses MIT OR Apache-2.0 dual licensing. Maintainers will choose the release version; applications currently use a local checkout dependency.
 
-## 后续方向
+## Future directions
 
-### Bevy 0.20 适配（待启动）
+### Bevy 0.20 migration (not started)
 
-按[版本对应策略](guides/integration.md#bevy-版本要求)支持 Bevy 0.19 及后续次版本。0.20 已完成兼容性评估，暂不升级；实施时完成以下工作：
+Support Bevy 0.19 and subsequent minor releases through the [version-mapping policy](guides/integration.md#bevy-version-requirements). The 0.20 compatibility assessment is complete; migration is deferred. Implementation work:
 
-- 将 Bevy 迁至 `0.20` 系列、`bevy_tween` 迁至 `0.14` 系列，同步独立 consumer 和窗口示例，核对工具链要求。
-- 迁移 Query 迭代、pointer 事件、observer 泛型、BSN 表达式及受影响的 Template、裁剪和 AutoFocus 测试。
-- 将 `PointerCaptureMap` 纳入既有页面撤权流程，保留其它有效目标的捕获，回归切页后的正常命中。
-- 完成相关 crate、公开旅程、独立 consumer 和示例验证；重点复核焦点、滚动与动画调度，复测既有动画基准，并更新兼容表和使用文档。
+- Move Bevy to the `0.20` series and `bevy_tween` to `0.14`, update standalone consumers and windowed examples, and check toolchain requirements.
+- Migrate Query iteration, pointer events, observer generics, BSN expressions, and affected Template, clipping, and AutoFocus tests.
+- Include `PointerCaptureMap` in existing page input revocation, preserving other valid targets' captures and testing normal hit detection after navigation.
+- Validate affected crates, public journeys, standalone consumers, and examples. Recheck focus, scroll, and animation scheduling, rerun the existing animation benchmark, and update the compatibility table and user documentation.
 
-### 其它方向
+### Other directions
 
-原生 Tab 导航与输入分发自动接入路由活动资格，需要 Bevy/UI 提供适合的公开扩展入口。该方向同时包括焦点准入和当前焦点桥的替换。现有应用可继续通过 `RouterInputGate` 接入键盘和手柄处理器。
+Automatic route activity integration with native Tab navigation and input dispatch needs suitable public extension points in Bevy/UI. This work also includes focus admission and replacement of the current focus bridge. Applications can use `RouterInputGate` in keyboard and gamepad handlers today.
 
-其它方向包括浏览器 URL/history、异步 Scene 加载、typed route/search、多出口、其它 renderer 和公开实例逐出接口。每项工作先明确应用场景、期望行为和验证方法，再进入实施计划。
+Other directions include browser URL/history integration, asynchronous Scene loading, typed routes and search, multiple outlets, other renderers, and a public instance-eviction API. Each starts with an application use case, expected behavior, and a verification approach before an implementation plan.
 
-## 发布顺序
+## Release sequence
 
-确定发布版本，更新 Cargo 元数据；随后运行[验证指南](development/verification.md)中的最终树检查和打包 consumer。六个 crate 的依赖顺序为 Core → View → BSN / Platform → ECS → facade，其中 Platform 只依赖 Core。
-
-发布文件检查覆盖源码、文档、示例和包内容。Git 历史另行扫描；需要只分享当前源码时，可从检查后的文件创建独立发布快照。
+Choose the release version, update Cargo metadata, then run the checks and Cargo package verification from the [verification guide](development/verification.md). The six crates can be released in dependency order: Core → View → BSN / Platform → ECS → facade. Platform depends only on Core.

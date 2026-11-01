@@ -1,12 +1,12 @@
-# 添加过渡动画
+# Add page transitions
 
-[English](transitions.en.md) | 简体中文
+English | [简体中文](transitions.zh-CN.md)
 
-给已有的 Bevy UI 页面加上切换动画。Router 负责让进入、退出页面在合适的时间存在，应用决定效果、时长和缓动。下面先使用 Tween 适配；已有动画系统可以直接接入后半部分的自定义驱动器。
+Animate page changes in an existing Bevy UI application. Router manages how long entering and leaving pages remain available; your application chooses effects, durations, and easing. Start with the Tween adapter below, or connect an existing animation system with the custom driver later on this page.
 
-## 1. 添加依赖和插件
+## 1. Add the dependency and plugin
 
-在现有 `bevy_ui_router` 依赖上启用 `tween`，即 `features = ["bsn", "tween"]`，并添加：
+Enable `tween` on your existing `bevy_ui_router` dependency: `features = ["bsn", "tween"]`. Then add:
 
 ```toml
 [dependencies.bevy_tween]
@@ -14,19 +14,19 @@ version = "0.13"
 default-features = false
 ```
 
-沿用入门教程的导入，在 `add_bsn_router` 之前安装插件：
+Keep the tutorial's imports and install the plugin before `add_bsn_router`:
 
 ```rust
 app.add_plugins(RouteTweenPlugin::default());
 ```
 
-教程中的 `DefaultPlugins` 已包含动画需要的时间插件。
+The tutorial's `DefaultPlugins` already includes the time plugin animation needs.
 
-## 2. 连接路由并定义效果
+## 2. Connect the effect to your router
 
-在已有 `BsnRouter` 的声明链上，加上 `.transition_driver(RouteTweenDriver::new(prepare_effect))`，再实现下面的 `prepare_effect`。它让新页面在 240 毫秒内从右侧滑入。
+Add `.transition_driver(RouteTweenDriver::new(prepare_effect))` to your existing `BsnRouter` builder, then define `prepare_effect` below. It slides an entering page in from the right over 240 milliseconds.
 
-`surface()` 返回 Router 为页面提供的外层动画节点。这里只修改它已有的 `UiTransform`；`is_outermost()` 避免父子页面重复移动。
+`surface()` returns the outer animation node Router provides for the page. Here we change its existing `UiTransform`; `is_outermost()` avoids moving both a parent and its child.
 
 ```rust
 use std::time::Duration;
@@ -51,56 +51,56 @@ fn prepare_effect(
 }
 ```
 
-`tracks.enter(...)` 播放进入动画；需要退出动画时，使用 `tracks.exit(...)`。两者可组合 `tween`、`sequence`、`parallel` 等有限时间线。退出页面的动画都放进 `exit`，库会等它们结束后再隐藏或清理页面。没有添加动画时直接切页。
+Use `tracks.enter(...)` for entering animation and `tracks.exit(...)` for leaving animation. Both accept finite timelines built with `tween`, `sequence`, and `parallel`. Put all leaving-page animation in `exit`; Router waits for it to finish before hiding or cleaning up the page. Adding no tracks switches pages immediately.
 
-适配器负责计时、取消、结束和按需窗口的重绘。动画可以修改外层节点已有的 `UiTransform`、`ZIndex` 和 `Node` 布局字段（不含 `display`）；外层节点的组件、父子关系、可见性和输入状态仍由 Router 管理。
+The adapter handles timing, cancellation, completion, and redraw for on-demand windows. Animations may change the outer node's existing `UiTransform`, `ZIndex`, and `Node` layout fields except `display`. Router continues to manage its components, parent/child relationships, visibility, and input.
 
-## 3. 运行并调整效果
+## 3. Run and adjust the example
 
-从仓库根目录进入窗口示例目录：
+From the repository root, enter the windowed example directory:
 
 ```sh
 cd examples/windowed
 cargo run --features tween --bin tween_transitions
 ```
 
-点击页面按钮切换，点击 `Effect: …` 切换效果、`Exit: …` 开关退出动画，修改后在下一次导航生效。效果代码在 [effects.rs](../../examples/windowed/src/bin/tween_transitions/effects.rs)，完整接入在[示例入口](../../examples/windowed/src/bin/tween_transitions.rs)。
+Click page buttons to navigate. Click `Effect: …` to change effects and `Exit: …` to toggle exit animation; changes apply to the next navigation. Find effects in [effects.rs](../../examples/windowed/src/bin/tween_transitions/effects.rs) and complete setup in the [example entry point](../../examples/windowed/src/bin/tween_transitions.rs).
 
 <details>
-<summary>更多插值类型、自选插件与执行顺序</summary>
+<summary>More interpolation types, custom plugins, and execution order</summary>
 
-适配器支持 `EaseKind` / `EaseClosure` 和 boxed 组件插值，默认注册 `UiTransform`、`Node`、`ZIndex`。应用内容的其它组件可用 `RouteTweenPlugin::default().with_component::<T>()` 注册，通过 `with_closure` 或 boxed interpolator 操作。typed interpolator、resource/asset tween 和 tween event 需要下文的自定义驱动器。
+The adapter supports `EaseKind` / `EaseClosure` and boxed component interpolation, with `UiTransform`, `Node`, and `ZIndex` registered by default. Register other application-content components with `RouteTweenPlugin::default().with_component::<T>()`, using `with_closure` or a boxed interpolator. Typed interpolators, resource/asset tweens, and tween events need the custom driver below.
 
-如同时使用 `DefaultTweenPlugins`，先安装 `RouteTweenPlugin`，让上游 debug 插件识别路由动画的独立时钟。反过来安装不影响计时，但可能出现未知时间上下文的误报。自选 Bevy 插件时需提供 `TimePlugin`。
+When also using `DefaultTweenPlugins`, install `RouteTweenPlugin` first so the upstream debug plugin recognizes the route animation's independent clock. Reversing that order preserves timing but may produce an unknown-time-context warning. With a custom Bevy plugin set, provide `TimePlugin`.
 
-动画在页面切换后从零开始，使用 `Time<Real>`；在 UI Prepare 前应用插值，最后一次写入后回收控制器。取消会同步停止写入。按需更新的窗口在动画期间及提交完成请求时会收到重绘请求。需要自定义时钟或完成策略时，使用下文的驱动器接口。
+Animation starts at zero after the page switch using `Time<Real>`. Interpolation runs before UI Prepare, and controllers are removed after their final write. Cancellation stops writes synchronously. On-demand windows receive redraw requests during animation and when completion is submitted. Use the driver interface below for custom clocks or completion policies.
 
 </details>
 
-## 接入已有动画系统
+## Connect an existing animation system
 
-实现 `RouteTransitionDriver` 即可连接自己的动画系统。可以先在 `examples/windowed` 目录运行不依赖 Tween 的示例：
+Implement `RouteTransitionDriver` to connect your own animation system. To try the example without Tween, run from the `examples/windowed` directory:
 
 ```sh
 cargo run --bin transitions
 ```
 
-[窗口示例](../../examples/windowed/src/bin/transitions.rs)使用这个接口实现平移和缩放旋转。按钮和键盘操作相同：
+The [windowed example](../../examples/windowed/src/bin/transitions.rs) implements both a slide and a scale/rotation effect through the same driver interface. Buttons and keyboard shortcuts perform the same actions:
 
-| 按键 | 操作 |
+| Key | Action |
 | --- | --- |
-| `1` / `2` | 进入保留状态的 Notes / Gallery 页面 |
-| `3` | 进入每次返回都重新创建的 Fresh 页面 |
+| `1` / `2` | Open the retained Notes / Gallery page |
+| `3` | Open Fresh, which creates a new instance on return |
 | `B` | Back |
-| `E` | 切换下一次过渡的效果 |
-| `H` | 切换是否持有退出页面；关闭时仅播放进入动画 |
-| `R` | 连续发出导航，观察旧动画取消 |
+| `E` | Change the effect for the next transition |
+| `H` | Toggle holding the outgoing page; disabling it animates entry only |
+| `R` | Send successive navigation requests and observe cancellation |
 
-点击页面计数器后切换页面，可比较保留与重新创建的行为。[动画实现](../../examples/windowed/src/bin/transitions/animation.rs)使用官方 `Time<Real>`、`Timer`、`EasingCurve` 和 `UiTransform`；无需额外动画库。窗口运行环境见[应用集成](integration.md#运行仓库示例)。
+Click a page counter before navigating to compare retained state with fresh creation. The [animation implementation](../../examples/windowed/src/bin/transitions/animation.rs) uses Bevy's `Time<Real>`, `Timer`, `EasingCurve`, and `UiTransform`, with no additional animation runtime. See [application integration](integration.md#run-the-examples) for window requirements.
 
-### 注册驱动器
+### Register the driver
 
-为 Router 注册驱动器：
+Register the driver for your Router:
 
 ```rust
 let declaration = BsnRouter::new(root)
@@ -109,51 +109,51 @@ let declaration = BsnRouter::new(root)
 let router = app.add_bsn_router(declaration)?;
 ```
 
-`MyTransitionDriver` 实现 `RouteTransitionDriver`。回调同步运行，可使用 `&mut World` 访问应用资源：
+`MyTransitionDriver` implements `RouteTransitionDriver`. Callbacks run synchronously and receive `&mut World` to access application state:
 
-| 回调 | 应用职责 |
+| Callback | Application responsibility |
 | --- | --- |
-| `prepare(world, context)` | 设置首帧样式并记录动画状态，此时不要启动计时。返回 `Skip` 或 `Run { hold_exit }`。 |
-| `presented(world, id)` | 页面已切换，启动应用动画。 |
-| `cancelled(world, id, reason)` | 在返回前停止本次动画对组件的全部写入，并清理应用动画状态。 |
+| `prepare(world, context)` | Set initial styles and record animation state without starting elapsed-time animation. Return `Skip` or `Run { hold_exit }`. |
+| `presented(world, id)` | Start animation after the page switch. |
+| `cancelled(world, id, reason)` | Stop every writer for this session and remove its application animation state before returning. |
 
-每次调用 `prepare` 后都会收到 `presented` 或 `cancelled`；已经开始的动画也可能随后取消。`Skip` 会触发 `cancelled(..., Skipped)`，以便撤销准备状态。其它原因包括 `PreparationAborted`、`Superseded` 和 `AuthorityLost`。取消已发布的动画不会撤销已提交的路由与 history。
+Every `prepare` is followed by `presented` or `cancelled`; a presented session can also be cancelled later. `Skip` invokes `cancelled(..., Skipped)` so the application can discard preparation state. Other reasons are `PreparationAborted`, `Superseded`, and `AuthorityLost`. Cancelling a published animation does not undo committed routing or history.
 
-`RouteTransitionContext` 提供本次动画的 `id()`、Router、导航请求、`NavigationKind` 与前后地址 `from()` / `to()`。用 `entering()` 和 `leaving()` 取得进入、退出的目标；`preserved()` 中继续共用的页面仅供读取。目标的 `frame()` 标识路由实例，`content()` 是应用内容根，`surface()` 是外层动画节点。整页效果通常只处理 `is_outermost()`，避免父子页面重复变换。
+`RouteTransitionContext` supplies the animation’s `id()`, Router, navigation request, `NavigationKind`, and previous/next locations through `from()` / `to()`. Use `entering()` and `leaving()` for changed targets; shared pages in `preserved()` provide read-only context. A target’s `frame()` identifies the route instance, `content()` is the application content root, and `surface()` is the outer animation node. Whole-page effects usually select `is_outermost()` to avoid transforming both a parent and its child.
 
-### 保存动画状态与处理取消
+### Store animation state and handle cancellation
 
-页面重叠布局在 `prepare` 中设置。
+Set overlapping page layouts in `prepare`.
 
-把计时器、动画组件或第三方动画控制器放在应用资源或独立 Entity 上，以外层节点为目标。也可以直接动画化自己的 `content()`。
+Keep timers, animation components, or third-party animators in application resources or separate entities, targeting the outer node. You can also animate your own `content()` directly.
 
-`cancelled` 返回前应停止本次动画的所有写入。回调排队的 Commands 会在 Router 继续之前执行。结束或取消时，Router 恢复仍由它管理的外层节点原值，并保留当前的 `display`；之后不再继续修改这些节点。
+`cancelled` must stop all writes for this animation before returning. Commands queued by the callback are flushed before Router continues. On finish or cancellation, Router restores the original values on outer nodes it still manages, preserving the current `display`. Stop modifying those nodes once the animation ends.
 
-示例把唯一动画写入者保存在资源中，在 `cancelled` 立即移除；每帧系统排在 `Update` 的 `RouterScheduleSet::PublishSnapshots` 之后，用正常 Bevy 组件写入推进效果。
+The example stores its single animation writer in a resource and removes it immediately in `cancelled`. Its animation system runs in `Update` after `RouterScheduleSet::PublishSnapshots`, changing ordinary Bevy component values each frame.
 
-使用 winit 按需更新模式时，在动画运行期间发送 `RequestRedraw`，让窗口持续更新。
+With on-demand winit updates, send `RequestRedraw` while animation runs to keep the window updating.
 
-### 退出动画结束后释放页面
+### Release pages after exit animation
 
-`Run { hold_exit: true }` 让退出页面保持可见，延后它原定的清理或隐藏保留。退出页面已经非活动，不能继续接收路由输入或保留焦点。`Run { hold_exit: false }` 不等待退出动画，适合初次进入或仅播放进入动画；返回后不要继续修改退出页面的外层节点。
+`Run { hold_exit: true }` keeps outgoing pages visible while deferring cleanup or hiding for retention. They are already inactive and cannot receive routed input or retain focus. `Run { hold_exit: false }` does not wait for exit animation, supporting initial entry and entry-only animation; do not keep modifying the outgoing pages’ outer nodes after returning.
 
-先停止对应目标的动画写入，再发送命令：
+Stop the relevant animation writers before issuing commands:
 
 ```rust
-// 退出动画已停止；进入动画仍可继续。
+// Leaving writers have stopped; entering animation may continue.
 commands.release_route_transition_exit(session_id.clone());
 
-// 全部动画写入已停止；也释放尚未释放的退出页面。
+// All animation writers have stopped; also release any remaining exit.
 commands.finish_route_transition(session_id);
 ```
 
-用本次动画的 `RouteTransitionId` 发送命令：退出动画结束时释放页面，全部动画结束后完成过渡。
+Use this animation’s `RouteTransitionId`: release the outgoing page when exit animation ends, then finish the transition when all animation ends.
 
 <details>
-<summary>连续导航与请求完成时间</summary>
+<summary>Successive navigation and request completion</summary>
 
-活动页面、当前参数与历史记录在页面切换时更新，不必等待动画结束。持有退出页面时，请求可处于 `PostCommitCleanup`；退出页面的清理或保留完成后，请求即可结束，进入动画仍可继续。只有进入动画时，不延长导航请求。
+The active page, current parameters, and history change at the page switch, without waiting for animation. Holding an outgoing page can keep the request in `PostCommitCleanup`. Once cleanup or retention of the outgoing page completes, the request can finish while entering animation continues. Entry-only animation does not extend the request.
 
-后续请求若正在等待旧退出动画，Router 可以先取消旧动画并处理退出页面，再推进队列。没有实际页面进入或退出的导航不会新建动画，已有的只进入动画可以继续。
+If a later request is waiting for an old exit animation, Router can cancel it and handle the outgoing page before advancing the queue. Navigation with no actual entering or leaving pages starts no new animation; an existing entry-only animation can continue.
 
 </details>

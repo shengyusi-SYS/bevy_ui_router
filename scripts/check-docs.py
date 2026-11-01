@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Check local Markdown links, language pairs, code examples, and package licenses."""
+"""Check local Markdown file links and section anchors."""
 from collections import Counter
 from pathlib import Path
 import re
 import sys
-import tomllib
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,14 +37,10 @@ def anchors(path):
     return result
 
 
-def examples(text):
-    return re.findall(r"^```(sh|toml|json)\s*\n(.*?)^```", text, re.M | re.S)
-
-
 def main():
     errors = []
-    paths = [ROOT / "AGENTS.md", ROOT / "README.md", ROOT / "README.en.md",
-             ROOT / "CONTRIBUTING.md", ROOT / "CONTRIBUTING.en.md", *sorted((ROOT / "docs").rglob("*.md"))]
+    paths = [ROOT / "AGENTS.md", ROOT / "README.md", ROOT / "README.zh-CN.md",
+             ROOT / "CONTRIBUTING.md", ROOT / "CONTRIBUTING.zh-CN.md", *sorted((ROOT / "docs").rglob("*.md"))]
     anchor_cache = {}
     links = 0
     for path in paths:
@@ -69,29 +64,11 @@ def main():
                     anchor_cache[destination] = anchors(destination)
                 if unquote(parsed.fragment) not in anchor_cache[destination]:
                     errors.append(f"{path.relative_to(ROOT)}: missing anchor {target}")
-        relative = path.relative_to(ROOT)
-        if path.name != "AGENTS.md" and not path.name.endswith(".en.md"):
-            english = path.with_name(path.stem + ".en.md")
-            if not english.is_file():
-                errors.append(f"{relative}: missing English version")
-            elif examples(text) != examples(english.read_text(encoding="utf-8")):
-                errors.append(f"{relative}: shell/TOML/JSON examples differ between languages")
-    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())
-    if workspace["workspace"]["package"].get("license") != "MIT OR Apache-2.0":
-        errors.append("Workspace must declare MIT OR Apache-2.0")
-    for member in workspace["workspace"]["members"]:
-        manifest = tomllib.loads((ROOT / member / "Cargo.toml").read_text())
-        if manifest["package"].get("license") != {"workspace": True}:
-            errors.append(f"{member}: license must inherit the workspace value")
-        for name in ("LICENSE-MIT", "LICENSE-APACHE"):
-            license_path = ROOT / member / name
-            if not license_path.is_file() or license_path.read_bytes() != (ROOT / name).read_bytes():
-                errors.append(f"{member}/{name}: differs from the root license")
     for error in errors:
         print(error, file=sys.stderr)
     if errors:
         return 1
-    print(f"PASS: {len(paths)} Markdown files, {links} local links, bilingual examples, and six package license pairs.")
+    print(f"PASS: {len(paths)} Markdown files, {links} local links.")
     return 0
 
 

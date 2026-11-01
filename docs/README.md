@@ -1,32 +1,32 @@
-# 文档
+# Documentation
 
-[English](README.en.md) | 简体中文
+English | [简体中文](README.zh-CN.md)
 
-## 使用 Router
+## Use Router
 
-第一次接入，从[双页窗口教程](guides/integration.md)开始。依赖、完整代码和运行步骤在同一页。
+Start with the [two-page window tutorial](guides/integration.md). Dependencies, complete code, and run instructions are all on one page.
 
-跑起来以后，再按需要阅读：
+Once it runs, read what you need:
 
-- [页面状态与滚动](guides/pages.md)：保留页面、读取参数、加载内容、恢复滚动与输入处理。
-- [过渡动画](guides/transitions.md)：用 Tween 或自己的动画系统设计效果。
-- [系统返回](guides/platform-back.md)：鼠标后退键与 Android 传统返回。
-- [排查问题](guides/debugging.md)：从当前路由状态定位问题，再检查窗口与输入。
+- [Page state and scrolling](guides/pages.md): retain pages, read parameters, load content, restore scroll, and handle input.
+- [Transitions](guides/transitions.md): design effects with Tween or your own animation system.
+- [System Back](guides/platform-back.md): mouse Back and Android traditional Back.
+- [Troubleshooting](guides/debugging.md): start with routing state, then inspect the window and input.
 
-[产品概览](overview.md)列出能力范围；[版本对应表](guides/integration.md#bevy-版本要求)说明应选择哪个版本。
+The [overview](overview.md) describes available capabilities. The [compatibility table](guides/integration.md#bevy-version-requirements) helps you select a version.
 
-## 查询具体规则
+## Look up behavior
 
-[行为参考](contracts/README.md)按导航、Scene、生命周期和输入分类，适合查阅精确行为。API 文档可在仓库根目录生成：
+The [behavior reference](contracts/README.md) covers navigation, Scenes, lifecycle, and input. Generate the API reference from the repository root:
 
 ```sh
 cargo doc -p bevy_ui_router --all-features --no-deps --open
 ```
 
-## 参与开发
+## Contribute
 
-从[开发指南](development/README.md)进入对应实现与测试。模块关系见[架构总览](architecture/README.md)，执行过程见[运行机制](architecture/runtime.md)。
+Use the [development guide](development/README.md) to find implementations and tests. See [architecture](architecture/README.md) for module relationships and [runtime](architecture/runtime.md) for execution flow.
 
-[验证](development/verification.md) · [性能测量](performance.md) · [设计理由](development/design-lessons.md) · [路线图](roadmap.md)
+[Verification](development/verification.md) · [Performance](performance.md) · [Design rationale](development/design-lessons.md) · [Roadmap](roadmap.md)
 
-已完成计划与实验过程通过 `git log -- docs` 查阅；[性能数据](data/performance/README.md)保留对应源码与环境信息。
+Completed plans and experiments are available through `git log -- docs`; [performance data](data/performance/README.md) includes source and environment information.

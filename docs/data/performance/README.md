@@ -1,8 +1,8 @@
-# 历史性能数据
+# Historical performance data
 
-[English](README.en.md) | 简体中文
+English | [简体中文](README.zh-CN.md)
 
-按完整提交源码保存公开 benchmark 数据。运行方法和各模式计时边界见[性能测量](../../performance.md)。CSV 保存样本汇总；窗口数据保存逐样本值。
+Public benchmark data is retained with complete source commits. See [performance measurement](../../performance.md) for commands and timing boundaries. Benchmark CSVs contain summaries; window data retains individual samples.
 
 | Dataset / 数据 | Rows / 行 | Source / 源码 |
 | --- | --- | --- |
@@ -12,13 +12,13 @@
 | [Steady / 稳态执行](performance-steady-2026-10-17.csv) | 192 | before `d731ccbeabe1232f71d1727c8f5e061e091fb854` → after `a5b16d0348aba65b361b478ed5995e2102b07734` |
 | [Initial dynamic page / 初始动态页面](performance-initial-steady-2026-10-18.csv) | 40 | before `2037699a1463f997cc506bbc43da94d5f09526c4` → after `9c222bb636b76bea62adc5ec30402a306ea133d6` |
 | [Transitions / 过渡全路径](performance-transitions-2026-10-25.csv) | 750 | before `9ac27b8c3f154b9ac5a524470ae8f540c21b2237` → after `7e12ae72654acbe6649eaee832c4670d28d9be9e` |
-| [Window / 窗口过渡](performance-transition-window-2026-10-25.csv) | 4800 | 同上；无 BRP 的优化窗口构建 |
+| [Window / 窗口过渡](performance-transition-window-2026-10-25.csv) | 4800 | Same sources; optimized window build without BRP |
 
-## 测量环境
+## Measurement environment
 
-这些数据使用 Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 个可见逻辑 CPU；Rust 为 `1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0，Bevy 为 0.19.1。使用 `bsn` feature 与默认 bench 优化 profile：opt-level 3、debuginfo 0、debug assertions/overflow checks 关闭。CPU affinity 和频率由系统管理。
+These runs used Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`, an AMD Ryzen 9 9950X, and 24 visible logical CPUs; Rust `1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0, and Bevy 0.19.1. Builds used the `bsn` feature and the default optimized bench profile: opt-level 3, debuginfo 0, debug assertions and overflow checks disabled. CPU affinity and frequency were managed by the system.
 
-前五组测量的 `Cargo.lock` SHA-256：`1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`。这些二进制身份如下；过渡测量的来源另列于下文。
+The first five datasets used `Cargo.lock` SHA-256 `1cb3ee92ac2d388259b5511ef5867c67b85e7044f3b5d76752b9d1fb42205ce8`. Their binary identities follow; transition sources are listed separately below.
 
 | Dataset / 数据 | Binary SHA-256 / 二进制 SHA-256 |
 | --- | --- |
@@ -30,19 +30,19 @@
 | Initial before | `2669913ec81e8d6dc7a963faff2b672d39d5e420dcc56ef0977d961f62ccc509` |
 | Initial after | `d3b3c50dc2b046cc50778f1acf674e53b945b48f14354972ab766cbe62e9da5a` |
 
-## 运行顺序和比较范围
+## Run order and comparison scope
 
-- **Keep-alive**：两轮各按 flat → nested 串行执行，每组 24 行、每场景 128 样本。记录未过滤的全部汇总。
-- **父子库存**：每组 24 行、128 样本、64 次导航预热。round 3/4 是完整串行 flat → nested 配对，标记 `uncontended_pair`；早期重叠运行标记 `contended`，未配对组为 `unpaired`。保留全部 168 行，比较采用完整串行配对。
-- **空闲更新**：before 两轮 → 构建 after → after 两轮，均为 flat、1/32/128 内容规模。每组 48 行；较慢组与离群值均保留。
-- **稳态执行**：构建完成后按 before 1 → after 1 → before 2 → after 2 运行。每组 48 行；after 增加两个固定 focus 调度相关实体，控制组保持原样。
-- **初始动态页面**：before 1 → 构建 after → after 1 → before 2 → after 2。nested、128/1024 个动态节点、64 update 预热、每场景 128 样本，每组 10 行；一条请求和一项 history。
+- **Keep-alive**: two rounds of sequential flat → nested runs, with 24 rows per group and 128 samples per scenario. All summaries are retained without filtering.
+- **Parent/child inventory**: 24 rows per group, 128 samples, and 64 warmup navigations. Rounds 3/4 are complete sequential flat → nested pairs, marked `uncontended_pair`. Early overlapping runs are `contended`; the unmatched group is `unpaired`. All 168 rows are retained; comparisons use complete sequential pairs.
+- **Idle updates**: two before rounds → build after → two after rounds, all flat with content sizes 1/32/128. Each group has 48 rows, retaining slower groups and outliers.
+- **Steady execution**: after building, run before 1 → after 1 → before 2 → after 2. Each group has 48 rows. After adds two fixed focus-scheduling entities; the control group is unchanged.
+- **Initial dynamic page**: before 1 → build after → after 1 → before 2 → after 2. Nested content with 128/1024 dynamic nodes, 64 warmup updates, 128 samples per scenario, and 10 rows per group; one request and one history entry.
 
-串行配对期间构建和计时分开，关闭窗口、renderer 和插桩。宿主系统负载会影响 wall-clock，比较时一并查看控制组与各轮波动。idle 的每个样本是 32 update 均值；这些汇总分位数用于各组比较，逐帧延迟和堆内存另行测量。
+For sequential pairs, builds and measurements were separate, with windows, renderers, and instrumentation closed. Host load affects wall-clock time; compare control groups and variation across rounds as well. Each idle sample averages 32 updates. These summary percentiles support group comparisons; per-frame latency and heap memory use separate measurements.
 
-## 过渡测量：2026-10-25
+## Transition measurements: 2026-10-25
 
-使用上面的同机环境、Bevy 0.19.1 与默认优化 profile，`CARGO_INCREMENTAL=0`、构建并发数 2。根 lock SHA-256 为 `0fc9c7ada9ed0bc2dd0f580cd6e4bbada45de8d8c4c5629a9d71ba1601f3aad5`；窗口 lock 为 `cd1fe4460a631e586c745ec840e3c87b0ce5a9a1638621e3e6ad1935d591bbab`。窗口使用 X11/WSLg、Vulkan、Mesa 26.0.8 llvmpipe（LLVM 21.1.8），1060×720，无 BRP/截屏。
+These runs use the same machine above, Bevy 0.19.1, the default optimized profile, `CARGO_INCREMENTAL=0`, and two build jobs. Root lock SHA-256: `0fc9c7ada9ed0bc2dd0f580cd6e4bbada45de8d8c4c5629a9d71ba1601f3aad5`; window lock: `cd1fe4460a631e586c745ec840e3c87b0ce5a9a1638621e3e6ad1935d591bbab`. The 1060×720 window uses X11/WSLg, Vulkan, Mesa 26.0.8 llvmpipe (LLVM 21.1.8), without BRP or screenshots.
 
 | Variant | Source | Benchmark binary SHA-256 |
 | --- | --- | --- |
@@ -50,16 +50,16 @@
 | `input_batch` | `a8682de49aa7ca659bf0382ffea7ae6530ae6242` | `f079ec75010f12a769a795edf4be6dc2d2f6ab747de550da8ff6c4262fdc8207` |
 | `after` | `7e12ae72654acbe6649eaee832c4670d28d9be9e` | `8c2e8fd7e0bfcee863f6881c4173686f441981cbd0705860439a2757f89c2e2e` |
 
-窗口 `before` 二进制 SHA-256 为 `80196bd253515200e9f36c03615e3b9983d685bc6f427e4f9074494fb0543ef9`，`after` 为 `c50cd11662ce2def4ef37e980a05be59e4ddd617c52f2869a41975c38c52f292`，源码对应上表。
+Window binary SHA-256: `before` is `80196bd253515200e9f36c03615e3b9983d685bc6f427e4f9074494fb0543ef9`; `after` is `c50cd11662ce2def4ef37e980a05be59e4ddd617c52f2869a41975c38c52f292`. Sources match the table above.
 
-所有正式计时均与构建分开串行运行。headless 运行顺序为 `before 1 → input_batch 1 → before 2 → input_batch 2`，再做 nested/128 和无 UI/128 的 before/input_batch 对照，最后 `after 1 → before 3 → after 2`。每个完整 flat 组 90 行，16 样本，32/128/1024 节点；两个单规模补充各 30 行。仅 `ui=1` 运行真实布局与候选投影；所有操作使用 Replace 保持单项 history。预热和完成边界见[方法](../../performance.md#动画全路径)。
+All formal timing runs were serial and separate from builds. Headless order: `before 1 → input_batch 1 → before 2 → input_batch 2`, followed by before/input_batch comparisons for nested/128 and no-UI/128, then `after 1 → before 3 → after 2`. Each full flat group has 90 rows, 16 samples, and 32/128/1024 nodes. Each focused group has 30 rows. Only `ui=1` includes normal layout and candidate projection. All operations use Replace to keep a one-entry history. See the [method](../../performance.md#full-animation-path) for warmup and completion boundaries.
 
-窗口按 `before 1 → before 2 → after 1 → after 2` 独立运行。每种效果先预热 60 个合格 update，再收集 120 个 main 和 120 个 render 样本；五种模式共 1200 行/轮。应用按真实时间推进，采到的动画进度和导航次数可随更新间隔变化，不能当作固定工作量的 CPU 对照。CSV 的 `elapsed_ns` 是 wall-clock；`update_interval_ns` 只记录主循环更新间隔。
+Window order: `before 1 → before 2 → after 1 → after 2`. Each effect warms 60 qualified updates, then collects 120 main and 120 render samples; five modes produce 1200 rows per run. Application time is real, so sampled animation progress and navigation counts can vary with update intervals; this is not a fixed-work CPU comparison. CSV `elapsed_ns` is wall-clock; `update_interval_ns` records main-loop update intervals only.
 
-结果保留全部行与离群值。headless 的 1024 节点缓存命中、持有退出阶段，p50 从 1.009–1.022 ms/update 降到 0.492–0.534 ms/update；每个样本是 32 update 的均值。1024 节点 fresh、关闭过渡时，发布所在 update 包含立即清理，p50 从 392–403 ms 降到 199–214 ms。前者来自批次输入资格/祖先观察，后者来自单次不可变 adoption 校验中的登记表索引；全部原校验与逐写复验保留。
+All rows and outliers are retained. For 1024-node cache hits with held exit, headless p50 falls from 1.009–1.022 ms/update to 0.492–0.534 ms/update; each sample averages 32 updates. With 1024 fresh nodes and transitions disabled, the publication update includes immediate cleanup; p50 falls from 392–403 ms to 199–214 ms. The changes batch input eligibility/ancestor observations and index registry reads within each immutable adoption validation. All original checks and post-write revalidation remain.
 
-小场景和控制组存在波动，`after 1` 的部分控制行较慢，不能把所有差值归因于修改。窗口空闲与动画耗时也同步变化，因此本组窗口数据用于检查真实调度和提交行为，不支持硬件 GPU 或实际呈现 FPS 的提升结论。退出清理的 EntityRef 读取候选仅约 5% 收益，未达到本轮 10% 保留门槛，已撤销；未增加跨写缓存或减少复验。
+Small cases and controls vary; some `after 1` controls are slower, so not every difference is attributable to the changes. Window idle and animation timings move together as well. Window data verifies real scheduling and submission behavior; it does not establish a hardware GPU or presentation-FPS improvement. A cleanup EntityRef-read candidate saved only about 5%, below this run's 10% retention threshold, and was reverted. No cross-write cache or reduced revalidation was added.
 
-## 维护
+## Maintenance
 
-历史文件保留完整行和质量标记。新的对照使用新的数据文件，并记录源码、工具链、二进制、命令和环境。旧候选补丁、阶段 profile 和临时窗口探针通过 Git 历史追溯。
+Historical files retain all rows and quality annotations. Store new comparisons in new files with source, toolchain, binary, commands, and environment. Previous candidate patches, phase profiles, and temporary window probes remain available in Git history.

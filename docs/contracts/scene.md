@@ -1,51 +1,51 @@
-# Scene 与挂载合同
+# Scene and mounting contract
 
-[中文](scene.md) | [English](scene.en.md)
+[中文](scene.zh-CN.md) | [English](scene.md)
 
-本页说明 factory 注册、同步 Scene 创建和嵌套页面的挂载。接入步骤见[使用指南](../guides/integration.md)，host 与发布规则见[生命周期](lifecycle.md)。
+This page covers factory registration, synchronous Scene creation, and mounting nested pages. See the [integration guide](../guides/integration.md) for setup and [lifecycle](lifecycle.md) for hosts and publication.
 
-## 注册与运行装配
+## Registration and runtime setup
 
-推荐用 `BsnRouter::new(root).fallback(factory)` 与 `AppBsnExt::add_bsn_router` 接入。`page(path, factory)` 声明有路径的页面或布局，`layout(factory)` 声明 pathless 布局，`index(factory)` 声明默认子页；`.children(...)` 保持显式层级，`.error_view(factory)` 在该节点直接绑定错误页。每份声明只有一个显式 root，库不补建隐藏父层。
+The recommended entry point is `BsnRouter::new(root).fallback(factory)` with `AppBsnExt::add_bsn_router`. `page(path, factory)` declares a page or layout with a path, `layout(factory)` declares a pathless layout, and `index(factory)` declares a default child. `.children(...)` keeps nesting explicit; `.error_view(factory)` associates an error page directly with its node. Each declaration has one explicit root; no hidden parent is inserted.
 
-声明编译成原有 Core 路由树、View registry 与 BSN factories。构造和安装不调用 factory；pattern/tree 错误保留原 `RouteError` 和声明位置。生成的 driver key 检查当前注册空间，多个 Router 可与手工注册共存。验证或安装失败不留下本批 factory 注册，成功后仍使用同一运行管线。
+Declarations compile to the existing Core route tree, View registry, and BSN factories. Construction and installation never call a factory. Pattern/tree errors retain the original `RouteError` and declaration location. Generated driver keys check the current registration namespace, allowing multiple Routers and manual registrations to coexist. Validation or installation failure leaves no factory registrations from the attempted batch; success uses the same runtime pipeline.
 
-应用在自有 host 上添加 `RouterHostRegistration`。可用 `.initial(location)` 指定默认首屏；后续通过 Commands 或即时 `RouterNavigation` 导航，从 snapshots 观察结果。入队及首屏规则见[导航合同](navigation.md#请求history-与-presentation)。
+The application adds `RouterHostRegistration` to its own host. `.initial(location)` supplies a default destination; later navigation uses Commands or immediate `RouterNavigation`, with results observed through snapshots. See [navigation](navigation.md#requests-history-and-presentation) for enqueue and startup rules.
 
-| Feature | 提供的能力 |
+| Feature | Capability |
 | --- | --- |
-| `default` / `view` | 渲染无关的视图模型，保持纯 Rust 依赖 |
-| `ecs` | Bevy ECS 集成 |
-| `bsn` | 官方 Scene bridge，包含 `ecs` |
+| `default` / `view` | Renderer-neutral view model with Bevy-free dependencies |
+| `ecs` | Bevy ECS integration |
+| `bsn` | Official Scene bridge, including `ecs` |
 
-高级显式接入仍可通过 `register_bsn_view`、`RouteViewRegistry` 与 `RouterConfig` 自行建立映射。driver key 共用注册命名空间，重复注册同步报错、保留原 factory，该次注册不调用 factory。`RouteViewRegistry::insert` 同样拒绝重复 view key，保留原 descriptor。安装时验证 normal view、error view、fallback 和 driver binding；按节点声明顺序检查，同节点先检查 normal view。
+Advanced explicit integration can still build mappings through `register_bsn_view`, `RouteViewRegistry`, and `RouterConfig`. Driver keys share one registration namespace. Duplicate registration fails synchronously, preserves the original factory, and does not call it. `RouteViewRegistry::insert` also rejects duplicate view keys and preserves the descriptor. Installation validates normal views, error views, fallback, and driver bindings in node declaration order, checking a node's normal view first.
 
-当前注册 API 用于装配期，动态 unregister/rebind 留待后续扩展；窗口、相机、字体、渲染配置和 asset 路径由应用配置。公开入口见 [App extension](../../crates/bevy_ui_router_ecs/src/app_ext.rs)。
+The current registration API is for setup; dynamic unregister/rebind is a future extension. Applications configure windows, cameras, fonts, rendering, and asset paths. Public entry points are in [App extension](../../crates/bevy_ui_router_ecs/src/app_ext.rs).
 
-## Scene profile 与创建责任
+## Scene profile and creation ownership
 
-声明入口与 `AppBsnExt::register_bsn_view` 接收相同的同步 factory：输入为只读 `RouteViewInput`，返回一个新 Scene 或 `BsnBuildError`。fresh 路径每个 view effect 调用一次 factory，并单次消费 Scene。错误呈现使用自己的 factory 调用和身份；keep-alive 命中直接复用已经应用的实体。
+The declaration interface and `AppBsnExt::register_bsn_view` accept the same synchronous factory that takes read-only `RouteViewInput` and returns a fresh Scene or `BsnBuildError`. Each fresh view effect calls the factory once and consumes its Scene once. Error presentations use their own factory call and identity; keep-alive hits reuse already applied entities.
 
-factory 输入包含 requested location、matched route、route-local params、raw search、fragment、origin，以及错误尝试的原始 failure。factory 通过这些普通数据构建声明；World、Commands、Entity、slot、frame/generation 和 lifecycle 权限由 ECS 执行层持有。
+Factory input includes requested location, matched route, route-local params, raw search, fragment, origin, and the original failure for error attempts. The factory builds declarations from this data. The ECS execution layer holds World, Commands, Entity, slot, frame/generation, and lifecycle authority.
 
-支持代码组合的 native Scene、标准 `ChildOf` 声明图、component/bundle/fallible templates、图内命名引用和资源 handles。cached Scene asset inclusion（含已加载 patch）在 UI 分配前返回错误；依赖未就绪在同步执行中返回失败。非 `ChildOf` 输出和 template 主动创建的声明闭包外实体由应用管理。
+Supported content includes code-composed native Scenes, standard `ChildOf` declaration graphs, component/bundle/fallible templates, named references inside the graph, and resource handles. Cached Scene asset inclusion, including loaded patches, returns an error before UI allocation. Dependencies that are not ready fail in this synchronous profile. Applications manage non-`ChildOf` output and entities that templates create outside the declared closure.
 
-同步 Scene 也需要 `AssetServer` 和 `Assets<ScenePatch>`。最小环境可安装 `TaskPoolPlugin`、`AssetPlugin`、`ScenePlugin`。含 BSN binding 的 Router 缺少这些资源时，底层安装返回 `MissingSceneRuntime`，声明入口通过 `BsnRouterError::Install` 保留该错误；资源在运行期间撤销时，在调用 Scene 前返回明确失败。
+Synchronous Scenes also require `AssetServer` and `Assets<ScenePatch>`. A minimal setup can install `TaskPoolPlugin`, `AssetPlugin`, and `ScenePlugin`. Installing a Router with BSN bindings without these resources returns `MissingSceneRuntime`, preserved as `BsnRouterError::Install` by the declaration interface; removing them later produces an explicit failure before calling Scene execution.
 
-执行流程是：官方 resolve → 预检声明图 → 预分配并登记 exact Entity → 用私有 shell wrapper 和引用 seed 应用原 Scene。原 root/child 名称继续指向原内容 Entity，匿名节点使用本次 attempt 的唯一引用。Scene 的 component 值和声明的 Children 顺序保持，由官方 relationship callbacks 执行关系写入。
+Execution follows: official resolve → declaration preflight → exact Entity preallocation and registration → apply the original Scene with a private shell wrapper and reference seed. Original root/child names still resolve to their original content entities, while anonymous nodes use attempt-local unique references. Scene component values and declared Children order are preserved, with official relationship callbacks performing relationship writes.
 
-声明 Entity 提前分配；读取声明图的官方 getter 可能给 leaf 添加空 `Children` 并触发 hook。错误报告保留原来源。提前登记覆盖了 apply 在建立 `ChildOf` 前失败的情况，依赖 handles 持有到真实 apply/settlement 完成。
+Declaration entities are allocated early. The official declaration getter may add empty `Children` to a leaf and trigger its hook. Error reporting preserves the original source. Early registration covers apply failures before `ChildOf` is installed, and dependency handles remain held through actual apply/settlement completion.
 
-apply、adoption 和即时失败隔离在同一 exclusive 调用中完成。创建义务覆盖尚未挂接的部分 UI，在返回普通系统或下一输入/呈现边界前完成隔离，之后继续安全清理。实现见 [BSN preparation](../../crates/bevy_ui_router_ecs/src/bsn.rs) 和 [native Scene executor](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs)。
+Apply, adoption, and immediate failure isolation run in one exclusive call. Creation obligations cover partially built UI that is not yet attached. Isolation completes before returning to ordinary systems or the next input/presentation boundary, followed by safe cleanup. See [BSN preparation](../../crates/bevy_ui_router_ecs/src/bsn.rs) and the [native Scene executor](../../crates/bevy_ui_router_ecs/src/presentation/native_scene.rs).
 
-## Frame 内容与 default outlet
+## Frame content and default outlet
 
-实体层级为：应用 host → top slot → FrameShell → FrameContentTarget → Scene 内容。嵌套页面通过父内容中的 outlet、child slot 挂载下一层 frame。
+The hierarchy is application host → top slot → FrameShell → FrameContentTarget → Scene content. A nested page mounts its next frame through an outlet and child slot in the parent content.
 
-Router 管理 shell 的布局与隔离；Scene 定义内容根的普通 `Node`、`Visibility`、`Pickable` 等值，生命周期切换保留这些 authored 值。
+Router controls shell layout and isolation. Scenes define ordinary `Node`, `Visibility`, `Pickable`, and other content-root values; lifecycle changes preserve these authored values.
 
-有 child route 的 layout 声明唯一 `DefaultOutlet`，位于内容根或内部 `Node`；leaf 可以省略。缺失、重复、非容器或关系失效产生 mount failure。父 layout 复用时，同一个 outlet anchor 和 child slot 一起保留；marker 声明和实际 binding 分别管理，移动 marker 会按现有 binding 校验。
+A layout with a child route declares exactly one `DefaultOutlet` on its content root or an inner `Node`. A leaf may omit it. Missing, duplicate, non-container, or invalidly related outlets produce mount failure. Reusing a parent layout preserves its outlet anchor and child slot together; the marker declaration and actual binding are managed separately. Moving the marker is checked against the existing binding.
 
-消费 mount 前复核 parent/frame generation、anchor、slot 和关系。entering parent 的无效 outlet 属于 pending rejection；已提交 preserved parent 丢失 binding 属于 authority loss，分别进入对应的失败路径。
+Before consuming a mount, ECS revalidates parent/frame generation, anchor, slot, and relationships. An invalid outlet on an entering parent is pending rejection. Losing the binding of a committed, preserved parent is authority loss. Each follows its corresponding failure path.
 
-每个 frame 的内容遍历在 child slot 处停止，嵌套 frame 按自身身份、role 和 binding 管理。具体创建与清理责任见[生命周期](lifecycle.md#cleanup-与内容边界)，pending focus 见[输入与焦点](input-focus.md)。
+A frame's content traversal stops at child slots. Nested frames are managed by their own identity, role, and binding. See [lifecycle](lifecycle.md#cleanup-and-content-boundaries) for creation/cleanup obligations and [input and focus](input-focus.md) for pending focus.

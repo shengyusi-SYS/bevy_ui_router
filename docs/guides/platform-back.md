@@ -1,30 +1,30 @@
-# 系统返回
+# System Back
 
-[English](platform-back.en.md) | 简体中文
+English | [简体中文](platform-back.zh-CN.md)
 
-页面导航已经接好后，可以让鼠标后退键或 Android 返回键触发同一个 Back 操作。
+Once page navigation works, connect mouse Back or Android Back to the same operation.
 
-## 桌面鼠标返回
+## Desktop mouse Back
 
-在 `Cargo.toml` 中给 Router 添加 `desktop-back`，例如 `features = ["bsn", "desktop-back"]`。下面的代码沿用 `bevy::prelude::*` 和 `bevy_ui_router::prelude::*`。
+Add `desktop-back` to Router's features in `Cargo.toml`, for example `features = ["bsn", "desktop-back"]`. The code below uses `bevy::prelude::*` and `bevy_ui_router::prelude::*`.
 
-先在已有的 App 中安装插件，并注册返回处理器：
+First install the plugin and register the return handler in your existing App:
 
 ```rust
 app.add_plugins(DesktopBackInputPlugin)
     .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet));
 ```
 
-然后用一个应用组件，把 Router 关联到产生输入的窗口：
+Next, use an application component to associate Router with the window receiving input:
 
 ```rust
 #[derive(Component)]
 struct WindowRouter(RouterHandle);
 ```
 
-在窗口创建后执行 `commands.entity(window).insert(WindowRouter(router))`。其中 `window` 是窗口的 Entity，`router` 是 `add_bsn_router` 返回的 handle。
+After creating the window, call `commands.entity(window).insert(WindowRouter(router))`. Here, `window` is the window Entity and `router` is the handle returned by `add_bsn_router`.
 
-最后添加处理器。先决定是否关闭本地弹层；如果这次返回已由弹层处理，就跳过导航：
+Finally, add the handler. Decide whether to close a local overlay first; if the overlay handles this return, skip navigation:
 
 ```rust
 fn platform_back(
@@ -34,38 +34,38 @@ fn platform_back(
 ) {
     for request in requests.read() {
         let Ok(target) = windows.get(request.window) else { continue };
-        // 在这里先处理本地弹层，再决定是否导航。
+        // Handle local overlays here before deciding to navigate.
         match navigation.back(target.0) {
-            Ok(request_id) => { /* 保存 ID，通过 RouterSnapshots 观察完成。 */ }
+            Ok(request_id) => { /* Save the ID and observe RouterSnapshots. */ }
             Err(error) => eprintln!("Back was not enqueued: {error:?}"),
         }
     }
 }
 ```
 
-收到 `NoBackEntry` 表示没有上一页，由应用决定提示或退出。成功的 Back 沿用已有的页面保留和滚动恢复设置。
+`NoBackEntry` means there is no previous page; the application chooses feedback or exit. A successful Back uses the existing page retention and scroll restoration settings.
 
-弹层和页面返回应放在同一处理器中作一次决定，避免多个消息读取者分别执行返回。完整接线见[窗口示例](../../examples/windowed/src/main.rs)。
+Make one decision for overlays and page navigation in the same handler, so separate message readers do not each perform a return. See the [windowed example](../../examples/windowed/src/main.rs) for complete wiring.
 
-## Android 传统返回
+## Android traditional Back
 
-在 Android Bevy 应用中添加 `android-back`，例如 `features = ["bsn", "android-back"]`。使用 `AndroidBackInputPlugin`，并复用上面的窗口绑定和 `platform_back` 处理器：
+Add `android-back` in an Android Bevy application, for example `features = ["bsn", "android-back"]`. Use `AndroidBackInputPlugin` and reuse the window binding and `platform_back` handler above:
 
 ```rust
 app.add_plugins(AndroidBackInputPlugin)
     .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet));
 ```
 
-这个插件接收传统返回按键。
+This plugin receives traditional Back key input.
 
-在 Android 16 及以上、`targetSdk >= 36` 的应用中，传统 Back 键需要兼容配置。在现有 `AndroidManifest.xml` 的 `<application>` 或目标 `<activity>` 上设置：
+On Android 16 and later with `targetSdk >= 36`, traditional Back keys require a compatibility setting. Set it on the existing `<application>` or target `<activity>` in `AndroidManifest.xml`:
 
 ```xml
 <application android:enableOnBackInvokedCallback="false">
-    <!-- 现有应用配置与 activity。 -->
+    <!-- Existing application settings and activities. -->
 </application>
 ```
 
-该开关启用传统返回路径，同时关闭系统预测返回动画。详见 [Android 16 返回迁移说明](https://developer.android.com/about/versions/16/behavior-changes-16#predictive-back)。Activity 的设置优先于 application 默认值，见[按 Activity 配置](https://developer.android.com/guide/navigation/custom-back/predictive-back-gesture#opt-out-at-an-activity-level)。
+This setting enables the traditional Back path and disables system predictive Back animations. See the [Android 16 migration guidance](https://developer.android.com/about/versions/16/behavior-changes-16#predictive-back). An activity's setting takes precedence over the application default; see [activity-level configuration](https://developer.android.com/guide/navigation/custom-back/predictive-back-gesture#opt-out-at-an-activity-level).
 
-现代返回回调和预测手势需要单独接入。忽略这条按键消息不会自动交还 Android 的默认返回行为。
+Modern Back callbacks and predictive gestures need separate integration. Ignoring this key message does not automatically delegate to Android's default return behavior.

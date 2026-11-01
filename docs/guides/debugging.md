@@ -1,24 +1,24 @@
-# 导航与窗口调试
+# Navigation and window debugging
 
-[中文](debugging.md) | [English](debugging.en.md)
+[中文](debugging.zh-CN.md) | [English](debugging.md)
 
-先按症状检查路由状态，再按需要检查窗口布局和输入。
+Start with the symptoms below to check routing state, then inspect window layout and input as needed.
 
-## 先定位导航问题
+## Diagnose navigation first
 
-| 现象 | 先检查什么 |
+| Symptom | Check first |
 | --- | --- |
-| 安装报 `MissingSceneRuntime` | 在添加 Router 前安装 `AssetPlugin` 和 `ScenePlugin`；最小示例还安装 `TaskPoolPlugin` |
-| 首屏没有出现 | 是否配置 `.initial(...)`、是否创建携带正确 `RouterHostRegistration` 的页面容器、App 是否持续更新；`AwaitingHost` 表示仍在等待页面容器 |
-| 快照已有目标位置，但画面为空 | 检查应用容器和页面的布局尺寸、可见性、相机、渲染目标和 UI 渲染插件 |
-| 导航调用没有返回请求 ID | Commands 不立即返回 ID；提交失败会输出警告。需要立即处理提交结果时使用 `RouterNavigation`，之后从快照观察切页结果 |
-| 导航失败 | 用请求的 `RequestStatus::Failed`、`trace()`、`diagnostics()` 查看失败来源；当前显示错误页时也可读 `active().failure()` |
-| 页面已切换，请求仍在 `PostCommitCleanup` | 页面和访问记录已经切换，但退出动画或清理尚未结束；检查 `cleanup()` 与退出动画是否完成 |
-| Back 无法执行 | `NoBackEntry` 表示没有更早的成功记录；由应用决定此时的界面反馈或退出动作 |
-| 页面状态被重建 | 核对页面的保留开关、容量、原父布局是否还在，以及路径参数、查询参数和片段是否改变；见[保留说明](pages.md#保留页面状态) |
-| 滚动没有恢复 | 先确认 Back 成功且该次访问有记录，再查看 `RouteScrollRestorations::pending`、容器名称、布局、相机与恢复是否就绪或取消；见[滚动恢复](pages.md#滚动恢复) |
+| Installation returns `MissingSceneRuntime` | Install `AssetPlugin` and `ScenePlugin` before adding Router; the minimal example also installs `TaskPoolPlugin` |
+| The initial page never appears | Check `.initial(...)`, a host with the correct `RouterHostRegistration`, and ongoing App updates; `AwaitingHost` means Router is still waiting for a host |
+| The snapshot has the expected location but the screen is empty | Check application host/page sizes, visibility, camera/render target, and UI renderer |
+| Navigation returns no request ID | Commands return no synchronous ID; enqueue failures log a warning by default. Use `RouterNavigation` for the immediate enqueue result, then snapshots for execution results |
+| Navigation fails | Inspect the request's `RequestStatus::Failed`, `trace()`, and `diagnostics()` for the failure source; a displayed error page also exposes `active().failure()` |
+| The page changed but the request remains in `PostCommitCleanup` | The page and history have changed, but exit animation or cleanup is still pending; inspect `cleanup()` and whether exit animation has finished |
+| Back cannot run | `NoBackEntry` means there is no earlier successful entry; the application chooses feedback or a host exit action |
+| Page state is recreated | Check retention opt-in, capacity, whether the original parent layout still exists, and changes to path parameters, query strings, or fragments; see [retention](pages.md#retain-page-state) |
+| Scroll is not restored | First confirm a successful Back and a saved position for that visit, then inspect `RouteScrollRestorations::pending`, container keys, layout/camera, and ready/cancel state; see [scroll restoration](pages.md#restore-scroll-positions) |
 
-在 `RouterScheduleSet::PublishSnapshots` 之后读取本轮结果。下面的函数供应用在诊断按钮、错误处理或状态变化时按需调用，避免每帧重复输出：
+Read the current update's result after `RouterScheduleSet::PublishSnapshots`. Call this helper on demand from a diagnostic action, error handler, or state change rather than printing the same records every frame:
 
 ```rust
 use bevy_ui_router::prelude::*;
@@ -37,20 +37,20 @@ fn inspect_router(snapshots: &RouterSnapshots, router: RouterHandle) {
 }
 ```
 
-持有 `RouterNavigation` 返回的请求 ID 时，用 `snapshots.request(router, id)` 查询：`Found` 可读取 `status()`、`trace()` 和 `diagnostics()`；`NotRetained` 表示完成记录已被淘汰，`Unknown` 表示该 Router 中没有对应请求。`running_request()` 只表示正在执行的请求，结束后会变为 `None`。
+With a request ID returned by `RouterNavigation`, use `snapshots.request(router, id)`: `Found` exposes `status()`, `trace()`, and `diagnostics()`; `NotRetained` means the completed record was evicted; `Unknown` means this Router has no matching request. `running_request()` only identifies a running request and becomes None after it terminates.
 
-## 启动和观察窗口
+## Start and inspect a window
 
-[窗口示例](../../examples/windowed/src/main.rs)提供 Bevy Remote Protocol（BRP）调试入口，可以发送输入、读取布局和状态、保存渲染截图。输入在应用内处理，系统鼠标和键盘焦点保持原位。
+The [windowed example](../../examples/windowed/src/main.rs) exposes a Bevy Remote Protocol (BRP) endpoint for sending input, inspecting layout and state, and saving rendered screenshots. Input is handled inside the application, keeping the system pointer and keyboard focus in place.
 
-从仓库根目录进入窗口示例目录并启动：
+From the repository root, enter the windowed example directory and start it:
 
 ```sh
 cd examples/windowed
 cargo run --features ui-debug
 ```
 
-在另一个终端，也进入 `examples/windowed` 目录，再运行 Python 调试工具：
+In another terminal, also enter `examples/windowed`, then run the Python client:
 
 ```sh
 python3 ui_debug.py snapshot
@@ -58,28 +58,28 @@ python3 ui_debug.py find "Layout counter"
 python3 ui_debug.py capture router-ui.png
 ```
 
-Python 调试工具使用标准库，无需安装额外依赖。调试服务仅在 debug 构建中启用，默认地址为 `127.0.0.1:15703`。
+The Python client uses only the standard library. The debug service runs only in debug builds, at `127.0.0.1:15703` by default.
 
 <details>
-<summary>snapshot 字段说明</summary>
+<summary>snapshot field reference</summary>
 
-| 字段 | 含义 |
+| Field | Meaning |
 | --- | --- |
-| `windows`、`scale_factor` | 窗口 Entity 和显示缩放 |
-| `center_physical`、`size_physical` | 实际节点位置和尺寸，以物理像素表示 |
-| `router_active` | 内容是否属于当前活动页面 |
-| `pointer_allowed`、`keyboard_allowed` | 当前输入资格 |
-| `route_location`、`route_search`、`route_fragment` | 分别表示路径、查询参数和片段的原字符串 |
-| `route_id` | 所属路由的标识；错误页为 `null` |
-| `scroll_requested`、`scroll_actual` | 请求位置与布局裁剪后的实际位置 |
-| `pending_restore` | 当前页面内 `list` 容器的待恢复位置，容器创建前也可查询 |
-| `focus` | 当前焦点 Entity |
+| `windows`, `scale_factor` | Window Entity and display scale |
+| `center_physical`, `size_physical` | Actual node position and size in physical pixels |
+| `router_active` | Whether the content belongs to the active page |
+| `pointer_allowed`, `keyboard_allowed` | Current input eligibility |
+| `route_location`, `route_search`, `route_fragment` | Separate raw path, search, and fragment strings |
+| `route_id` | The owning frame's route; null for the fallback |
+| `scroll_requested`, `scroll_actual` | Requested position and the position clamped by layout |
+| `pending_restore` | Waiting position for `list` in the current scope, available even before its container exists |
+| `focus` | The focused Entity |
 
 </details>
 
-非活动内容的路由字段为 `null`。`find` 按名称或显示文本筛选节点；查找当前页面时再选择 `router_active=true`，因为保留页面的 Entity 仍然存在。
+Inactive content has null route fields. `find` filters nodes by name or displayed text. Select `router_active=true` when locating the current page, because retained page Entities still exist.
 
-点击使用窗口内的**逻辑坐标**。将目标的 `center_physical` 除以该窗口的 `scale_factor`，再传给 `click`。例如，查询得到逻辑位置为 `(100, 120)` 时：
+Clicks use **logical coordinates** within the window. Divide the target's `center_physical` by the window's `scale_factor` before passing it to `click`. For example, if the resulting logical position is `(100, 120)`:
 
 ```sh
 python3 ui_debug.py click 100 120
@@ -87,31 +87,31 @@ python3 ui_debug.py key Digit2
 python3 ui_debug.py key Space
 ```
 
-工具在按下与释放之间等待应用帧推进。截图通过 `router/capture` 和 `router/capture_status` 获取 PNG。使用 `--url` 选择端点，完整参数见 `python3 ui_debug.py --help`。
+The client waits for application frames between press and release. Screenshots are returned as PNG through `router/capture` and `router/capture_status`. Use `--url` to select an endpoint; run `python3 ui_debug.py --help` for all options.
 
-## 用户行为检查
+## Check user behavior
 
-| 操作 | 观察结果 |
+| Action | Expected result |
 | --- | --- |
-| Overview / Settings，或 `1` / `2` | Push 到页面，状态栏更新位置和 history |
-| Replace（`R`）后 Back（`B` 或鼠标后退侧键） | Replace 更新当前项，Back 返回前一成功项 |
-| 增加 Layout counter 和 page count，在 Overview / Settings 往返 | 原 layout/page Entity 及各自计数保留，离场页面退出布局和输入 |
-| 增加 Layout counter，Outside（`4`）后进入另一子页 | 布局 A 和计数保留，子页按新路由选择，工具栏显示新路径 |
-| 在列表区域滚动，切页后 Back | 恢复该 history entry 的位置；重复访问同一页面分别保存位置 |
-| Delayed（`3`）→ Load（`L`）→ 滚动 → Outside → Back | 返回新建的 Delayed 页面；列表创建前已有恢复意图 |
-| 上一步返回后，Ready（`G`）再 Load | 首次正常布局恢复原位置；也可先 Load，待内容准备好后 Ready |
-| 返回后 Cancel（`C`）再 Load，或等待 ready 时主动滚动 | 取消等待中的恢复，保留新列表初值或用户的新位置 |
-| 点击 page counter 获焦，再按 Space | 当前页面计数增加；切页释放旧焦点，新页点击后取得焦点 |
-| 按住页面按钮，按 `1`/`2` 切页，再释放 | 离场页面的手势撤销，当前页面与其它有效目标继续交互 |
-| Fail（`E`），再 Overview | 显示 Build error fallback，失败保持 history，后续导航恢复页面 |
+| Overview / Settings, or `1` / `2` | Push the page and update location and history in the status bar |
+| Replace (`R`), then Back (`B` or the mouse Back button) | Replace updates the current entry; Back returns to the previous successful entry |
+| Increase Layout counter and page count, then switch between Overview and Settings | Keep the original layout/page Entities and counts; inactive pages leave layout and input |
+| Increase Layout counter, visit Outside (`4`), then open a different child page | Keep layout A and its count, select the child from the new route, and display the new path in the toolbar |
+| Scroll a list, leave the page, then go Back | Restore that history entry's position; repeated visits to a page keep separate positions |
+| Delayed (`3`) → Load (`L`) → scroll → Outside → Back | Create a new Delayed page, with a restoration intent available before the list is created |
+| After returning, use Ready (`G`), then Load | Restore on the first normal layout; loading first and marking ready later also works |
+| After returning, use Cancel (`C`), then Load, or scroll while waiting for ready | Cancel the waiting restoration and keep the new list's initial position or the user's new position |
+| Click page counter to focus it, then press Space | Increase the active page's count; departure clears its focus, and clicking the new page gives it focus |
+| Hold a page button, switch with `1`/`2`, then release | Revoke the departing page's gesture while current content and other valid targets remain interactive |
+| Fail (`E`), then Overview | Show the Build error fallback, retain history on failure, then recover through navigation |
 
-示例的保留容量为 3，布局 A、Overview 和 Settings 开启保留；Delayed 和 Outside 离场后清理。fallback 替换路由布局并清理旧缓存，恢复后得到新布局和页面。Load 演示稍后创建应用内容，Ready/Cancel 使用公开滚动命令。
+The example has a retained capacity of 3. Layout A, Overview, and Settings enable retention; Delayed and Outside are cleaned up on departure. The fallback replaces the route layout and clears old retained content, so recovery creates new layout and page instances. Load demonstrates delayed application content; Ready/Cancel use public scroll commands.
 
-终端和状态栏提供请求、目标 Entity、history cursor 与 focus。页面键盘处理器在 `RouterInputSet::Ready` 后检查输入资格。
+The terminal and status bar show request state, target Entity, history cursor, and focus. The page's keyboard handler checks input eligibility after `RouterInputSet::Ready`.
 
-## 滚动和持续手势
+## Scroll and hold gestures
 
-列表使用真实 `MouseWheel` 消息。先把窗口内光标移到 `overview-scroll`、`settings-scroll` 或已加载的 `delayed-scroll` 区域，再通过 `router/input` 发送事件：
+Lists use real `MouseWheel` messages. Move the cursor into `overview-scroll`, `settings-scroll`, or the loaded `delayed-scroll` region, then send an event through `router/input`:
 
 ```json
 {
@@ -125,21 +125,21 @@ python3 ui_debug.py key Space
 }
 ```
 
-把示意的 `123` 换成 `snapshot` 中的窗口 Entity；负 `y` 向下滚动。传递方式是 `python3 ui_debug.py rpc router/input '<JSON>'`。示例的滚轮处理器修改 Bevy `ScrollPosition`，Router 的滚动标记负责按访问保存位置。
+Replace the illustrative `123` with the window Entity from the snapshot. Negative `y` scrolls down. Send it with `python3 ui_debug.py rpc router/input '<JSON>'`. The example's scroll observer changes Bevy `ScrollPosition`; Router's marker stores positions per visit.
 
-持续手势分两次发送 `MouseButtonInput`，使用相同窗口、`button: "Left"`，并将 `state` 分别设为 `Pressed`、`Released`。在两次调用之间切换页面并等待帧推进，即可检查离场撤销。普通点击使用 `click`；消息编码见 [client](../../examples/windowed/ui_debug.py) 的 `Bridge.event` 和 `Bridge.click`。
+For a held gesture, send `MouseButtonInput` twice with the same window and `button: "Left"`, first with `state: "Pressed"`, then with `state: "Released"`. Navigate and wait for frame advancement between those calls to check departure cancellation. Use `click` for ordinary clicks. See `Bridge.event` and `Bridge.click` in the [client](../../examples/windowed/ui_debug.py) for message encoding.
 
-## 排查问题
+## Troubleshoot
 
-| 现象 | 检查方法 |
+| Symptom | What to check |
 | --- | --- |
-| 调试工具无法连接 | 确认以 `--features ui-debug` 启动 debug 构建，进程仍在运行，端点为 `127.0.0.1:15703` |
-| 点击落在错误位置 | 用新的 `snapshot` 定位活动节点，按窗口缩放把物理坐标换成逻辑坐标 |
-| Back 后位置未恢复 | 确认 Back 成功且该次访问已有记录，再查看 `router_active`、`pending_restore` 和两个滚动位置字段 |
-| 显式恢复一直等待 | 内容准备好后发送 Ready；确认 key 唯一、容器有 `ScrollPosition` 并启用了滚动溢出 |
-| `pending_restore` 已消失 | 检查是否已恢复、用户已滚动、应用已取消，或绑定已失效 |
-| 有布局数据但截图为空 | 检查窗口、相机、渲染目标和渲染插件；等待帧推进后再次截图 |
+| Client cannot connect | Start a debug build with `--features ui-debug`, keep it running, and use `127.0.0.1:15703` |
+| Click lands in the wrong place | Locate an active node in a fresh snapshot and convert physical coordinates using the window scale |
+| Back does not restore a position | Confirm Back succeeded and the visit has a saved position, then inspect `router_active`, `pending_restore`, and both scroll fields |
+| Explicit restoration keeps waiting | Send Ready after content is available; check that the key is unique and the container has `ScrollPosition` and scroll overflow |
+| `pending_restore` disappeared | Check whether restoration finished, the user scrolled, the application canceled, or the binding became invalid |
+| Layout exists but the screenshot is blank | Check the window, camera/render target, and renderer; advance frames and capture again |
 
-容器名称重复或缺少有效布局、相机时，终端警告会带上首次发现的 Router、frame、generation 和 key。每个 Router 每类警告显示一次。恢复规则见[导航参考](../contracts/navigation.md#按访问恢复滚动)。
+Duplicate keys or missing valid layout/camera produce a terminal warning with the first affected Router, frame, generation, and key. Each Router reports each warning category once. Restoration behavior is described in the [navigation contract](../contracts/navigation.md).
 
-性能测量见[性能指南](../performance.md)，平台与完整测试入口见[验证指南](../development/verification.md)。
+See the [performance guide](../performance.md) for measurement and the [verification guide](../development/verification.md) for platform checks and the complete test entry points.

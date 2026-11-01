@@ -1,14 +1,14 @@
 # Bevy UI Router
 
-[English](README.en.md) | 简体中文
+English | [简体中文](README.zh-CN.md)
 
-给 Bevy UI 添加页面导航。用路径组织页面，在切换时复用公共布局，并通过 `push`、`replace`、`back` 管理访问记录。需要时，可以保留页面状态、恢复滚动位置，并接入自己设计的过渡动画。
+Page navigation for Bevy UI. Organize pages by path, reuse shared layouts, and navigate with `push`, `replace`, and `back`. Opt into retained page state, scroll restoration on Back, and transitions designed by your application.
 
-当前支持 **Bevy 0.19**，尚未发布到 crates.io。
+Currently supports **Bevy 0.19**. Not yet published to crates.io.
 
-## 运行示例
+## Run the examples
 
-想先看看现有功能，可以运行仓库里的交互示例：
+To try the existing features first, run the interactive example:
 
 ```sh
 git clone https://github.com/shengyusi-SYS/bevy_ui_router.git
@@ -16,11 +16,11 @@ cd bevy_ui_router/examples/windowed
 cargo run
 ```
 
-点击 Overview / Settings 切换页面，修改计数后切回来，再试滚动与 Back。没有桌面环境时，可以运行[无窗口示例](docs/guides/integration.md#运行仓库示例)。
+Click Overview / Settings, change a counter and return to it, then try scrolling and Back. Without a desktop environment, try the [headless examples](docs/guides/integration.md#run-the-examples).
 
-## 接入应用
+## Add routing to your app
 
-下面声明了首页 `/` 和设置页 `/settings`。`DefaultOutlet` 标记子页面放在哪里：
+This declares a home page at `/` and settings at `/settings`. `DefaultOutlet` marks where the child page appears:
 
 ```rust
 let pages = BsnRouter::new(
@@ -33,23 +33,23 @@ let pages = BsnRouter::new(
 .initial("/");
 ```
 
-页面内容使用 Bevy 的 `bsn!` 描述。
+Page content uses Bevy's `bsn!` syntax.
 
-**[从这里开始：运行一个完整的双页窗口](docs/guides/integration.md)**。教程包含依赖、完整代码、导航操作和每一步的解释。
+**[Start here: run a complete two-page window](docs/guides/integration.md)**. The tutorial includes dependencies, complete code, navigation controls, and an explanation of each step.
 
-## 继续使用
+## Next steps
 
-- [页面状态与滚动](docs/guides/pages.md)：保留状态、读取当前参数、加载内容与恢复滚动。
-- [过渡动画](docs/guides/transitions.md)：用 Tween 或已有动画系统定义效果。
-- [系统返回](docs/guides/platform-back.md)：接入鼠标后退键和 Android 传统返回。
-- [排查问题](docs/guides/debugging.md)：页面不显示、导航失败或状态没有保留。
+- [Page state and scrolling](docs/guides/pages.md): retain state, read current parameters, load content, and restore scroll.
+- [Transitions](docs/guides/transitions.md): define effects with Tween or your existing animation system.
+- [System Back](docs/guides/platform-back.md): connect mouse Back and Android traditional Back.
+- [Troubleshooting](docs/guides/debugging.md): find missing pages, navigation failures, or lost state.
 
-API、行为规则及开发资料见[文档索引](docs/README.md)；参与开发见[贡献指南](CONTRIBUTING.md)。
+Find API references, behavior rules, and developer material in the [documentation index](docs/README.md). To contribute, see [contributing](CONTRIBUTING.md).
 
-## 生产实践
+## Production use
 
-[涟音 LianYin](https://lianyin.eztools.fun/zh-cn/) 是一款跨平台、跨设备音乐播放器，在实际产品中使用本库管理页面导航、历史返回、页面保留和滚动位置恢复。产品介绍与版本发布见[涟音仓库](https://github.com/shengyusi-SYS/lianyin)。
+[LianYin](https://lianyin.eztools.fun/en/) is a cross-platform, multi-device music player that uses this library in production for navigation, history, page retention, and scroll restoration. See the [LianYin repository](https://github.com/shengyusi-SYS/lianyin) for product information and releases.
 
-## 许可证
+## License
 
-本项目采用双许可证，可选择 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)。
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
