@@ -51,4 +51,4 @@ Place the handler in the same `PreUpdate` with `.after(PlatformBackInputSet)` so
 
 Plugins register raw and Back message channels idempotently. Device input comes from the application's Bevy backend; tests can inject standard messages. Features enable only the needed mouse or keyboard input. Applications select Router ECS, Scene, window, and platform runtime plugins separately.
 
-The Android adapter uses traditional key messages; modern callbacks and predictive Back gestures are future capabilities. Bevy messages have no Android cancellation flag, so applications explicitly choose their exit behavior when history is empty. See the [integration guide](../guides/integration.en.md#android-traditional-back) for the Android manifest compatibility setting.
+The Android adapter uses traditional key messages; modern callbacks and predictive Back gestures are future capabilities. Bevy messages have no Android cancellation flag, so applications explicitly choose their exit behavior when history is empty. See the [system Back guide](../guides/platform-back.en.md#android-traditional-back) for the Android manifest compatibility setting.

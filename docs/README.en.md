@@ -2,30 +2,31 @@
 
 English | [简体中文](README.md)
 
-Start by [running an example](../README.en.md#run-the-examples), then follow the [integration guide](guides/integration.en.md). Each user and developer guide has an English and Chinese version.
+## Use Router
 
-| I want to… | Start here |
-| --- | --- |
-| Understand what Router does | [Overview](overview.en.md) |
-| Add routing to a Bevy application | [Integration](guides/integration.en.md) |
-| Add application-owned animation | [Transition guide](guides/transitions.en.md) |
-| Debug a window, navigation, or input | [Debugging](guides/debugging.en.md) |
-| Look up navigation, Scene, lifecycle, and input behavior | [Behavior contracts](contracts/README.en.md) |
-| Understand modules and data structures | [Architecture](architecture/README.en.md) |
-| Follow a navigation through the runtime | [Runtime](architecture/runtime.en.md) |
-| Change ownership handoffs or failure cleanup | [Lifecycle execution](architecture/lifecycle.en.md) |
-| Fix a bug or build a feature | [Development](development/README.en.md) |
-| Run checks and validate packages | [Verification](development/verification.en.md) |
-| Measure navigation and idle updates | [Performance](performance.en.md) |
-| Understand key design choices | [Design rationale](development/design-lessons.en.md) |
-| See upcoming work | [Roadmap](roadmap.en.md) |
+Start with the [two-page window tutorial](guides/integration.en.md). Dependencies, complete code, and run instructions are all on one page.
 
-## API reference and history
+Once it runs, read what you need:
 
-Generate the API reference from the repository root:
+- [Page state and scrolling](guides/pages.en.md): retain pages, read parameters, load content, restore scroll, and handle input.
+- [Transitions](guides/transitions.en.md): design effects with Tween or your own animation system.
+- [System Back](guides/platform-back.en.md): mouse Back and Android traditional Back.
+- [Troubleshooting](guides/debugging.en.md): start with routing state, then inspect the window and input.
+
+The [overview](overview.en.md) describes available capabilities. The [compatibility table](guides/integration.en.md#bevy-version-requirements) helps you select a version.
+
+## Look up behavior
+
+The [behavior reference](contracts/README.en.md) covers navigation, Scenes, lifecycle, and input. Generate the API reference from the repository root:
 
 ```sh
-cargo doc --workspace --all-features --no-deps --locked
+cargo doc -p bevy_ui_router --all-features --no-deps --open
 ```
 
-Open `target/doc/bevy_ui_router/index.html`. Examples link to runnable source; the development guide links features to implementation and tests. Completed plans and experiments remain available through `git log -- docs`. Retained [performance data](data/performance/README.en.md) includes source and environment information.
+## Contribute
+
+Use the [development guide](development/README.en.md) to find implementations and tests. See [architecture](architecture/README.en.md) for module relationships and [runtime](architecture/runtime.en.md) for execution flow.
+
+[Verification](development/verification.en.md) · [Performance](performance.en.md) · [Design rationale](development/design-lessons.en.md) · [Roadmap](roadmap.en.md)
+
+Completed plans and experiments are available through `git log -- docs`; [performance data](data/performance/README.en.md) includes source and environment information.

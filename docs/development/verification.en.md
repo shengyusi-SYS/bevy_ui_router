@@ -64,6 +64,8 @@ cargo test -p bevy_ui_router --test dependency_contract --test facade_consumers 
 
 The consumer harness separately exercises no defaults, default `view`, explicit `view`, `ecs`, `bsn`, `platform`, `desktop-back`, and `android-back`. Each application declares its minimal dependencies, and both recommended examples compile and run from their unchanged source. Compile-rejection cases check the error category, target symbol, and source location for private API and feature boundaries.
 
+Repository links resolve relative to each document. All six crates share the root README; before publishing to crates.io, also check links on its rendered page rather than relying only on local link validation.
+
 Check documentation and release content with:
 
 ```sh
@@ -126,7 +128,7 @@ The Tween example defines slide and scale/rotation effects through one preparati
 
 The Linux build uses X11. CI installs `libxkbcommon-dev`, `libx11-dev`, `libxi-dev`, `libxcursor-dev`, and `libxrandr-dev`. Interaction checks cover push/replace/back, layout and page counters, positions for separate visits, delayed content, clicks and Space, focus release, gestures across navigation, error fallback, and recovery. See [window debugging](../guides/debugging.en.md) for steps and BRP commands.
 
-The example's keyboard handler explicitly queries the gate after `RouterInputSet::Ready`. Applications integrating native Tab/Dispatch also need to verify target selection and dispatch. Android manifest setup is in the [integration guide](../guides/integration.en.md).
+The example's keyboard handler explicitly queries the gate after `RouterInputSet::Ready`. Applications integrating native Tab/Dispatch also need to verify target selection and dispatch. Android manifest setup is in the [system Back guide](../guides/platform-back.en.md#android-traditional-back).
 
 ## Performance fixtures and packages
 

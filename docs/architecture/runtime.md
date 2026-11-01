@@ -135,7 +135,7 @@ flowchart TB
 
 可选 `RouteTweenPlugin` 在 UI Prepare 前使用独立时间上下文推进 `bevy_tween` 控制器，从 presented 时刻开始计时。官方插值写完最后一帧后移除对应控制器，再通知原过渡释放或完成；取消同步移除写入者。应用可同时使用自己的 Tween 插件。页面系统在 PublishSnapshots 后提交的导航可能在后续更新发布，不能把 Commands 调用视为同步页面切换。
 
-输入在 picking Backend 前刷新资格；有可见退出页时暂时排除其原生 UI 候选，Backend 后恢复完整栈，避免旧页阻挡新页命中。随后在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[接入指南](../guides/integration.md)。
+输入在 picking Backend 前刷新资格；有可见退出页时暂时排除其原生 UI 候选，Backend 后恢复完整栈，避免旧页阻挡新页命中。随后在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[输入接入](../guides/pages.md#输入与焦点接入)。
 
 只读阶段可复用本轮 frame 内容、membership 和 child-slot 切口，写入后或进入新调度阶段重新观察。focus 还验证 shell、已提交切口和 slot 外侧闭包；保留实例验证完整后代及其与输入/focus 的隔离。
 

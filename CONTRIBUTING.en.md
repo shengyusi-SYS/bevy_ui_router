@@ -9,3 +9,5 @@ When reporting a problem, include the Bevy and Rust versions, enabled features, 
 Start with the [development guide](docs/development/README.en.md) to find the relevant contract, implementation, and tests. Describe the user-visible change and validation results in your contribution, and update both language versions of the affected documentation. Small documentation fixes can be submitted directly.
 
 See [verification](docs/development/verification.en.md) for commands and checks appropriate to each type of change. Workspace collaboration rules are in [AGENTS.md](AGENTS.md).
+
+Link to repository files relative to the current document (for example, `docs/guides/integration.md` or `../README.md`); keep full URLs for external sites. Write usage guides in operation order, with specialized configuration in the relevant advanced section.

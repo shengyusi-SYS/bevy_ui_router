@@ -96,7 +96,7 @@ While waiting, the frozen target and original entry record remain, and the actua
 
 `RouterScrollSet::Prepare` writes requested positions in `PostUpdate`, after `UiSystems::Content` and before `UiSystems::Layout`. Reads between publication and Prepare may still see the previous component value. After normal layout, Router revalidates complete active-branch ownership, records the clamped result once, and consumes the intent. Later content growth leaves that result alone. Missing real layout or a valid camera abandons the attempt, preserves the value from binding, and emits a bounded diagnostic. Restoration uses normal layout rather than extra layout passes or fixed-frame retries.
 
-Records follow canonical entries: Replace, forward truncation, and Router removal release the corresponding records. Host loss cancels intents while retaining records for visits still in history. See the [integration guide](../guides/integration.en.md#restore-scroll-positions).
+Records follow canonical entries: Replace, forward truncation, and Router removal release the corresponding records. Host loss cancels intents while retaining records for visits still in history. See the [scroll guide](../guides/pages.en.md#restore-scroll-positions).
 
 ## Snapshots and diagnostics
 

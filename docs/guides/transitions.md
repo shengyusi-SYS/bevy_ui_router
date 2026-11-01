@@ -1,22 +1,32 @@
-# 应用自定义路由过渡
+# 添加过渡动画
 
-[中文](transitions.md) | [English](transitions.en.md)
+[English](transitions.en.md) | 简体中文
 
-Router 默认不安装过渡 driver。应用决定效果、缓动、时长和叠放布局。使用可选 Tween 适配时，库协调控制器的开始、取消与完成；使用自己的动画系统时，实现下文的 `RouteTransitionDriver`。相关类型均从 `bevy_ui_router::prelude::*` 导入。
+给已有的 Bevy UI 页面加上切换动画。Router 负责让进入、退出页面在合适的时间存在，应用决定效果、时长和缓动。下面先使用 Tween 适配；已有动画系统可以直接接入后半部分的自定义驱动器。
 
-当前展示表面接入面向原生 Bevy UI / BSN 页面。
+## 1. 添加依赖和插件
 
-## 使用 Tween 适配
+在现有 `bevy_ui_router` 依赖上启用 `tween`，即 `features = ["bsn", "tween"]`，并添加：
 
-启用 Router 的 `bsn,tween` features，并添加 `bevy_tween = { version = "0.13", default-features = false }`。安装 `RouteTweenPlugin::default()`；应用仍提供 `TimePlugin`（`DefaultPlugins` 已包含）。运行完整示例：
-
-```sh
-cargo run --locked --manifest-path examples/windowed/Cargo.toml --features tween --bin tween_transitions
+```toml
+[dependencies.bevy_tween]
+version = "0.13"
+default-features = false
 ```
 
-[窗口入口](../../examples/windowed/src/bin/tween_transitions.rs)使用统一路由声明、Commands 和保留计数。[应用效果](../../examples/windowed/src/bin/tween_transitions/effects.rs)提供平移、缩放旋转和进入动画模式，不维护 session、计时器或结束回调。 窗口按钮显示当前效果和退出动画模式；点击切换后，下一次导航使用新设置。
+沿用入门教程的导入，在 `add_bsn_router` 之前安装插件：
 
-在 `BsnRouter` 上配置 `.transition_driver(RouteTweenDriver::new(prepare_effect))`。应用只需一个准备回调，例如：
+```rust
+app.add_plugins(RouteTweenPlugin::default());
+```
+
+教程中的 `DefaultPlugins` 已包含动画需要的时间插件。
+
+## 2. 连接路由并定义效果
+
+在已有 `BsnRouter` 的声明链上，加上 `.transition_driver(RouteTweenDriver::new(prepare_effect))`，再实现下面的 `prepare_effect`。它让新页面在 240 毫秒内从右侧滑入。
+
+`surface()` 返回 Router 为页面提供的外层动画节点。这里只修改它已有的 `UiTransform`；`is_outermost()` 避免父子页面重复移动。
 
 ```rust
 use std::time::Duration;
@@ -41,23 +51,41 @@ fn prepare_effect(
 }
 ```
 
-`enter` 和 `exit` 接收第三方 `tween`、`sequence`、`parallel` 等有限时间线。添加 exit track 即要求保留退出页面；退出写入者全部完成后自动 release，全部 track 完成后自动 finish。没有 track 时跳过过渡。所有写入 leaving surface 的动画放在 exit track 中。
+`tracks.enter(...)` 播放进入动画；需要退出动画时，使用 `tracks.exit(...)`。两者可组合 `tween`、`sequence`、`parallel` 等有限时间线。退出页面的动画都放进 `exit`，库会等它们结束后再隐藏或清理页面。没有添加动画时直接切页。
 
-适配器在路由发布后从零开始计时，使用 `Time<Real>`；在 UI Prepare 前应用插值，最后一次写入后回收控制器。取消同步停止写入，连续导航沿原队列推进；按需更新窗口会在动画期间以及提交最终完成请求时请求重绘。
+适配器负责计时、取消、结束和按需窗口的重绘。动画可以修改外层节点已有的 `UiTransform`、`ZIndex` 和 `Node` 布局字段（不含 `display`）；外层节点的组件、父子关系、可见性和输入状态仍由 Router 管理。
 
-适配器支持 `EaseKind` / `EaseClosure` 和 boxed 组件插值，默认注册 `UiTransform`、`Node`、`ZIndex`。应用内容的其它组件可用 `RouteTweenPlugin::default().with_component::<T>()` 注册，通过 `with_closure` 或 boxed interpolator 操作。typed interpolator、resource/asset tween 和 tween event 不由该适配器注册；需要这些能力时使用手工 driver。控制器位于独立 Entity，保持原表面写入边界；应用额外资源副作用仍由应用管理。
+## 3. 运行并调整效果
 
-如同时使用 `DefaultTweenPlugins`，先安装 `RouteTweenPlugin`，以便把私有时间上下文登记给上游 debug 插件。若上游 debug 已先安装，计时仍独立，但它可能误报未知时间上下文；适配器不会覆盖应用已有的 debug 配置。自定义时钟或特殊完成策略也使用下面的手工 driver。
-
-## 运行手工 driver 示例
-
-从仓库根目录运行：
+从仓库根目录进入窗口示例目录：
 
 ```sh
-cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transitions
+cd examples/windowed
+cargo run --features tween --bin tween_transitions
 ```
 
-[窗口示例](../../examples/windowed/src/bin/transitions.rs)使用同一个 driver 接口实现平移和缩放旋转。按钮和键盘操作相同：
+点击页面按钮切换，点击 `Effect: …` 切换效果、`Exit: …` 开关退出动画，修改后在下一次导航生效。效果代码在 [effects.rs](../../examples/windowed/src/bin/tween_transitions/effects.rs)，完整接入在[示例入口](../../examples/windowed/src/bin/tween_transitions.rs)。
+
+<details>
+<summary>更多插值类型、自选插件与执行顺序</summary>
+
+适配器支持 `EaseKind` / `EaseClosure` 和 boxed 组件插值，默认注册 `UiTransform`、`Node`、`ZIndex`。应用内容的其它组件可用 `RouteTweenPlugin::default().with_component::<T>()` 注册，通过 `with_closure` 或 boxed interpolator 操作。typed interpolator、resource/asset tween 和 tween event 需要下文的自定义驱动器。
+
+如同时使用 `DefaultTweenPlugins`，先安装 `RouteTweenPlugin`，让上游 debug 插件识别路由动画的独立时钟。反过来安装不影响计时，但可能出现未知时间上下文的误报。自选 Bevy 插件时需提供 `TimePlugin`。
+
+动画在页面切换后从零开始，使用 `Time<Real>`；在 UI Prepare 前应用插值，最后一次写入后回收控制器。取消会同步停止写入。按需更新的窗口在动画期间及提交完成请求时会收到重绘请求。需要自定义时钟或完成策略时，使用下文的驱动器接口。
+
+</details>
+
+## 接入已有动画系统
+
+实现 `RouteTransitionDriver` 即可连接自己的动画系统。可以先在 `examples/windowed` 目录运行不依赖 Tween 的示例：
+
+```sh
+cargo run --bin transitions
+```
+
+[窗口示例](../../examples/windowed/src/bin/transitions.rs)使用这个接口实现平移和缩放旋转。按钮和键盘操作相同：
 
 | 按键 | 操作 |
 | --- | --- |
@@ -68,11 +96,11 @@ cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin transition
 | `H` | 切换是否持有退出页面；关闭时仅播放进入动画 |
 | `R` | 连续发出导航，观察旧动画取消 |
 
-点击页面计数器后切换页面，可比较保留与重新创建的行为。[动画实现](../../examples/windowed/src/bin/transitions/animation.rs)使用官方 `Time<Real>`、`Timer`、`EasingCurve` 和 `UiTransform`；无需额外动画 runtime。窗口运行环境见[应用集成](integration.md#运行仓库示例)。
+点击页面计数器后切换页面，可比较保留与重新创建的行为。[动画实现](../../examples/windowed/src/bin/transitions/animation.rs)使用官方 `Time<Real>`、`Timer`、`EasingCurve` 和 `UiTransform`；无需额外动画库。窗口运行环境见[应用集成](integration.md#运行仓库示例)。
 
-## 接入 driver
+### 注册驱动器
 
-为每个 Router 注册一个应用 driver：
+为 Router 注册驱动器：
 
 ```rust
 let declaration = BsnRouter::new(root)
@@ -86,28 +114,28 @@ let router = app.add_bsn_router(declaration)?;
 | 回调 | 应用职责 |
 | --- | --- |
 | `prepare(world, context)` | 设置首帧样式并记录动画状态，此时不要启动计时。返回 `Skip` 或 `Run { hold_exit }`。 |
-| `presented(world, id)` | 路由已发布，启动应用动画。此通知不表示进入动画已完成。 |
-| `cancelled(world, id, reason)` | 在返回前停止该 session 的所有写入者，并清理应用动画状态。 |
+| `presented(world, id)` | 页面已切换，启动应用动画。 |
+| `cancelled(world, id, reason)` | 在返回前停止本次动画对组件的全部写入，并清理应用动画状态。 |
 
-每次调用 `prepare` 后都会收到 `presented` 或 `cancelled`；已 presented 的 session 也可能随后取消。`Skip` 会触发 `cancelled(..., Skipped)`，以便撤销准备状态。其它原因包括 `PreparationAborted`、`Superseded` 和 `AuthorityLost`。取消已发布的动画不会撤销已提交的路由与 history。
+每次调用 `prepare` 后都会收到 `presented` 或 `cancelled`；已经开始的动画也可能随后取消。`Skip` 会触发 `cancelled(..., Skipped)`，以便撤销准备状态。其它原因包括 `PreparationAborted`、`Superseded` 和 `AuthorityLost`。取消已发布的动画不会撤销已提交的路由与 history。
 
-`RouteTransitionContext` 提供不透明 `id()`、Router、request、`NavigationKind`、`from()` / `to()`，以及 `entering()`、`leaving()`、`preserved()`。目标包含 exact `frame()`、应用内容根 `content()` 和可临时修改的 `surface()`。整页效果通常只处理 `is_outermost()` 的目标，避免同时变换父 frame 和嵌套子 frame；preserved frames 仅供读取上下文。
+`RouteTransitionContext` 提供本次动画的 `id()`、Router、导航请求、`NavigationKind` 与前后地址 `from()` / `to()`。用 `entering()` 和 `leaving()` 取得进入、退出的目标；`preserved()` 中继续共用的页面仅供读取。目标的 `frame()` 标识路由实例，`content()` 是应用内容根，`surface()` 是外层动画节点。整页效果通常只处理 `is_outermost()`，避免父子页面重复变换。
 
-## 表面与动画状态
+### 保存动画状态与处理取消
 
-`surface()` 是既有 Router shell 的 Entity。授权期间可以修改它已有的 `Node` 布局字段（不含 `display`）、`UiTransform` 和 `ZIndex` 值。关系、组件集合、可见性、输入及身份仍由 Router 管理。重叠布局由应用在 `prepare` 中设置，Router 不添加动画 wrapper，也不替换应用 host。
+页面重叠布局在 `prepare` 中设置。
 
-把计时器、动画组件或第三方 animator 放在应用资源或独立的应用 Entity 上，显式指定目标 surface。不要向 Router shell 添加动画组件。应用也可动画化自己的 `content()`；这部分修改及资源副作用由应用自行收尾。
+把计时器、动画组件或第三方动画控制器放在应用资源或独立 Entity 上，以外层节点为目标。也可以直接动画化自己的 `content()`。
 
-`cancelled` 必须同步停止写入，不能只设置一个等下一帧才生效的停止标记。回调排队的 Commands 会在 Router 继续之前 flush。结束或取消时，Router 恢复仍具有 exact ownership 的 shell 基线，并保留当前 Router 控制的 `display`；保存 Entity 不会延长写入授权。
+`cancelled` 返回前应停止本次动画的所有写入。回调排队的 Commands 会在 Router 继续之前执行。结束或取消时，Router 恢复仍由它管理的外层节点原值，并保留当前的 `display`；之后不再继续修改这些节点。
 
 示例把唯一动画写入者保存在资源中，在 `cancelled` 立即移除；每帧系统排在 `Update` 的 `RouterScheduleSet::PublishSnapshots` 之后，用正常 Bevy 组件写入推进效果。
 
-应用也负责窗口重绘。Reactive winit 模式不会因计时器存在而持续更新；示例在动画运行期间发送 `RequestRedraw`。若应用采用按需更新，等待中的其它应用计时任务也需要安排唤醒。
+使用 winit 按需更新模式时，在动画运行期间发送 `RequestRedraw`，让窗口持续更新。
 
-## 退出释放与完成
+### 退出动画结束后释放页面
 
-`Run { hold_exit: true }` 让退出页面保持可见，延后它原定的清理或保留处置。退出页面已经非活动，不能继续接收路由输入或保留焦点。`Run { hold_exit: false }` 不延后退出处置，适合初次进入或仅播放进入动画；返回后不要继续写 leaving surfaces。
+`Run { hold_exit: true }` 让退出页面保持可见，延后它原定的清理或隐藏保留。退出页面已经非活动，不能继续接收路由输入或保留焦点。`Run { hold_exit: false }` 不等待退出动画，适合初次进入或仅播放进入动画；返回后不要继续修改退出页面的外层节点。
 
 先停止对应目标的动画写入，再发送命令：
 
@@ -119,10 +147,13 @@ commands.release_route_transition_exit(session_id.clone());
 commands.finish_route_transition(session_id);
 ```
 
-`RouteTransitionId` 只标识这一次动画 session。重复或过期命令不会影响后续 session。示例先在退出动画结束时 release，再在进入动画结束时 finish。
+用本次动画的 `RouteTransitionId` 发送命令：退出动画结束时释放页面，全部动画结束后完成过渡。
 
-active、当前输入与 history 在路由发布时更新。持有退出页面时，请求可继续处于 `PostCommitCleanup`；退出责任完成后请求即可终结，进入动画仍可继续。只进入的动画不延长请求生命周期。
+<details>
+<summary>连续导航与请求完成时间</summary>
 
-若后续请求正在等待旧退出责任，Router 可以先取消旧 session 并完成退出处置，再推进队列；这一步不判断新目标是否复用旧表面。没有真实 entering/leaving 变化的等价导航不会新建动画 session，已有的只进入 session 可以继续。
+活动页面、当前参数与历史记录在页面切换时更新，不必等待动画结束。持有退出页面时，请求可处于 `PostCommitCleanup`；退出页面的清理或保留完成后，请求即可结束，进入动画仍可继续。只有进入动画时，不延长导航请求。
 
-职责划分参考 [Vue Router transitions](https://router.vuejs.org/guide/advanced/transitions.html) 和 [Motion presence](https://motion.dev/docs/react-animate-presence)：路由管理实例存续，应用组合具体效果；不照搬 DOM 或动画运行时。
+后续请求若正在等待旧退出动画，Router 可以先取消旧动画并处理退出页面，再推进队列。没有实际页面进入或退出的导航不会新建动画，已有的只进入动画可以继续。
+
+</details>

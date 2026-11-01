@@ -98,7 +98,7 @@ publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不�
 
 请求值统一在 `PostUpdate` 的 `RouterScrollSet::Prepare` 写入，该 set 在 `UiSystems::Content` 后、`UiSystems::Layout` 前；publication 后、Prepare 前读取组件可能仍为原值。正常布局后复验当前完整 branch 归属，单次回写实际裁剪位置并消费意图，内容随后增长不追赶旧目标。缺少实际布局或有效相机时不保存伪造位置，本次尝试放弃并保留绑定时原值，给出有界诊断；不额外运行布局或按固定帧重试。
 
-记录随 canonical entry 回收：Replace、forward 截断及 Router 移除释放对应记录；host loss 撤销意图，保留仍在 history 中的访问记录。接入方式见[集成指南](../guides/integration.md#滚动恢复)。
+记录随 canonical entry 回收：Replace、forward 截断及 Router 移除释放对应记录；host loss 撤销意图，保留仍在 history 中的访问记录。接入方式见[滚动指南](../guides/pages.md#滚动恢复)。
 
 ## Snapshots 与诊断
 

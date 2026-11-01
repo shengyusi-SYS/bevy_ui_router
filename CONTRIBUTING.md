@@ -9,3 +9,5 @@
 开始修改前，阅读[开发指南](docs/development/README.md)，按功能找到对应合同、源码和测试。提交说明写清用户会看到的变化及验证结果；更新对应的中英文文档。简单文档修正可以直接提交。
 
 完整检查命令和按风险选择验证的方法见[验证指南](docs/development/verification.md)。工作区协作约定见 [AGENTS.md](AGENTS.md)。
+
+仓库内文档互链使用相对当前文件的路径（如 `docs/guides/integration.md`、`../README.md`），外部网站保留完整 URL。使用指南按实际操作顺序写，特殊配置放在对应进阶小节。

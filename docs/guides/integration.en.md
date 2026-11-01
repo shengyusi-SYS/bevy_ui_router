@@ -1,38 +1,22 @@
-# Application integration
+# Add page navigation to a Bevy app
 
-[中文](integration.md) | [English](integration.en.md)
+English | [简体中文](integration.md)
 
-The `bsn` feature of `bevy_ui_router` connects Bevy Scenes to a route tree. Router handles page changes, shared layouts, and navigation history. This guide starts with runnable examples, then covers retained state, scrolling, input, and platform Back controls.
+Build a window with Home and Settings pages: press `1` or `2` to navigate, and `B` to go back. All dependencies and code are included below. Existing Bevy applications can follow the same three steps.
 
-## Run the examples
+First follow [Bevy’s environment setup](https://bevy.org/learn/quick-start/getting-started/setup/) for Rust and platform dependencies. Skip this if you already have a working Bevy window application.
 
-From the repository root:
+## 1. Create a project
 
-```sh
-cargo run --locked -p bevy_ui_router --features bsn --example bsn_quick_start
-cargo run --locked -p bevy_ui_router --features bsn --example bsn_nested
-```
-
-| Example | Contents | Runtime |
-| --- | --- | --- |
-| [bsn_quick_start.rs](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) | Declare pages, set the initial destination, and read results | Headless; exits when complete |
-| [bsn_nested.rs](../../crates/bevy_ui_router/examples/bsn_nested.rs) | Nested layouts, query updates, application async content, and scroll restoration | Headless with real UI layout; exits when complete |
-| [windowed](../../examples/windowed/) | Clickable pages, retained state, focus, and error recovery | Interactive window |
-| [transitions](../../examples/windowed/src/bin/transitions.rs) | Application animation, exit release, and successive navigation | Interactive window |
-
-Start the windowed example:
+Run these commands in your projects directory so the two folders sit alongside each other:
 
 ```sh
-cargo run --locked --manifest-path examples/windowed/Cargo.toml --bin router_windowed
+git clone https://github.com/shengyusi-SYS/bevy_ui_router.git
+cargo new router-demo
+cd router-demo
 ```
 
-The windowed application configures its window, camera, font, and styling. Its Linux build uses X11 and needs the X11/xkbcommon development libraries. Running it requires a display and graphics driver. See [window debugging](debugging.en.md) for automated input and screenshots.
-
-Route transitions are disabled by default. See [application-defined route transitions](transitions.en.md) to connect application animation and run the separate example with two effects.
-
-## Use Router in a separate Cargo application
-
-Create `router-demo` next to the `bevy_ui_router` checkout. Copy [the quick start](../../crates/bevy_ui_router/examples/bsn_quick_start.rs) into `router-demo/src/main.rs`, then add this `Cargo.toml`. Adjust `path` to match your directory layout.
+If you already have Router, create `router-demo` next to it. Replace `Cargo.toml` with:
 
 ```toml
 [package]
@@ -41,262 +25,170 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", default-features = false, features = ["bsn"] }
-bevy_app = { version = "0.19", default-features = false }
-bevy_asset = { version = "0.19", default-features = false }
-bevy_ecs = { version = "0.19", default-features = false }
-bevy_scene = { version = "0.19", default-features = false }
-bevy_ui = { version = "0.19", default-features = false }
+bevy = { version = "0.19", default-features = false, features = ["ui"] }
+bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = ["bsn"] }
 ```
 
-Run `cargo run` in `router-demo`. The project uses Rust edition 2024. Toolchain details and check commands are in the [verification guide](../development/verification.en.md).
+This enables Bevy's UI features and Router's `bsn` page integration. Router is not yet published, so the dependency uses a local path. In an existing application, add the Router dependency and keep your Bevy configuration.
 
-For the nested example, also add its layout, camera, and input dependencies:
+## 2. Add pages and navigation
 
-```toml
-bevy_input_focus = { version = "0.19", default-features = false }
-bevy_internal = { version = "0.19", default-features = false, features = ["bevy_window", "bevy_camera", "bevy_ui", "bevy_picking"] }
+Put this complete program in `src/main.rs`:
+
+```rust
+use bevy::prelude::*;
+use bevy_ui_router::prelude::*;
+
+#[derive(Resource)]
+struct Pages(RouterHandle);
+
+fn main() {
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins);
+
+    let router = app
+        .add_bsn_router(
+            BsnRouter::new(
+                layout(|_| {
+                    Ok(bsn! {
+                        Node { width: percent(100), height: percent(100) }
+                        DefaultOutlet
+                    })
+                })
+                .children([
+                    index(|_| Ok(page_content("Home"))),
+                    page("settings", |_| Ok(page_content("Settings"))),
+                ]),
+            )
+            .fallback(|_| Ok(page_content("Page unavailable")))
+            .initial("/"),
+        )
+        .expect("valid routes");
+
+    app.insert_resource(Pages(router))
+        .add_systems(Startup, setup)
+        .add_systems(Update, navigate)
+        .run();
+}
+
+fn page_content(title: &'static str) -> impl Scene {
+    bsn! {
+        Node {
+            width: percent(100), height: percent(100),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+        }
+        Children [(Text(title))]
+    }
+}
+
+fn setup(mut commands: Commands, pages: Res<Pages>) {
+    commands.spawn(Camera2d);
+    commands
+        .spawn(Node {
+            width: percent(100),
+            height: percent(100),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(px(24)),
+            ..default()
+        })
+        .with_children(|root| {
+            root.spawn(Text::new("1: Home    2: Settings    B: Back"));
+            root.spawn((
+                Node {
+                    width: percent(100),
+                    flex_grow: 1.0,
+                    ..default()
+                },
+                RouterHostRegistration::new(pages.0),
+            ));
+        });
+}
+
+fn navigate(keys: Res<ButtonInput<KeyCode>>, pages: Res<Pages>, mut commands: Commands) {
+    if keys.just_pressed(KeyCode::Digit1) {
+        commands.router(pages.0).push("/");
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        commands.router(pages.0).push("/settings");
+    } else if keys.just_pressed(KeyCode::KeyB) {
+        commands.router(pages.0).back();
+    }
+}
 ```
+
+Three parts of the program handle routing:
+
+1. **Declare pages.** `index` matches the parent path `/`; `page("settings", ...)` matches `/settings`. The outer `layout` provides a shared layout, and `DefaultOutlet` marks where the child page appears. Each closure returns a new Bevy Scene when a page needs creating; this example describes its UI with `bsn!`.
+2. **Choose where pages appear.** `setup` adds `RouterHostRegistration` to an ordinary UI container. Routed pages appear inside it. Container sizes, cameras, and windows use normal Bevy UI setup.
+3. **Navigate.** `navigate` calls `commands.router(handle)`. The example stores the handle in a `Pages` resource so systems can use it.
+
+`.initial("/")` selects the first page. The required `.fallback(...)` supplies an error page for an unmatched address or failed page creation.
+
+## 3. Run and switch pages
+
+```sh
+cargo run
+```
+
+The window starts on **Home**. Press `2` for **Settings**, then `B` to return to Home. The shortcut hint stays at the top while the page below changes. These are application-wide shortcuts.
+
+There are three navigation operations:
+
+```rust
+commands.router(pages.0).push("/settings");     // Add a visit
+commands.router(pages.0).replace("/settings");  // Replace the current visit
+commands.router(pages.0).back();                // Return to the previous visit
+```
+
+These calls queue a page change rather than changing the screen immediately. Without an earlier visit, `back()` leaves the page in place and logs the reason. To handle results in code, see [navigation troubleshooting](debugging.en.md#diagnose-navigation-first).
+
+## Add your own content
+
+Replace `page_content` with your UI. Put a navigation bar in `layout` and `DefaultOutlet` in its body area; the navigation bar can stay in place as you switch between sibling pages.
+
+Child paths are relative to their parent route. For an item detail page, declare `page("items/:id", ...)` and navigate to `/items/42`. Addresses also support query strings and fragments, such as `/items/42?sort=name#details`. See [page state and scrolling](pages.en.md) to read current parameters, retain pages, or load content later.
+
+In an existing application, install Bevy plugins before `add_bsn_router`; it installs Router's systems. `DefaultPlugins` already includes the required Scene plugins.
+
+<details>
+<summary>When choosing Bevy plugins individually</summary>
+
+Install `AssetPlugin` and `ScenePlugin` before adding Router. For manual route-tree and view-registry setup, see the [Scene reference](../contracts/scene.en.md#registration-and-runtime-setup).
+
+</details>
+
+Next, add [input and focus for page controls](pages.en.md#input-and-focus), [transitions](transitions.en.md), or [system Back](platform-back.en.md) as needed.
+
+## Run the examples
+
+After the tutorial, move from `router-demo` into the neighboring Router repository to try retained counters, scroll restoration, and error pages:
+
+```sh
+cd ../bevy_ui_router/examples/windowed
+cargo run
+```
+
+To check routing without opening a window, return to the repository root and run:
+
+```sh
+cd ../..
+cargo run -p bevy_ui_router --features bsn --example bsn_quick_start
+```
+
+It prints `Succeeded` and the current path, then exits. The [nested example](../../crates/bevy_ui_router/examples/bsn_nested.rs) combines layouts, query updates, delayed content, and scrolling:
+
+```sh
+cargo run -p bevy_ui_router --features bsn --example bsn_nested
+```
+
+Windowed examples need a display and graphics driver and use X11 on Linux. Follow the Bevy system setup linked at the start of this page. For layout inspection and screenshots, see [debugging](debugging.en.md#start-and-inspect-a-window).
 
 ## Bevy version requirements
-
-Starting with Bevy 0.19, this library follows the ecosystem's version-mapping approach: each newly supported Bevy minor release gets a corresponding Router release series. Applications select the Router version matching their Bevy version. The compatibility table retains historical mappings, following the pattern used by [bevy_egui](https://github.com/mvlabat/bevy_egui#bevy-support-table).
 
 | Bevy | Router |
 | --- | --- |
 | `0.19` | Current source, not yet published |
 
-Bevy `0.20` migration work is recorded in the [roadmap](../roadmap.en.md#bevy-020-migration-not-started) and is deferred. This mapping applies to Bevy integrations; Core/View do not depend on Bevy.
+Starting with Bevy 0.19, each supported Bevy minor version has a corresponding Router release series. Choose the series matching your application. `version = "0.19"` accepts compatible patch updates; applications use their own lockfiles.
 
-Each release series uses an ordinary Cargo requirement for its Bevy minor version. The current requirement is `version = "0.19"`; Cargo selects compatible patch releases according to its [default requirements](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements). The repository's `Cargo.lock` and example commands using `--locked` reproduce repository builds. Consumers resolve dependencies through their own manifests and lockfiles, using standard Cargo source configuration.
-
-## Declare pages and start
-
-Install the Bevy plugins your application needs first. A minimal headless application uses `TaskPoolPlugin`, `AssetPlugin`, and `ScenePlugin`; visible UI also needs window, camera, UI/render, and input plugins. Then associate paths with Scene factories through `page`, `layout`, and `index`:
-
-```rust
-use bevy_app::App;
-use bevy_scene::bsn;
-use bevy_ui::Node;
-use bevy_ui_router::prelude::*;
-
-fn install_pages(app: &mut App) -> Result<RouterHandle, BsnRouterError> {
-    let router = app.add_bsn_router(
-        BsnRouter::new(
-            layout(|_| Ok(bsn! { Node DefaultOutlet })).children([
-                index(|_| Ok(bsn! { Node })),
-                page("items/:id", |_| Ok(bsn! { Node })),
-            ]),
-        )
-        .fallback(|_| Ok(bsn! { Node }))
-        .initial("/"),
-    )?;
-    app.world_mut()
-        .spawn((Node::default(), RouterHostRegistration::new(router)));
-    Ok(router)
-}
-```
-
-The application controls host layout. `layout` consumes no path; `index` declares the default child at its parent's path. Use `page(...).children(...)` for a layout with a path. A single-page Router can use `BsnRouter::new(page(...))` directly, with no implicit layout. Child paths are relative to their parent; a leading `/` does not escape that parent.
-
-Factories receive the creation-time `&RouteViewInput` and return a fresh Scene or `BsnBuildError`. A `fallback` is required; `.error_view(factory)` declares a local error page on a route. Installation generates and validates the route tree and view/driver bindings together. Declaration errors identify the node, without requiring callers to create keys or unwrap every route.
-
-`initial` is a one-time default destination. Router waits for its first ready host, then enqueues an ordinary Push. An explicit navigation successfully enqueued beforehand consumes the still-pending default. An initial enqueue failure reports a warning and ends that default attempt; re-registering a host never replays a consumed initial. Windowed applications then call `app.run()`; the quick start's bounded update loop is for headless verification.
-
-`add_bsn_router` installs Router systems; you may also install `BevyUiRouterPlugin` beforehand. If installation returns `MissingSceneRuntime`, install `AssetPlugin` and `ScenePlugin` first so `AssetServer` and `Assets<ScenePatch>` are available.
-
-Advanced integrations that organize their own registries can still use `register_bsn_view`, `RouteViewRegistry`, `RouteTree`, and `add_ui_router(RouterConfig)`. Both interfaces share validation and execution. Duplicate keys preserve the original registration and return an error. See the [Scene contract](../contracts/scene.en.md).
-
-## Navigate and observe results
-
-Ordinary interactions navigate through `Commands`, which can share a system with `RouteInputs` and application component queries:
-
-```rust
-use bevy_ecs::prelude::Commands;
-use bevy_ui_router::prelude::*;
-
-fn open_item(commands: &mut Commands, router: RouterHandle) {
-    commands.router(router).push("/items/42?sort=name#details");
-}
-```
-
-The same interface offers `.replace(destination)` and `.back()`. Bevy applies deferred commands before they enter the existing Router queue. These methods return no synchronous request ID and do not guarantee publication in the current update. Enqueue failures use Bevy's warning handler by default. Select a `bevy_ecs::error::ErrorHandler` with `.with_error_handler(handler)`; downcast its `BevyError` to `NavigationCommandError` to inspect the Router, operation, and original `NavigationEnqueueError`.
-
-Strings use `RouteLocation::from_address` to separate path, search, and fragment. It removes the separating `?`/`#` while retaining raw contents and the distinction between missing and empty values. It does not parse external URLs, decode escapes, or resolve against the current page. Explicit construction remains available:
-
-```rust
-let location = RouteLocation::new("/items/42")
-    .with_search("sort=name")
-    .with_fragment("details");
-```
-
-`new` always receives only the path. Both setters retain their supplied strings, including any `?` or `#` prefix. Commands do not reparse a structured location. See the [navigation contract](../contracts/navigation.en.md) for matching and reuse rules.
-
-Use `RouterNavigation::{push,replace,back}` when you need the immediate enqueue error or a request ID; `Ok(request_id)` only means the request was enqueued. Use Commands alongside current-page queries to avoid borrowing `RouteInputs` and `ResMut<RouterNavigation>` together. The platform Back handler below demonstrates the immediate interface.
-
-`RouterSnapshots::request(handle, id)` provides `Succeeded`, `Failed`, and other request states. `NotRetained` means a completed record was evicted; `Unknown` means no matching record exists or the ID belongs to another Router. Schedule systems that need current snapshots after `RouterScheduleSet::PublishSnapshots` in `Update`. A request can remain in `PostCommitCleanup` after its page and history are published; read presentation and request completion separately.
-
-A layout Scene declares exactly one `DefaultOutlet` on the `Node` where its child belongs. Sibling navigation reuses common parent layouts, outlets, and component state. Place application controls with independent lifetimes outside the routed content boundary. See the [Scene](../contracts/scene.en.md) and [lifecycle](../contracts/lifecycle.en.md) contracts for mounting and hosts.
-
-## Retain layouts and pages
-
-Add `.keep_alive()` to a `page(...)` or `layout(...)` declaration, and set `.keep_alive_capacity(n)` on `BsnRouter`:
-
-| Setting | Purpose |
-| --- | --- |
-| `BsnRoute::keep_alive()` | Allow this route's Entity and local state to remain after departure. Off by default. Common layouts still reuse normally within the active branch. |
-| `BsnRouter::keep_alive_capacity(n)` | Maximum number of inactive retained instances. Defaults to 0. Parent layouts and child pages count separately. |
-| `BsnRoute::preserve_on_search()` | Allow reuse across query changes. Off by default. Active and retained instances follow the same rule, including parameter and identity checks. |
-
-Departure retention needs three conditions: **the route opts in, Router capacity is nonzero, and the original normal parent instance and outlet/slot scope remain valid**. The parent can be active or retained. A root directly under the host has no such parent and is cleaned up on departure. Removing or evicting a parent also removes its dependent retained instances. Capacity 0 can deliberately disable retention globally.
-
-Configure parents and children separately. Returning to a retained layout selects or creates the child from the target route. To reuse several levels across a query change, enable `preserve_on_search` at each level. Router rebuilds from the first node with a different identity or a disabled setting. If search and fragment change together, the deepest frame's fragment rebuild rule also applies. See [navigation](../contracts/navigation.en.md) for capacity, LRU, and history-entry behavior.
-
-## Load content and reactivate pages
-
-Pages can load data with ordinary Bevy systems and tasks:
-
-1. The factory creates the page structure. Its `RouteViewInput` describes the route at creation time.
-2. Once the page is active, read the current location with `RouteInputs::current` and start or update tasks using the application's data identifiers.
-3. Tasks return data or handles. Application systems check the matching page and data version before changing the World. The application decides whether to continue or cancel work after departure.
-4. Reactivating a retained page keeps its original Entity and component state without calling the factory again. `RouteInputs::current` only returns current inputs for active content; use `RouteActivity` when only a boolean is needed.
-5. When content is ready for scroll restoration, mark the current restoration intent ready.
-
-The [nested example](../../crates/bevy_ui_router/examples/bsn_nested.rs) combines these steps. Activity, current input, and input eligibility queries are explained below.
-
-## Restore scroll positions
-
-Add `RouteScroll::new("body")`, Bevy's `ScrollPosition`, and a `Node` with scroll overflow to the scroll container. Import `RouteScroll` from the facade/prelude. Use a different stable key for each container within a page, such as `"body"` and `"sidebar"`. A child page may reuse its parent layout's key.
-
-The default policy restores once during the first normal layout after a unique container binding is found. Choose an explicit policy when restoration should wait for data or dynamic content:
-
-```rust
-let marker = RouteScroll::new("body")
-    .with_restore_policy(RouteScrollRestorePolicy::Explicit);
-```
-
-BSN updates components through the official `PatchFromTemplate` mechanism; see the [nested example](../../crates/bevy_ui_router/examples/bsn_nested.rs). When the content is ready, find the current restoration intent and mark it ready:
-
-```rust
-fn allow_restore(
-    restores: RouteScrollRestorations,
-    mut commands: Commands,
-    pages: Query<(Entity, &PageState)>,
-) {
-    for (scope, page) in &pages {
-        if page.content_ready {
-            if let Some(restore) = restores.pending(scope, "body") {
-                commands.ready_route_scroll(restore.id());
-            }
-        }
-    }
-}
-```
-
-`PageState` is an application component. `scope` can be any content Entity within the current active frame, so the query works before the container exists. `restore.position()` is the saved two-dimensional position in logical pixels for that visit.
-
-Cancel with `commands.cancel_route_scroll(restore.id())`. When handling user scrolling, use the container's `RouteScroll::key()` to find and cancel a waiting restoration. This also records the user's intention when the container is already at an edge and its numeric position stays unchanged. Ready triggers one restoration; later content growth follows ordinary layout. Each Back operation has its own restoration ID. The command carries the ID queried here rather than finding the current intent again when it executes.
-
-Order systems as follows:
-
-| Work | Schedule position |
-| --- | --- |
-| Create UI structure and apply deferred writes | In `Update` or before `UiSystems::Prepare`, allowing camera and related propagation to finish |
-| Send ready/cancel or change existing component values | Before `RouterScrollSet::Prepare` |
-| Override the restoration position from application logic | After `RouterScrollSet::Prepare` and before Layout |
-| Read the final clamped position | After normal Layout |
-
-Install normal UI layout and provide a valid camera/render target. Read navigation and layout results after their respective stages. The [navigation contract](../contracts/navigation.en.md) covers early and late containers, retained pages, and history entries.
-
-## Connect input and focus
-
-`RouteInputs::current` already checks activity, so an ordinary page does not also need `RouteActivity`. It is available from the facade/prelude and can share a system with mutable application component queries and Commands:
-
-```rust
-fn update_route_labels(inputs: RouteInputs, mut labels: Query<(Entity, &mut Text)>) {
-    for (entity, mut text) in &mut labels {
-        if let Some(input) = inputs.current(entity)
-            && text.0 != input.location().path()
-        {
-            text.0 = input.location().path().to_owned();
-        }
-    }
-}
-
-app.add_systems(
-    Update,
-    update_route_labels.after(RouterScheduleSet::PublishSnapshots),
-);
-```
-
-Use `RouteActivity::is_active(entity)` when only activity is needed. Query current inputs each update so reused layouts and reactivated pages see the new location. Write text only when it changes to reduce `Changed<Text>` notifications. The [public usage journey](../../crates/bevy_ui_router/tests/public_usage.rs) combines parameter reads, application state updates, and navigation.
-
-`RouteInputRef::params()` returns the owning frame's own parameters; `location()` includes the full path/search/fragment. Error frames provide `failure()` and `origin()`, while a normal prefix has `failure() == None`. The fallback has `route() == None` and empty parameters. Inactive content or content with an invalid owner returns `None`. Copy values needed across World changes or `await`. See the [activity contract](../contracts/input-focus.en.md) and [standalone consumer](../../crates/bevy_ui_router/tests/consumers/bsn.rs).
-
-Use the dedicated gate for targeted input:
-
-- **Pointer:** use Bevy UI picking. Router isolates inactive content and revokes a departing target's previous gesture state. Schedule content creation, hiding, and movement before input refresh.
-- **Keyboard/gamepad:** run targeted systems after `RouterInputSet::Ready` in `PreUpdate`, and check `RouterInputGate::allows_keyboard` or `allows_gamepad` for each target. Global shortcuts follow the application's own rules.
-- **Focus:** install `InputFocusPlugin` and let the application choose initial focus. Router maintains managed targets' focus eligibility during publication and departure. When integrating `TabNavigationPlugin` / `InputDispatchPlugin`, connect the Router gate to target selection and dispatch. The windowed example uses an explicitly gated keyboard handler.
-
-Follow [window debugging](debugging.en.md) to check interaction. Platform and device verification is recorded in the [verification guide](../development/verification.en.md).
-
-## Desktop mouse Back
-
-Enable the facade's `desktop-back` feature, for example `features = ["bsn", "desktop-back"]`. Import the adapter from `bevy_ui_router::prelude::*` or `platform::prelude::*`:
-
-```rust
-app.add_plugins(DesktopBackInputPlugin)
-    .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet));
-```
-
-Store the Router handle on the window Entity. Use one application handler to decide whether to close a local overlay or navigate:
-
-```rust
-#[derive(Component)]
-struct WindowRouter(RouterHandle);
-
-fn platform_back(
-    mut requests: MessageReader<PlatformBackRequested>,
-    windows: Query<&WindowRouter>,
-    mut navigation: ResMut<RouterNavigation>,
-) {
-    for request in requests.read() {
-        let Ok(target) = windows.get(request.window) else { continue };
-        // Handle local overlays here before deciding to navigate.
-        match navigation.back(target.0) {
-            Ok(request_id) => { /* Save the ID and observe RouterSnapshots. */ }
-            Err(error) => eprintln!("Back was not enqueued: {error:?}"),
-        }
-    }
-}
-```
-
-`WindowRouter` is an application component. Attach it with `commands.entity(window).insert(WindowRouter(router))` to associate the input window with the Router's host. On `NoBackEntry`, the application chooses feedback or a host action such as exit. A queued Back follows the usual history, retention, scroll restoration, and cleanup flow.
-
-Every `MessageReader` can read the message, so keep local UI priority and the navigation decision in the same handler. The [windowed example](../../examples/windowed/src/main.rs) has runnable wiring; the [Back journeys](../../crates/bevy_ui_router/tests/platform_back.rs) cover multiple windows and overlay priority.
-
-Enabling `desktop-back` on its own uses Bevy app/ECS/input. The application supplies its window and input backend. See the [architecture overview](../architecture/README.en.md) for `platform` and default-facade dependencies.
-
-## Android traditional Back
-
-Enable `android-back` in an Android Bevy application, for example `features = ["bsn", "android-back"]`. Install the key source and reuse the application handler above:
-
-```rust
-app.add_plugins(AndroidBackInputPlugin)
-    .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet));
-```
-
-The adapter accepts the first press of logical `BrowserBack` / `GoBack`, skipping repeats and releases. The application configures Android windowing and packaging. On its own, this feature uses the std and keyboard features of Bevy app/ECS/input.
-
-On Android 16 and later with `targetSdk >= 36`, traditional Back keys require a compatibility setting. Set it on the existing `<application>` or target `<activity>` in `AndroidManifest.xml`:
-
-```xml
-<application android:enableOnBackInvokedCallback="false">
-    <!-- Existing application settings and activities. -->
-</application>
-```
-
-This setting enables the traditional Back path and disables system predictive Back animations. See the [Android 16 migration guidance](https://developer.android.com/about/versions/16/behavior-changes-16#predictive-back). An activity's setting takes precedence over the application default; see [activity-level configuration](https://developer.android.com/guide/navigation/custom-back/predictive-back-gesture#opt-out-at-an-activity-level).
-
-This adapter represents a key-press intent. Bevy's `KeyboardInput` supplies press/release information; Android cancellation flags, predictive progress, and modern Back callbacks need dedicated application integration. After ignoring an intent or receiving `NoBackEntry`, the same handler explicitly chooses the host's return behavior. See the [Android consumer](../../crates/bevy_ui_router/tests/consumers/android_back.rs) for minimal wiring and the [verification guide](../development/verification.en.md) for platform status.
+See the [roadmap](../roadmap.en.md#bevy-020-migration-not-started) for work on other Bevy versions.

@@ -64,6 +64,8 @@ cargo test -p bevy_ui_router --test dependency_contract --test facade_consumers 
 
 consumer harness 分别使用无默认、默认 `view`、显式 `view`、`ecs`、`bsn`、`platform`、`desktop-back` 和 `android-back`。每个应用声明自己的最小依赖；两个推荐示例也会以原样源码编译运行。编译拒绝用例按错误类别、目标符号和源码位置检查私有 API 及 feature 边界。
 
+仓库内链接相对文档所在目录解析。六个 crate 共用根 README；发布到 crates.io 前还需核对其页面中的链接，不能仅用本地链接检查代替。
+
 文档与发布内容检查：
 
 ```sh
@@ -126,7 +128,7 @@ Tween 示例用同一准备回调定义平移和缩放旋转，可切换退出�
 
 Linux 构建采用 X11；CI 安装 `libxkbcommon-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev` 和 `libxrandr-dev`。交互检查包括 push/replace/back、布局与页面计数、不同访问的滚动位置、晚到内容、点击和 Space、焦点释放、跨页手势、错误 fallback 和恢复。具体步骤与 BRP 命令见[窗口调试](../guides/debugging.md)。
 
-窗口示例的键盘处理器在 `RouterInputSet::Ready` 后显式查询 gate；应用接入原生 Tab/Dispatch 时，还需验证其目标选择和派发路径。Android manifest 接线见[集成指南](../guides/integration.md#android-传统返回)。
+窗口示例的键盘处理器在 `RouterInputSet::Ready` 后显式查询 gate；应用接入原生 Tab/Dispatch 时，还需验证其目标选择和派发路径。Android manifest 接线见[系统返回指南](../guides/platform-back.md#android-传统返回)。
 
 ## 性能夹具与发布产物
 

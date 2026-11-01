@@ -2,9 +2,21 @@
 
 [中文](debugging.md) | [English](debugging.en.md)
 
-Start with public snapshots to locate routing problems, then inspect window layout and input as needed. Ordinary applications can read navigation state without starting a debug service.
+Start with the symptoms below to check routing state, then inspect window layout and input as needed.
 
 ## Diagnose navigation first
+
+| Symptom | Check first |
+| --- | --- |
+| Installation returns `MissingSceneRuntime` | Install `AssetPlugin` and `ScenePlugin` before adding Router; the minimal example also installs `TaskPoolPlugin` |
+| The initial page never appears | Check `.initial(...)`, a host with the correct `RouterHostRegistration`, and ongoing App updates; `AwaitingHost` means Router is still waiting for a host |
+| The snapshot has the expected location but the screen is empty | Check application host/page sizes, visibility, camera/render target, and UI renderer |
+| Navigation returns no request ID | Commands return no synchronous ID; enqueue failures log a warning by default. Use `RouterNavigation` for the immediate enqueue result, then snapshots for execution results |
+| Navigation fails | Inspect the request's `RequestStatus::Failed`, `trace()`, and `diagnostics()` for the failure source; a displayed error page also exposes `active().failure()` |
+| The page changed but the request remains in `PostCommitCleanup` | The page and history have changed, but exit animation or cleanup is still pending; inspect `cleanup()` and whether exit animation has finished |
+| Back cannot run | `NoBackEntry` means there is no earlier successful entry; the application chooses feedback or a host exit action |
+| Page state is recreated | Check retention opt-in, capacity, whether the original parent layout still exists, and changes to path parameters, query strings, or fragments; see [retention](pages.en.md#retain-page-state) |
+| Scroll is not restored | First confirm a successful Back and a saved position for that visit, then inspect `RouteScrollRestorations::pending`, container keys, layout/camera, and ready/cancel state; see [scroll restoration](pages.en.md#restore-scroll-positions) |
 
 Read the current update's result after `RouterScheduleSet::PublishSnapshots`. Call this helper on demand from a diagnostic action, error handler, or state change rather than printing the same records every frame:
 
@@ -25,41 +37,31 @@ fn inspect_router(snapshots: &RouterSnapshots, router: RouterHandle) {
 }
 ```
 
-| Symptom | Check first |
-| --- | --- |
-| Installation returns `MissingSceneRuntime` | Install `AssetPlugin` and `ScenePlugin` before adding Router; the minimal example also installs `TaskPoolPlugin` |
-| The initial page never appears | Check `.initial(...)`, a host with the correct `RouterHostRegistration`, and ongoing App updates; `AwaitingHost` means Router is still waiting for a host |
-| The snapshot has the expected location but the screen is empty | Check application host/page sizes, visibility, camera/render target, and UI renderer |
-| Commands navigation gives no request ID | Commands return no synchronous ID; enqueue failures log a warning by default. Use `RouterNavigation` for the immediate enqueue result, then snapshots for execution results |
-| Navigation fails | Inspect the request's `RequestStatus::Failed`, `trace()`, and `diagnostics()` for the failure source; a displayed error page also exposes `active().failure()` |
-| The page changed but the request remains in `PostCommitCleanup` | The page and history are published, but cleanup or a held transition exit is pending; inspect `cleanup()` and whether the animation releases its exit targets |
-| Back cannot run | `NoBackEntry` means there is no earlier successful entry; the application chooses feedback or a host exit action |
-| Page state is recreated | Check retention opt-in, capacity, the original parent/outlet, and parameter/query/fragment reuse rules; see [retention](integration.en.md#retain-layouts-and-pages) |
-| Scroll is not restored | First confirm a successful Back and a saved position for that visit, then inspect `RouteScrollRestorations::pending`, container keys, layout/camera, and ready/cancel state; see [scroll restoration](integration.en.md#restore-scroll-positions) |
-
 With a request ID returned by `RouterNavigation`, use `snapshots.request(router, id)`: `Found` exposes `status()`, `trace()`, and `diagnostics()`; `NotRetained` means the completed record was evicted; `Unknown` means this Router has no matching request. `running_request()` only identifies a running request and becomes None after it terminates.
 
 ## Start and inspect a window
 
 The [windowed example](../../examples/windowed/src/main.rs) exposes a Bevy Remote Protocol (BRP) endpoint for sending input, inspecting layout and state, and saving rendered screenshots. Input is handled inside the application, keeping the system pointer and keyboard focus in place.
 
-From the repository root:
+From the repository root, enter the windowed example directory and start it:
 
 ```sh
-cargo run --locked --manifest-path examples/windowed/Cargo.toml --features ui-debug
+cd examples/windowed
+cargo run --features ui-debug
 ```
 
-In another terminal, run the Python client from the same directory:
+In another terminal, also enter `examples/windowed`, then run the Python client:
 
 ```sh
-python3 examples/windowed/ui_debug.py snapshot
-python3 examples/windowed/ui_debug.py find "Layout counter"
-python3 examples/windowed/ui_debug.py capture router-ui.png
+python3 ui_debug.py snapshot
+python3 ui_debug.py find "Layout counter"
+python3 ui_debug.py capture router-ui.png
 ```
 
-Running the example requires a display and graphics driver. The Python client uses the standard library. In a debug build with the feature enabled, `ui-debug` listens on `127.0.0.1:15703` and keeps the window updating to process requests. Release builds retain their normal runtime behavior. The debug window starts without requesting focus.
+The Python client uses only the standard library. The debug service runs only in debug builds, at `127.0.0.1:15703` by default.
 
-`snapshot` includes:
+<details>
+<summary>snapshot field reference</summary>
 
 | Field | Meaning |
 | --- | --- |
@@ -73,17 +75,19 @@ Running the example requires a display and graphics driver. The Python client us
 | `pending_restore` | Waiting position for `list` in the current scope, available even before its container exists |
 | `focus` | The focused Entity |
 
+</details>
+
 Inactive content has null route fields. `find` filters nodes by name or displayed text. Select `router_active=true` when locating the current page, because retained page Entities still exist.
 
 Clicks use **logical coordinates** within the window. Divide the target's `center_physical` by the window's `scale_factor` before passing it to `click`. For example, if the resulting logical position is `(100, 120)`:
 
 ```sh
-python3 examples/windowed/ui_debug.py click 100 120
-python3 examples/windowed/ui_debug.py key Digit2 --logical '{"Character":"2"}'
-python3 examples/windowed/ui_debug.py key Space
+python3 ui_debug.py click 100 120
+python3 ui_debug.py key Digit2
+python3 ui_debug.py key Space
 ```
 
-The client waits for application frames between press and release. Screenshots are returned as PNG through `router/capture` and `router/capture_status`. Use `--url` to select an endpoint; run `python3 examples/windowed/ui_debug.py --help` for all options.
+The client waits for application frames between press and release. Screenshots are returned as PNG through `router/capture` and `router/capture_status`. Use `--url` to select an endpoint; run `python3 ui_debug.py --help` for all options.
 
 ## Check user behavior
 
@@ -103,7 +107,7 @@ The client waits for application frames between press and release. Screenshots a
 
 The example has a retained capacity of 3. Layout A, Overview, and Settings enable retention; Delayed and Outside are cleaned up on departure. The fallback replaces the route layout and clears old retained content, so recovery creates new layout and page instances. Load demonstrates delayed application content; Ready/Cancel use public scroll commands.
 
-The terminal and status bar show request state, target Entity, history cursor, and focus. The page's keyboard handler checks the gate after `RouterInputSet::Ready`.
+The terminal and status bar show request state, target Entity, history cursor, and focus. The page's keyboard handler checks input eligibility after `RouterInputSet::Ready`.
 
 ## Scroll and hold gestures
 
@@ -121,7 +125,7 @@ Lists use real `MouseWheel` messages. Move the cursor into `overview-scroll`, `s
 }
 ```
 
-Replace the illustrative `123` with the window Entity from the snapshot. Negative `y` scrolls down. Send it with `python3 examples/windowed/ui_debug.py rpc router/input '<JSON>'`. The example's scroll observer changes Bevy `ScrollPosition`; Router's marker stores positions per visit.
+Replace the illustrative `123` with the window Entity from the snapshot. Negative `y` scrolls down. Send it with `python3 ui_debug.py rpc router/input '<JSON>'`. The example's scroll observer changes Bevy `ScrollPosition`; Router's marker stores positions per visit.
 
 For a held gesture, send `MouseButtonInput` twice with the same window and `button: "Left"`, first with `state: "Pressed"`, then with `state: "Released"`. Navigate and wait for frame advancement between those calls to check departure cancellation. Use `click` for ordinary clicks. See `Bridge.event` and `Bridge.click` in the [client](../../examples/windowed/ui_debug.py) for message encoding.
 
@@ -138,4 +142,4 @@ For a held gesture, send `MouseButtonInput` twice with the same window and `butt
 
 Duplicate keys or missing valid layout/camera produce a terminal warning with the first affected Router, frame, generation, and key. Each Router reports each warning category once. Restoration behavior is described in the [navigation contract](../contracts/navigation.en.md).
 
-Debug input travels through Bevy `WindowEvent` and typed messages, and screenshots come from the renderer. To check system events, physical devices, or native platform behavior, run the same interactions in that environment and record its configuration. Polling, continuous updates, and screenshots add runtime work; use the dedicated commands in the [performance guide](../performance.en.md) for measurement. The [verification guide](../development/verification.en.md) lists the complete test entry points.
+See the [performance guide](../performance.en.md) for measurement and the [verification guide](../development/verification.en.md) for platform checks and the complete test entry points.

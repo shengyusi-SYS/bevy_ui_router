@@ -51,4 +51,4 @@ facade 或 Platform 的 `desktop-back` / `android-back` features 提供 `Desktop
 
 插件幂等注册原始与返回消息通道。设备输入由应用已有的 Bevy 后端提供，也可注入标准消息测试。各 feature 只启用所需 mouse 或 keyboard 输入；应用自行安装 Router ECS、Scene、窗口和平台运行插件。
 
-Android adapter 使用传统按键消息；现代 callback 与预测返回手势属于后续能力。Bevy 消息中没有 Android 取消标志，应用需明确处理无 history 时的退出策略。Android manifest 兼容开关见[接入指南](../guides/integration.md#android-传统返回)。
+Android adapter 使用传统按键消息；现代 callback 与预测返回手势属于后续能力。Bevy 消息中没有 Android 取消标志，应用需明确处理无 history 时的退出策略。Android manifest 兼容开关见[系统返回指南](../guides/platform-back.md#android-传统返回)。
