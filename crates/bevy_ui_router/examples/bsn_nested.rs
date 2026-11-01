@@ -15,7 +15,6 @@ use bevy_internal::{
 };
 use bevy_scene::{PatchFromTemplate, ScenePlugin, bsn};
 use bevy_ui::{ComputedNode, FlexDirection, Node, Overflow, ScrollPosition, Val};
-use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
 
 #[derive(Component, Clone, Default)]
@@ -73,105 +72,41 @@ fn main() {
         },
     ));
 
-    let layout_driver = app
-        .register_bsn_view(ViewDriverKey::new("layout").unwrap(), |_| {
-            Ok(bsn! {
-                Node { width: Val::Px(480.0), height: Val::Px(240.0) }
-                Layout
-                Children [
-                    (Node { width: Val::Px(80.0), height: Val::Percent(100.0) } Sidebar),
-                    (Node {
-                        width: Val::Px(400.0), height: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Column,
-                    } MainColumn Children [
-                        (Node { width: Val::Percent(100.0), height: Val::Px(32.0) } ToolbarState),
-                        (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet WorkspaceOutlet)
-                    ])
-                ]
-            })
+    let workspace = page("workspace", |_| {
+        Ok(bsn! {
+            Node { width: Val::Px(480.0), height: Val::Px(240.0) }
+            Layout
+            Children [
+                (Node { width: Val::Px(80.0), height: Val::Percent(100.0) } Sidebar),
+                (Node {
+                    width: Val::Px(400.0), height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                } MainColumn Children [
+                    (Node { width: Val::Percent(100.0), height: Val::Px(32.0) } ToolbarState),
+                    (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet WorkspaceOutlet)
+                ])
+            ]
         })
-        .unwrap();
-    let mut views = RouteViewRegistry::new();
-    let layout_view = RouteViewKey::new("layout").unwrap();
-    views
-        .insert(layout_view.clone(), RouteViewDescriptor::new(layout_driver))
-        .unwrap();
-    let app_driver = app
-        .register_bsn_view(ViewDriverKey::new("app").unwrap(), |_| {
-            Ok(bsn! {
-                Node { width: Val::Percent(100.0), height: Val::Percent(100.0) }
-                DefaultOutlet
-            })
+    })
+    .keep_alive()
+    .preserve_on_search()
+    .children([content_page("overview"), content_page("settings"), content_page("help")]);
+    let root = layout(|_| {
+        Ok(bsn! {
+            Node { width: Val::Percent(100.0), height: Val::Percent(100.0) }
+            DefaultOutlet
         })
-        .unwrap();
-    let app_view = RouteViewKey::new("app").unwrap();
-    views
-        .insert(app_view.clone(), RouteViewDescriptor::new(app_driver))
-        .unwrap();
-    let mut routes = RouteTree::builder()
-        .root_with_options(
-            RoutePattern::pathless(),
-            RouteNodeOptions::new()
-                .with_view(app_view)
-                .with_preserve_on_search(true),
-        )
-        .unwrap();
-    let root = routes.root_id().unwrap();
-    let workspace = routes
-        .route_with_options(
-            root,
-            RoutePattern::path("workspace").unwrap(),
-            RouteNodeOptions::new()
-                .with_view(layout_view)
-                .with_keep_alive(true)
-                .with_preserve_on_search(true),
-        )
-        .unwrap();
-    for name in ["overview", "settings", "help", "outside"] {
-        let driver = app
-            .register_bsn_view(ViewDriverKey::new(name).unwrap(), move |_| {
-                Ok(bsn! {
-                    Node {
-                        width: Val::Px(360.0), height: Val::Px(160.0),
-                        flex_shrink: 0.0, overflow: Overflow::scroll(),
-                    }
-                    { RouteScroll::patch(|marker, _| {
-                        *marker = RouteScroll::new("body")
-                            .with_restore_policy(RouteScrollRestorePolicy::Explicit);
-                    }) }
-                    Page(name)
-                    Children [(Node {
-                        width: Val::Px(720.0), flex_shrink: 0.0,
-                        flex_direction: FlexDirection::Column,
-                    } PageBody)]
-                })
-            })
-            .unwrap();
-        let view = RouteViewKey::new(name).unwrap();
-        views
-            .insert(view.clone(), RouteViewDescriptor::new(driver))
-            .unwrap();
-        routes
-            .route_with_options(
-                if name == "outside" { root } else { workspace },
-                RoutePattern::path(name).unwrap(),
-                RouteNodeOptions::new().with_view(view),
-            )
-            .unwrap();
-    }
-    let fallback = RouteViewKey::new("error").unwrap();
-    let driver = app
-        .register_bsn_view(ViewDriverKey::new("error").unwrap(), |input| {
-            eprintln!("Navigation failed: {:?}", input.failure());
-            Ok(bsn! { Node })
-        })
-        .unwrap();
-    views
-        .insert(fallback.clone(), RouteViewDescriptor::new(driver))
-        .unwrap();
+    })
+    .preserve_on_search()
+    .children([workspace, content_page("outside")]);
     let router = app
-        .add_ui_router(
-            RouterConfig::new(routes.build().unwrap(), views, fallback).with_keep_alive_capacity(1),
+        .add_bsn_router(
+            BsnRouter::new(root)
+                .fallback(|input| {
+                    eprintln!("Navigation failed: {:?}", input.failure());
+                    Ok(bsn! { Node })
+                })
+                .keep_alive_capacity(1),
         )
         .unwrap();
     app.world_mut().spawn((
@@ -319,6 +254,28 @@ fn main() {
     load_content(&mut app, returned_settings);
 
     println!("Reused the original layout and toolbar state=7 with the newly selected child.");
+}
+
+/// The factory creates the page once. Its current published location is read
+/// through RouteInputs when application work starts or installs its result.
+fn content_page(name: &'static str) -> BsnRoute {
+    page(name, move |_| {
+        Ok(bsn! {
+            Node {
+                width: Val::Px(360.0), height: Val::Px(160.0),
+                flex_shrink: 0.0, overflow: Overflow::scroll(),
+            }
+            { RouteScroll::patch(|marker, _| {
+                *marker = RouteScroll::new("body")
+                    .with_restore_policy(RouteScrollRestorePolicy::Explicit);
+            }) }
+            Page(name)
+            Children [(Node {
+                width: Val::Px(720.0), flex_shrink: 0.0,
+                flex_direction: FlexDirection::Column,
+            } PageBody)]
+        })
+    })
 }
 
 /// Application work owns only ordinary input/data, never a World borrow or a

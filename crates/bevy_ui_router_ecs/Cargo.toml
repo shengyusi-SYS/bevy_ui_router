@@ -10,8 +10,12 @@ license.workspace = true
 [features]
 default = []
 bsn = ["dep:bevy_ui_router_bsn", "dep:bevy_asset", "dep:bevy_scene", "dep:bevy_reflect", "bevy_input_focus/bevy_reflect"]
+tween = ["dep:bevy_tween", "dep:bevy_time", "dep:bevy_window"]
 
 [dependencies]
+bevy_tween = { version = "0.13.0", default-features = false, optional = true }
+bevy_time = { version = "0.19", default-features = false, optional = true }
+bevy_window = { version = "0.19", default-features = false, optional = true }
 bevy_app = { version = "0.19", default-features = false }
 bevy_asset = { version = "0.19", default-features = false, optional = true }
 bevy_camera = { version = "0.19", default-features = false }

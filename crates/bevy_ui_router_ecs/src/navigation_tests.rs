@@ -8929,6 +8929,7 @@ fn vacant_back_capacity_entry(handle: RouterHandle) -> RouterEntry {
         handle,
         engine,
         views: RouteViewRegistry::new(),
+        initial: None,
         host: None,
         host_settlement: None,
         pending_host_admission_failure: None,

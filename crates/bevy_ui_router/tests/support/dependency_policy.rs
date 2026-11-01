@@ -5,7 +5,12 @@ pub const BEVY_VERSION: &str = "0.19.x";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 pub fn is_bevy_package(name: &str) -> bool {
-    name == "bevy" || name.starts_with("bevy_") && !name.starts_with("bevy_ui_router")
+    // These ecosystem dependencies have their own release versions. The Bevy
+    // engine crates they depend on still follow the official-source policy.
+    name == "bevy"
+        || name.starts_with("bevy_")
+            && !name.starts_with("bevy_ui_router")
+            && !matches!(name, "bevy_tween" | "bevy_time_runner")
 }
 
 fn package_name<'a>(alias: &'a str, dependency: &'a Value) -> &'a str {

@@ -14,8 +14,16 @@ use bevy_scene::{CachedSceneError, ResolveSceneError, ResolvedSceneRoot, Scene, 
 use bevy_ui_router_bsn::{BsnBuildError, BsnSceneFactory};
 use bevy_ui_router_core::view_input::RouteViewInput;
 
+mod declaration;
+mod install;
+pub use declaration::{BsnRoute, BsnRouter, index, layout, page};
+pub use install::BsnRouterError;
+
 /// Register fresh synchronous native Scenes in the Router's shared driver namespace.
 pub trait AppBsnExt {
+    /// Compiles page/factory declarations and installs the existing Router pipeline.
+    fn add_bsn_router(&mut self, router: BsnRouter) -> Result<crate::RouterHandle, BsnRouterError>;
+
     fn register_bsn_view<F, S>(
         &mut self,
         key: bevy_ui_router_view::ViewDriverKey,
@@ -27,6 +35,10 @@ pub trait AppBsnExt {
 }
 
 impl AppBsnExt for bevy_app::App {
+    fn add_bsn_router(&mut self, router: BsnRouter) -> Result<crate::RouterHandle, BsnRouterError> {
+        install::install(self, router)
+    }
+
     fn register_bsn_view<F, S>(
         &mut self,
         key: bevy_ui_router_view::ViewDriverKey,

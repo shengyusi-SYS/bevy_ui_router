@@ -10,9 +10,11 @@ resolver = "3"
 
 [features]
 default = []
+tween = ["bevy_ui_router/tween", "dep:bevy_tween"]
 ui-debug = ["bevy_internal/bevy_remote", "bevy_internal/serialize", "bevy_internal/png", "dep:serde_json", "dep:image"]
 
 [dependencies]
+bevy_tween = { version = "0.13.0", default-features = false, optional = true }
 bevy_ui_router = { path = "../../crates/bevy_ui_router", features = ["bsn", "desktop-back"] }
 bevy_ecs = { version = "0.19", default-features = false }
 bevy_scene = { version = "0.19", default-features = false }
@@ -24,3 +26,8 @@ bevy_internal = { version = "0.19", default-features = false, features = [
 
 serde_json = { version = "1", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
+
+[[bin]]
+name = "tween_transitions"
+path = "src/bin/tween_transitions.rs"
+required-features = ["tween"]

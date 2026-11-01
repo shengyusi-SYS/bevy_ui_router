@@ -5,10 +5,7 @@ use bevy_input_focus::{FocusCause, InputFocus, InputFocusPlugin};
 use bevy_internal::window::PrimaryWindow;
 use bevy_internal::{input::mouse::MouseScrollUnit, picking::Pickable, prelude::*};
 use bevy_scene::{Scene, bsn};
-use bevy_ui_router::{
-    ecs::{RouterInputSet, RouterScheduleSet},
-    prelude::*,
-};
+use bevy_ui_router::prelude::*;
 
 #[derive(Component, Clone, Copy, Debug)]
 enum Action {
@@ -49,7 +46,6 @@ struct WindowRouter(RouterHandle);
 #[derive(Resource)]
 struct Demo {
     router: RouterHandle,
-    initial_requested: bool,
     last_request: Option<NavigationRequestId>,
     result: String,
 }
@@ -71,13 +67,12 @@ fn main() {
     #[cfg(all(debug_assertions, feature = "ui-debug"))]
     app.add_plugins(ui_debug::UiDebugPlugin);
 
-    let mut views = RouteViewRegistry::new();
-    let root_view = register(&mut app, &mut views, "root", |_| {
+    let root_view = layout(|_| {
         Ok(bsn! {
             Node { width: Val::Percent(100.0), height: Val::Percent(100.0) } DefaultOutlet
         })
     });
-    let layout = register(&mut app, &mut views, "layout", |_| {
+    let workspace = page("workspace", |_| {
         Ok(bsn! {
             Node {
                 width: Val::Percent(100.0), height: Val::Percent(100.0),
@@ -94,27 +89,12 @@ fn main() {
             ]
         })
     });
-    let mut routes = RouteTree::builder()
-        .root_with_options(
-            RoutePattern::pathless(),
-            RouteNodeOptions::new().with_view(root_view),
-        )
-        .unwrap();
-    let root = routes.root_id().unwrap();
-    let workspace = routes
-        .route_with_options(
-            root,
-            RoutePattern::path("workspace").unwrap(),
-            RouteNodeOptions::new()
-                .with_view(layout)
-                .with_keep_alive(true),
-        )
-        .unwrap();
+    let mut workspace_pages = Vec::new();
     for (name, color) in [
         ("overview", Color::srgb(0.12, 0.35, 0.32)),
         ("settings", Color::srgb(0.22, 0.22, 0.45)),
     ] {
-        let view = register(&mut app, &mut views, name, move |_| {
+        let view = page(name, move |_| {
             Ok(bsn! {
                 Node {
                     width: Val::Percent(100.0), height: Val::Percent(100.0),
@@ -146,17 +126,9 @@ fn main() {
                 ]
             })
         });
-        routes
-            .route_with_options(
-                workspace,
-                RoutePattern::path(name).unwrap(),
-                RouteNodeOptions::new()
-                    .with_view(view)
-                    .with_keep_alive(true),
-            )
-            .unwrap();
+        workspace_pages.push(view.keep_alive());
     }
-    let delayed = register(&mut app, &mut views, "delayed", |_| {
+    let delayed = page("delayed", |_| {
         Ok(bsn! {
             Node {
                 width: Val::Percent(100.0), height: Val::Percent(100.0),
@@ -180,38 +152,19 @@ fn main() {
             ]
         })
     });
-    routes
-        .route_with_options(
-            workspace,
-            RoutePattern::path("delayed").unwrap(),
-            RouteNodeOptions::new().with_view(delayed),
-        )
-        .unwrap();
-    let outside = register(&mut app, &mut views, "outside", |_| {
+    workspace_pages.push(delayed);
+    let outside = page("outside", |_| {
         Ok(bsn! {
             Node { width: Val::Percent(100.0), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(24.0)) }
             Name::new("outside") BackgroundColor(Color::srgb(0.18, 0.15, 0.27))
             Children [(Text({"Outside layout A. Return to a new child: A keeps its own state.".to_owned()}) Pickable::IGNORE)]
         })
     });
-    routes
-        .route_with_options(
-            root,
-            RoutePattern::path("outside").unwrap(),
-            RouteNodeOptions::new().with_view(outside),
-        )
-        .unwrap();
-    let broken = register(&mut app, &mut views, "broken", |_| {
+    let broken = page("broken", |_| {
         Err::<Box<dyn Scene>, _>(BsnBuildError::new("Intentional example build failure"))
     });
-    routes
-        .route_with_options(
-            workspace,
-            RoutePattern::path("broken").unwrap(),
-            RouteNodeOptions::new().with_view(broken),
-        )
-        .unwrap();
-    let fallback = register(&mut app, &mut views, "fallback", |input| {
+    workspace_pages.push(broken);
+    let fallback = |input: &RouteViewInput| {
         let message = format!(
             "Build failed; fallback is visible.\n{:?}\n\nUse Overview or Settings to recover.",
             input.failure()
@@ -221,17 +174,21 @@ fn main() {
             Name::new("fallback") BackgroundColor(Color::srgb(0.36, 0.12, 0.15))
             Children [(Text(message) Pickable { should_block_lower: false, is_hoverable: false })]
         })
-    });
+    };
     let router = app
-        .add_ui_router(
-            RouterConfig::new(routes.build().unwrap(), views, fallback).with_keep_alive_capacity(3),
+        .add_bsn_router(
+            BsnRouter::new(
+                root_view.children([workspace.keep_alive().children(workspace_pages), outside]),
+            )
+            .fallback(fallback)
+            .keep_alive_capacity(3)
+            .initial("/workspace/overview"),
         )
         .unwrap();
     app.insert_resource(Demo {
         router,
-        initial_requested: false,
         last_request: None,
-        result: "Waiting for host".into(),
+        result: "Initial page configured".into(),
     })
     .add_systems(Startup, setup)
     .add_systems(
@@ -241,9 +198,7 @@ fn main() {
     .add_systems(PreUpdate, platform_back.after(PlatformBackInputSet))
     .add_systems(
         Update,
-        (start_initial_navigation, update_status)
-            .chain()
-            .after(RouterScheduleSet::PublishSnapshots),
+        update_status.after(RouterScheduleSet::PublishSnapshots),
     )
     .add_observer(click)
     .add_observer(restore_click)
@@ -251,22 +206,6 @@ fn main() {
     .add_observer(release)
     .add_observer(scroll)
     .run();
-}
-
-fn register<S: Scene>(
-    app: &mut App,
-    views: &mut RouteViewRegistry,
-    name: &str,
-    factory: impl FnMut(&RouteViewInput) -> Result<S, BsnBuildError> + Send + Sync + 'static,
-) -> RouteViewKey {
-    let driver = app
-        .register_bsn_view(ViewDriverKey::new(name).unwrap(), factory)
-        .unwrap();
-    let key = RouteViewKey::new(name).unwrap();
-    views
-        .insert(key.clone(), RouteViewDescriptor::new(driver))
-        .unwrap();
-    key
 }
 
 fn setup(mut commands: Commands, demo: Res<Demo>, window: Single<Entity, With<PrimaryWindow>>) {
@@ -587,21 +526,6 @@ fn press(event: On<Pointer<Press>>, pages: Query<(), With<PageButton>>) {
 fn release(event: On<Pointer<Release>>, pages: Query<(), With<PageButton>>) {
     if pages.contains(event.event_target()) {
         println!("Page release {:?}", event.event_target());
-    }
-}
-
-fn start_initial_navigation(
-    mut demo: ResMut<Demo>,
-    snapshots: Res<RouterSnapshots>,
-    mut navigation: ResMut<RouterNavigation>,
-) {
-    if !demo.initial_requested
-        && snapshots
-            .get(demo.router)
-            .is_some_and(|snapshot| snapshot.availability() == &RouterAvailability::Ready)
-    {
-        demo.initial_requested = true;
-        navigate(Action::Overview, &mut demo, &mut navigation);
     }
 }
 

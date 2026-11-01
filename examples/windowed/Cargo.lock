@@ -295,6 +295,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bevy"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bfadbebfc6599aa59289b754ac30023959854304f3d393da2cf62bb3cd5df8f"
+dependencies = [
+ "bevy_internal",
+]
+
+[[package]]
 name = "bevy_a11y"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1354,6 +1363,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_time_runner"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13d4a4ad3990e6058427394b5e24223ec7f65b0d3fd06482f5f5b53d77e08556"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_log",
+ "bevy_reflect",
+ "bevy_time",
+ "rustc_version",
+]
+
+[[package]]
 name = "bevy_transform"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1368,6 +1391,19 @@ dependencies = [
  "derive_more",
  "serde",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "bevy_tween"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e838a06f232e8f7f7e00fc6c245d7c6080a2a2b892f4cb397028af03a3749c39"
+dependencies = [
+ "bevy",
+ "bevy_math",
+ "bevy_time_runner",
+ "rustc_version",
+ "tracing",
 ]
 
 [[package]]
@@ -1480,10 +1516,13 @@ dependencies = [
  "bevy_picking",
  "bevy_reflect",
  "bevy_scene",
+ "bevy_time",
+ "bevy_tween",
  "bevy_ui",
  "bevy_ui_router_bsn",
  "bevy_ui_router_core",
  "bevy_ui_router_view",
+ "bevy_window",
 ]
 
 [[package]]
@@ -3798,6 +3837,7 @@ dependencies = [
  "bevy_input_focus",
  "bevy_internal",
  "bevy_scene",
+ "bevy_tween",
  "bevy_ui_router",
  "image",
  "serde_json",

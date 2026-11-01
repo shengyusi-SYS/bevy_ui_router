@@ -19,6 +19,8 @@ use crate::app_ext::RouterHandle;
 mod presence;
 mod session;
 mod surface;
+#[cfg(feature = "tween")]
+pub(crate) mod tween;
 pub(crate) use presence::{
     holds_visible_claim, reap_absent_presence, release_transition_presence,
     seal_transition_presence,

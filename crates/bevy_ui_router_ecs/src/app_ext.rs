@@ -7,7 +7,7 @@ use bevy_app::App;
 use bevy_ecs::{
     component::Component, lifecycle::HookContext, resource::Resource, world::DeferredWorld,
 };
-use bevy_ui_router_core::prelude::{RouteTree, RouteViewKey};
+use bevy_ui_router_core::prelude::{RouteLocation, RouteTree, RouteViewKey};
 use bevy_ui_router_view::{RouteViewRegistry, ViewDriverKey};
 
 pub struct RouterConfig {
@@ -15,6 +15,7 @@ pub struct RouterConfig {
     views: RouteViewRegistry,
     fallback: RouteViewKey,
     keep_alive_capacity: usize,
+    initial: Option<RouteLocation>,
     transition_driver: Option<Box<dyn crate::transition::RouteTransitionDriver>>,
 }
 
@@ -25,15 +26,33 @@ impl RouterConfig {
             views,
             fallback,
             keep_alive_capacity: 0,
+            initial: None,
             transition_driver: None,
         }
     }
 
-    /// Sets the maximum number of inactive opted-in leaf instances.
+    /// Sets the maximum number of inactive opted-in page and layout instances.
     /// The default and zero disable retention.
     pub fn with_keep_alive_capacity(mut self, capacity: usize) -> Self {
         self.keep_alive_capacity = capacity;
         self
+    }
+
+    /// Navigates once when this router first becomes ready.
+    ///
+    /// A successfully enqueued explicit navigation consumes this default before
+    /// it is submitted. Re-registering a host never replays a consumed initial.
+    pub fn with_initial_location(mut self, location: impl Into<RouteLocation>) -> Self {
+        self.initial = Some(location.into());
+        self
+    }
+
+    #[cfg(feature = "bsn")]
+    pub(crate) fn set_transition_driver(
+        &mut self,
+        driver: Option<Box<dyn crate::transition::RouteTransitionDriver>>,
+    ) {
+        self.transition_driver = driver;
     }
 
     /// Adds application-owned animation around route publication. Without a
@@ -284,6 +303,18 @@ impl ViewDriverStore {
     }
 
     #[cfg(feature = "bsn")]
+    pub(crate) fn install_native_batch(
+        &mut self,
+        factories: Vec<(ViewDriverKey, bevy_ui_router_bsn::BsnSceneFactory)>,
+    ) {
+        self.drivers.extend(
+            factories
+                .into_iter()
+                .map(|(key, factory)| (key, ViewExecutor::Native(factory))),
+        );
+    }
+
+    #[cfg(feature = "bsn")]
     pub(crate) fn native_mut(
         &mut self,
         key: &ViewDriverKey,
@@ -366,103 +397,134 @@ impl TestAppRouterExt for App {
 impl AppRouterExt for App {
     fn add_ui_router(&mut self, config: RouterConfig) -> Result<RouterHandle, RouterInstallError> {
         crate::plugin::install_foundations(self);
-        let RouterConfig {
-            routes,
-            views,
-            fallback,
-            keep_alive_capacity,
-            transition_driver,
-        } = config;
-        let drivers = self.world().resource::<ViewDriverStore>();
-        let mut binding_error = None;
-        #[cfg(feature = "bsn")]
-        let mut uses_native = false;
-        bevy_ui_router_core::integration::for_each_route_view_binding(
-            &routes,
-            |normal, boundary, error| {
-                if binding_error.is_some() {
-                    return;
-                }
-                let Some(normal) = normal else {
-                    binding_error = Some(RouterInstallErrorKind::MissingRouteView);
+        validate_router_config(self, &config, &[])?;
+        install_validated_router(self, config)
+    }
+}
+
+// Both the explicit registry API and the BSN declaration compiler use this
+// validation. Additional keys belong to a fully prepared native factory batch.
+pub(crate) fn validate_router_config(
+    app: &App,
+    config: &RouterConfig,
+    additional_native: &[ViewDriverKey],
+) -> Result<(), RouterInstallError> {
+    let drivers = app.world().resource::<ViewDriverStore>();
+    let mut binding_error = None;
+    #[cfg(feature = "bsn")]
+    let mut uses_native = false;
+    bevy_ui_router_core::integration::for_each_route_view_binding(
+        &config.routes,
+        |normal, boundary, error| {
+            if binding_error.is_some() {
+                return;
+            }
+            let Some(normal) = normal else {
+                binding_error = Some(RouterInstallErrorKind::MissingRouteView);
+                return;
+            };
+            let Some(normal_driver) =
+                bevy_ui_router_view::integration::driver_key(&config.views, normal)
+            else {
+                binding_error = Some(RouterInstallErrorKind::UnknownRouteView);
+                return;
+            };
+            if !drivers.contains(normal_driver) && !additional_native.contains(normal_driver) {
+                binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
+                return;
+            }
+            #[cfg(feature = "bsn")]
+            {
+                uses_native |=
+                    drivers.is_native(normal_driver) || additional_native.contains(normal_driver);
+            }
+            if boundary.is_some() {
+                let Some(error) = error else {
+                    binding_error = Some(RouterInstallErrorKind::MissingErrorView);
                     return;
                 };
-                let Some(normal_driver) =
-                    bevy_ui_router_view::integration::driver_key(&views, normal)
+                let Some(error_driver) =
+                    bevy_ui_router_view::integration::driver_key(&config.views, error)
                 else {
                     binding_error = Some(RouterInstallErrorKind::UnknownRouteView);
                     return;
                 };
-                if !drivers.contains(normal_driver) {
+                if !drivers.contains(error_driver) && !additional_native.contains(error_driver) {
                     binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
-                    return;
                 }
                 #[cfg(feature = "bsn")]
                 {
-                    uses_native |= drivers.is_native(normal_driver);
+                    uses_native |=
+                        drivers.is_native(error_driver) || additional_native.contains(error_driver);
                 }
-                if boundary.is_some() {
-                    let Some(error) = error else {
-                        binding_error = Some(RouterInstallErrorKind::MissingErrorView);
-                        return;
-                    };
-                    let Some(error_driver) =
-                        bevy_ui_router_view::integration::driver_key(&views, error)
-                    else {
-                        binding_error = Some(RouterInstallErrorKind::UnknownRouteView);
-                        return;
-                    };
-                    if !drivers.contains(error_driver) {
-                        binding_error = Some(RouterInstallErrorKind::UnknownViewDriver);
-                    }
-                    #[cfg(feature = "bsn")]
-                    {
-                        uses_native |= drivers.is_native(error_driver);
-                    }
-                }
-            },
-        );
-        if let Some(kind) = binding_error {
-            return Err(RouterInstallError::new(kind));
-        }
-        let fallback_driver = bevy_ui_router_view::integration::driver_key(&views, &fallback)
-            .ok_or_else(|| RouterInstallError::new(RouterInstallErrorKind::MissingFallbackView))?;
-        if !drivers.contains(fallback_driver) {
-            return Err(RouterInstallError::new(
-                RouterInstallErrorKind::UnknownViewDriver,
-            ));
-        }
-        #[cfg(feature = "bsn")]
-        if (uses_native || drivers.is_native(fallback_driver))
-            && !crate::bsn::scene_runtime_is_present(self.world())
-        {
-            return Err(RouterInstallError::new(
-                RouterInstallErrorKind::MissingSceneRuntime,
-            ));
-        }
-        let handle = self
-            .world_mut()
-            .resource_mut::<crate::navigation::RouterNavigation>()
-            .install(routes, views, fallback, keep_alive_capacity)
-            .map_err(|_| RouterInstallError::new(RouterInstallErrorKind::UnknownRouteView))?;
-        let projection = self
-            .world()
-            .resource::<crate::navigation::RouterNavigation>()
-            .entries
-            .iter()
-            .find(|entry| entry.handle == handle)
-            .expect("the installed router entry is retained")
-            .engine
-            .snapshot();
-        self.world_mut()
-            .resource_mut::<crate::snapshots::RouterSnapshots>()
-            .install_router(handle, projection);
-        if let Some(driver) = transition_driver {
-            crate::transition::register_transition_driver(self.world_mut(), handle, driver)
-                .expect("a newly installed router has no transition driver");
-        }
-        Ok(handle)
+            }
+        },
+    );
+    if let Some(kind) = binding_error {
+        return Err(RouterInstallError::new(kind));
     }
+    let fallback_driver =
+        bevy_ui_router_view::integration::driver_key(&config.views, &config.fallback)
+            .ok_or_else(|| RouterInstallError::new(RouterInstallErrorKind::MissingFallbackView))?;
+    if !drivers.contains(fallback_driver) && !additional_native.contains(fallback_driver) {
+        return Err(RouterInstallError::new(
+            RouterInstallErrorKind::UnknownViewDriver,
+        ));
+    }
+    #[cfg(feature = "bsn")]
+    if (uses_native
+        || drivers.is_native(fallback_driver)
+        || additional_native.contains(fallback_driver))
+        && !crate::bsn::scene_runtime_is_present(app.world())
+    {
+        return Err(RouterInstallError::new(
+            RouterInstallErrorKind::MissingSceneRuntime,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn install_validated_router(
+    app: &mut App,
+    config: RouterConfig,
+) -> Result<RouterHandle, RouterInstallError> {
+    let RouterConfig {
+        routes,
+        views,
+        fallback,
+        keep_alive_capacity,
+        initial,
+        transition_driver,
+    } = config;
+    let handle = app
+        .world_mut()
+        .resource_mut::<crate::navigation::RouterNavigation>()
+        .install(routes, views, fallback, keep_alive_capacity)
+        .map_err(|_| RouterInstallError::new(RouterInstallErrorKind::UnknownRouteView))?;
+    app.world_mut()
+        .resource_mut::<crate::navigation::RouterNavigation>()
+        .entries
+        .iter_mut()
+        .find(|entry| entry.handle == handle)
+        .expect("the installed router entry is retained")
+        .initial = initial;
+    let projection = app
+        .world()
+        .resource::<crate::navigation::RouterNavigation>()
+        .entries
+        .iter()
+        .find(|entry| entry.handle == handle)
+        .expect("the installed router entry is retained")
+        .engine
+        .snapshot();
+    app.world_mut()
+        .resource_mut::<crate::snapshots::RouterSnapshots>()
+        .install_router(handle, projection);
+    if let Some(driver) = transition_driver {
+        crate::transition::register_transition_driver(app.world_mut(), handle, driver)
+            .expect("a newly installed router has no transition driver");
+    }
+    Ok(handle)
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ mod mount;
 #[cfg(feature = "bsn")]
 mod native_focus;
 mod navigation;
+mod navigation_commands;
 mod plugin;
 mod presentation;
 mod registry;
@@ -40,9 +41,10 @@ pub use app_ext::{
     RouterInstallErrorKind, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
 };
 #[cfg(feature = "bsn")]
-pub use bsn::AppBsnExt;
+pub use bsn::{AppBsnExt, BsnRoute, BsnRouter, BsnRouterError, index, layout, page};
 pub use input::RouterInputGate;
 pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterNavigation};
+pub use navigation_commands::{NavigationCommandError, RouteNavigationCommandsExt, RouterCommands};
 pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet, RouterScrollSet};
 pub use route_inputs::RouteInputs;
 pub use scroll::{
@@ -50,6 +52,8 @@ pub use scroll::{
     RouteScrollRestoreId, RouteScrollRestorePolicy,
 };
 pub use snapshots::{NavigationRequestSnapshot, RequestLookup, RouterSnapshot, RouterSnapshots};
+#[cfg(feature = "tween")]
+pub use transition::tween::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};
 pub use transition::{
     RouteTransitionCommandsExt, RouteTransitionContext, RouteTransitionDriver, RouteTransitionId,
     RouteTransitionTarget, TransitionCancelReason, TransitionPreparation,
@@ -57,16 +61,19 @@ pub use transition::{
 
 pub mod prelude {
     #[cfg(feature = "bsn")]
-    pub use crate::AppBsnExt;
+    pub use crate::{AppBsnExt, BsnRoute, BsnRouter, BsnRouterError, index, layout, page};
     pub use crate::{
-        AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
-        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
-        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
-        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
+        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouteActivity,
+        RouteInputs, RouteNavigationCommandsExt, RouteScroll, RouteScrollCommandsExt,
+        RouteScrollRestoration, RouteScrollRestorations, RouteScrollRestoreId,
+        RouteScrollRestorePolicy, RouteTransitionCommandsExt, RouteTransitionContext,
+        RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget, RouterCommands,
         RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
         RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
         RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
         TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
+    #[cfg(feature = "tween")]
+    pub use crate::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};
 }

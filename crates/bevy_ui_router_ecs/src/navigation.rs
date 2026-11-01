@@ -2022,6 +2022,7 @@ pub(crate) struct RouterEntry {
     pub(crate) handle: RouterHandle,
     pub(crate) engine: RouterEngine,
     views: RouteViewRegistry,
+    pub(crate) initial: Option<RouteLocation>,
     pub(crate) host: Option<HostBinding>,
     host_settlement: Option<ProvisionalHostSettlement>,
     pending_host_admission_failure: Option<HostAdmissionFailureHolder>,
@@ -5636,6 +5637,7 @@ impl RouterNavigation {
             handle,
             engine,
             views,
+            initial: None,
             host: None,
             host_settlement: None,
             pending_host_admission_failure: None,
@@ -5747,6 +5749,7 @@ impl RouterNavigation {
             .push(location)
             .map_err(map_navigation_enqueue_error)?;
         entry.requests.push(request);
+        entry.initial = None;
         Ok(request)
     }
 
@@ -5777,6 +5780,7 @@ impl RouterNavigation {
             .replace(location)
             .map_err(map_navigation_enqueue_error)?;
         entry.requests.push(request);
+        entry.initial = None;
         Ok(request)
     }
 
@@ -5903,6 +5907,7 @@ impl RouterNavigation {
             let bound = BoundBackCapacityReservation::bind(request, permit, execution);
             entry.back_capacity_reservations.push((request, bound));
             entry.requests.push(request);
+            entry.initial = None;
             Ok(request)
         })();
 
@@ -6127,7 +6132,7 @@ pub struct NavigationEnqueueError {
 }
 
 impl NavigationEnqueueError {
-    const fn new(kind: NavigationEnqueueErrorKind) -> Self {
+    pub(crate) const fn new(kind: NavigationEnqueueErrorKind) -> Self {
         Self { kind }
     }
 
@@ -7385,6 +7390,30 @@ pub(crate) fn collect_navigation_for_test(world: &mut World) {
 }
 
 fn collect_navigation(navigation: &mut RouterNavigation) {
+    // Initial locations are defaults, not a parallel request queue. Wait for
+    // the first ready host, then consume once through the public enqueue path.
+    let initial = navigation
+        .entries
+        .iter_mut()
+        .filter(|entry| {
+            entry.initial.is_some() && entry.engine.availability() == &RouterAvailability::Ready
+        })
+        .filter_map(|entry| {
+            entry
+                .initial
+                .take()
+                .map(|location| (entry.handle, location))
+        })
+        .collect::<Vec<_>>();
+    for (router, location) in initial {
+        if let Err(error) = navigation.push(router, location) {
+            crate::navigation_commands::warn_navigation_enqueue_error(
+                router,
+                bevy_ui_router_core::NavigationKind::Push,
+                error,
+            );
+        }
+    }
     for entry in &mut navigation.entries {
         if entry.retained_miss_cleanup.is_none()
             && entry.pending_back_resolution_action.is_none()

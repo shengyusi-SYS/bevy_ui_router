@@ -11,7 +11,6 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use bevy_scene::{ResolvedScene, SceneFunction, ScenePlugin, bsn};
 use bevy_ui::{Node, Val};
-use bevy_ui_router::ecs::RouterScheduleSet;
 use bevy_ui_router::prelude::*;
 
 #[derive(Component)]
@@ -287,68 +286,63 @@ fn main() {
     ));
     let calls = Arc::new(FactoryCalls::default());
     let factory_calls = Arc::clone(&calls);
-    let layout_driver = app
-        .register_bsn_view(ViewDriverKey::new("layout").unwrap(), move |_| {
-            factory_calls.layout.fetch_add(1, Ordering::SeqCst);
-            Ok(bsn! {
-                Node { width: Val::Px(311.0) }
-                NativeLayout
-                Children [
-                    (Node { height: Val::Px(32.0) } ToolbarState),
-                    (Node { flex_grow: 1.0 } DefaultOutlet)
-                ]
-            })
+    let root = page("/", move |_| {
+        factory_calls.layout.fetch_add(1, Ordering::SeqCst);
+        Ok(bsn! {
+            Node { width: Val::Px(311.0) }
+            NativeLayout
+            Children [
+                (Node { height: Val::Px(32.0) } ToolbarState),
+                (Node { flex_grow: 1.0 } DefaultOutlet)
+            ]
         })
-        .unwrap();
+    })
+    .preserve_on_search();
     let factory_calls = Arc::clone(&calls);
-    let leaf_driver = app
-        .register_bsn_view(ViewDriverKey::new("leaf").unwrap(), move |input| {
-            let item = input
-                .params()
-                .get("id")
-                .expect("leaf route-local id")
-                .to_owned();
-            let instance = factory_calls.leaf.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
-                root.push_template(Node {
-                    width: Val::Px(47.0),
-                    ..Node::default()
-                });
-                root.push_template(NativeLeaf { item, instance });
-                root.push_template(
-                    RouteScroll::new("body").with_restore_policy(RouteScrollRestorePolicy::Explicit),
-                );
-            }))
-        })
-        .unwrap();
+    let leaf = page("items/:id", move |input| {
+        let item = input
+            .params()
+            .get("id")
+            .expect("leaf route-local id")
+            .to_owned();
+        let instance = factory_calls.leaf.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
+            root.push_template(Node {
+                width: Val::Px(47.0),
+                ..Node::default()
+            });
+            root.push_template(NativeLeaf { item, instance });
+            root.push_template(
+                RouteScroll::new("body").with_restore_policy(RouteScrollRestorePolicy::Explicit),
+            );
+        }))
+    });
     let factory_calls = Arc::clone(&calls);
-    let broken_driver = app
-        .register_bsn_view(ViewDriverKey::new("broken").unwrap(), move |_| {
-            let attempt = factory_calls.broken.fetch_add(1, Ordering::SeqCst) + 1;
-            let template = FailTemplate {
-                message: format!("consumer authored child failure {attempt}"),
-                calls: Arc::clone(&factory_calls),
-            };
-            Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
-                root.push_template(Node::default());
-                let mut child = ResolvedScene::default();
-                child.push_template(Node {
-                    width: Val::Px(913.0),
-                    ..Node::default()
-                });
-                child.push_template(PartialFailedChild);
-                child.push_bundle_template(template);
-                root.get_or_insert_related_resolved_scenes::<ChildOf>()
-                    .scenes
-                    .push(child);
-            }))
-        })
-        .unwrap();
+    let broken = page("broken", move |_| {
+        let attempt = factory_calls.broken.fetch_add(1, Ordering::SeqCst) + 1;
+        let template = FailTemplate {
+            message: format!("consumer authored child failure {attempt}"),
+            calls: Arc::clone(&factory_calls),
+        };
+        Ok(SceneFunction(move |_, root: &mut ResolvedScene| {
+            root.push_template(Node::default());
+            let mut child = ResolvedScene::default();
+            child.push_template(Node {
+                width: Val::Px(913.0),
+                ..Node::default()
+            });
+            child.push_template(PartialFailedChild);
+            child.push_bundle_template(template);
+            root.get_or_insert_related_resolved_scenes::<ChildOf>()
+                .scenes
+                .push(child);
+        }))
+    });
     let received_failures = Arc::new(Mutex::new(Vec::new()));
     let received = Arc::clone(&received_failures);
     let factory_calls = Arc::clone(&calls);
-    let fallback_driver = app
-        .register_bsn_view(ViewDriverKey::new("fallback").unwrap(), move |input| {
+    let router = app
+        .add_bsn_router(BsnRouter::new(root.children([leaf, broken])).fallback(move |input| {
             factory_calls.fallback.fetch_add(1, Ordering::SeqCst);
             let failure = input.failure().expect("fallback receives original failure");
             received
@@ -356,49 +350,7 @@ fn main() {
                 .unwrap()
                 .push((failure.kind(), failure.message().to_owned()));
             Ok(bsn! { Node { width: Val::Px(71.0) } ErrorPage })
-        })
-        .unwrap();
-
-    let layout = RouteViewKey::new("layout").unwrap();
-    let leaf = RouteViewKey::new("leaf").unwrap();
-    let broken = RouteViewKey::new("broken").unwrap();
-    let fallback = RouteViewKey::new("fallback").unwrap();
-    let mut routes = RouteTree::builder()
-        .root_with_options(
-            RoutePattern::path("/").unwrap(),
-            RouteNodeOptions::new()
-                .with_view(layout.clone())
-                .with_preserve_on_search(true),
-        )
-        .unwrap();
-    let root = routes.root_id().unwrap();
-    routes
-        .route_with_options(
-            root,
-            RoutePattern::path("items/:id").unwrap(),
-            RouteNodeOptions::new().with_view(leaf.clone()),
-        )
-        .unwrap();
-    routes
-        .route_with_options(
-            root,
-            RoutePattern::path("broken").unwrap(),
-            RouteNodeOptions::new().with_view(broken.clone()),
-        )
-        .unwrap();
-    let mut views = RouteViewRegistry::new();
-    for (view, driver) in [
-        (layout, layout_driver),
-        (leaf, leaf_driver),
-        (broken, broken_driver),
-        (fallback.clone(), fallback_driver),
-    ] {
-        views
-            .insert(view, RouteViewDescriptor::new(driver))
-            .unwrap();
-    }
-    let router = app
-        .add_ui_router(RouterConfig::new(routes.build().unwrap(), views, fallback))
+        }))
         .unwrap();
     app.init_resource::<SnapshotObservation>().add_systems(
         Update,

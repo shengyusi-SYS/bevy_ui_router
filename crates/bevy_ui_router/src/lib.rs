@@ -54,22 +54,27 @@ pub mod view {
 #[cfg(feature = "ecs")]
 pub mod ecs {
     pub use bevy_ui_router_ecs::{
-        AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
-        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
-        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
-        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
+        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouteActivity,
+        RouteInputs, RouteNavigationCommandsExt, RouteScroll, RouteScrollCommandsExt,
+        RouteScrollRestoration, RouteScrollRestorations, RouteScrollRestoreId,
+        RouteScrollRestorePolicy, RouteTransitionCommandsExt, RouteTransitionContext,
+        RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget, RouterCommands,
         RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
         RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
         RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
         TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
+    #[cfg(feature = "tween")]
+    pub use bevy_ui_router_ecs::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};
 }
 
 #[cfg(feature = "bsn")]
 pub mod bsn {
     pub use bevy_ui_router_bsn::{BsnBuildError, BsnSceneFactory, DefaultOutlet};
-    pub use bevy_ui_router_ecs::AppBsnExt;
+    pub use bevy_ui_router_ecs::{
+        AppBsnExt, BsnRoute, BsnRouter, BsnRouterError, index, layout, page,
+    };
 }
 
 #[cfg(feature = "platform")]
@@ -78,6 +83,8 @@ pub mod platform {
 }
 
 pub mod prelude {
+    #[cfg(feature = "tween")]
+    pub use bevy_ui_router_ecs::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};
     #[cfg(feature = "android-back")]
     pub use bevy_ui_router_platform::android_back::AndroidBackInputPlugin;
     #[cfg(any(feature = "desktop-back", feature = "android-back"))]
@@ -88,7 +95,10 @@ pub mod prelude {
     };
 
     #[cfg(feature = "bsn")]
-    pub use crate::bsn::{AppBsnExt, BsnBuildError, BsnSceneFactory, DefaultOutlet};
+    pub use crate::bsn::{
+        AppBsnExt, BsnBuildError, BsnRoute, BsnRouter, BsnRouterError, BsnSceneFactory,
+        DefaultOutlet, index, layout, page,
+    };
 
     pub use crate::core::{
         ActivePresentation, ActivePresentationKind, BackCapabilitySnapshot, BackIntent, BackPolicy,
@@ -114,14 +124,15 @@ pub mod prelude {
 
     #[cfg(feature = "ecs")]
     pub use crate::ecs::{
-        AppRouterExt, BevyUiRouterPlugin, NavigationEnqueueError, NavigationEnqueueErrorKind,
-        NavigationRequestSnapshot, RequestLookup, RouteActivity, RouteInputs, RouteScroll,
-        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
-        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
-        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInstallError,
-        RouterInstallErrorKind, RouterNavigation, RouterScrollSet, RouterSnapshot, RouterSnapshots,
-        TransitionCancelReason, TransitionPreparation, ViewDriverRegistrationError,
-        ViewDriverRegistrationErrorKind,
+        AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
+        NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouteActivity,
+        RouteInputs, RouteNavigationCommandsExt, RouteScroll, RouteScrollCommandsExt,
+        RouteScrollRestoration, RouteScrollRestorations, RouteScrollRestoreId,
+        RouteScrollRestorePolicy, RouteTransitionCommandsExt, RouteTransitionContext,
+        RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget, RouterCommands,
+        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
+        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
+        RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
+        TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
     };
 }

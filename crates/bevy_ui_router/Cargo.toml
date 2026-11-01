@@ -13,6 +13,7 @@ default = ["view"]
 view = ["dep:bevy_ui_router_view"]
 ecs = ["view", "dep:bevy_ui_router_ecs"]
 bsn = ["ecs", "dep:bevy_ui_router_bsn", "bevy_ui_router_ecs/bsn"]
+tween = ["ecs", "bevy_ui_router_ecs/tween"]
 platform = ["dep:bevy_ui_router_platform"]
 desktop-back = ["platform", "bevy_ui_router_platform/desktop-back"]
 android-back = ["platform", "bevy_ui_router_platform/android-back"]
@@ -61,6 +62,11 @@ required-features = ["bsn"]
 [[test]]
 name = "default_facade_features"
 path = "tests/default_facade_features.rs"
+
+[[test]]
+name = "public_usage"
+path = "tests/public_usage.rs"
+required-features = ["bsn"]
 
 [[test]]
 name = "public_navigation_journeys"
