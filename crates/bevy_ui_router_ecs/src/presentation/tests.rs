@@ -33,7 +33,7 @@ use bevy_internal::{
     },
     window::{PrimaryWindow, Window, WindowRef},
 };
-use bevy_picking::events::{Over, Pointer};
+use bevy_picking::events::PointerOver;
 use bevy_ui::{ComputedNode, UiGlobalTransform};
 use bevy_ui_router_core::{
     integration::{EngineAction, RootFrameTask, RouterEngine},
@@ -88,7 +88,7 @@ struct NestedTargetDeliveries(std::collections::BTreeMap<Entity, usize>);
 
 fn install_nested_pointer_observer(app: &mut App) {
     app.world_mut().add_observer(
-        |event: On<Pointer<Over>>,
+        |event: On<PointerOver>,
          mut deliveries: bevy_ecs::prelude::ResMut<NestedTargetDeliveries>| {
             *deliveries.0.entry(event.event_target()).or_default() += 1;
         },
@@ -393,7 +393,7 @@ fn guarded_settlement_stops_writes_after_protected_partition_drift() {
     let target = frame.shell();
     let protected = world.spawn(ProtectedIsolationMarker).id();
     world.add_observer(
-        move |event: On<Insert, Visibility>, mut commands: Commands| {
+        move |event: On<Insert<Visibility>>, mut commands: Commands| {
             if event.entity == target {
                 commands
                     .entity(protected)

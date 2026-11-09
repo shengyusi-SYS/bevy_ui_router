@@ -377,7 +377,6 @@ impl FixtureControl {
 #[derive(Component, Clone, Default, Debug, Eq, PartialEq)]
 struct LocalState(u32);
 
-#[derive(Clone)]
 struct FailAfterChildWrite {
     width: u16,
     message: &'static str,
@@ -400,7 +399,11 @@ impl Template for FailAfterChildWrite {
     }
 
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self {
+            width: self.width,
+            message: self.message,
+            applied: self.applied.clone(),
+        }
     }
 }
 
@@ -1851,7 +1854,7 @@ fn observe_app_owned_inserts<T: Component>(
     writes: Arc<AtomicUsize>,
 ) {
     let entities = entities.iter().copied().collect::<HashSet<_>>();
-    app.world_mut().add_observer(move |event: On<Insert, T>| {
+    app.world_mut().add_observer(move |event: On<Insert<T>>| {
         if entities.contains(&event.entity) {
             writes.fetch_add(1, Ordering::Relaxed);
         }
@@ -3568,7 +3571,7 @@ fn retained_native_hit_preserves_state_and_skips_factory_and_scene_apply() {
     fixture
         .app
         .world_mut()
-        .add_observer(move |_: On<Insert, LocalState>| {
+        .add_observer(move |_: On<Insert<LocalState>>| {
             observed.fetch_add(1, Ordering::Relaxed);
         });
     let first = push_and_settle(
@@ -4340,7 +4343,7 @@ fn retained_native_host_loss_during_invalid_cache_root_cleanup_settles_and_readm
     let cleanup_root_removals = Arc::new(AtomicUsize::new(0));
     let observed = cleanup_root_removals.clone();
     fixture.app.world_mut().add_observer(
-        move |event: On<Despawn, LocalState>, mut commands: Commands| {
+        move |event: On<Despawn<LocalState>>, mut commands: Commands| {
             if event.entity == cached_root {
                 observed.fetch_add(1, Ordering::Relaxed);
                 commands.entity(host).remove::<RouterHostRegistration>();
@@ -4496,7 +4499,7 @@ fn retained_native_lru_evicts_the_oldest_inactive_leaf_and_rebuilds_on_return() 
     fixture
         .app
         .world_mut()
-        .add_observer(move |_: On<Insert, LocalState>| {
+        .add_observer(move |_: On<Insert<LocalState>>| {
             observed.fetch_add(1, Ordering::Relaxed);
         });
     let mut originals = Vec::new();

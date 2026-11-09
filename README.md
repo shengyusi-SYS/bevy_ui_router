@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Page navigation for Bevy UI. Organize pages by path, reuse shared layouts, and navigate with `push`, `replace`, and `back`. Opt into retained page state, scroll restoration on Back, and transitions designed by your application.
 
-Currently supports **Bevy 0.19**. Not yet published to crates.io.
+Currently supports **Bevy 0.20.1**. Not yet published to crates.io.
 
 This project is developed entirely by GPT flagship models (to use up my remaining quota); my role is discussion, supervision, and feedback.
 

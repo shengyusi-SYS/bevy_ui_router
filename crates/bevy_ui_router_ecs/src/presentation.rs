@@ -3759,7 +3759,9 @@ fn prepare_presentation_access<'w>(
         previous_hover,
         state,
         resources,
-    ) in query.iter_many_unique_mut(world, access_entities.keys())
+    ) in query
+        .iter_many_unique_mut(world, access_entities.keys())
+        .flatten()
     {
         let (nav, reg, input_gate, focus, route) = resources;
         if publication {

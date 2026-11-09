@@ -61,7 +61,7 @@ fn main() {
                     .keep_alive(),
                 ]),
             )
-            .fallback(|_| Ok(bsn! { Node Children [(Text::new("Page unavailable"))] }))
+            .fallback(|_| Ok(bsn! { Node Children [Text::new("Page unavailable")] }))
             .keep_alive_capacity(2)
             .initial("/notes")
             .transition_driver(RouteTweenDriver::new(prepare_effect)),
@@ -87,14 +87,15 @@ fn page_scene(title: &'static str, color: Color) -> impl Scene {
         }
         BackgroundColor(color)
         Children [
-            (Text::new(title) TextFont { font_size: FontSize::Px(36.0) }),
-            (
-                Button PageCounter(0)
-                Node { padding: UiRect::all(Val::Px(18.0)) }
-                BackgroundColor(Color::srgb(0.08, 0.12, 0.18))
-                Children [(Text::new("Count: 0") Pickable::IGNORE)]
-            ),
-            (Text::new("Click the count, switch pages, then return. The instance retains its state.")),
+            Text::new(title) TextFont { font_size: FontSize::Px(36.0) }
+            --
+            Button PageCounter(0)
+            Node { padding: UiRect::all(Val::Px(18.0)) }
+            BackgroundColor(Color::srgb(0.08, 0.12, 0.18))
+            Children [Text::new("Count: 0") Pickable::IGNORE
+            ]
+            --
+            Text::new("Click the count, switch pages, then return. The instance retains its state.")
         ]
     }
 }
@@ -168,7 +169,7 @@ fn setup(mut commands: Commands, demo: Res<Demo>, effects: Res<Effects>) {
 }
 
 fn click(
-    click: On<Pointer<Click>>,
+    click: On<PointerClick>,
     demo: Res<Demo>,
     actions: Query<&Action>,
     inputs: RouteInputs,

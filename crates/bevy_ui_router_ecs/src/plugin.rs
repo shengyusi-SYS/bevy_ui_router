@@ -238,12 +238,12 @@ mod tests {
             let (_, system) = schedules
                 .get(label)
                 .unwrap()
-                .systems()
+                .systems_with_access()
                 .unwrap()
                 .find(|(_, system)| system.system_type() == kind)
                 .unwrap();
             assert!(
-                !system.is_exclusive(),
+                !system.access().is_exclusive(),
                 "{} needs no exclusive World access",
                 system.name()
             );

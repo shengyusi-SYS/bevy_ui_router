@@ -59,7 +59,6 @@ impl bevy_scene::Scene for DependencyScene {
     }
 }
 
-#[derive(Clone)]
 struct KeepProtectedThenFail(Entity);
 
 #[derive(Resource)]
@@ -99,7 +98,7 @@ impl Template for KeepProtectedThenFail {
         Err("native retained apply source".into())
     }
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self(self.0.clone())
     }
 }
 
@@ -322,7 +321,7 @@ fn native_host_admission_allows_app_children_observer_to_mark_host() {
     let unrelated = app.world_mut().spawn_empty().id();
     let removable = app.world_mut().spawn_empty().id();
     app.world_mut().add_observer(
-        move |event: On<Insert, Children>, mut commands: Commands, mut observed: Local<bool>| {
+        move |event: On<Insert<Children>>, mut commands: Commands, mut observed: Local<bool>| {
             if event.entity == host && !*observed {
                 *observed = true;
                 commands.entity(host).insert(AppHostChildrenObserved);
@@ -2132,7 +2131,7 @@ fn native_invalid_cached_content_releases_its_completed_cleanup_before_host_reco
     // committed. Completing this cache must not claim the old protected proof
     // passed or prevent the normal driver from observing the changed host.
     app.world_mut()
-        .add_observer(move |event: On<Despawn, Node>, mut commands: Commands| {
+        .add_observer(move |event: On<Despawn<Node>>, mut commands: Commands| {
             if event.entity == cached_shell {
                 commands.entity(host).remove::<RouterHostRegistration>();
             }
@@ -2782,7 +2781,7 @@ fn native_idle_host_loss_despawn_escape_is_bounded_and_returns_app_focus() {
     let application = app.world_mut().spawn(Node::default()).id();
     app.init_resource::<EscapeCalls>();
     app.world_mut().add_observer(
-        move |event: On<Despawn, EscapeTrigger>, mut commands: Commands| {
+        move |event: On<Despawn<EscapeTrigger>>, mut commands: Commands| {
             if event.entity == trigger {
                 commands.queue(move |world: &mut World| {
                     assert!(world.get_entity(child).is_ok());
@@ -2858,7 +2857,7 @@ fn native_cleanup_allows_unrelated_app_sibling_presentation_update() {
     // A normal application callback runs after the cleanup plan has frozen its
     // protected facts. This sibling is outside the routed content and target set.
     app.world_mut()
-        .add_observer(move |event: On<Despawn, Node>, mut commands: Commands| {
+        .add_observer(move |event: On<Despawn<Node>>, mut commands: Commands| {
             if event.entity == child {
                 let updated = updated.clone();
                 commands.queue(move |world: &mut World| {
@@ -2965,7 +2964,7 @@ fn native_cleanup_despawn_registered_ancestor_stops_remaining_content_removal() 
         .id();
     app.init_resource::<RegistrationCalls>();
     app.world_mut().add_observer(
-        move |event: On<Despawn, RegisterAncestorOnDespawn>, mut commands: Commands| {
+        move |event: On<Despawn<RegisterAncestorOnDespawn>>, mut commands: Commands| {
             if event.entity != trigger {
                 return;
             }

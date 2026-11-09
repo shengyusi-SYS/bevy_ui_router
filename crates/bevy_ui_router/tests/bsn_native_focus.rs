@@ -54,7 +54,6 @@ struct NativeFocusTarget;
 #[derive(Resource, Default)]
 struct PlainAutoFocus(bool);
 
-#[derive(Clone)]
 struct PlainTemplate;
 
 impl Template for PlainTemplate {
@@ -71,11 +70,10 @@ impl Template for PlainTemplate {
         Ok(())
     }
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self
     }
 }
 
-#[derive(Clone)]
 struct FocusSceneTemplate {
     before: Vec<Operation>,
     after: Vec<Operation>,
@@ -105,11 +103,15 @@ impl Template for FocusSceneTemplate {
         Ok(())
     }
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self {
+            before: self.before.clone(),
+            after: self.after.clone(),
+            outlet: self.outlet.clone(),
+            autofocus: self.autofocus.clone(),
+        }
     }
 }
 
-#[derive(Clone)]
 struct ObserveThenFail;
 impl Template for ObserveThenFail {
     type Output = ();
@@ -125,7 +127,7 @@ impl Template for ObserveThenFail {
         Err("native focus child apply failure".into())
     }
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self
     }
 }
 
@@ -448,7 +450,7 @@ fn successful_autofocus_publishes_once_after_preserving_original_queue() {
             FocusEvent::Lost(fixture.prefix),
             FocusEvent::Gained(fixture.a, FocusCause::Pressed),
             FocusEvent::Lost(fixture.a),
-            FocusEvent::Gained(target, FocusCause::Navigated),
+            FocusEvent::Gained(target, FocusCause::Auto),
         ]
     );
 }
@@ -562,7 +564,7 @@ fn native_pending_autofocus_stays_silent_across_drain_then_publishes() {
         fixture.app.world().resource::<Events>().0,
         vec![
             FocusEvent::Lost(fixture.a),
-            FocusEvent::Gained(target, FocusCause::Navigated)
+            FocusEvent::Gained(target, FocusCause::Auto)
         ]
     );
 }
@@ -586,7 +588,7 @@ fn multiple_pending_frames_publish_only_the_last_real_focus_operation() {
         fixture.app.world().resource::<Events>().0,
         vec![
             FocusEvent::Lost(fixture.a),
-            FocusEvent::Gained(targets[2], FocusCause::Navigated)
+            FocusEvent::Gained(targets[2], FocusCause::Auto)
         ]
     );
 }
@@ -652,7 +654,7 @@ fn native_authority_loss_keeps_focus_queue_source_for_readmission() {
         struct LoseHost(bool);
         fixture.app.insert_resource(LoseHost(true));
         fixture.app.world_mut().add_observer(
-            move |_: On<Add, NativeFocusTarget>,
+            move |_: On<Add<NativeFocusTarget>>,
                   mut lose: ResMut<LoseHost>,
                   mut commands: Commands| {
                 if lose.0 {
@@ -798,7 +800,7 @@ fn authored_hidden_native_target_cannot_consume_pending_autofocus() {
     let mut fixture = fixture(vec![], vec![], false, false);
     prepare_prefix(&mut fixture, false, true);
     fixture.app.world_mut().add_observer(
-        |event: On<Add, NativeFocusTarget>, mut commands: Commands| {
+        |event: On<Add<NativeFocusTarget>>, mut commands: Commands| {
             commands.entity(event.entity).insert(Node {
                 display: bevy_ui::Display::None,
                 ..Node::default()
@@ -874,7 +876,7 @@ fn navigation_resource_scope_tail_app_set_supersedes_scene_autofocus() {
     fixture.app.init_resource::<TailFired>();
     let b = fixture.b;
     fixture.app.world_mut().add_observer(
-        move |_: On<Insert, RouterNavigation>,
+        move |_: On<Insert<RouterNavigation>>,
               attempts: Res<Attempts>,
               mut fired: ResMut<TailFired>,
               mut focus: ResMut<InputFocus>| {
@@ -912,7 +914,6 @@ struct PendingSourceMove {
     observed: bool,
 }
 
-#[derive(Clone)]
 enum SourceMoveTemplate {
     Root,
     Target,
@@ -944,7 +945,11 @@ impl Template for SourceMoveTemplate {
     }
 
     fn clone_template(&self) -> Self {
-        self.clone()
+        match self {
+            Self::Root => Self::Root,
+            Self::Target => Self::Target,
+            Self::Sibling => Self::Sibling,
+        }
     }
 }
 
@@ -1051,7 +1056,7 @@ fn pending_source_membership_at_publication(move_to_preserved: bool) {
     );
     prepare_prefix(&mut fixture, false, true);
     fixture.app.world_mut().add_observer(
-        move |_: On<Insert, RouterNavigation>,
+        move |_: On<Insert<RouterNavigation>>,
               mut evidence: ResMut<PendingSourceMove>,
               focus: Res<InputFocus>,
               gate: Res<RouterInputGate>,
@@ -1133,7 +1138,7 @@ fn pending_source_membership_at_publication(move_to_preserved: bool) {
             world.resource::<Events>().0,
             vec![
                 FocusEvent::Lost(fixture.a),
-                FocusEvent::Gained(target, FocusCause::Navigated)
+                FocusEvent::Gained(target, FocusCause::Auto)
             ]
         );
     }
@@ -1211,7 +1216,7 @@ fn resource_scope_tail_set_on_another_active_router_is_not_classified_as_pending
     struct TailFired(bool);
     fixture.app.init_resource::<TailFired>();
     fixture.app.world_mut().add_observer(
-        move |_: On<Insert, RouterNavigation>,
+        move |_: On<Insert<RouterNavigation>>,
               attempts: Res<Attempts>,
               mut fired: ResMut<TailFired>,
               mut focus: ResMut<InputFocus>| {
@@ -1403,7 +1408,7 @@ fn native_projectionless_fallback_consumes_its_own_autofocus_not_the_failed_owne
             FocusEvent::Lost(fixture.prefix),
             FocusEvent::Gained(fixture.a, FocusCause::Pressed),
             FocusEvent::Lost(fixture.a),
-            FocusEvent::Gained(fallback, FocusCause::Navigated),
+            FocusEvent::Gained(fallback, FocusCause::Auto),
         ]
     );
 }

@@ -54,14 +54,14 @@ impl Consumer {
         if ecs {
             for dependency in ["bevy_app", "bevy_ecs", "bevy_ui"] {
                 manifest.push_str(&format!(
-                    "{dependency} = {{ version = '0.19', default-features = false }}\n"
+                    "{dependency} = {{ version = '0.20.1', default-features = false }}\n"
                 ));
             }
         }
         if bsn {
             for dependency in ["bevy_asset", "bevy_scene"] {
                 manifest.push_str(&format!(
-                    "{dependency} = {{ version = '0.19', default-features = false }}\n"
+                    "{dependency} = {{ version = '0.20.1', default-features = false }}\n"
                 ));
             }
         }
@@ -69,7 +69,7 @@ impl Consumer {
             if !ecs {
                 for dependency in ["bevy_app", "bevy_ecs"] {
                     manifest.push_str(&format!(
-                        "{dependency} = {{ version = '0.19', default-features = false }}\n"
+                        "{dependency} = {{ version = '0.20.1', default-features = false }}\n"
                     ));
                 }
             }
@@ -80,13 +80,13 @@ impl Consumer {
                 (false, false) => unreachable!(),
             };
             manifest.push_str(&format!(
-                "bevy_input = {{ version = '0.19', default-features = false, features = {input_features} }}\n",
+                "bevy_input = {{ version = '0.20.1', default-features = false, features = {input_features} }}\n",
             ));
         }
         if native_ui {
             manifest.push_str(
-                "bevy_input_focus = { version = '0.19', default-features = false }\n\
-                 bevy_internal = { version = '0.19', default-features = false, features = ['bevy_window', 'bevy_camera', 'bevy_ui', 'bevy_picking'] }\n",
+                "bevy_input_focus = { version = '0.20.1', default-features = false }\n\
+                 bevy_internal = { version = '0.20.1', default-features = false, features = ['bevy_window', 'bevy_camera', 'bevy_ui', 'bevy_picking'] }\n",
             );
         }
         fs::create_dir_all(directory.join("src")).unwrap();

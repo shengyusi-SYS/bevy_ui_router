@@ -43,7 +43,6 @@ struct FactoryCalls {
     failing_template: AtomicUsize,
 }
 
-#[derive(Clone)]
 struct FailTemplate {
     message: String,
     calls: Arc<FactoryCalls>,
@@ -61,7 +60,10 @@ impl bevy_ecs::template::Template for FailTemplate {
     }
 
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self {
+            message: self.message.clone(),
+            calls: Arc::clone(&self.calls),
+        }
     }
 }
 
@@ -128,7 +130,10 @@ fn observe_snapshots(
     let router = snapshots.get(tracked.router).unwrap();
     for (entity, mut state) in &mut toolbar {
         state.1 = inputs.current(entity).map(|input| {
-            assert!(input.params().is_empty(), "parent parameters stay route-local");
+            assert!(
+                input.params().is_empty(),
+                "parent parameters stay route-local"
+            );
             assert!(input.failure().is_none());
             assert_eq!(Some(input.location()), router.active().location());
             input.location().clone()
@@ -136,19 +141,33 @@ fn observe_snapshots(
     }
     if let Some(entity) = published {
         assert!(activity.is_active(entity));
-        let input = inputs.current(entity).expect("input is published with native content");
-        assert_eq!(Some(input.location()), router.active().location().or_else(|| router.active().requested()));
-        assert_eq!(input.origin(), router.active().frames().last().unwrap().origin());
+        let input = inputs
+            .current(entity)
+            .expect("input is published with native content");
+        assert_eq!(
+            Some(input.location()),
+            router
+                .active()
+                .location()
+                .or_else(|| router.active().requested())
+        );
+        assert_eq!(
+            input.origin(),
+            router.active().frames().last().unwrap().origin()
+        );
         assert_eq!(input.failure(), router.active().failure());
         match tracked.native {
             ExpectedNative::Leaf(_) => {
                 assert!(input.route().is_some());
-                assert_eq!(input.params().get("id"), Some(native.get(entity).unwrap().1.unwrap().item.as_str()));
-            },
+                assert_eq!(
+                    input.params().get("id"),
+                    Some(native.get(entity).unwrap().1.unwrap().item.as_str())
+                );
+            }
             ExpectedNative::Error => {
                 assert_eq!(input.route(), None);
                 assert!(input.params().is_empty());
-            },
+            }
         }
     }
     observation.0 = Some(UpdateObservation {
@@ -245,7 +264,10 @@ fn assert_preserved_layout(app: &mut App, layout: Entity, anchor: Entity, toolba
     assert_eq!(only::<DefaultOutlet>(app), anchor);
     assert_eq!(only::<ToolbarState>(app), toolbar);
     assert_eq!(app.world().get::<ToolbarState>(toolbar).unwrap().0, 73);
-    assert_eq!(app.world().get::<ToolbarState>(toolbar).unwrap().1.as_ref(), observed_router(app).active().location());
+    assert_eq!(
+        app.world().get::<ToolbarState>(toolbar).unwrap().1.as_ref(),
+        observed_router(app).active().location()
+    );
     assert_eq!(
         app.world().get::<ChildOf>(anchor).map(ChildOf::parent),
         Some(layout)
@@ -292,8 +314,9 @@ fn main() {
             Node { width: Val::Px(311.0) }
             NativeLayout
             Children [
-                (Node { height: Val::Px(32.0) } ToolbarState),
-                (Node { flex_grow: 1.0 } DefaultOutlet)
+                Node { height: Val::Px(32.0) } ToolbarState
+                --
+                Node { flex_grow: 1.0 } DefaultOutlet
             ]
         })
     })
@@ -342,15 +365,17 @@ fn main() {
     let received = Arc::clone(&received_failures);
     let factory_calls = Arc::clone(&calls);
     let router = app
-        .add_bsn_router(BsnRouter::new(root.children([leaf, broken])).fallback(move |input| {
-            factory_calls.fallback.fetch_add(1, Ordering::SeqCst);
-            let failure = input.failure().expect("fallback receives original failure");
-            received
-                .lock()
-                .unwrap()
-                .push((failure.kind(), failure.message().to_owned()));
-            Ok(bsn! { Node { width: Val::Px(71.0) } ErrorPage })
-        }))
+        .add_bsn_router(
+            BsnRouter::new(root.children([leaf, broken])).fallback(move |input| {
+                factory_calls.fallback.fetch_add(1, Ordering::SeqCst);
+                let failure = input.failure().expect("fallback receives original failure");
+                received
+                    .lock()
+                    .unwrap()
+                    .push((failure.kind(), failure.message().to_owned()));
+                Ok(bsn! { Node { width: Val::Px(71.0) } ErrorPage })
+            }),
+        )
         .unwrap();
     app.init_resource::<SnapshotObservation>().add_systems(
         Update,
@@ -582,8 +607,8 @@ fn main() {
     let live_count = app.world().entities().count_spawned();
     for index in 0..96 {
         let item = format!("repeat-{index}");
-        let location = RouteLocation::new(format!("/items/{item}"))
-            .with_search(format!("sort={index}"));
+        let location =
+            RouteLocation::new(format!("/items/{item}")).with_search(format!("sort={index}"));
         let request = app
             .world_mut()
             .resource_mut::<RouterNavigation>()

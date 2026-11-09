@@ -71,7 +71,7 @@ use bevy_internal::{
     window::{PrimaryWindow, Window, WindowRef},
 };
 use bevy_picking::Pickable;
-use bevy_picking::events::{Over, Pointer};
+use bevy_picking::events::PointerOver;
 use bevy_ui::{ComputedNode, Node, UiGlobalTransform, Val};
 use bevy_ui_router_core::integration::{
     AdmissionError, BackTargetResumeAction, BackTargetStart, HostAdmissionAllocatorCounter,
@@ -2106,7 +2106,7 @@ struct NativeTargetDeliveries(std::collections::BTreeMap<Entity, usize>);
 
 fn install_native_pointer_observer(app: &mut App) {
     app.world_mut().add_observer(
-        |event: On<Pointer<Over>>,
+        |event: On<PointerOver>,
          mut deliveries: bevy_ecs::prelude::ResMut<NativeTargetDeliveries>| {
             *deliveries.0.entry(event.event_target()).or_default() += 1;
         },
@@ -43403,7 +43403,7 @@ fn observe_publication_resource<R: Resource>(
     let resource = crate::input::pointer_resource_entity::<R>(world).unwrap();
     let inserts = events.clone();
     world.add_observer(
-        move |event: On<bevy_ecs::lifecycle::Insert, R>,
+        move |event: On<bevy_ecs::lifecycle::Insert<R>>,
               navigation: Option<bevy_ecs::prelude::Res<RouterNavigation>>| {
             if event.entity == resource {
                 inserts.lock().unwrap().push((
@@ -43417,7 +43417,7 @@ fn observe_publication_resource<R: Resource>(
     );
     let removals = events.clone();
     world.add_observer(
-        move |event: On<bevy_ecs::lifecycle::Remove, R>,
+        move |event: On<bevy_ecs::lifecycle::Remove<R>>,
               navigation: Option<bevy_ecs::prelude::Res<RouterNavigation>>| {
             if event.entity == resource {
                 removals.lock().unwrap().push((
@@ -43635,7 +43635,7 @@ fn assert_back_publication_focus_after_preparation_observer(move_into_leaving: O
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observer_fired = fired.clone();
     app.world_mut().add_observer(
-        move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+        move |_: On<bevy_ecs::lifecycle::Insert<RouterNavigation>>,
               navigation: bevy_ecs::prelude::Res<RouterNavigation>,
               mut commands: bevy_ecs::prelude::Commands,
               mut focus: bevy_ecs::prelude::ResMut<InputFocus>,
@@ -44085,7 +44085,7 @@ fn publication_refreezes_host_after_preparation_resource_observer() {
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observer_fired = fired.clone();
     app.world_mut().add_observer(
-        move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+        move |_: On<bevy_ecs::lifecycle::Insert<RouterNavigation>>,
               mut commands: bevy_ecs::prelude::Commands| {
             if !observer_fired.swap(true, Ordering::SeqCst) {
                 commands.entity(host).remove::<RouterHostRegistration>();
@@ -44140,7 +44140,7 @@ fn publication_preserves_valid_focus_written_by_preparation_observer() {
     drive_navigation_system(app.world_mut());
     let target = app.world_mut().spawn_empty().id();
     app.world_mut().add_observer(
-        move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+        move |_: On<bevy_ecs::lifecycle::Insert<RouterNavigation>>,
               mut focus: bevy_ecs::prelude::ResMut<InputFocus>| {
             *focus = InputFocus::from_entity(target);
         },
@@ -44176,7 +44176,7 @@ fn publication_missing_required_resource_after_preparation_keeps_original_failur
             drive_navigation_system(app.world_mut());
         }
         app.world_mut().add_observer(
-            |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+            |_: On<bevy_ecs::lifecycle::Insert<RouterNavigation>>,
              mut commands: bevy_ecs::prelude::Commands| {
                 commands.queue(|world: &mut World| {
                     world.remove_resource::<InputFocus>();
@@ -44284,7 +44284,7 @@ fn initial_fallback_publication_refreezes_host_and_parent_after_resource_observe
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observe_fired = fired.clone();
         app.world_mut().add_observer(
-            move |_: On<bevy_ecs::lifecycle::Insert, RouterNavigation>,
+            move |_: On<bevy_ecs::lifecycle::Insert<RouterNavigation>>,
                   mut commands: bevy_ecs::prelude::Commands| {
                 if !observe_fired.swap(true, Ordering::SeqCst) {
                     if drift_host {

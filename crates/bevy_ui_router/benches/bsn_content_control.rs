@@ -63,7 +63,12 @@ impl Fixture {
         let host = app.world_mut().spawn(Node::default()).id();
         let scene = resolve(
             &app,
-            bsn! { Node Layout Children [(Node Toolbar(73)), (Node Outlet)] },
+            bsn! {
+                Node Layout Children [Node Toolbar(73)
+                    --
+                    Node Outlet
+                ]
+            },
         );
         let layout = app.world_mut().spawn(ChildOf(host)).id();
         scene

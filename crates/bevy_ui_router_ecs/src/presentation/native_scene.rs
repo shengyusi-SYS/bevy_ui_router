@@ -1852,7 +1852,6 @@ mod tests {
     #[derive(Component, Clone, Copy)]
     struct NamedEntity(Entity);
 
-    #[derive(Clone)]
     struct ResolveNamedEntity(SceneEntityReference);
 
     impl Template for ResolveNamedEntity {
@@ -1870,11 +1869,10 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self(self.0.clone())
         }
     }
 
-    #[derive(Clone)]
     struct CaptureClaims(Arc<Mutex<Vec<ExactRegistryClaim>>>);
 
     impl Template for CaptureClaims {
@@ -1896,7 +1894,7 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self(self.0.clone())
         }
     }
 
@@ -1924,7 +1922,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
     struct InstallDespawnChange {
         other: SceneEntityReference,
         remove_seal: bool,
@@ -1948,7 +1945,10 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self {
+                other: self.other.clone(),
+                remove_seal: self.remove_seal.clone(),
+            }
         }
     }
 
@@ -1979,7 +1979,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
     struct InsertNodeBundle;
 
     impl Template for InsertNodeBundle {
@@ -1999,11 +1998,10 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self
         }
     }
 
-    #[derive(Clone)]
     struct AttachProtected(Entity);
 
     #[derive(Component, Clone)]
@@ -2020,19 +2018,6 @@ mod tests {
         }
     }
 
-    impl Template for AttachProtectedOnInsert {
-        type Output = Self;
-
-        fn build_template(&self, _: &mut TemplateContext<'_, '_>) -> bevy_ecs::error::Result<Self> {
-            Ok(self.clone())
-        }
-
-        fn clone_template(&self) -> Self {
-            self.clone()
-        }
-    }
-
-    #[derive(Clone)]
     struct AttachToParent(Entity);
 
     impl Template for AttachToParent {
@@ -2046,7 +2031,7 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self(self.0.clone())
         }
     }
 
@@ -2065,11 +2050,10 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self(self.0.clone())
         }
     }
 
-    #[derive(Clone)]
     struct CreateOrdinaryForwardReferenceParent {
         child: SceneEntityReference,
         observed: Arc<Mutex<Option<(Entity, Entity, Entity, Vec<ExactRegistryClaim>)>>>,
@@ -2119,11 +2103,13 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self {
+                child: self.child.clone(),
+                observed: self.observed.clone(),
+            }
         }
     }
 
-    #[derive(Clone)]
     struct FailBundle;
 
     impl Template for FailBundle {
@@ -2137,7 +2123,7 @@ mod tests {
         }
 
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self
         }
     }
 
@@ -2424,7 +2410,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let scene_captured = captured.clone();
         app.world_mut().add_observer(
-            |event: On<Insert, ChildOf>,
+            |event: On<Insert<ChildOf>>,
              parents: Query<&ChildOf>,
              partial: Query<(), With<PartialNodeWasWritten>>,
              mut shells: Query<&mut Node, With<FrameShell>>| {
@@ -2567,7 +2553,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let scene_captured = captured.clone();
         app.world_mut().add_observer(
-            move |event: On<Insert, ChildOf>,
+            move |event: On<Insert<ChildOf>>,
                   parents: Query<&ChildOf>,
                   partial: Query<(), With<PartialNodeWasWritten>>,
                   shells: Query<(), With<FrameShell>>,
@@ -2616,7 +2602,7 @@ mod tests {
     fn adoption_returns_the_live_closure_after_descendant_marker_hooks() {
         let mut app = app();
         app.world_mut().add_observer(
-            |event: On<Remove, RouteOwnershipSeal>,
+            |event: On<Remove<RouteOwnershipSeal>>,
              authored: Query<&AuthoredValue>,
              mut commands: Commands| {
                 if authored.get(event.entity) == Ok(&AuthoredValue(1)) {
@@ -2650,7 +2636,7 @@ mod tests {
     fn adoption_rechecks_declared_sibling_order_after_marker_hooks() {
         let mut app = app();
         app.world_mut().add_observer(
-            |event: On<Remove, RouteOwnershipSeal>,
+            |event: On<Remove<RouteOwnershipSeal>>,
              authored: Query<(&AuthoredValue, &ChildOf)>,
              children: Query<&Children>,
              mut commands: Commands| {
@@ -2687,7 +2673,7 @@ mod tests {
     fn intended_marker_release_remains_settleable_after_a_relationship_hook_failure() {
         let mut app = app();
         app.world_mut().add_observer(
-            |event: On<Remove, RouteOwnershipSeal>,
+            |event: On<Remove<RouteOwnershipSeal>>,
              authored: Query<&AuthoredValue>,
              mut commands: Commands| {
                 if authored.get(event.entity) == Ok(&AuthoredValue(1)) {

@@ -545,7 +545,8 @@ fn prepare_physical_isolation<'w>(
         Option<&mut bevy_ui::Node>,
     )>();
     let mut entities = Vec::with_capacity(targets.len());
-    for (_entity, visibility, pickable, barrier, node) in query.iter_many_unique_mut(world, targets)
+    for (_entity, visibility, pickable, barrier, node) in
+        query.iter_many_unique_mut(world, targets).flatten()
     {
         #[cfg(feature = "bsn")]
         if native_content.contains(&_entity) {
@@ -849,7 +850,7 @@ fn prepare_pointer_mutation<'w>(
     let mut resources = PointerStateResources::default();
     let mut interactions = Vec::with_capacity(targets.len());
     for (entity, hover, previous_hover, state, interaction) in
-        query.iter_many_unique_mut(world, access_entities)
+        query.iter_many_unique_mut(world, access_entities).flatten()
     {
         if Some(entity) == hover_entity {
             resources.hover = hover;
@@ -955,11 +956,13 @@ pub(crate) mod tests {
         math::Vec2,
         picking::{
             backend::HitData,
-            events::{Click, Drag, DragEnd, DragEntry, Pointer, Press, Release},
+            events::{
+                DragEntry, PointerClick, PointerDrag, PointerDragEnd, PointerPress, PointerRelease,
+            },
             hover::{HoverMap, PreviousHoverMap},
             pointer::{
                 Location, PointerAction, PointerButton, PointerId, PointerInput,
-                PointerInteraction, PointerLocation, PointerPress,
+                PointerInteraction, PointerLocation, PointerPressState,
             },
         },
         window::{PrimaryWindow, Window, WindowRef},
@@ -1131,7 +1134,7 @@ pub(crate) mod tests {
 
     fn install_pointer_history_observers(app: &mut App) {
         app.world_mut().add_observer(
-            |event: On<Pointer<Press>>, mut deliveries: ResMut<PointerDeliveries>| {
+            |event: On<PointerPress>, mut deliveries: ResMut<PointerDeliveries>| {
                 deliveries
                     .0
                     .entry(event.event_target())
@@ -1140,12 +1143,12 @@ pub(crate) mod tests {
             },
         );
         app.world_mut().add_observer(
-            |event: On<Pointer<Drag>>, mut deliveries: ResMut<PointerDeliveries>| {
+            |event: On<PointerDrag>, mut deliveries: ResMut<PointerDeliveries>| {
                 deliveries.0.entry(event.event_target()).or_default().drags += 1;
             },
         );
         app.world_mut().add_observer(
-            |event: On<Pointer<Release>>, mut deliveries: ResMut<PointerDeliveries>| {
+            |event: On<PointerRelease>, mut deliveries: ResMut<PointerDeliveries>| {
                 deliveries
                     .0
                     .entry(event.event_target())
@@ -1154,12 +1157,12 @@ pub(crate) mod tests {
             },
         );
         app.world_mut().add_observer(
-            |event: On<Pointer<Click>>, mut deliveries: ResMut<PointerDeliveries>| {
+            |event: On<PointerClick>, mut deliveries: ResMut<PointerDeliveries>| {
                 deliveries.0.entry(event.event_target()).or_default().clicks += 1;
             },
         );
         app.world_mut().add_observer(
-            |event: On<Pointer<DragEnd>>, mut deliveries: ResMut<PointerDeliveries>| {
+            |event: On<PointerDragEnd>, mut deliveries: ResMut<PointerDeliveries>| {
                 deliveries
                     .0
                     .entry(event.event_target())
@@ -1311,7 +1314,7 @@ pub(crate) mod tests {
         app.world_mut().spawn((
             application_pointer,
             PointerLocation::new(application_location.clone()),
-            PointerPress::default(),
+            PointerPressState::default(),
             PointerInteraction::default(),
         ));
         app.world_mut().run_schedule(PreUpdate);
@@ -1893,11 +1896,11 @@ pub(crate) mod tests {
         seed_pointer_history(&mut world, &[target]);
         let resource_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inserts = resource_events.clone();
-        world.add_observer(move |_: On<bevy_ecs::lifecycle::Insert, HoverMap>| {
+        world.add_observer(move |_: On<bevy_ecs::lifecycle::Insert<HoverMap>>| {
             inserts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
         let removals = resource_events.clone();
-        world.add_observer(move |_: On<bevy_ecs::lifecycle::Remove, HoverMap>| {
+        world.add_observer(move |_: On<bevy_ecs::lifecycle::Remove<HoverMap>>| {
             removals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
         let unrelated = world.spawn_empty().id();

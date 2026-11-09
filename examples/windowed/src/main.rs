@@ -81,11 +81,14 @@ fn main() {
             }
             BackgroundColor(Color::srgb(0.08, 0.12, 0.19)) Layout Name::new("layout-a")
             Children [
-                (Text({"Shared layout / nested outlet".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }),
-                (Button Node { width: Val::Percent(100.0), height: Val::Px(40.0), padding: UiRect::all(Val::Px(8.0)) }
-                    BackgroundColor(Color::srgb(0.18, 0.27, 0.37)) Counter Name::new("layout-counter")
-                    Children [(Text({"Layout counter: 0 (click +1)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false })]),
-                (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet)
+                Text({"Shared layout / nested outlet".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }
+                --
+                Button Node { width: Val::Percent(100.0), height: Val::Px(40.0), padding: UiRect::all(Val::Px(8.0)) }
+                BackgroundColor(Color::srgb(0.18, 0.27, 0.37)) Counter Name::new("layout-counter")
+                Children [Text({"Layout counter: 0 (click +1)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }
+                ]
+                --
+                Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet
             ]
         })
     });
@@ -103,24 +106,29 @@ fn main() {
                 }
                 BackgroundColor(color) Name::new(name)
                 Children [
-                    (Text({name.to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable { should_block_lower: false, is_hoverable: false }),
-                    (Text({"Click / Space adds one. Scroll, switch pages, then Back.".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }),
-                    (Button Node { width: Val::Px(440.0), height: Val::Px(44.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(8.0)) }
-                        BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton Name::new(format!("{name}-count"))
-                        Children [(Text({"Page count: 0 (click / Space)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false })]),
-                    (Node {
+                    Text({name.to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable { should_block_lower: false, is_hoverable: false }
+                    --
+                    Text({"Click / Space adds one. Scroll, switch pages, then Back.".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }
+                    --
+                    Button Node { width: Val::Px(440.0), height: Val::Px(44.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(8.0)) }
+                    BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton Name::new(format!("{name}-count"))
+                    Children [Text({"Page count: 0 (click / Space)".to_owned()}) Pickable { should_block_lower: false, is_hoverable: false }
+                    ]
+                    --
+                    Node {
                         width: Val::Percent(100.0), height: Val::Px(120.0), flex_shrink: 0.0,
                         overflow: Overflow::scroll_y(),
                     }
                     Name::new(format!("{name}-scroll")) RouteScroll::new("list")
                     BackgroundColor(Color::srgb(0.06, 0.10, 0.16))
-                    Children [(Node {
-                        width: Val::Percent(100.0), min_height: Val::Px(720.0), flex_shrink: 0.0,
-                        padding: UiRect::all(Val::Px(12.0)),
-                        flex_direction: FlexDirection::Column,
-                    } Pickable::IGNORE Children [
-                        (Text({list_text(name)}) Pickable::IGNORE)
-                    ])])
+                    Children [Node {
+                            width: Val::Percent(100.0), min_height: Val::Px(720.0), flex_shrink: 0.0,
+                            padding: UiRect::all(Val::Px(12.0)),
+                            flex_direction: FlexDirection::Column,
+                        } Pickable::IGNORE Children [
+                            Text({list_text(name)}) Pickable::IGNORE
+                        ]
+                    ]
                 ]
             })
         });
@@ -135,18 +143,26 @@ fn main() {
             }
             BackgroundColor(Color::srgb(0.25, 0.27, 0.14)) Name::new("delayed") DelayedPage
             Children [
-                (Text({"Delayed list / explicit restore".to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable::IGNORE),
-                (Button Node { width: Val::Px(440.0), height: Val::Px(36.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(6.0)) }
-                    BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton Name::new("delayed-count")
-                    Children [(Text({"Page count: 0 (click / Space)".to_owned()}) Pickable::IGNORE)]),
-                (Node { column_gap: Val::Px(8.0) } Children [
-                    (Button RestoreControl({RestoreAction::Load}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
-                        Children [(Text({"Load [L]".to_owned()}) Pickable::IGNORE)]),
-                    (Button RestoreControl({RestoreAction::Ready}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
-                        Children [(Text({"Ready [G]".to_owned()}) Pickable::IGNORE)]),
-                    (Button RestoreControl({RestoreAction::Cancel}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
-                        Children [(Text({"Cancel [C]".to_owned()}) Pickable::IGNORE)])
-                ])
+                Text({"Delayed list / explicit restore".to_owned()}) TextFont { font_size: FontSize::Px(24.0) } Pickable::IGNORE
+                --
+                Button Node { width: Val::Px(440.0), height: Val::Px(36.0), flex_shrink: 0.0, padding: UiRect::all(Val::Px(6.0)) }
+                BackgroundColor(Color::srgb(0.12, 0.18, 0.25)) PageButton Name::new("delayed-count")
+                Children [Text({"Page count: 0 (click / Space)".to_owned()}) Pickable::IGNORE
+                ]
+                --
+                Node { column_gap: Val::Px(8.0) } Children [
+                    Button RestoreControl({RestoreAction::Load}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
+                    Children [Text({"Load [L]".to_owned()}) Pickable::IGNORE
+                    ]
+                    --
+                    Button RestoreControl({RestoreAction::Ready}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
+                    Children [Text({"Ready [G]".to_owned()}) Pickable::IGNORE
+                    ]
+                    --
+                    Button RestoreControl({RestoreAction::Cancel}) Node { padding: UiRect::all(Val::Px(6.0)) } BackgroundColor(Color::srgb(0.17, 0.23, 0.32))
+                    Children [Text({"Cancel [C]".to_owned()}) Pickable::IGNORE
+                    ]
+                ]
             ]
         })
     });
@@ -155,7 +171,8 @@ fn main() {
         Ok(bsn! {
             Node { width: Val::Percent(100.0), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(24.0)) }
             Name::new("outside") BackgroundColor(Color::srgb(0.18, 0.15, 0.27))
-            Children [(Text({"Outside layout A. Return to a new child: A keeps its own state.".to_owned()}) Pickable::IGNORE)]
+            Children [Text({"Outside layout A. Return to a new child: A keeps its own state.".to_owned()}) Pickable::IGNORE
+            ]
         })
     });
     let broken = page("broken", |_| {
@@ -170,7 +187,8 @@ fn main() {
         Ok(bsn! {
             Node { width: Val::Percent(100.0), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(24.0)) }
             Name::new("fallback") BackgroundColor(Color::srgb(0.36, 0.12, 0.15))
-            Children [(Text(message) Pickable { should_block_lower: false, is_hoverable: false })]
+            Children [Text(message) Pickable { should_block_lower: false, is_hoverable: false }
+            ]
         })
     };
     let router = app
@@ -325,7 +343,7 @@ fn platform_back(
 }
 
 fn click(
-    event: On<Pointer<Click>>,
+    event: On<PointerClick>,
     actions: Query<&Action>,
     mut counters: Query<&mut Counter>,
     mut pages: Query<&mut PageButton>,
@@ -383,7 +401,7 @@ fn keyboard(
 }
 
 fn restore_click(
-    event: On<Pointer<Click>>,
+    event: On<PointerClick>,
     actions: Query<&RestoreControl>,
     gate: Res<RouterInputGate>,
     activity: RouteActivity,
@@ -501,7 +519,7 @@ fn list_text(name: &str) -> String {
 
 // This is application input behavior; RouteScroll only opts into history storage.
 fn scroll(
-    event: On<Pointer<Scroll>>,
+    event: On<PointerScroll>,
     gate: Res<RouterInputGate>,
     restorations: RouteScrollRestorations,
     mut positions: Query<(&RouteScroll, &mut ScrollPosition)>,
@@ -524,13 +542,13 @@ fn scroll(
     }
 }
 
-fn press(event: On<Pointer<Press>>, pages: Query<(), With<PageButton>>) {
+fn press(event: On<PointerPress>, pages: Query<(), With<PageButton>>) {
     if pages.contains(event.event_target()) {
         println!("Page press {:?}", event.event_target());
     }
 }
 
-fn release(event: On<Pointer<Release>>, pages: Query<(), With<PageButton>>) {
+fn release(event: On<PointerRelease>, pages: Query<(), With<PageButton>>) {
     if pages.contains(event.event_target()) {
         println!("Page release {:?}", event.event_target());
     }

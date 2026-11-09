@@ -704,7 +704,7 @@ fn retained_parent_invalidated_during_child_apply_completes_both_original_cleanu
         .0;
     let invalidate = Arc::new(AtomicBool::new(true));
     fixture.app.world_mut().add_observer(
-        move |event: On<Insert, Page>, pages: Query<&Page>, mut commands: Commands| {
+        move |event: On<Insert<Page>>, pages: Query<&Page>, mut commands: Commands| {
             if pages.get(event.entity).is_ok_and(|page| page.0 == "d")
                 && invalidate.swap(false, Ordering::SeqCst)
             {
@@ -744,7 +744,7 @@ fn retained_parent_disposed_forest_completes_before_host_loss_and_readmission() 
         .history()
         .clone();
     fixture.app.world_mut().add_observer(
-        move |event: On<Despawn, Node>, mut commands: Commands| {
+        move |event: On<Despawn<Node>>, mut commands: Commands| {
             if event.entity == shell {
                 commands.entity(host).remove::<RouterHostRegistration>();
             }
@@ -838,7 +838,7 @@ fn retained_parent_live_forest_host_loss_transfers_original_cleanup_before_termi
     let fired = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&fired);
     fixture.app.world_mut().add_observer(
-        move |event: On<Despawn, Page>, mut commands: Commands| {
+        move |event: On<Despawn<Page>>, mut commands: Commands| {
             if event.entity == child {
                 observed.store(true, Ordering::SeqCst);
                 commands.entity(host).remove::<RouterHostRegistration>();

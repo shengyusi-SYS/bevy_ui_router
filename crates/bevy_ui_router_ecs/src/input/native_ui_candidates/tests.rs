@@ -15,11 +15,11 @@ use bevy_internal::{
 };
 use bevy_picking::{
     Pickable, PickingSystems,
-    events::{Click, Pointer, Press},
+    events::{PointerClick, PointerPress},
     hover::HoverMap,
     pointer::{
         Location, PointerAction, PointerButton, PointerId, PointerInput, PointerInteraction,
-        PointerLocation, PointerPress,
+        PointerLocation, PointerPressState,
     },
 };
 use bevy_scene::{ScenePlugin, bsn};
@@ -252,12 +252,12 @@ fn held_exit_input_candidates_do_not_block_active_or_application_targets() {
             ),
         );
     app.world_mut().add_observer(
-        |event: On<Pointer<Press>>, mut deliveries: ResMut<Deliveries>| {
+        |event: On<PointerPress>, mut deliveries: ResMut<Deliveries>| {
             *deliveries.presses.entry(event.event_target()).or_default() += 1;
         },
     );
     app.world_mut().add_observer(
-        |event: On<Pointer<Click>>, mut deliveries: ResMut<Deliveries>| {
+        |event: On<PointerClick>, mut deliveries: ResMut<Deliveries>| {
             *deliveries.clicks.entry(event.event_target()).or_default() += 1;
         },
     );
@@ -391,7 +391,7 @@ fn held_exit_input_candidates_do_not_block_active_or_application_targets() {
         app.world_mut().spawn((
             id,
             PointerLocation::new(location),
-            PointerPress::default(),
+            PointerPressState::default(),
             PointerInteraction::default(),
         ));
     }

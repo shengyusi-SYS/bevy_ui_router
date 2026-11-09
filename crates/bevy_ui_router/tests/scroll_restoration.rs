@@ -148,26 +148,30 @@ fn fixture(options: FixtureOptions) -> Fixture {
                     flex_direction: FlexDirection::Column,
                 }
                 Children [
-                    (Node {
+                    Node {
                         width: Val::Px(160.0), height: Val::Px(120.0),
                         flex_shrink: 0.0, overflow: Overflow::scroll(),
                     }
                     // The same key is valid in the parent and leaf frames.
                     RouteScroll::new("body") ScrollContainer("prefix")
-                    Children [(Node {
-                        width: Val::Px(600.0), height: Val::Px(800.0), flex_shrink: 0.0,
-                    })]),
-                    (Node {
+                    Children [Node {
+                            width: Val::Px(600.0), height: Val::Px(800.0), flex_shrink: 0.0,
+                        }
+                    ]
+                    --
+                    Node {
                         width: Val::Px(160.0), height: Val::Px(120.0),
                         flex_shrink: 0.0, overflow: Overflow::scroll(),
                     }
                     ScrollContainer("unmarked-prefix")
-                    Children [(Node {
-                        width: Val::Px(600.0), height: Val::Px(800.0), flex_shrink: 0.0,
-                    })]),
-                    (Node {
+                    Children [Node {
+                            width: Val::Px(600.0), height: Val::Px(800.0), flex_shrink: 0.0,
+                        }
+                    ]
+                    --
+                    Node {
                         width: Val::Px(160.0), height: Val::Px(120.0), flex_shrink: 0.0,
-                    } DefaultOutlet)
+                    } DefaultOutlet
                 ]
             })
         })
@@ -229,33 +233,34 @@ fn fixture(options: FixtureOptions) -> Fixture {
                         width: Val::Px(160.0), height: Val::Px(120.0),
                         flex_shrink: 0.0, overflow: Overflow::scroll(),
                     }
-                    { RouteScroll::patch(move |marker, _| {
-                        *marker = RouteScroll::new("body").with_restore_policy(
-                            if options.explicit_body {
-                                RouteScrollRestorePolicy::Explicit
-                            } else {
-                                RouteScrollRestorePolicy::Automatic
-                            },
-                        );
-                    }) }
+                    @{ RouteScroll::patch(move |marker, _| {
+                                *marker = RouteScroll::new("body").with_restore_policy(
+                                    if options.explicit_body {
+                                        RouteScrollRestorePolicy::Explicit
+                                    } else {
+                                        RouteScrollRestorePolicy::Automatic
+                                    },
+                                );
+                        }) }
                     ScrollPosition({ options.initial }) Page(name)
                     ScrollContainer("body")
                     Children [
-                        (Node {
+                        Node {
                             width: Val::Px({ size.x }), height: Val::Px({ size.y }), flex_shrink: 0.0,
                         }
                         PageContent(name)
                         Children [
-                            (Node {
+                            Node {
                                 width: Val::Px(100.0), height: Val::Px(80.0),
                                 flex_shrink: 0.0, overflow: Overflow::scroll(),
                             }
                             RouteScroll::new(if options.duplicate_keys { "body" } else { "secondary" })
                             ScrollContainer("secondary")
-                            Children [(Node {
-                                width: Val::Px(500.0), height: Val::Px(600.0), flex_shrink: 0.0,
-                            })])
-                        ])
+                            Children [Node {
+                                    width: Val::Px(500.0), height: Val::Px(600.0), flex_shrink: 0.0,
+                                }
+                            ]
+                        ]
                     ]
                 })
             })

@@ -112,8 +112,9 @@ fn native_templates_and_internal_outlet_survive_graph_preparation() {
         Node { width: Val::Px(91.0) }
         ContentValue(4)
         Children [
-            (Node { width: Val::Px(13.0) } ContentValue(5)),
-            (Node { flex_grow: 1.0 } DefaultOutlet ContentValue(6))
+            Node { width: Val::Px(13.0) } ContentValue(5)
+            --
+            Node { flex_grow: 1.0 } DefaultOutlet ContentValue(6)
         ]
     };
     let prepared = prepare_bsn_scene(app.world(), Box::new(scene)).unwrap();

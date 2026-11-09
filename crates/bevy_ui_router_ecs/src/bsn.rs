@@ -221,7 +221,7 @@ fn prepare_declarations(
         .map_err(|_| BsnPreparationError::Capacity)?;
     pending.push((&mut root.scene, None));
     while let Some((scene, parent)) = pending.pop() {
-        // 0.19.1 has no cached getter. Inserting the ChildOf collection ensures
+        // 0.20.1 has no cached getter. Inserting the ChildOf collection ensures
         // include_cached cannot succeed/mutate this scene: an existing cache
         // produces MultipleCached; otherwise the nonempty related map yields
         // LateCached. This is also the documented empty-Children leaf behavior.

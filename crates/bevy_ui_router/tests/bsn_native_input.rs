@@ -17,11 +17,13 @@ use bevy_internal::{
     window::{PrimaryWindow, Window, WindowRef},
 };
 use bevy_picking::{
-    events::{Click, Drag, DragEnd, Pointer, PointerState, Press, Release},
+    events::{
+        PointerClick, PointerDrag, PointerDragEnd, PointerPress, PointerRelease, PointerState,
+    },
     hover::{HoverMap, PickingInteraction, PreviousHoverMap},
     pointer::{
         Location, PointerAction, PointerButton, PointerId, PointerInput, PointerInteraction,
-        PointerLocation, PointerPress,
+        PointerLocation, PointerPressState,
     },
 };
 use bevy_scene::{ScenePlugin, bsn};
@@ -46,7 +48,7 @@ struct PointerDeliveries(BTreeMap<Entity, Deliveries>);
 fn observe_pointer_delivery(app: &mut App) {
     app.init_resource::<PointerDeliveries>();
     app.world_mut().add_observer(
-        |event: On<Pointer<Press>>, mut deliveries: ResMut<PointerDeliveries>| {
+        |event: On<PointerPress>, mut deliveries: ResMut<PointerDeliveries>| {
             deliveries
                 .0
                 .entry(event.event_target())
@@ -55,12 +57,12 @@ fn observe_pointer_delivery(app: &mut App) {
         },
     );
     app.world_mut().add_observer(
-        |event: On<Pointer<Drag>>, mut deliveries: ResMut<PointerDeliveries>| {
+        |event: On<PointerDrag>, mut deliveries: ResMut<PointerDeliveries>| {
             deliveries.0.entry(event.event_target()).or_default().drags += 1;
         },
     );
     app.world_mut().add_observer(
-        |event: On<Pointer<Release>>, mut deliveries: ResMut<PointerDeliveries>| {
+        |event: On<PointerRelease>, mut deliveries: ResMut<PointerDeliveries>| {
             deliveries
                 .0
                 .entry(event.event_target())
@@ -69,12 +71,12 @@ fn observe_pointer_delivery(app: &mut App) {
         },
     );
     app.world_mut().add_observer(
-        |event: On<Pointer<Click>>, mut deliveries: ResMut<PointerDeliveries>| {
+        |event: On<PointerClick>, mut deliveries: ResMut<PointerDeliveries>| {
             deliveries.0.entry(event.event_target()).or_default().clicks += 1;
         },
     );
     app.world_mut().add_observer(
-        |event: On<Pointer<DragEnd>>, mut deliveries: ResMut<PointerDeliveries>| {
+        |event: On<PointerDragEnd>, mut deliveries: ResMut<PointerDeliveries>| {
             deliveries
                 .0
                 .entry(event.event_target())
@@ -377,7 +379,7 @@ fn native_input_journey_with_target(
         app.world_mut().spawn((
             pointer,
             PointerLocation::new(location),
-            PointerPress::default(),
+            PointerPressState::default(),
             PointerInteraction::default(),
         ));
     }
@@ -1174,12 +1176,11 @@ mod live_content_eligibility_review {
         assert!(app.world().get::<bevy_ui::CalculatedClip>(child).is_none());
         app.world_mut().get_mut::<Node>(parent).unwrap().display = bevy_ui::Display::None;
         app.update();
-        assert_eq!(
+        assert!(
             app.world()
                 .get::<bevy_ui::CalculatedClip>(child)
                 .unwrap()
-                .clip,
-            bevy_internal::math::Rect::default()
+                .is_fully_clipped()
         );
         app.world_mut().get_mut::<Node>(parent).unwrap().display = bevy_ui::Display::Flex;
         app.update();
@@ -1207,9 +1208,11 @@ mod live_content_eligibility_review {
             .register_bsn_view(ViewDriverKey::new("hidden-outlet-layout").unwrap(), move |_| {
                 let display = if initially_hidden { bevy_ui::Display::None } else { bevy_ui::Display::Flex };
                 Ok(
-                    bsn! { Node { width: Val::Px(120.0), height: Val::Px(100.0) } Children [
-                        (Node { width: Val::Px(120.0), height: Val::Px(100.0), display: display } DefaultOutlet ReviewParent)
-                    ] },
+                    bsn! {
+                        Node { width: Val::Px(120.0), height: Val::Px(100.0) } Children [
+                            Node { width: Val::Px(120.0), height: Val::Px(100.0), display: display } DefaultOutlet ReviewParent
+                        ]
+                    },
                 )
             })
             .unwrap();
@@ -1354,7 +1357,6 @@ mod inactive_native_journeys {
     #[derive(Component, Clone, Default)]
     struct InactiveTarget;
 
-    #[derive(Clone)]
     struct PendingRoot;
     impl Template for PendingRoot {
         type Output = ();
@@ -1368,7 +1370,7 @@ mod inactive_native_journeys {
             Ok(())
         }
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self
         }
     }
 
@@ -1523,7 +1525,7 @@ mod inactive_native_journeys {
             app.world_mut().spawn((
                 *pointer,
                 PointerLocation::new(location.clone()),
-                PointerPress::default(),
+                PointerPressState::default(),
                 PointerInteraction::default(),
             ));
         }
@@ -1642,7 +1644,6 @@ mod inactive_native_journeys {
         );
     }
 
-    #[derive(Clone)]
     struct PreserveApplicationChildThenFail(Entity);
     impl Template for PreserveApplicationChildThenFail {
         type Output = ();
@@ -1658,7 +1659,7 @@ mod inactive_native_journeys {
             Err("native retained pointer apply source".into())
         }
         fn clone_template(&self) -> Self {
-            self.clone()
+            Self(self.0.clone())
         }
     }
 

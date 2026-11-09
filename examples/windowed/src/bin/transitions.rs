@@ -108,14 +108,19 @@ fn main() {
                 }
                 BackgroundColor(color) Name::new(format!("{name}-page"))
                 Children [
-                    (Text(title) TextFont { font_size: FontSize::Px(34.0) } Pickable::IGNORE),
-                    (Text({"The router publishes the route. This application animates its surface.".to_owned()}) Pickable::IGNORE),
-                    (Button PageCounter Name::new(format!("{name}-counter"))
-                        Node { width: Val::Px(330.0), padding: UiRect::all(Val::Px(18.0)) }
-                        BackgroundColor(Color::srgb(0.07, 0.10, 0.16))
-                        Children [(Text({"Page count: 0 (click +1)".to_owned()}) Pickable::IGNORE)]),
-                    (Node { flex_grow: 1.0 } Pickable::IGNORE),
-                    (Text({"Try E, then navigate again. Try H for enter-only presentation.\nR sends new requests before earlier animations finish.".to_owned()}) Pickable::IGNORE)
+                    Text(title) TextFont { font_size: FontSize::Px(34.0) } Pickable::IGNORE
+                    --
+                    Text({"The router publishes the route. This application animates its surface.".to_owned()}) Pickable::IGNORE
+                    --
+                    Button PageCounter Name::new(format!("{name}-counter"))
+                    Node { width: Val::Px(330.0), padding: UiRect::all(Val::Px(18.0)) }
+                    BackgroundColor(Color::srgb(0.07, 0.10, 0.16))
+                    Children [Text({"Page count: 0 (click +1)".to_owned()}) Pickable::IGNORE
+                    ]
+                    --
+                    Node { flex_grow: 1.0 } Pickable::IGNORE
+                    --
+                    Text({"Try E, then navigate again. Try H for enter-only presentation.\nR sends new requests before earlier animations finish.".to_owned()}) Pickable::IGNORE
                 ]
             })
         });
@@ -134,7 +139,8 @@ fn main() {
         Ok(bsn! {
             Node { width: Val::Percent(100.0), height: Val::Percent(100.0), padding: UiRect::all(Val::Px(30.0)) }
             BackgroundColor(Color::srgb(0.35, 0.08, 0.1))
-            Children [(Text(message) Pickable::IGNORE)]
+            Children [Text(message) Pickable::IGNORE
+            ]
         })
     });
     let router = app
@@ -325,7 +331,7 @@ fn keyboard(
 }
 
 fn click(
-    event: On<Pointer<Click>>,
+    event: On<PointerClick>,
     actions: Query<&Action>,
     mut counters: Query<&mut PageCounter>,
     gate: Res<RouterInputGate>,

@@ -191,7 +191,12 @@ impl Fixture {
         let page_calls = factory_calls.clone();
         let layout = app
             .register_bsn_view(ViewDriverKey::new("layout").unwrap(), |_| {
-                Ok(bsn! { Node Layout Children [(Node Toolbar(73)), (Node DefaultOutlet)] })
+                Ok(bsn! {
+                    Node Layout Children [Node Toolbar(73)
+                        --
+                        Node DefaultOutlet
+                    ]
+                })
             })
             .unwrap();
         let page = app

@@ -932,10 +932,13 @@ mod tests {
         ));
         let driver = app
             .register_bsn_view(ViewDriverKey::new("cleanup-native").unwrap(), |_| {
-                Ok(bsn! { Node { width: Val::Px(101.0) } Children [
-                    (Node { width: Val::Px(21.0) }),
-                    (Node { width: Val::Px(22.0) })
-                ] })
+                Ok(bsn! {
+                    Node { width: Val::Px(101.0) } Children [
+                        Node { width: Val::Px(21.0) }
+                        --
+                        Node { width: Val::Px(22.0) }
+                    ]
+                })
             })
             .unwrap();
         let view = RouteViewKey::new("native").unwrap();

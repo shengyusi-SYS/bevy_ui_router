@@ -3582,7 +3582,7 @@ fn registered_same_batch_reparent_uses_actual_leaf_order_and_individual_removal_
     world.insert_resource(QuarantineLeaseTable::new());
     world.insert_resource(DespawnOrder::default());
     world.add_observer(
-        |event: On<Despawn, RecordDespawn>, mut order: ResMut<DespawnOrder>| {
+        |event: On<Despawn<RecordDespawn>>, mut order: ResMut<DespawnOrder>| {
             order.0.push(event.entity);
         },
     );

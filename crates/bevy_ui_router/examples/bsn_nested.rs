@@ -77,14 +77,16 @@ fn main() {
             Node { width: Val::Px(480.0), height: Val::Px(240.0) }
             Layout
             Children [
-                (Node { width: Val::Px(80.0), height: Val::Percent(100.0) } Sidebar),
-                (Node {
+                Node { width: Val::Px(80.0), height: Val::Percent(100.0) } Sidebar
+                --
+                Node {
                     width: Val::Px(400.0), height: Val::Percent(100.0),
                     flex_direction: FlexDirection::Column,
                 } MainColumn Children [
-                    (Node { width: Val::Percent(100.0), height: Val::Px(32.0) } ToolbarState),
-                    (Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet WorkspaceOutlet)
-                ])
+                    Node { width: Val::Percent(100.0), height: Val::Px(32.0) } ToolbarState
+                    --
+                    Node { width: Val::Percent(100.0), flex_grow: 1.0 } DefaultOutlet WorkspaceOutlet
+                ]
             ]
         })
     })
@@ -265,15 +267,16 @@ fn content_page(name: &'static str) -> BsnRoute {
                 width: Val::Px(360.0), height: Val::Px(160.0),
                 flex_shrink: 0.0, overflow: Overflow::scroll(),
             }
-            { RouteScroll::patch(|marker, _| {
-                *marker = RouteScroll::new("body")
-                    .with_restore_policy(RouteScrollRestorePolicy::Explicit);
-            }) }
+            @{ RouteScroll::patch(|marker, _| {
+                        *marker = RouteScroll::new("body")
+                        .with_restore_policy(RouteScrollRestorePolicy::Explicit);
+                }) }
             Page(name)
-            Children [(Node {
-                width: Val::Px(720.0), flex_shrink: 0.0,
-                flex_direction: FlexDirection::Column,
-            } PageBody)]
+            Children [Node {
+                    width: Val::Px(720.0), flex_shrink: 0.0,
+                    flex_direction: FlexDirection::Column,
+                } PageBody
+            ]
         })
     })
 }

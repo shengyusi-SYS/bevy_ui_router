@@ -313,7 +313,6 @@ fn facade_native_root_and_internal_outlets_preserve_live_siblings() {
     }
 }
 
-#[derive(Clone)]
 struct FailNativeTemplate(String);
 
 impl bevy_ecs::template::Template for FailNativeTemplate {
@@ -325,7 +324,7 @@ impl bevy_ecs::template::Template for FailNativeTemplate {
         Err(bevy_ecs::error::BevyError::error(self.0.clone()))
     }
     fn clone_template(&self) -> Self {
-        self.clone()
+        Self(self.0.clone())
     }
 }
 
@@ -452,7 +451,7 @@ fn facade_native_root_publishes_and_refreshes_dynamic_content() {
         ScenePlugin,
     ));
     let driver = app.register_bsn_view(ViewDriverKey::new("native").unwrap(), |_| {
-        Ok(bsn! { Node { width: Val::Px(157.0) } NativePage Children [(Node { height: Val::Px(29.0) })] })
+        Ok(bsn! { Node { width: Val::Px(157.0) } NativePage Children [Node { height: Val::Px(29.0) }] })
     }).unwrap();
     let view = RouteViewKey::new("page").unwrap();
     let routes = RouteTree::builder()
@@ -680,7 +679,7 @@ fn assert_cleanup_observer_returns_application_content(content: usize) {
         escaped: None,
     });
     app.add_observer(
-        |event: On<Despawn, EscapeOnDespawn>,
+        |event: On<Despawn<EscapeOnDespawn>>,
          mut commands: Commands,
          mut observation: ResMut<EscapeObservation>| {
             observation.callback_count += 1;

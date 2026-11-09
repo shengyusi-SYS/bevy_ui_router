@@ -3231,9 +3231,9 @@ pub(crate) mod tests {
         let expected = ComponentManifest::from_world(&world, entity).unwrap();
         for clipped in [true, false, true] {
             if clipped {
-                world.entity_mut(entity).insert(bevy_ui::CalculatedClip {
-                    clip: Default::default(),
-                });
+                world
+                    .entity_mut(entity)
+                    .insert(bevy_ui::CalculatedClip::default());
             } else {
                 world.entity_mut(entity).remove::<bevy_ui::CalculatedClip>();
             }
