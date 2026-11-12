@@ -1,0 +1,21 @@
+# This compatibility branch targets the incremental UI backport.
+# Consumers must provide equivalent application-root Bevy patches.
+[patch.crates-io]
+bevy_app = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_asset = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_camera = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_color = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_ecs = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_input = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_input_focus = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_internal = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_picking = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_reflect = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_scene = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_time = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_ui = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_window = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_log = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_platform = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }
+bevy_utils = { git = "https://github.com/shengyusi-SYS/bevy.git", branch = "dev-lianyin" }

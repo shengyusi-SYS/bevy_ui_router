@@ -12,9 +12,7 @@ use bevy_ecs::{
 };
 use bevy_ui::{
     ComputedNode, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, ContentSize, Node,
-    ScrollPosition, UiGlobalTransform, UiTransform,
-    experimental::{UiChildren, UiRootNodes},
-    ui_surface::UiSurface,
+    ScrollPosition, UiGlobalTransform, UiTransform, layout_tree::ComputedLayout,
 };
 use bevy_ui_router_core::{
     fingerprint::RouteSegmentReuseKey,
@@ -818,13 +816,12 @@ pub(crate) fn settle_scroll_system(
 
 #[derive(SystemParam)]
 pub(crate) struct ScrollLayout<'w, 's> {
-    roots: UiRootNodes<'w, 's>,
-    children: UiChildren<'w, 's>,
     nodes: Query<
         'w,
         's,
         (
             &'static ComputedNode,
+            &'static ComputedLayout,
             &'static ComputedUiRenderTargetInfo,
             &'static ComputedUiTargetCamera,
         ),
@@ -843,24 +840,21 @@ fn laid_out_containers(
     containers: &[Container],
     layout: &mut SystemState<ScrollLayout<'static, 'static>>,
 ) -> HashSet<Entity> {
-    if containers.is_empty() || !world.contains_resource::<UiSurface>() {
+    if containers.is_empty() {
         return HashSet::new();
     }
     let Ok(ScrollLayout {
-        roots,
-        children,
         nodes: layout_nodes,
         cameras,
     }) = layout.get(world)
     else {
         return HashSet::new();
     };
-    let roots = roots.iter().collect::<HashSet<_>>();
-    let surface = world.resource::<UiSurface>();
     containers
         .iter()
         .filter_map(|container| {
-            let (node, info, target_camera) = layout_nodes.get(container.entity).ok()?;
+            let (node, computed_layout, info, target_camera) =
+                layout_nodes.get(container.entity).ok()?;
             let camera = target_camera.get()?;
             if cameras.get(camera).is_err()
                 || info.physical_size().min_element() == 0
@@ -872,31 +866,9 @@ fn laid_out_containers(
             {
                 return None;
             }
-            let mut entity = container.entity;
-            let mut seen = HashSet::new();
-            loop {
-                if layout_nodes.get(entity).is_err() {
-                    return None;
-                }
-                if roots.contains(&entity) {
-                    break;
-                }
-                if !seen.insert(entity) {
-                    return None;
-                }
-                let parent = children.get_parent(entity)?;
-                if !children
-                    .iter_ui_children(parent)
-                    .any(|child| child == entity)
-                {
-                    return None;
-                }
-                entity = parent;
-            }
-            surface
-                .root_entity_to_viewport_node
-                .contains_key(&entity)
-                .then_some(container.entity)
+            // Bevy owns reachability and layout cache validity. Detached or
+            // invalid trees have their ComputedLayout cleared by UiSystems::Layout.
+            computed_layout.has_layout().then_some(container.entity)
         })
         .collect()
 }
