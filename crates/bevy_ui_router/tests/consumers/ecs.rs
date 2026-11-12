@@ -9,10 +9,14 @@ use bevy_ui_router::prelude::*;
 #[derive(Component)]
 struct HostSentinel(u32);
 
-fn tick_active_content(activity: RouteActivity, inputs: RouteInputs, mut work: Query<(Entity, &mut HostSentinel)>) {
+fn tick_active_content(queries: RouteQueries, mut work: Query<(Entity, &mut HostSentinel)>) {
+    let reader = queries.read();
     for (entity, mut sentinel) in &mut work {
-        assert!(inputs.current(entity).is_none(), "app-owned host has no route input");
-        if activity.is_active(entity) {
+        assert!(
+            reader.current(entity).is_none(),
+            "app-owned host has no route input"
+        );
+        if reader.is_active(entity) {
             sentinel.0 += 1;
         }
     }

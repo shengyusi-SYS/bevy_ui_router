@@ -802,7 +802,7 @@ fn main() {
     };
     assert!(samples > 0);
     eprintln!(
-        "Router baseline: {}-{}, optimized={}, shape={shape:?}, samples={samples}, idle frames/sample={IDLE_BATCH}; {}",
+        "Router baseline: {}-{}, optimized={}, shape={shape:?}, samples={samples}; CSV records updates/sample; {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         !cfg!(debug_assertions),

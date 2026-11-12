@@ -189,8 +189,8 @@ fn main() {
     assert!(app.world().get_entity(help_page).is_err());
     let restoration = app
         .world_mut()
-        .run_system_once(move |restorations: RouteScrollRestorations| {
-            restorations.pending(returned_overview, "body")
+        .run_system_once(move |queries: RouteQueries| {
+            queries.read().pending(returned_overview, "body")
         })
         .unwrap()
         .expect("Back freezes the original entry's scroll for the fresh child");
@@ -207,8 +207,8 @@ fn main() {
     assert_scroll(&app, returned_overview, saved_scroll);
     assert!(
         app.world_mut()
-            .run_system_once(move |restorations: RouteScrollRestorations| {
-                restorations.pending(returned_overview, "body")
+            .run_system_once(move |queries: RouteQueries| {
+                queries.read().pending(returned_overview, "body")
             })
             .unwrap()
             .is_none()
@@ -259,7 +259,7 @@ fn main() {
 }
 
 /// The factory creates the page once. Its current published location is read
-/// through RouteInputs when application work starts or installs its result.
+/// through RouteQueries when application work starts or installs its result.
 fn content_page(name: &'static str) -> BsnRoute {
     page(name, move |_| {
         Ok(bsn! {
@@ -285,14 +285,16 @@ fn content_page(name: &'static str) -> BsnRoute {
 /// Router lifecycle capability. A real application can replace this computation
 /// with its own data source without changing the route or scroll contracts.
 fn load_content(app: &mut App, page: Entity) {
-    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
-    let source = inputs
-        .get(app.world())
-        .unwrap()
-        .current(page)
-        .expect("the application starts work for its active page")
-        .location()
-        .clone();
+    let mut query_state = bevy_ecs::system::SystemState::<RouteQueries>::new(app.world_mut());
+    let source = {
+        let queries = query_state.get(app.world()).unwrap();
+        let reader = queries.read();
+        reader
+            .current(page)
+            .expect("the application starts work for its active page")
+            .location()
+            .clone()
+    };
     let task_source = source.clone();
     let task = AsyncComputeTaskPool::get().spawn(async move {
         future::yield_now().await;
@@ -319,13 +321,13 @@ fn install_loaded_content(
     mut commands: Commands,
     mut tasks: Query<(Entity, &mut ContentTask)>,
     bodies: Query<(Entity, &ChildOf), With<PageBody>>,
-    inputs: RouteInputs,
-    restorations: RouteScrollRestorations,
+    queries: RouteQueries,
 ) {
+    let reader = queries.read();
     for (page, mut task) in &mut tasks {
         // This application chooses to install only on active pages. Keeping a
         // task while hidden is a policy choice; retention does not cancel it.
-        let Some(current) = inputs.current(page) else {
+        let Some(current) = reader.current(page) else {
             continue;
         };
         let Some(result) = block_on(poll_once(&mut task.0)) else {
@@ -354,17 +356,18 @@ fn install_loaded_content(
         // These Commands install content before the normal layout/scroll pass.
         // Look up the current intent now rather than carrying an old restore ID
         // through the task or guessing readiness from a number of frames.
-        if let Some(intent) = restorations.pending(page, "body") {
+        if let Some(intent) = reader.pending(page, "body") {
             commands.ready_route_scroll(intent.id());
         }
     }
 }
 
 fn assert_current_input(app: &mut App, target: Entity, expected: Option<&RouteLocation>) {
-    let mut inputs = bevy_ecs::system::SystemState::<RouteInputs>::new(app.world_mut());
-    let input = inputs.get(app.world()).unwrap();
+    let mut query_state = bevy_ecs::system::SystemState::<RouteQueries>::new(app.world_mut());
+    let queries = query_state.get(app.world()).unwrap();
+    let reader = queries.read();
     assert_eq!(
-        input.current(target).map(|input| input.location()),
+        reader.current(target).map(|input| input.location()),
         expected
     );
 }

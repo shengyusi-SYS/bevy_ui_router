@@ -26,13 +26,13 @@ Search compares optional raw strings exactly. Missing, empty, `?` prefixes, key 
 | Only fragment changes | Keep ancestors and rebuild the deepest normal frame; keep frame/slot identities and advance generation |
 | Canonical path, search, and fragment are equivalent | Keep the normal presentation structure; history still follows the command, and explicit scroll restoration may write positions |
 
-A fresh or rebuilt view receives an immutable `RouteViewInput` factory snapshot. Preserved layouts and retained hits keep their local state and skip the factory. Applications read this publication's inputs with `RouteInputs::current(Entity)`.
+A fresh or rebuilt view receives an immutable `RouteViewInput` factory snapshot. Preserved layouts and retained hits keep their local state and skip the factory. Applications call `RouteQueries::read()` before a query loop, then read this publication's inputs with the reader's `current(Entity)`.
 
-`BsnRoute::preserve_on_search()` (or the lower-level `RouteNodeOptions::with_preserve_on_search(true)`) opts a node into reuse across raw search changes; the default is false. It applies to both current-prefix reuse and retained hits while keeping params, route/view/slot/key, and parent-scope identity checks. Each level opts in separately. When search and fragment both change and the whole chain would otherwise be reusable, ancestors remain and the deepest frame rebuilds with a new generation. Preserved content reads new search values through `RouteInputs::current`.
+`BsnRoute::preserve_on_search()` (or the lower-level `RouteNodeOptions::with_preserve_on_search(true)`) opts a node into reuse across raw search changes; the default is false. It applies to both current-prefix reuse and retained hits while keeping params, route/view/slot/key, and parent-scope identity checks. Each level opts in separately. When search and fragment both change and the whole chain would otherwise be reusable, ancestors remain and the deepest frame rebuilds with a new generation. Preserved content reads new search values through the reader's `current`.
 
 `RouteInputRef` has five read-only getters: `route()`, `params()`, `location()`, `origin()`, and `failure()`. Search/fragment are available through `location()`. Params belong to the local route; the full location belongs to the current presentation. Normal frames have no failure. A route-error frame uses the boundary route, its local params, and the original failure; normal ancestors keep no failure. Router fallback has no route, empty params, and the original failure. Error/fallback location is the failed request's location.
 
-`RouteInputs::current` already checks activity; reading current inputs does not require a separate `RouteActivity` call. Publication switches all target inputs together, including preserved and retained content. Pending, stale, or rejected work leaves active inputs unchanged. Inactive content returns no current inputs. New inputs are available immediately after publication, before request termination. Structural no-ops add no physical writes for input updates. See [activity queries](input-focus.md#page-activity-queries) for entity scope and borrowing.
+`RouteQueryReader::current` already checks activity; reading current inputs does not require a separate `is_active` call. Publication switches all target inputs together, including preserved and retained content. Pending, stale, or rejected work leaves active inputs unchanged. Inactive content returns no current inputs. New inputs are available immediately after publication, before request termination. Structural no-ops add no physical writes for input updates. See [activity queries](input-focus.md#page-activity-queries) for entity scope and borrowing.
 
 Active error presentations use the normal execution path instead of the equivalent-normal-navigation shortcut. Reuse checks include route-tree provenance and route/slot/explicit-key identity.
 
@@ -60,7 +60,7 @@ A history entry identifies a visit; retention identifies a page instance. Multip
 
 ## Requests, history, and presentation
 
-`RouterNavigation::{push,replace,back}` enqueues immediately, returning a real request ID or `NavigationEnqueueError`. `commands.router(handle)` provides deferred Push/Replace/Back, invoking that same entry point when Bevy applies Commands. It can coexist with `RouteInputs` and application component queries in one system without borrowing the mutable navigation resource.
+`RouterNavigation::{push,replace,back}` enqueues immediately, returning a real request ID or `NavigationEnqueueError`. `commands.router(handle)` provides deferred Push/Replace/Back, invoking that same entry point when Bevy applies Commands. It can coexist with `RouteQueries` and application component queries in one system without borrowing the mutable navigation resource.
 
 Commands convert string destinations through `RouteLocation::from_address`; structured locations retain their values. The methods return no synchronous request ID and do not guarantee publication in the current update. Enqueue failures call Bevy's warning handler by default; `.with_error_handler(handler)` selects an application handler. `NavigationCommandError` retains the Router, `NavigationKind`, and original `NavigationEnqueueError`. Rejected enqueue attempts have no request ID; execution failures after admission remain visible in snapshots.
 
@@ -88,7 +88,7 @@ When a normal page leaves, Router saves the last valid displayed two-dimensional
 
 Successful Back freezes restoration intents for saved frame/key pairs in the target entry, including retained hits and preserved prefixes. Containers may already exist or appear later. Push/Replace keep current values for live/reused instances, while fresh Scenes use initial values. A target with no record keeps its current value. Navigation can terminate while content is still becoming ready.
 
-Each publication creates fresh opaque intent IDs, even for repeated Back to the same entry, frame, or Entity. `RouteScrollRestorations::pending(scope_entity, key)` queries the frozen position and ID from any content in the exact active frame, including before the container exists. An intent binds once to one container, recording its original Entity, frame, key, policy, and position. Losing that binding or changing the key/policy consumes the intent rather than transferring it to a replacement Entity.
+Each publication creates fresh opaque intent IDs, even for repeated Back to the same entry, frame, or Entity. `RouteQueryReader::pending(scope_entity, key)` queries the frozen position and ID from any content in the exact active frame, including before the container exists. An intent binds once to one container, recording its original Entity, frame, key, policy, and position. Losing that binding or changing the key/policy consumes the intent rather than transferring it to a replacement Entity.
 
 The default `Automatic` policy attempts restoration on the first normal layout after binding. `with_restore_policy(RouteScrollRestorePolicy::Explicit)` waits for `ready_route_scroll(id)` through `Commands`; ready may arrive before a late container. A new publication cancels old intents. Enqueueing, unpublished preparation, and failure that preserves current content leave the current intent intact. Old or consumed IDs have no effect.
 
@@ -106,7 +106,7 @@ Queued and last-terminal requests remain distinct from the running request. An e
 
 Read this update's snapshots after `RouterScheduleSet::PublishSnapshots` in `Update`. ECS owns the internal observe/drive/commit/cleanup ordering.
 
-`RouterSnapshots` is marked changed only when observable values change, so Bevy change detection can skip unchanged projections. This signal covers all Routers and requests. Query current content ownership and activity through `RouteInputs` / `RouteActivity`; those facts and scrolling may change independently of snapshots.
+`RouterSnapshots` is marked changed only when observable values change, so Bevy change detection can skip unchanged projections. This signal covers all Routers and requests. Query current content ownership and activity through a `RouteQueries` reader; those facts and scrolling may change independently of snapshots.
 
 Diagnostics identify Router/request, route when matched, failure source, and phase. They distinguish recovery failures from post-publication anomalies and record semantic transitions rather than polling iterations.
 

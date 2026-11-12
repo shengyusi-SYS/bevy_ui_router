@@ -14,7 +14,7 @@ Simpler setup compiles declarations into the existing route tree and installatio
 
 ## Visits, instances, and physical responsibility
 
-A history entry represents a visit, an instance preserves entities and local state, and an owner holds execution responsibility. One instance can serve several visits, so scroll records belong to entries. Build input is a snapshot of one execution; reused instances obtain current input through `RouteInputs`.
+A history entry represents a visit, an instance preserves entities and local state, and an owner holds execution responsibility. One instance can serve several visits, so scroll records belong to entries. Build input is a snapshot of one execution; reused instances obtain current input through a `RouteQueries` reader's `current` method.
 
 Nested navigation preserves shared layouts. Parents and children choose keep-alive independently. Returning to P/D lets inventory decide whether P can be reused while the current route selects D. Each holds its own payload and exact parent dependency, preserving toolbar state while allowing a fresh child page.
 
@@ -40,11 +40,11 @@ Component and relationship writes can synchronously trigger hooks and observers.
 
 ## Activity, input, and background work
 
-Applications use `RouteActivity` to decide whether page systems keep working. Activity queries check the nearest registered boundary and the complete parent mounting chain. Page activity, authored visibility, and the input gate each serve a separate purpose.
+Applications use a `RouteQueries` reader's `is_active` method to decide whether page systems keep working. Activity queries check the nearest registered boundary and the complete parent mounting chain. Page activity, authored visibility, and the input gate each serve a separate purpose.
 
 Revocation handles current and previous hover, press/click/drag state, and focus while preserving other valid targets. Focus candidates also preserve operation order: later set/clear operations replace earlier candidates, even when the final value is equal.
 
-Page systems can combine read-only `RouteInputs`, mutable application queries, and Commands navigation without splitting one user action across systems. Use mutable `RouterNavigation` when an immediate request ID or synchronous enqueue-error handling is needed, arranging compatible resource borrows and scheduling.
+Page systems can combine `RouteQueries`, mutable application queries, and Commands navigation without splitting one user action across systems. Call `read()` once before a loop so activity, inputs, and pending-scroll lookups share observations of the borrowed metadata. Use mutable `RouterNavigation` when an immediate request ID or synchronous enqueue-error handling is needed, arranging compatible resource borrows and scheduling.
 
 ## Future native input integration
 

@@ -35,13 +35,25 @@ impl AppWork {
 // This is an ordinary application system with mutable application state. The
 // Router query must not borrow all components or depend on input eligibility.
 fn perform_active_work(
+    queries: RouteQueries,
     activity: RouteActivity,
     inputs: RouteInputs,
     mut work: Query<(Entity, &mut AppWork)>,
 ) {
+    let routes = queries.read();
     for (entity, mut work) in &mut work {
-        work.active = activity.is_active(entity);
-        let input = inputs.current(entity);
+        work.active = routes.is_active(entity);
+        assert_eq!(work.active, activity.is_active(entity));
+        let input = routes.current(entity);
+        let original = inputs.current(entity);
+        assert_eq!(
+            input.as_ref().map(|i| i.location()),
+            original.as_ref().map(|i| i.location())
+        );
+        assert_eq!(
+            input.as_ref().map(|i| i.params()),
+            original.as_ref().map(|i| i.params())
+        );
         assert_eq!(
             input.is_some(),
             work.active,
@@ -55,7 +67,8 @@ fn perform_active_work(
     }
 }
 
-fn observe_current_inputs(inputs: RouteInputs, mut work: Query<(Entity, &mut AppWork)>) {
+fn observe_current_inputs(queries: RouteQueries, mut work: Query<(Entity, &mut AppWork)>) {
+    let inputs = queries.read();
     for (entity, mut work) in &mut work {
         let current = inputs.current(entity);
         work.current_location = current.as_ref().map(|input| input.location().clone());
@@ -405,4 +418,36 @@ fn application_query_tracks_active_content_retention_and_exact_router_host() {
         .unwrap();
     assert!(!work(&app, other_router).active);
     assert!(!work(&app, other_layout).active);
+}
+
+#[test]
+fn a_new_reader_observes_host_replacement_within_one_system_run() {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        ScenePlugin,
+        BevyUiRouterPlugin,
+    ));
+    let (router, host) = install_router(&mut app, "reader");
+    app.update();
+    navigate(&mut app, router, 1);
+    let target = target(&mut app, "reader", 1);
+    app.world_mut()
+        .run_system_once(
+            move |mut params: ParamSet<(RouteQueries, Query<&mut RouterHostRegistration>)>| {
+                {
+                    let queries = params.p0();
+                    let routes = queries.read();
+                    assert!(routes.is_active(target));
+                    assert!(routes.current(target).is_some());
+                }
+                *params.p1().get_mut(host).unwrap() = RouterHostRegistration::new(router);
+                let queries = params.p0();
+                let routes = queries.read();
+                assert!(!routes.is_active(target));
+                assert!(routes.current(target).is_none());
+            },
+        )
+        .unwrap();
 }

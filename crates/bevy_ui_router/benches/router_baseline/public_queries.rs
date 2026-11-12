@@ -12,6 +12,9 @@ enum Api {
     Activity,
     Inputs,
     Scroll,
+    ReaderActivity,
+    ReaderInputs,
+    ReaderScroll,
 }
 
 impl Api {
@@ -21,6 +24,16 @@ impl Api {
             Self::Activity => "legacy_activity",
             Self::Inputs => "legacy_inputs",
             Self::Scroll => "legacy_scroll_miss",
+            Self::ReaderActivity => "reader_activity",
+            Self::ReaderInputs => "reader_inputs",
+            Self::ReaderScroll => "reader_scroll_miss",
+        }
+    }
+
+    fn pending_result(self) -> &'static str {
+        match self {
+            Self::Scroll | Self::ReaderScroll => "none",
+            _ => "n/a",
         }
     }
 }
@@ -107,6 +120,40 @@ fn scroll_loop(
     }
 }
 
+fn reader_loop(
+    config: Res<Workload>,
+    queries: RouteQueries,
+    mut work: Query<(Entity, &mut ConsumerWork)>,
+) {
+    // Reader construction belongs to the timed consumer and occurs once per
+    // update, with the same target selection and application writes as legacy.
+    let reader = queries.read();
+    match config.api {
+        Api::ReaderActivity => {
+            for (entity, mut work) in &mut work {
+                work.observed = black_box(reader.is_active(config.target(entity)));
+                work.visits += 1;
+            }
+        }
+        Api::ReaderInputs => {
+            for (entity, mut work) in &mut work {
+                work.observed = reader.current(config.target(entity)).is_some_and(|input| {
+                    black_box(input.location().path());
+                    true
+                });
+                work.visits += 1;
+            }
+        }
+        Api::ReaderScroll => {
+            for (entity, mut work) in &mut work {
+                work.observed = black_box(reader.pending(config.target(entity), "body")).is_some();
+                work.visits += 1;
+            }
+        }
+        _ => unreachable!("reader consumer only runs for reader rows"),
+    }
+}
+
 fn populate(fixture: &mut Fixture, page: Entity, content: usize, active: bool) {
     spawn_control_content(
         fixture.app.world_mut(),
@@ -155,7 +202,7 @@ fn fixture(content: usize, shape: ContentShape) -> (Fixture, Entity, Entity) {
         targets: Targets::PerTarget,
         root: active,
     });
-    // All rows pay the same four cheap run conditions. Only the selected
+    // All rows pay the same five cheap run conditions. Only the selected
     // consumer executes, with its own normal typed SystemParam access.
     fixture.app.add_systems(
         Update,
@@ -164,6 +211,12 @@ fn fixture(content: usize, shape: ContentShape) -> (Fixture, Entity, Entity) {
             activity_loop.run_if(|config: Res<Workload>| config.api == Api::Activity),
             inputs_loop.run_if(|config: Res<Workload>| config.api == Api::Inputs),
             scroll_loop.run_if(|config: Res<Workload>| config.api == Api::Scroll),
+            reader_loop.run_if(|config: Res<Workload>| {
+                matches!(
+                    config.api,
+                    Api::ReaderActivity | Api::ReaderInputs | Api::ReaderScroll
+                )
+            }),
         )
             .after(RouterScheduleSet::PublishSnapshots),
     );
@@ -178,7 +231,9 @@ fn assert_behavior(fixture: &mut Fixture, active: Entity, inactive: Entity, cont
             move |activity: RouteActivity,
                   inputs: RouteInputs,
                   scroll: RouteScrollRestorations,
+                  queries: RouteQueries,
                   work: Query<(Entity, &ConsumerWork)>| {
+                let reader = queries.read();
                 assert!(activity.is_active(active));
                 assert_eq!(
                     inputs.current(active).unwrap().location().path(),
@@ -188,12 +243,30 @@ fn assert_behavior(fixture: &mut Fixture, active: Entity, inactive: Entity, cont
                 assert!(!activity.is_active(inactive));
                 assert!(inputs.current(inactive).is_none());
                 assert!(scroll.pending(inactive, "body").is_none());
+                for entity in [active, inactive] {
+                    assert_eq!(reader.is_active(entity), activity.is_active(entity));
+                    assert_eq!(
+                        reader.current(entity).map(|input| input.location()),
+                        inputs.current(entity).map(|input| input.location())
+                    );
+                    assert!(reader.pending(entity, "body").is_none());
+                }
                 let mut active_count = 0;
                 let mut inactive_count = 0;
                 for (entity, work) in &work {
                     assert_eq!(activity.is_active(entity), work.active);
                     assert_eq!(inputs.current(entity).is_some(), work.active);
                     assert!(scroll.pending(entity, "body").is_none());
+                    assert_eq!(reader.is_active(entity), work.active);
+                    assert_eq!(
+                        reader.current(entity).map(|input| input.location()),
+                        inputs.current(entity).map(|input| input.location())
+                    );
+                    assert_eq!(
+                        reader.current(entity).map(|input| input.params()),
+                        inputs.current(entity).map(|input| input.params())
+                    );
+                    assert!(reader.pending(entity, "body").is_none());
                     if work.active {
                         active_count += 1;
                     } else {
@@ -218,8 +291,10 @@ fn assert_consumer(fixture: &mut Fixture, api: Api, targets: Targets, visits: us
     for work in query.iter(fixture.app.world()) {
         let expected = match api {
             Api::Empty => true,
-            Api::Activity | Api::Inputs => targets == Targets::SameRoot || work.active,
-            Api::Scroll => false,
+            Api::Activity | Api::Inputs | Api::ReaderActivity | Api::ReaderInputs => {
+                targets == Targets::SameRoot || work.active
+            }
+            Api::Scroll | Api::ReaderScroll => false,
         };
         assert_eq!(work.observed, expected);
         assert_eq!(work.visits, visits);
@@ -262,7 +337,15 @@ pub(super) fn run(shape: ContentShape, samples: usize, smoke: bool) {
         let builds = fixture.factory_count();
         let mut visits = 0;
         for targets in [Targets::SameRoot, Targets::PerTarget] {
-            for api in [Api::Empty, Api::Activity, Api::Inputs, Api::Scroll] {
+            for api in [
+                Api::Empty,
+                Api::Activity,
+                Api::Inputs,
+                Api::Scroll,
+                Api::ReaderActivity,
+                Api::ReaderInputs,
+                Api::ReaderScroll,
+            ] {
                 {
                     let mut config = fixture.app.world_mut().resource_mut::<Workload>();
                     config.api = api;
@@ -276,9 +359,10 @@ pub(super) fn run(shape: ContentShape, samples: usize, smoke: bool) {
                 assert_eq!(fixture.app.world().entities().count_spawned(), live);
                 assert_eq!(fixture.factory_count(), builds);
                 println!(
-                    "{shape_name},{},{},none,{content},{content},{},{batch},{},{live},1,0",
+                    "{shape_name},{},{},{},{content},{content},{},{batch},{},{live},1,0",
                     api.name(),
                     targets.name(),
+                    api.pending_result(),
                     content * 2,
                     timing_columns(&values),
                 );

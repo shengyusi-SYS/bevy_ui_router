@@ -16,7 +16,7 @@ Start with the symptoms below to check routing state, then inspect window layout
 | The page changed but the request remains in `PostCommitCleanup` | The page and history have changed, but exit animation or cleanup is still pending; inspect `cleanup()` and whether exit animation has finished |
 | Back cannot run | `NoBackEntry` means there is no earlier successful entry; the application chooses feedback or a host exit action |
 | Page state is recreated | Check retention opt-in, capacity, whether the original parent layout still exists, and changes to path parameters, query strings, or fragments; see [retention](pages.md#retain-page-state) |
-| Scroll is not restored | First confirm a successful Back and a saved position for that visit, then inspect `RouteScrollRestorations::pending`, container keys, layout/camera, and ready/cancel state; see [scroll restoration](pages.md#restore-scroll-positions) |
+| Scroll is not restored | First confirm a successful Back and a saved position for that visit, then inspect the `RouteQueries` reader's `pending` result, container keys, layout/camera, and ready/cancel state; see [scroll restoration](pages.md#restore-scroll-positions) |
 
 Read the current update's result after `RouterScheduleSet::PublishSnapshots`. Call this helper on demand from a diagnostic action, error handler, or state change rather than printing the same records every frame:
 

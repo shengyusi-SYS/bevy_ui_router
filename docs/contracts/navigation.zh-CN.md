@@ -26,13 +26,13 @@ search 按缺省/存在及原始字符串精确比较：`None`、空串、是否
 | 仅 fragment 变化 | 保留祖先，重建最深 normal frame；frame/slot 身份保持，generation 推进 |
 | canonical path/search/fragment 全部等价 | normal presentation 保持原结构，history 仍按命令语义提交；显式滚动恢复可写入位置 |
 
-新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留布局和命中的库存实例不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用通过 `RouteInputs::current(Entity)` 读取所属 active frame 的本次已发布输入。
+新建或重建 view 得到不可变的 `RouteViewInput` factory 快照。保留布局和命中的库存实例不重新调用 factory，其局部内容维持原状态；历史 factory input 不随导航更新。应用在查询循环前调用 `RouteQueries::read()`，通过读取器的 `current(Entity)` 读取所属 active frame 的本次已发布输入。
 
-`BsnRoute::preserve_on_search()`（或底层 `RouteNodeOptions::with_preserve_on_search(true)`）显式允许该节点在 raw search 变化时复用，默认 false。它同时用于当前 prefix 和下述库存命中，不归一化 query，也不忽略 params、route/view/slot/key 或父 scope 身份。各层独立选择；父布局开启不使默认子页自动复用。同时改变 search 和 fragment 时，若整链原可复用，仍保留祖先并替换最深 frame、推进其 generation。需要读取新 query 的保留内容使用 `RouteInputs::current`。
+`BsnRoute::preserve_on_search()`（或底层 `RouteNodeOptions::with_preserve_on_search(true)`）显式允许该节点在 raw search 变化时复用，默认 false。它同时用于当前 prefix 和下述库存命中，不归一化 query，也不忽略 params、route/view/slot/key 或父 scope 身份。各层独立选择；父布局开启不使默认子页自动复用。同时改变 search 和 fragment 时，若整链原可复用，仍保留祖先并替换最深 frame、推进其 generation。需要读取新 query 的保留内容使用读取器的 `current`。
 
 `RouteInputRef` 提供 `route()`、`params()`、`location()`、`origin()`、`failure()` 五个只读 getters；search/fragment 经 `location()` 读取。每层 params 仅属于该 route，完整 location 属于本次 presentation。normal frame 的 failure 为 None；route-error frame 使用错误边界 route/local params 和原 failure，正常前缀不继承 failure；router fallback 的 route 为 None、params 为空、failure 为原失败。error/fallback location 使用失败请求位置，成功 history 保持原值。
 
-`RouteInputs::current` 已包含活动资格判断；读取当前输入无需先调用 `RouteActivity`。每次 publication 同时切换目标各层输入，包括 preserved 和缓存命中的内容。pending/stale/rejected 工作不改旧 active 输入，非活动内容不能读取当前值；发布后即可读取新值，不等请求 terminal。结构 no-op 不为输入更新增加物理写入。Entity 查询范围与借用边界见[页面活动查询](input-focus.zh-CN.md#页面活动查询)。
+`RouteQueryReader::current` 已包含活动资格判断；读取当前输入无需先调用 `is_active`。每次 publication 同时切换目标各层输入，包括 preserved 和缓存命中的内容。pending/stale/rejected 工作不改旧 active 输入，非活动内容不能读取当前值；发布后即可读取新值，不等请求 terminal。结构 no-op 不为输入更新增加物理写入。Entity 查询范围与借用边界见[页面活动查询](input-focus.zh-CN.md#页面活动查询)。
 
 active error presentation 不走 normal 等价导航优化。复用判定包含路由树来源（provenance）、route/slot/explicit key 等完整身份。
 
@@ -60,7 +60,7 @@ history entry 标识一次访问，缓存标识页面实例。不同 entry 可�
 
 ## 请求、history 与 presentation
 
-`RouterNavigation::{push,replace,back}` 是即时入队入口，返回真实 request ID 或 `NavigationEnqueueError`。`commands.router(handle)` 提供延迟 Push/Replace/Back，在 Bevy 应用 Commands 时调用同一入口；它可与 `RouteInputs`、应用组件 Query 在同一系统中使用，不持有可变导航资源借用。
+`RouterNavigation::{push,replace,back}` 是即时入队入口，返回真实 request ID 或 `NavigationEnqueueError`。`commands.router(handle)` 提供延迟 Push/Replace/Back，在 Bevy 应用 Commands 时调用同一入口；它可与 `RouteQueries`、应用组件 Query 在同一系统中使用，不持有可变导航资源借用。
 
 Commands 的字符串目标转换为 `RouteLocation::from_address`；传入结构化 location 则保留原值。它不返回同步 request ID，也不保证本轮发布。入队失败默认调用 Bevy warning handler，`.with_error_handler(handler)` 允许应用选择处理器。`NavigationCommandError` 保留 Router、`NavigationKind` 和原 `NavigationEnqueueError`；被拒绝的入队没有 request ID，已入队请求的执行失败仍从 snapshots 观察。
 
@@ -90,7 +90,7 @@ publication 后 cleanup 或 host loss 不回滚已经提交的 history，也不�
 
 成功 Back 为目标 entry 的已保存 frame/key 冻结恢复意图，包括 cache hit 与仍存活的 preserved prefix；容器可以已经存在或随后创建。Push/Replace 保持存活或缓存复用实例的当前值，fresh Scene 使用初值。目标没有记录时保持当前值。导航终态不等待内容就绪。
 
-意图的 opaque ID 在每次 publication 独立创建；同 entry、frame 或 Entity 再次 Back 也不复用。`RouteScrollRestorations::pending(scope_entity, key)` 从该 exact active frame 的任意内容查询冻结位置及 ID，容器尚不存在也可查询。意图只绑定一次唯一容器，记录其原 Entity、frame、key、策略与位置；已绑定容器失效、key/策略改变或被替换时消费意图，不跟随替代 Entity。
+意图的 opaque ID 在每次 publication 独立创建；同 entry、frame 或 Entity 再次 Back 也不复用。`RouteQueryReader::pending(scope_entity, key)` 从该 exact active frame 的任意内容查询冻结位置及 ID，容器尚不存在也可查询。意图只绑定一次唯一容器，记录其原 Entity、frame、key、策略与位置；已绑定容器失效、key/策略改变或被替换时消费意图，不跟随替代 Entity。
 
 `RouteScroll::new(key)` 默认 `Automatic`：绑定后的首个正常布局尝试一次。`with_restore_policy(RouteScrollRestorePolicy::Explicit)` 等待应用经 `Commands` 的 `ready_route_scroll(id)` 允许尝试，ready 可先于晚容器出现。新 publication 撤销旧意图；仅入队、未发布准备或保留当前内容的失败不取消它。旧或已消费 ID 无效果。
 
@@ -108,7 +108,7 @@ queued、running 和 last-terminal 分别观察；error presentation 的 request
 
 公开稳定读取边界为 `Update` 中 `RouterScheduleSet::PublishSnapshots` 之后，可读本轮 snapshots。内部 Observe/Drive/Commit/Cleanup 顺序由 ECS 持有，应用通过公开命令发起导航。
 
-Router 发布 `RouterSnapshots` 时仅在可观察值变化后标记资源 changed；应用可用 Bevy change detection 跳过无变化快照的投影。该信号覆盖所有 Router 与请求，不代表动态内容归属、activity 或滚动变化；需要当前归属时仍使用 `RouteInputs` / `RouteActivity`。
+Router 发布 `RouterSnapshots` 时仅在可观察值变化后标记资源 changed；应用可用 Bevy change detection 跳过无变化快照的投影。该信号覆盖所有 Router 与请求，不代表动态内容归属、activity 或滚动变化；需要当前归属时使用 `RouteQueries` 读取器。
 
 诊断定位 Router/request、route（若匹配）、失败来源与阶段，区分恢复失败和已提交后的异常。仅在语义转移时记录，不按 polling 次数制造事件。
 

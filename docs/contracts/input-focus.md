@@ -24,15 +24,21 @@ Focus handling preserves the application's queue, cause, and deferred-event orde
 
 ## Page activity queries
 
-`RouteActivity::is_active(Entity)` helps applications decide whether to run a page timer, query, or background task. It checks the published active assignment, the nearest registered boundary's exact claim, host registration incarnation, and current containment. Cached, pending, leaving, failed, quarantined, and unrelated application-host targets return false.
+`RouteQueries::read()` returns a borrowed `RouteQueryReader`. Create one reader before iterating page entities; activity, current-input, and pending-scroll queries share ownership and hierarchy observations within that reader.
 
-`RouteInputs::current(Entity)` uses the same active-frame resolution and returns a borrowed `RouteInputRef`, or None without valid active ownership. Both require Core to be Ready and the exact frame to remain in its logical active set. An invalid or inactive nearest registered boundary rejects the query immediately. Valid content in other Routers resolves through its own scope.
+- `is_active(Entity)` helps applications decide whether to run a page timer, query, or background task.
+- `current(Entity)` returns a borrowed `RouteInputRef`, or None without valid active ownership. It already checks activity.
+- `pending(Entity, key)` returns an unfinished scroll restoration for the active frame and key, even before the container exists. See [scroll restoration](navigation.md#scroll-restoration-by-visit).
 
-Ordinary page descendants and non-interactive entities can be queried without extra routing components. Both SystemParams read Router metadata and relevant hierarchy, so they work alongside application `Query<(Entity, &mut T)>` parameters. Run after `RouterScheduleSet::PublishSnapshots` to see this update's publication. Input references live only for the SystemParam borrow; copy the plain data you need before World mutation or await. See [navigation](navigation.md#matching-and-location-updates) for field meanings.
+The shared resolver checks the published active assignment, the nearest registered boundary's exact claim, host registration incarnation, and current containment. Core must be Ready and the exact frame must remain in its logical active set. An invalid or inactive nearest registered boundary rejects the query immediately. Cached, pending, leaving, failed, quarantined, and unrelated application-host targets have no active result. Valid content in other Routers resolves through its own scope.
+
+Ordinary page descendants and non-interactive entities need no extra routing components. `RouteQueries` reads Router metadata and relevant hierarchy, so it works alongside application `Query<(Entity, &mut T)>` parameters and Commands. Run after `RouterScheduleSet::PublishSnapshots` to see this update's publication. Reader facts live only for its immutable borrow; after World mutation, a new `read()` observes fresh facts even within the same tick. Input references borrow the reader; copy needed plain data before World mutation or await. See [navigation](navigation.md#matching-and-location-updates) for field meanings.
+
+`RouteActivity::is_active`, `RouteInputs::current`, and `RouteScrollRestorations::pending` remain available through the same resolver. Use one `RouteQueryReader` for repeated or mixed lookups.
 
 Activity, visibility, and input eligibility are separate checks. Applications use activity to control their systems and background work; input handlers still use the gate. Systems, observers, and other application logic in hidden retained content continue according to the application's scheduling.
 
-Sources: [input](../../crates/bevy_ui_router_ecs/src/input.rs), [native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs), [activity](../../crates/bevy_ui_router_ecs/src/activity.rs), [current inputs](../../crates/bevy_ui_router_ecs/src/route_inputs.rs), and [scheduling](../../crates/bevy_ui_router_ecs/src/plugin.rs).
+Sources: [public queries](../../crates/bevy_ui_router_ecs/src/route_queries.rs), [input](../../crates/bevy_ui_router_ecs/src/input.rs), [native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs), and [scheduling](../../crates/bevy_ui_router_ecs/src/plugin.rs).
 
 ## Window-level Back input
 

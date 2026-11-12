@@ -24,15 +24,21 @@ pending Scene 的 `InputFocus::set`/AutoFocus 保存为候选。原 owner 成功
 
 ## 页面活动查询
 
-`RouteActivity::is_active(Entity)` 帮助应用决定页面 timer、查询或后台工作是否执行。它核对已发布 active assignment、最近登记边界的 exact claim、host registration incarnation 和当前 containment。cached、pending、leaving、failed、quarantine 及无关应用 host 返回 false。
+`RouteQueries::read()` 返回借用的 `RouteQueryReader`。遍历页面 Entity 前创建一次读取器，让活动、当前输入和待恢复滚动查询在其中共享归属与层级观察。
 
-`RouteInputs::current(Entity)` 使用相同的 active-frame 解析，返回借用的 `RouteInputRef`，无有效活动归属时返回 None。两者要求 Core 为 Ready 且 exact frame 在逻辑 active 集合中。最近的已登记边界失效或非活动时直接拒绝；其它 Router 的有效内容按自己的 scope 查询。
+- `is_active(Entity)` 帮助应用决定页面 timer、查询或后台工作是否执行。
+- `current(Entity)` 返回借用的 `RouteInputRef`，无有效活动归属时返回 None，已包含活动资格检查。
+- `pending(Entity, key)` 返回活动 frame 下对应 key 的未完成滚动恢复，容器尚未存在时也可查询。详见[滚动恢复](navigation.zh-CN.md#按访问恢复滚动)。
 
-普通页面后代和非交互 Entity 都可以查询，目标无需额外路由组件。两个 SystemParam 只读 Router 元数据和相关层级，可与应用 `Query<(Entity, &mut T)>` 共用。在 `RouterScheduleSet::PublishSnapshots` 后可读取本轮发布结果。输入引用只在当前 SystemParam 借用期有效，跨 World mutation 或 await 前复制所需普通数据。字段含义见[导航合同](navigation.zh-CN.md#匹配与-location-更新)。
+共享 resolver 核对已发布 active assignment、最近登记边界的 exact claim、host registration incarnation 和当前 containment。Core 必须为 Ready，exact frame 必须在逻辑 active 集合中。最近的已登记边界失效或非活动时直接拒绝；cached、pending、leaving、failed、quarantine 及无关应用 host 没有活动结果。其它 Router 的有效内容按自己的 scope 查询。
+
+普通页面后代和非交互 Entity 无需额外路由组件。`RouteQueries` 只读 Router 元数据和相关层级，可与应用 `Query<(Entity, &mut T)>` 及 Commands 共用。在 `RouterScheduleSet::PublishSnapshots` 后可读取本轮发布结果。观察事实只在读取器的不可变借用期内共享；World mutation 后再次 `read()` 会读取新事实，同 tick 也如此。输入引用借用读取器，跨 World mutation 或 await 前复制所需普通数据。字段含义见[导航合同](navigation.zh-CN.md#匹配与-location-更新)。
+
+`RouteActivity::is_active`、`RouteInputs::current` 和 `RouteScrollRestorations::pending` 仍通过同一 resolver 提供；循环或混合查询使用一个 `RouteQueryReader`。
 
 activity 与可见性、输入资格分别判断。应用通过它控制自己的系统和后台工作；输入处理仍使用 gate。隐藏缓存中的系统、observer 和其他应用逻辑继续按应用自身调度执行。
 
-实现见 [input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs)、[activity](../../crates/bevy_ui_router_ecs/src/activity.rs)、[当前输入](../../crates/bevy_ui_router_ecs/src/route_inputs.rs) 和 [调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。
+实现见[公开查询](../../crates/bevy_ui_router_ecs/src/route_queries.rs)、[input](../../crates/bevy_ui_router_ecs/src/input.rs)、[native focus](../../crates/bevy_ui_router_ecs/src/native_focus.rs) 和[调度](../../crates/bevy_ui_router_ecs/src/plugin.rs)。
 
 ## 窗口级返回输入
 

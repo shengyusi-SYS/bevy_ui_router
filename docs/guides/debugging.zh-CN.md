@@ -16,7 +16,7 @@
 | 页面已切换，请求仍在 `PostCommitCleanup` | 页面和访问记录已经切换，但退出动画或清理尚未结束；检查 `cleanup()` 与退出动画是否完成 |
 | Back 无法执行 | `NoBackEntry` 表示没有更早的成功记录；由应用决定此时的界面反馈或退出动作 |
 | 页面状态被重建 | 核对页面的保留开关、容量、原父布局是否还在，以及路径参数、查询参数和片段是否改变；见[保留说明](pages.zh-CN.md#保留页面状态) |
-| 滚动没有恢复 | 先确认 Back 成功且该次访问有记录，再查看 `RouteScrollRestorations::pending`、容器名称、布局、相机与恢复是否就绪或取消；见[滚动恢复](pages.zh-CN.md#滚动恢复) |
+| 滚动没有恢复 | 先确认 Back 成功且该次访问有记录，再查看 `RouteQueries` 读取器的 `pending` 结果、容器名称、布局、相机与恢复是否就绪或取消；见[滚动恢复](pages.zh-CN.md#滚动恢复) |
 
 在 `RouterScheduleSet::PublishSnapshots` 之后读取本轮结果。下面的函数供应用在诊断按钮、错误处理或状态变化时按需调用，避免每帧重复输出：
 

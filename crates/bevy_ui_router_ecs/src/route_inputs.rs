@@ -9,6 +9,8 @@ use crate::active_scope::ActiveRouteScope;
 /// descendants. Inactive or invalid boundaries return `None`, never inputs from
 /// an active ancestor. This reads only Router metadata and hierarchy, and may be
 /// used alongside an application's mutable component query.
+///
+/// Repeated or mixed queries can share work through [`crate::RouteQueries::read`].
 #[derive(SystemParam)]
 pub struct RouteInputs<'w, 's> {
     scope: ActiveRouteScope<'w, 's>,

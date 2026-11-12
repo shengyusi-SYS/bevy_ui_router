@@ -54,6 +54,7 @@ sequenceDiagram
     opt Immediate call
         Nav-->>App: request ID
     end
+    Note over Nav,Core: Requests wait in order for prior foreground work to settle
     Nav->>Core: get action, freeze instance selection
     loop Target chain, parent to child
         alt Current / Retained
@@ -128,7 +129,7 @@ flowchart TB
 Applications use these public ordering points:
 
 - Submit dynamic topology changes before `RouterInputSet::Refresh`; read `RouterInputGate` and handle target-addressed keyboard/gamepad input after `Ready`.
-- Read this update's snapshots, `RouteInputs`, and `RouteActivity` after `RouterScheduleSet::PublishSnapshots`. Layout and scroll settlement still follow in `PostUpdate`.
+- Read this update's snapshots and `RouteQueries` after `RouterScheduleSet::PublishSnapshots`. Layout and scroll settlement still follow in `PostUpdate`.
 - `RouterScrollSet::Prepare` runs after `UiSystems::Content` and before `UiSystems::Layout`, writing restoration requests for that update.
 
 The other lifecycle sets in the diagram are crate-private and orchestrated by ECS. Plugins and App extensions share idempotent installation.
@@ -137,6 +138,19 @@ Optional `RouteTweenPlugin` advances `bevy_tween` controllers before UI Prepare 
 
 Input eligibility refreshes before the picking Backend. While an exit is visible, its native UI candidates are temporarily excluded and the complete stack is restored after Backend, allowing the new page to receive hits. Inactive targets are then filtered between hover generation and interactions. Publication revokes leaving targets' historical hover, press, click, drag, and focus in the same call. Applications integrate target filtering for native TabNavigation/InputDispatch; see the [input integration](../guides/pages.md#input-and-focus).
 
-An active branch observation uses a private [read context](../../crates/bevy_ui_router_ecs/src/read_observation.rs) to share the registry index, native content membership, outlet counts, and identical retained-preservation checks within one immutable World borrow. Role-specific values, mount bindings, and manifest policies remain separate checks; preservation never authorizes activation or cleanup. Writes and new scheduling phases require a new observation. Focus also validates shells, committed boundaries, and the closure outside slots; retained instances validate all descendants and their separation from input/focus.
+Application queries use a [public reader](../../crates/bevy_ui_router_ecs/src/route_queries.rs) borrowing current Router metadata and typed hierarchy queries. Call `RouteQueries::read()` once before a loop to share frame/mount checks, target results, and lookups alongside application queries and Commands.
+
+```mermaid
+flowchart LR
+    App["application system"] --> Read["RouteQueries.read(): one reader"]
+    Read --> Methods["is_active / current / pending"]
+    Methods --> Resolve["shared ActiveRouteScope resolver"]
+    Legacy["RouteActivity / RouteInputs / RouteScrollRestorations"] --> Resolve
+    Resolve --> Facts["borrowed Router metadata + typed hierarchy queries"]
+```
+
+Observations are scoped to the reader borrow; each new `read()` starts from current metadata and hierarchy. The three existing query entry points use the same resolver; repeated and mixed lookups share work through the reader.
+
+Internal active-branch observation separately uses a private [ReadObservation](../../crates/bevy_ui_router_ecs/src/read_observation.rs) to share the registry index, native content membership, outlet counts, and identical retained-preservation checks within one immutable World borrow. Role-specific values, mount bindings, and manifest policies remain separate checks; preservation never authorizes activation or cleanup. Writes and new scheduling phases require a new observation. Focus also validates shells, committed boundaries, and the closure outside slots; retained instances validate all descendants and their separation from input/focus.
 
 Empty work phases return immediately, while idle hosts are still observed each update. Scroll Prepare returns when no intents exist; Settle keeps sampling actual layout. All `RouteScroll` markers participate in duplicate-key detection before layout eligibility is checked. Snapshots are marked changed only when their values change; the input gate is written when permissions change or revocation is needed. The BSN focus bridge checks the official drain on first use or after changes to the `PostUpdate` schedule graph, and keeps observing the focus queue during stable scheduling.

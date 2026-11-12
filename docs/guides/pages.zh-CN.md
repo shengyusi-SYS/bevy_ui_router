@@ -6,7 +6,7 @@
 
 ## 读取当前路径与参数
 
-用 `RouteInputs` 读取页面当前的路径和参数。创建页面的闭包只收到**创建时**的值；布局复用或保留页面重新出现后，当前值可能已经不同。
+用 `RouteQueries` 读取页面当前的路径和参数。循环前调用一次 `read()`，让其中的查询共享归属检查。创建页面的闭包只收到**创建时**的值；布局复用或保留页面重新出现后，当前值可能已经不同。
 
 下面的系统更新带有 `RouteLabel` 标记的文字。先在页面内需要显示路径的 `Text` 实体上添加该标记：
 
@@ -15,11 +15,12 @@
 struct RouteLabel;
 
 fn update_route_labels(
-    inputs: RouteInputs,
+    queries: RouteQueries,
     mut labels: Query<(Entity, &mut Text), With<RouteLabel>>,
 ) {
+    let routes = queries.read();
     for (entity, mut text) in &mut labels {
-        let Some(input) = inputs.current(entity) else { continue };
+        let Some(input) = routes.current(entity) else { continue };
         text.set_if_neq(Text::new(input.location().path()));
     }
 }
@@ -36,7 +37,7 @@ app.add_systems(
 
 对于 `page("items/:id", ...)`，在该页面内用 `input.params().get("id")` 读取参数；query 和 fragment 分别用 `input.location().search()`、`.fragment()` 读取。参数属于当前这一层路由，外层布局不会自动获得子页的参数。
 
-`current(entity)` 只为活动页面返回输入。只想判断页面是否活动时，使用 `RouteActivity::is_active(entity)`。
+`routes.current(entity)` 只为活动页面返回输入。只想判断页面是否活动时，使用 `routes.is_active(entity)`。读取器可与上面的可变应用 `Query` 及 Commands 共用；每次 `read()` 都重新观察当前事实。`RouteActivity`、`RouteInputs` 和 `RouteScrollRestorations` 仍可用于单次查询。
 
 ## 保留页面状态
 
@@ -56,13 +57,13 @@ page("settings", |_| Ok(page_content("Settings"))).keep_alive()
 
 默认情况下，地址中的查询参数（query）改变会重建页面。比如从 `/items?sort=name` 切到 `/items?sort=date`，希望保留页面并自己更新列表，可以在对应的 `page(...)` 上加 `.preserve_on_search()`。
 
-从外层布局到目标页，想继续复用的每一层都要设置它。当前页面和保留页面遵守同一规则。复用后用本页前面的 `RouteInputs` 更新内容。路径参数改变、或最深页面的片段（fragment）改变，仍可能重建；详细判定见[导航参考](../contracts/navigation.zh-CN.md#匹配与-location-更新)。
+从外层布局到目标页，想继续复用的每一层都要设置它。当前页面和保留页面遵守同一规则。复用后用本页前面的 `routes.current(entity)` 更新内容。路径参数改变、或最深页面的片段（fragment）改变，仍可能重建；详细判定见[导航参考](../contracts/navigation.zh-CN.md#匹配与-location-更新)。
 
 ## 动态内容与重新激活
 
 数据加载使用应用自己的 Bevy 任务和系统：先创建页面或加载提示，再把完成的数据写入页面。
 
-保留页面仍在 World 中，普通 Query 和后台任务不会因它离场而自动暂停。页面系统可以先调用 `inputs.current(entity)`，返回 `None` 就跳过本次更新。异步结果应用前，检查它是否仍对应当前页面和数据版本；需要跨 `await` 使用的路径或参数，先复制为普通值。
+保留页面仍在 World 中，普通 Query 和后台任务不会因它离场而自动暂停。页面系统可以先调用 `routes.current(entity)`，返回 `None` 就跳过本次更新。异步结果应用前，检查它是否仍对应当前页面和数据版本；需要跨 `await` 使用的路径或参数，先复制为普通值。
 
 带延迟加载的完整流程见[嵌套示例](../../crates/bevy_ui_router/examples/bsn_nested.rs)。
 
@@ -98,13 +99,14 @@ struct PageState {
 }
 
 fn allow_restore(
-    restores: RouteScrollRestorations,
+    queries: RouteQueries,
     mut commands: Commands,
     pages: Query<(Entity, &PageState)>,
 ) {
+    let routes = queries.read();
     for (entity, page) in &pages {
         if page.content_ready
-            && let Some(restore) = restores.pending(entity, "body")
+            && let Some(restore) = routes.pending(entity, "body")
         {
             commands.ready_route_scroll(restore.id());
         }

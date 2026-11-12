@@ -28,6 +28,7 @@ mod read_observation;
 mod registry;
 mod retained;
 mod route_inputs;
+mod route_queries;
 mod scroll;
 mod snapshots;
 #[cfg(test)]
@@ -48,6 +49,7 @@ pub use navigation::{NavigationEnqueueError, NavigationEnqueueErrorKind, RouterN
 pub use navigation_commands::{NavigationCommandError, RouteNavigationCommandsExt, RouterCommands};
 pub use plugin::{BevyUiRouterPlugin, RouterInputSet, RouterScheduleSet, RouterScrollSet};
 pub use route_inputs::RouteInputs;
+pub use route_queries::{RouteQueries, RouteQueryReader};
 pub use scroll::{
     RouteScroll, RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
     RouteScrollRestoreId, RouteScrollRestorePolicy,
@@ -66,14 +68,15 @@ pub mod prelude {
     pub use crate::{
         AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
         NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouteActivity,
-        RouteInputs, RouteNavigationCommandsExt, RouteScroll, RouteScrollCommandsExt,
-        RouteScrollRestoration, RouteScrollRestorations, RouteScrollRestoreId,
-        RouteScrollRestorePolicy, RouteTransitionCommandsExt, RouteTransitionContext,
-        RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget, RouterCommands,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
-        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
-        RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
-        TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        RouteInputs, RouteNavigationCommandsExt, RouteQueries, RouteQueryReader, RouteScroll,
+        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
+        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        RouterCommands, RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate,
+        RouterInputSet, RouterInstallError, RouterInstallErrorKind, RouterNavigation,
+        RouterScheduleSet, RouterScrollSet, RouterSnapshot, RouterSnapshots,
+        TransitionCancelReason, TransitionPreparation, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
     };
     #[cfg(feature = "tween")]
     pub use crate::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};

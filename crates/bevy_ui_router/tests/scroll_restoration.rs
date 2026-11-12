@@ -481,9 +481,21 @@ fn scroll(app: &mut App, entity: Entity, position: Vec2) {
 fn pending_scroll(app: &mut App, scope: Entity, key: &str) -> Option<RouteScrollRestoration> {
     let key = key.to_owned();
     app.world_mut()
-        .run_system_once(move |restorations: RouteScrollRestorations| {
-            restorations.pending(scope, &key)
-        })
+        .run_system_once(
+            move |queries: RouteQueries, restorations: RouteScrollRestorations| {
+                let current = queries.read().pending(scope, &key);
+                let original = restorations.pending(scope, &key);
+                assert_eq!(
+                    current.as_ref().map(|r| r.id()),
+                    original.as_ref().map(|r| r.id())
+                );
+                assert_eq!(
+                    current.as_ref().map(|r| r.position().0),
+                    original.as_ref().map(|r| r.position().0)
+                );
+                current
+            },
+        )
         .unwrap()
 }
 

@@ -10,6 +10,8 @@ use crate::active_scope::ActiveRouteScope;
 ///
 /// This parameter only reads Router metadata and hierarchy components, so it can
 /// be used beside an application's `Query<(Entity, &mut T)>` for its own state.
+///
+/// Repeated or mixed queries can share work through [`crate::RouteQueries::read`].
 #[derive(SystemParam)]
 pub struct RouteActivity<'w, 's> {
     scope: ActiveRouteScope<'w, 's>,

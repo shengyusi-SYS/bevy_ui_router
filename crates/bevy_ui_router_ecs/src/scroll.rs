@@ -110,6 +110,8 @@ impl RouteScrollRestoration {
 ///
 /// The scroll container need not exist yet. Invalid or inactive boundaries return
 /// `None`; the lookup does not borrow application scroll components.
+///
+/// Repeated or mixed queries can share work through [`crate::RouteQueries::read`].
 #[derive(SystemParam)]
 pub struct RouteScrollRestorations<'w, 's> {
     scope: ActiveRouteScope<'w, 's>,
@@ -117,15 +119,23 @@ pub struct RouteScrollRestorations<'w, 's> {
 impl RouteScrollRestorations<'_, '_> {
     pub fn pending(&self, scope_entity: Entity, key: &str) -> Option<RouteScrollRestoration> {
         let (entry, frame) = self.scope.resolve(scope_entity)?;
-        let current = entry.engine.current_history_entry()?;
-        let intent = entry.scroll.pending.iter().find(|intent| {
-            intent.entry == current && intent.frame == *frame.frame() && intent.key == key
-        })?;
-        Some(RouteScrollRestoration {
-            id: intent.id.clone(),
-            position: intent.position.clone(),
-        })
+        pending_restoration(entry, frame, key)
     }
+}
+
+pub(crate) fn pending_restoration(
+    entry: &crate::navigation::RouterEntry,
+    frame: &RealizedFrame,
+    key: &str,
+) -> Option<RouteScrollRestoration> {
+    let current = entry.engine.current_history_entry()?;
+    let intent = entry.scroll.pending.iter().find(|intent| {
+        intent.entry == current && intent.frame == *frame.frame() && intent.key == key
+    })?;
+    Some(RouteScrollRestoration {
+        id: intent.id.clone(),
+        position: intent.position.clone(),
+    })
 }
 
 /// Deferred application control of a specific restoration intent.

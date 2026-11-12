@@ -7,7 +7,7 @@
 //! `BsnRouter` with `AppBsnExt::add_bsn_router`, and attach its handle to an
 //! application-owned UI container using `RouterHostRegistration`.
 //! Use `initial` for the first page and `commands.router(handle)` for subsequent
-//! Push, Replace, and Back operations. `RouteInputs` reads the current context of
+//! Push, Replace, and Back operations. `RouteQueries::read()` reads the current context of
 //! active content, including reused layouts and reactivated pages.
 //!
 //! The application supplies Bevy's asset/Scene runtime, UI layout, window, camera,
@@ -93,14 +93,15 @@ pub mod ecs {
     pub use bevy_ui_router_ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
         NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouteActivity,
-        RouteInputs, RouteNavigationCommandsExt, RouteScroll, RouteScrollCommandsExt,
-        RouteScrollRestoration, RouteScrollRestorations, RouteScrollRestoreId,
-        RouteScrollRestorePolicy, RouteTransitionCommandsExt, RouteTransitionContext,
-        RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget, RouterCommands,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
-        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
-        RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
-        TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        RouteInputs, RouteNavigationCommandsExt, RouteQueries, RouteQueryReader, RouteScroll,
+        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
+        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        RouterCommands, RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate,
+        RouterInputSet, RouterInstallError, RouterInstallErrorKind, RouterNavigation,
+        RouterScheduleSet, RouterScrollSet, RouterSnapshot, RouterSnapshots,
+        TransitionCancelReason, TransitionPreparation, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
     };
     #[cfg(feature = "tween")]
     pub use bevy_ui_router_ecs::{RouteTweenDriver, RouteTweenPlugin, RouteTweenTracks};
@@ -166,13 +167,14 @@ pub mod prelude {
     pub use crate::ecs::{
         AppRouterExt, BevyUiRouterPlugin, NavigationCommandError, NavigationEnqueueError,
         NavigationEnqueueErrorKind, NavigationRequestSnapshot, RequestLookup, RouteActivity,
-        RouteInputs, RouteNavigationCommandsExt, RouteScroll, RouteScrollCommandsExt,
-        RouteScrollRestoration, RouteScrollRestorations, RouteScrollRestoreId,
-        RouteScrollRestorePolicy, RouteTransitionCommandsExt, RouteTransitionContext,
-        RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget, RouterCommands,
-        RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate, RouterInputSet,
-        RouterInstallError, RouterInstallErrorKind, RouterNavigation, RouterScheduleSet,
-        RouterScrollSet, RouterSnapshot, RouterSnapshots, TransitionCancelReason,
-        TransitionPreparation, ViewDriverRegistrationError, ViewDriverRegistrationErrorKind,
+        RouteInputs, RouteNavigationCommandsExt, RouteQueries, RouteQueryReader, RouteScroll,
+        RouteScrollCommandsExt, RouteScrollRestoration, RouteScrollRestorations,
+        RouteScrollRestoreId, RouteScrollRestorePolicy, RouteTransitionCommandsExt,
+        RouteTransitionContext, RouteTransitionDriver, RouteTransitionId, RouteTransitionTarget,
+        RouterCommands, RouterConfig, RouterHandle, RouterHostRegistration, RouterInputGate,
+        RouterInputSet, RouterInstallError, RouterInstallErrorKind, RouterNavigation,
+        RouterScheduleSet, RouterScrollSet, RouterSnapshot, RouterSnapshots,
+        TransitionCancelReason, TransitionPreparation, ViewDriverRegistrationError,
+        ViewDriverRegistrationErrorKind,
     };
 }

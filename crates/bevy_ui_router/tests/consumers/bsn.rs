@@ -113,8 +113,7 @@ fn published_native<'a>(
 fn observe_snapshots(
     tracked: Option<Res<TrackedRequest>>,
     snapshots: Res<RouterSnapshots>,
-    activity: RouteActivity,
-    inputs: RouteInputs,
+    queries: RouteQueries,
     mut toolbar: Query<(Entity, &mut ToolbarState)>,
     gate: Res<RouterInputGate>,
     native: Query<(Entity, Option<&NativeLeaf>, Has<ErrorPage>)>,
@@ -128,8 +127,9 @@ fn observe_snapshots(
     };
     let published = published_native(tracked.native, &gate, native.iter());
     let router = snapshots.get(tracked.router).unwrap();
+    let reader = queries.read();
     for (entity, mut state) in &mut toolbar {
-        state.1 = inputs.current(entity).map(|input| {
+        state.1 = reader.current(entity).map(|input| {
             assert!(
                 input.params().is_empty(),
                 "parent parameters stay route-local"
@@ -140,8 +140,8 @@ fn observe_snapshots(
         });
     }
     if let Some(entity) = published {
-        assert!(activity.is_active(entity));
-        let input = inputs
+        assert!(reader.is_active(entity));
+        let input = reader
             .current(entity)
             .expect("input is published with native content");
         assert_eq!(
@@ -496,8 +496,8 @@ fn main() {
     // record. The same public lookup works without manufacturing an intent.
     assert!(
         app.world_mut()
-            .run_system_once(move |restorations: RouteScrollRestorations| {
-                restorations.pending(returned_leaf, "body")
+            .run_system_once(move |queries: RouteQueries| {
+                queries.read().pending(returned_leaf, "body")
             })
             .unwrap()
             .is_none()

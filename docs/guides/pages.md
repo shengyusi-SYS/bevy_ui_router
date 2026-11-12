@@ -6,7 +6,7 @@ After the [two-page window tutorial](integration.md), use the features below as 
 
 ## Read the current path and parameters
 
-Use `RouteInputs` to read the current path and parameters. The page-building closure receives values **at creation time**; those values may change when a layout is reused or a retained page returns.
+Use `RouteQueries` to read the current path and parameters. Call `read()` once before the loop to share ownership checks across its queries. The page-building closure receives values **at creation time**; those values may change when a layout is reused or a retained page returns.
 
 This system updates text carrying a `RouteLabel` marker. Add that marker to the page's `Text` entity where you want the path displayed:
 
@@ -15,11 +15,12 @@ This system updates text carrying a `RouteLabel` marker. Add that marker to the 
 struct RouteLabel;
 
 fn update_route_labels(
-    inputs: RouteInputs,
+    queries: RouteQueries,
     mut labels: Query<(Entity, &mut Text), With<RouteLabel>>,
 ) {
+    let routes = queries.read();
     for (entity, mut text) in &mut labels {
-        let Some(input) = inputs.current(entity) else { continue };
+        let Some(input) = routes.current(entity) else { continue };
         text.set_if_neq(Text::new(input.location().path()));
     }
 }
@@ -36,7 +37,7 @@ app.add_systems(
 
 Within `page("items/:id", ...)`, use `input.params().get("id")`. Query strings and fragments are available through `input.location().search()` and `.fragment()`. Parameters belong to the current route level; an outer layout does not automatically receive its child's parameters.
 
-`current(entity)` returns input only for active pages. If you only need a yes/no answer, use `RouteActivity::is_active(entity)`.
+`routes.current(entity)` returns input only for active pages. If you only need a yes/no answer, use `routes.is_active(entity)`. The reader works alongside the mutable application `Query` above and Commands. Each `read()` starts with fresh observations; `RouteActivity`, `RouteInputs`, and `RouteScrollRestorations` remain available for individual lookups.
 
 ## Retain page state
 
@@ -56,13 +57,13 @@ Shared layouts already stay in place when switching between their child pages; t
 
 Query changes rebuild pages by default. To keep `/items?sort=name` when switching to `/items?sort=date` and update the list yourself, add `.preserve_on_search()` to its `page(...)` declaration.
 
-Enable it at every level you want to reuse, from the outer layout to the target page. Current and retained pages follow the same policy. Update reused content through `RouteInputs`, as shown above. Path-parameter changes or changes to the deepest page's fragment can still rebuild content; see the [navigation reference](../contracts/navigation.md#matching-and-location-updates).
+Enable it at every level you want to reuse, from the outer layout to the target page. Current and retained pages follow the same policy. Update reused content through `routes.current(entity)`, as shown above. Path-parameter changes or changes to the deepest page's fragment can still rebuild content; see the [navigation reference](../contracts/navigation.md#matching-and-location-updates).
 
 ## Load content and reactivate pages
 
 Use your application's Bevy tasks and systems to load data: create a page or loading indicator, then apply the completed data.
 
-Retained pages remain in the World. Ordinary queries and background tasks do not automatically pause when a page leaves. A page system can check `inputs.current(entity)` and skip the update when it returns `None`. Before applying an async result, check that it still belongs to the intended page and data version. Copy paths or parameters into owned values before carrying them across `await`.
+Retained pages remain in the World. Ordinary queries and background tasks do not automatically pause when a page leaves. A page system can check `routes.current(entity)` and skip the update when it returns `None`. Before applying an async result, check that it still belongs to the intended page and data version. Copy paths or parameters into owned values before carrying them across `await`.
 
 The [nested example](../../crates/bevy_ui_router/examples/bsn_nested.rs) demonstrates delayed loading.
 
@@ -98,13 +99,14 @@ struct PageState {
 }
 
 fn allow_restore(
-    restores: RouteScrollRestorations,
+    queries: RouteQueries,
     mut commands: Commands,
     pages: Query<(Entity, &PageState)>,
 ) {
+    let routes = queries.read();
     for (entity, page) in &pages {
         if page.content_ready
-            && let Some(restore) = restores.pending(entity, "body")
+            && let Some(restore) = routes.pending(entity, "body")
         {
             commands.ready_route_scroll(restore.id());
         }
