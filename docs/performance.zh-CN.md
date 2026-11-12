@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-默认每个普通场景采样 128 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
+默认每个普通场景采样 128 次，`retained_steady` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
 
 固定机器、工具链、依赖、features 和优化参数，至少重复两轮。串行完成构建与计时，保存全部配对输出。先比较相同工作的绝对 p50/p95、update 次数及波动，再选择需要 profile 的路径。
 
@@ -26,6 +26,7 @@ cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locke
 | `keep_alive` | 关闭保留、首次 miss、预热命中、LRU 淘汰，以及各自的空闲更新 | 每页 1/32/128 节点 |
 | `instances` | 父子 fresh、原父/新子、父子命中、父依赖淘汰 | 父和子各自 1/32/128 节点 |
 | `steady` | 首次导航后的动态内容，比较两层/三层 frame、普通滚动 marker 和无 Router 控制 | 128/1024 节点 |
+| `retained_steady` | 固定活动页和共同父布局，积累 0/1/4 个保留兄弟页；空闲与滚动位置更新 | 父布局 128、活动页 32；每个保留页 32/1024 个动态节点 |
 | `transitions` | 关闭过渡、仅进入、持有退出；分别测发布、逐帧更新、释放、完成与空闲 | 每页 32/128/1024 节点 |
 
 ### 动画全路径
@@ -71,6 +72,17 @@ ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router
 
 只完成一次导航，在 publication 后通过公开 World 创建内容。透明 pathless layout 构成三层 frame 对照；普通 `RouteScroll + ScrollPosition` marker 用于观察滚动接线的空闲成本。
 
+### 固定活动内容的保留兄弟页对照
+
+```sh
+ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > retained-steady-router.csv
+ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > retained-steady-ui.csv
+```
+
+共同父布局固定有 128 个普通动态后代，活动页固定有 32 个。每个夹具依次访问兄弟页并返回原活动页，积累 0、1、4 个保留页；每个保留页分别使用 32 或 1024 个动态后代。全部后代在 publication 后通过公开 World 添加。库存增长时，活动页和共同父布局保持原 Entity；flat 和 nested 使用相同节点预算。
+
+每个阶段预热 64 次 update，随后分别测量空闲更新和仅改变活动页 `ScrollPosition` 的更新。每个样本取 32 次 update 的均值，滚动行包含 component 写入。`ROUTER_BENCH_UI=1` 安装正常 layout、UiStack、picking 系统及相机输入，并检查真实滚动溢出和计算后的显示位置；`0` 或不设置时测量无 UI layout 的 Router。夹具不注入 pointer。CSV 记录节点预算、保留页、活实体、请求记录、factory 构建和正式样本的滚动写入数。计时外断言检查 activity/输入资格、Entity 和数量保持不变、采样期间无 factory 重建，以及退出父作用域时完整清理内容。
+
 ## 计时边界
 
 Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::update`、导航 API 和快照推进。导航从 enqueue 前计时到请求终态、无 running request 且前台 cleanup 清空，包含构建、resolve/apply、输入授权刷新、publication 和旧内容清理。初始化、目标字符串构造、详细断言与 CSV 输出在计时外。
@@ -82,7 +94,7 @@ Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::upda
 | 实体和请求数量 | 场景组完成后读取的稳定状态；failure 行在对应 recover 完成后读取 |
 | update 上限 | 每步 32 次更新的防挂起断言 |
 
-普通模式是 headless CPU 侧测量，覆盖 Router 与基础调度；`transitions` 的 UI 开关额外覆盖正常布局和输入候选投影，未注入 pointer 时不测实际命中。窗口提交另用上述窗口模式，GPU 执行、实际呈现和 I/O 需在对应环境单独测量。根 workspace 与独立窗口可能使用不同 executor/features，比较前记录实际构建配置。
+普通模式是 headless CPU 侧测量，覆盖 Router 与基础调度；`transitions` 和 `retained_steady` 的 UI 开关额外覆盖正常布局和输入候选投影，未注入 pointer 时不测实际命中。窗口提交另用上述窗口模式，GPU 执行、实际呈现和 I/O 需在对应环境单独测量。根 workspace 与独立窗口可能使用不同 executor/features，比较前记录实际构建配置。
 
 直接 BSN 对照保留 host/layout/outlet，测 Scene 构造、resolve/apply、旧页删除和普通 update。它用于观察引擎构建成本；Router 基准还包含 history、授权、隔离和恢复工作。
 
@@ -94,9 +106,10 @@ CI 运行基准夹具的行为断言：
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
 ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
+`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。`retained_steady` 的 smoke 保留两种更新工作负载，以及 0/4 个各有 32 个后代的保留页，每组为两个样本、每样本四次 update。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
 
 ## 保存与阅读结果
 

@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-Ordinary scenarios use 128 samples by default. Set a positive `ROUTER_BENCH_SAMPLES` to adjust this. `ROUTER_BENCH_SHAPE` accepts `flat` (default) or `nested`; both use the same content-node budget, with the latter forming a shallow four-level tree.
+Ordinary scenarios use 128 samples by default; `retained_steady` uses 32. Set a positive `ROUTER_BENCH_SAMPLES` to adjust this. `ROUTER_BENCH_SHAPE` accepts `flat` (default) or `nested`; both use the same content-node budget, with the latter forming a shallow four-level tree.
 
 Fix the machine, toolchain, dependencies, features, and optimization settings, and repeat at least twice. Build and measure sequentially, preserving all paired output. Compare absolute p50/p95, update counts, and variation for equivalent work before choosing a path to profile.
 
@@ -26,6 +26,7 @@ Fix the machine, toolchain, dependencies, features, and optimization settings, a
 | `keep_alive` | Retention disabled, initial miss, warmed hit, LRU eviction, and corresponding idle updates | 1/32/128 nodes per page |
 | `instances` | Fresh parent/child, retained parent/fresh child, parent/child hits, dependency eviction | 1/32/128 nodes each for parent and child |
 | `steady` | Dynamic content after initial navigation, comparing two/three frames, ordinary scroll markers, and a no-Router control | 128/1024 nodes |
+| `retained_steady` | The same active leaf and shared parent with 0/1/4 retained siblings; idle and scroll-position updates | Parent 128, active leaf 32; each retained leaf 32/1024 dynamic nodes |
 | `transitions` | Disabled, enter-only, and held exit; publication, animation updates, release, finish, and idle | 32/128/1024 nodes per page |
 
 ### Full animation path
@@ -71,6 +72,17 @@ ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router
 
 Complete one navigation and create content through the public World after publication. A transparent pathless layout supplies the three-frame control. An ordinary `RouteScroll + ScrollPosition` marker measures the idle cost of scroll observation.
 
+### Retained siblings with fixed active content
+
+```sh
+ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > retained-steady-router.csv
+ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > retained-steady-ui.csv
+```
+
+The shared parent has 128 ordinary dynamic descendants and the active leaf has 32. Within each fixture, visit sibling pages and return to the original active leaf to accumulate 0, 1, and 4 retained siblings, each with 32 or 1024 dynamic descendants. All descendants are added through the public World after publication. The active leaf and shared parent entities stay identical as inventory grows. Both flat and nested shapes keep these node budgets unchanged.
+
+Each stage warms 64 updates, then measures idle updates and updates changing only the active `ScrollPosition`. Each sample averages 32 updates; the scroll row includes the component write. `ROUTER_BENCH_UI=1` installs normal layout, UiStack, picking systems, and camera input, and checks real scroll overflow and the computed displayed position. `0` or an unset value measures Router without UI layout. No pointer is injected. CSV records node budgets, retained pages, live entities, request records, factory builds, and measured scroll writes. Untimed assertions verify activity/input eligibility, unchanged entities and counts, no factory rebuild during sampling, and complete content cleanup when leaving the parent scope.
+
 ## Timing boundaries
 
 The Router fixture installs TaskPool, Asset, and Scene runtime and advances through ordinary `App::update`, navigation APIs, and snapshots. Navigation timing starts before enqueue and ends at a terminal request, no running request, and completed foreground cleanup. It includes building, resolve/apply, input authorization refresh, publication, and old-content cleanup. Initialization, target-string construction, detailed assertions, and CSV output are untimed.
@@ -82,7 +94,7 @@ The Router fixture installs TaskPool, Asset, and Scene runtime and advances thro
 | Entity and request counts | Stable state at the end of a scenario group; failure rows are read after their corresponding recovery |
 | Update limit | An assertion that each step settles within 32 updates |
 
-Ordinary modes measure headless Router and basic scheduling. The `transitions` UI option additionally covers normal layout and input candidate projection; without injected pointers it does not measure actual hit testing. Use the window mode above for submission; GPU execution, actual presentation, and I/O require their corresponding environment. The root workspace and separate window application can use different executors/features, so record the actual build configuration before comparisons.
+Ordinary modes measure headless Router and basic scheduling. The `transitions` and `retained_steady` UI options additionally cover normal layout and input candidate projection; without injected pointers they do not measure actual hit testing. Use the window mode above for submission; GPU execution, actual presentation, and I/O require their corresponding environment. The root workspace and separate window application can use different executors/features, so record the actual build configuration before comparisons.
 
 The direct BSN control keeps the host/layout/outlet and measures Scene construction, resolve/apply, old-page deletion, and ordinary updates. It shows engine construction cost; Router benchmarks additionally perform history, authorization, isolation, and recovery work.
 
@@ -94,9 +106,10 @@ CI runs the benchmark fixtures' behavior assertions:
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
 ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances`, `steady`, and `transitions` also support `-- --test`. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
+`instances`, `steady`, and `transitions` also support `-- --test`. The `retained_steady` smoke check keeps both workloads and 0/4 retained siblings with 32 descendants each, using two samples of four updates. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
 
 ## Save and read results
 
