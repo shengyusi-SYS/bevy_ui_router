@@ -9,22 +9,14 @@ See the [overview](overview.md) for available features and the [behavior contrac
 | Work | Deliverable |
 | --- | --- |
 | Public documentation | English and Chinese user and developer guides, runnable examples, file cleanup, and privacy checks |
+| Public query performance | A borrowed read session shared by activity, current-input, and pending-scroll queries; [delivery and verification plan](changes/query-performance/plan.md) |
 | Release preparation | MIT OR Apache-2.0 dual licensing is selected; choose the release version, then validate the final packages with an independent consumer |
 
 Applications and UI code implement animation effects. The project uses MIT OR Apache-2.0 dual licensing. Maintainers will choose the release version; applications currently use a local checkout dependency.
 
+Current source targets Bevy `0.20`, with dependencies and standalone consumers declaring `0.20.1` and the optional Tween adapter declaring `bevy_tween 0.14.1`. See [version requirements](guides/integration.md#bevy-version-requirements) and [verification](development/verification.md) for compatibility and checks.
+
 ## Future directions
-
-### Bevy 0.20 migration (not started)
-
-Support Bevy 0.19 and subsequent minor releases through the [version-mapping policy](guides/integration.md#bevy-version-requirements). The 0.20 compatibility assessment is complete; migration is deferred. Implementation work:
-
-- Move Bevy to the `0.20` series and `bevy_tween` to `0.14`, update standalone consumers and windowed examples, and check toolchain requirements.
-- Migrate Query iteration, pointer events, observer generics, BSN expressions, and affected Template, clipping, and AutoFocus tests.
-- Include `PointerCaptureMap` in existing page input revocation, preserving other valid targets' captures and testing normal hit detection after navigation.
-- Validate affected crates, public journeys, standalone consumers, and examples. Recheck focus, scroll, and animation scheduling, rerun the existing animation benchmark, and update the compatibility table and user documentation.
-
-### Other directions
 
 Automatic route activity integration with native Tab navigation and input dispatch needs suitable public extension points in Bevy/UI. This work also includes focus admission and replacement of the current focus bridge. Applications can use `RouterInputGate` in keyboard and gamepad handlers today.
 

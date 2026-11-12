@@ -25,7 +25,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["ui"] }
+bevy = { version = "0.20", default-features = false, features = ["ui"] }
 bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = ["bsn"] }
 ```
 
@@ -187,8 +187,8 @@ cargo run -p bevy_ui_router --features bsn --example bsn_nested
 
 | Bevy | Router |
 | --- | --- |
-| `0.19` | 当前源码，尚未发布 |
+| `0.20` | 当前源码，尚未发布；仓库依赖当前使用 `0.20.1` |
 
-本库从 Bevy 0.19 起，按 Bevy 次版本提供对应的 Router 发布系列；应用选择与自身 Bevy 匹配的版本。`version = "0.19"` 接受兼容的补丁更新，应用使用自己的 lockfile。
+Router 与应用应使用相同的 Bevy 次版本。`version = "0.20"` 接受 `0.20` 系列内兼容的补丁更新，应用使用自己的 lockfile。新的 Bevy 次版本需要显式适配与验证。
 
-其它 Bevy 版本的适配进度见[路线图](../roadmap.zh-CN.md#bevy-020-适配待启动)。
+正在开展的工作与后续方向见[路线图](../roadmap.zh-CN.md)。

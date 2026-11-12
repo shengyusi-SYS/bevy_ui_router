@@ -33,7 +33,7 @@ cargo test --workspace --all-features --locked
 
 独立 consumer 联网解析自己的依赖并生成 lockfile，随后用 `--locked` 编译运行；仓库的 `cargo fetch` 不替代下游解析。共享 target 由一位验证负责人顺序运行 Cargo/rustc。
 
-CI 的 `--locked` 复现已提交的依赖快照；版本要求见[接入指南](../guides/integration.zh-CN.md#bevy-版本要求)。独立 consumer 使用 `0.19` 范围重新生成自己的 lockfile，不复用仓库的 Bevy 选择。维护依赖快照时用 `cargo update` 解析兼容更新，再运行相应检查。
+CI 的 `--locked` 复现已提交的依赖快照；版本要求见[接入指南](../guides/integration.zh-CN.md#bevy-版本要求)。独立 consumer 当前声明 Bevy `0.20.1`，重新生成自己的 lockfile，不复用仓库的 Bevy 选择。这接受 `0.20` 系列内兼容的补丁更新，不表示自动兼容其它次版本。维护依赖快照时用 `cargo update` 解析兼容更新，再运行相应检查。
 
 全特性与最小 feature 各有检查用途。修改 ECS 的可选 BSN 接线时，补充基础 ECS 路径：
 
@@ -153,6 +153,7 @@ Cargo 会生成、解压并编译验证发布包。包内容可用 `cargo packag
 
 | 环境或能力 | 已有记录 | 后续检查 |
 | --- | --- | --- |
+| 当前 Bevy `0.20` 源码 | workspace manifests、独立 consumer 和窗口示例声明 `0.20.1`；可选 `bevy_tween` 声明 `0.14.1` | 在候选树验证实际解析依赖；依赖声明本身不代表运行通过 |
 | Bevy `0.19` 系列 | 历史记录覆盖 `0.19.0` / `0.19.1` 的 workspace、公开旅程和独立 consumer 回归 | 依赖更新后按变更范围验证实际解析结果 |
 | Headless Scene/UI | 导航、布局、picking、focus、保留、活动与滚动组合 | 按功能改动选择完整操作链 |
 | 打包产物 | 六个库包和解压后的 BSN consumer | 最终发布树重新打包并运行 consumer |

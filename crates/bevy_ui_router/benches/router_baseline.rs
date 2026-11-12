@@ -6,6 +6,9 @@
 //! ROUTER_BENCH_MODE=instances measures parent/child inventory coordination.
 //! ROUTER_BENCH_MODE=steady isolates initial dynamic content and ordinary scroll observation.
 //! ROUTER_BENCH_MODE=retained_steady fixes active content while growing retained siblings.
+//! ROUTER_BENCH_MODE=public_queries measures ordinary systems calling public read APIs.
+#[path = "router_baseline/public_queries.rs"]
+mod public_queries;
 #[path = "router_baseline/retained_instances.rs"]
 mod retained_instances;
 #[path = "router_baseline/retained_steady.rs"]
@@ -789,12 +792,10 @@ fn main() {
             !cfg!(debug_assertions),
             "use cargo bench for optimized measurements; --test runs a smoke check"
         );
-        let default_samples =
-            if std::env::var("ROUTER_BENCH_MODE").as_deref() == Ok("retained_steady") {
-                32
-            } else {
-                128
-            };
+        let default_samples = match std::env::var("ROUTER_BENCH_MODE").as_deref() {
+            Ok("retained_steady" | "public_queries") => 32,
+            _ => 128,
+        };
         std::env::var("ROUTER_BENCH_SAMPLES").map_or(default_samples, |value| {
             value.parse().expect("positive sample count")
         })
@@ -824,6 +825,10 @@ fn main() {
             retained_steady::run(shape, samples, smoke);
             return;
         }
+        Ok(mode) if mode == "public_queries" => {
+            public_queries::run(shape, samples, smoke);
+            return;
+        }
         Ok(mode) if mode == "instances" => {
             retained_instances::run(shape, samples);
             return;
@@ -840,7 +845,7 @@ fn main() {
         Err(std::env::VarError::NotPresent) => {}
         mode => {
             panic!(
-                "ROUTER_BENCH_MODE must be unset, steady, retained_steady, keep_alive, instances or transitions, got {mode:?}"
+                "ROUTER_BENCH_MODE must be unset, steady, retained_steady, public_queries, keep_alive, instances or transitions, got {mode:?}"
             )
         }
     }

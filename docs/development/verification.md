@@ -33,7 +33,7 @@ cargo test --workspace --all-features --locked
 
 Standalone consumers resolve their own dependencies online and generate lockfiles, then build and run with `--locked`; fetching the repository dependencies does not replace downstream resolution. Assign one validation owner to run Cargo/rustc sequentially against a shared target directory.
 
-CI uses `--locked` to reproduce the committed dependency snapshot; see [integration](../guides/integration.md#bevy-version-requirements) for version requirements. Standalone consumers generate their own lockfiles from the `0.19` range instead of reusing the repository's Bevy selection. When maintaining the dependency snapshot, use `cargo update` to resolve compatible updates, then run the relevant checks.
+CI uses `--locked` to reproduce the committed dependency snapshot; see [integration](../guides/integration.md#bevy-version-requirements) for version requirements. Standalone consumers currently declare Bevy `0.20.1` and generate their own lockfiles instead of reusing the repository's Bevy selection. This permits compatible patch updates within `0.20`, not automatic compatibility with another minor version. When maintaining the dependency snapshot, use `cargo update` to resolve compatible updates, then run the relevant checks.
 
 All-feature and minimal-feature checks serve different purposes. When changing optional BSN wiring in ECS, also test the base ECS path:
 
@@ -153,6 +153,7 @@ This table summarizes historical verification recorded in the repository and hel
 
 | Environment or capability | Existing record | Next checks |
 | --- | --- | --- |
+| Current Bevy `0.20` source | Workspace manifests, standalone consumers, and windowed examples declare `0.20.1`; optional `bevy_tween` declares `0.14.1` | Verify the actual resolved dependencies on the candidate tree; declarations alone do not establish a passed run |
 | Bevy `0.19` series | Historical workspace, public-journey, and standalone-consumer regressions cover `0.19.0` / `0.19.1` | Validate the resolved dependencies according to the scope of each update |
 | Headless Scene/UI | Combined navigation, layout, picking, focus, retention, activity, and scrolling | Select complete journeys for the changed behavior |
 | Package archives | Six library packages and the extracted BSN consumer | Repackage the final release tree and run its consumer |

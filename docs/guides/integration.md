@@ -25,7 +25,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["ui"] }
+bevy = { version = "0.20", default-features = false, features = ["ui"] }
 bevy_ui_router = { path = "../bevy_ui_router/crates/bevy_ui_router", features = ["bsn"] }
 ```
 
@@ -187,8 +187,8 @@ Windowed examples need a display and graphics driver and use X11 on Linux. Follo
 
 | Bevy | Router |
 | --- | --- |
-| `0.19` | Current source, not yet published |
+| `0.20` | Current source, not yet published; repository dependencies currently use `0.20.1` |
 
-Starting with Bevy 0.19, each supported Bevy minor version has a corresponding Router release series. Choose the series matching your application. `version = "0.19"` accepts compatible patch updates; applications use their own lockfiles.
+Match the Bevy minor version used by Router and your application. `version = "0.20"` accepts compatible patch updates within `0.20`; applications use their own lockfiles. A new Bevy minor version requires an explicit Router compatibility update and verification.
 
-See the [roadmap](../roadmap.md#bevy-020-migration-not-started) for work on other Bevy versions.
+See the [roadmap](../roadmap.md) for active work and future directions.
