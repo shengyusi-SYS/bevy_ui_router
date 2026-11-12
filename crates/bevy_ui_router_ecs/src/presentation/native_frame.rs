@@ -419,11 +419,18 @@ pub(crate) fn observe_content<'w>(
     frame: &RouteFrameVersion,
     root: Entity,
 ) -> Result<NativeContentObservation<'w>, crate::frame_local::FrameLocalError> {
-    use crate::frame_local::FrameLocalError;
     let registry = world.resource::<RouteEntityRegistry>();
-    let root_record = registry
-        .record(root)
-        .ok_or(FrameLocalError::MissingRoot(root))?;
+    observe_content_with_records(world, frame, root, |entity| registry.record(entity))
+}
+
+pub(crate) fn observe_content_with_records<'w>(
+    world: &'w World,
+    frame: &RouteFrameVersion,
+    root: Entity,
+    record: impl Fn(Entity) -> Option<&'w crate::registry::RouteEntityRecord>,
+) -> Result<NativeContentObservation<'w>, crate::frame_local::FrameLocalError> {
+    use crate::frame_local::FrameLocalError;
+    let root_record = record(root).ok_or(FrameLocalError::MissingRoot(root))?;
     if !matches!(root_record.owner(), RegistryOwner::Committed(EntityOwner::FrameContentTarget(owner)) if owner == frame)
         || world.get::<FrameContentTarget>(root) != Some(&FrameContentTarget(frame.clone()))
         || world.get::<RouteOwnershipSeal>(root)
@@ -441,7 +448,7 @@ pub(crate) fn observe_content<'w>(
             return Err(FrameLocalError::RelationshipCycle(entity));
         }
         if entity != root
-            && let Some(record) = registry.record(entity)
+            && let Some(record) = record(entity)
         {
             if matches!(record.owner(), RegistryOwner::Committed(EntityOwner::ChildSlot { parent, .. }) | RegistryOwner::Provisional(ProvisionalOwner::ChildSlot { parent, .. }) if parent == frame)
                 && world.get::<RouteOwnershipSeal>(entity)
@@ -456,7 +463,7 @@ pub(crate) fn observe_content<'w>(
             return Err(FrameLocalError::OwnershipDrift(entity));
         }
         if entity != root
-            && registry.record(entity).is_none()
+            && record(entity).is_none()
             && world
                 .get_resource::<QuarantineLeaseTable>()
                 .is_some_and(|table| {
@@ -479,7 +486,7 @@ pub(crate) fn observe_content<'w>(
                 }
                 // Preserve the physical enumeration order: managed parent order,
                 // then its authored children. The later visit proves each cut.
-                if registry.record(child).is_some() {
+                if record(child).is_some() {
                     child_slots.push(child);
                 }
             }
@@ -886,28 +893,51 @@ pub(super) fn observe_native_values<'w>(
     lifecycle: EntityLifecycle,
 ) -> Option<NativeContentObservation<'w>> {
     let root = frame.native_root()?;
-    let registry = world.resource::<RouteEntityRegistry>();
-    let valid =
-        frame.entities.iter().all(|entity| {
-            registry.record(entity.entity).is_some_and(|record| {
-                record.claim() == entity.claim && record.lifecycle() == lifecycle
-            }) && world.get::<RouteOwnershipSeal>(entity.entity)
-                == Some(&RouteOwnershipSeal::new(entity.claim.seal()))
-                && world.get::<FrameLifecycle>(entity.entity) == Some(&FrameLifecycle(lifecycle))
-                && world.get::<ChildOf>(entity.entity).map(ChildOf::parent) == Some(entity.parent)
-        }) && shell_visual_values_are_current(world, frame.shell(), frame.frame(), lifecycle)
-            && world.get::<FrameShell>(frame.shell()) == Some(&FrameShell(frame.frame.clone()))
-            && world.get::<Pickable>(frame.shell()) == Some(&Pickable::IGNORE)
-            && world
-                .get::<RouterInputBarrier>(frame.shell())
-                .is_some_and(RouterInputBarrier::denies_all)
-            && world
-                .get::<Children>(frame.shell())
-                .is_some_and(|children| children.len() == 1 && children[0] == root);
-    if !valid {
+    if !native_values_are_current(world, frame, root, lifecycle) {
         return None;
     }
     observe_content(world, frame.frame(), root).ok()
+}
+
+pub(super) fn observe_native_values_with_observation<'w>(
+    observation: &crate::read_observation::ReadObservation<'w>,
+    frame: &RealizedFrame,
+    lifecycle: EntityLifecycle,
+) -> Option<std::rc::Rc<NativeContentObservation<'w>>> {
+    let root = frame.native_root()?;
+    if !native_values_are_current(observation.world(), frame, root, lifecycle) {
+        return None;
+    }
+    observation
+        .native_content(frame.frame(), root)
+        .ok()
+        .map(|facts| facts.content)
+}
+
+fn native_values_are_current(
+    world: &World,
+    frame: &RealizedFrame,
+    root: Entity,
+    lifecycle: EntityLifecycle,
+) -> bool {
+    let registry = world.resource::<RouteEntityRegistry>();
+    frame.entities.iter().all(|entity| {
+        registry
+            .record(entity.entity)
+            .is_some_and(|record| record.claim() == entity.claim && record.lifecycle() == lifecycle)
+            && world.get::<RouteOwnershipSeal>(entity.entity)
+                == Some(&RouteOwnershipSeal::new(entity.claim.seal()))
+            && world.get::<FrameLifecycle>(entity.entity) == Some(&FrameLifecycle(lifecycle))
+            && world.get::<ChildOf>(entity.entity).map(ChildOf::parent) == Some(entity.parent)
+    }) && shell_visual_values_are_current(world, frame.shell(), frame.frame(), lifecycle)
+        && world.get::<FrameShell>(frame.shell()) == Some(&FrameShell(frame.frame.clone()))
+        && world.get::<Pickable>(frame.shell()) == Some(&Pickable::IGNORE)
+        && world
+            .get::<RouterInputBarrier>(frame.shell())
+            .is_some_and(RouterInputBarrier::denies_all)
+        && world
+            .get::<Children>(frame.shell())
+            .is_some_and(|children| children.len() == 1 && children[0] == root)
 }
 
 #[cfg(test)]
@@ -1025,6 +1055,33 @@ mod tests {
             .id();
         let application = app.world_mut().spawn_empty().id();
 
+        {
+            let observation = crate::read_observation::ReadObservation::new(app.world());
+            let first = observation
+                .native_content(parent.frame(), parent.native_root().unwrap())
+                .unwrap();
+            let again = observation
+                .native_content(parent.frame(), parent.native_root().unwrap())
+                .unwrap();
+            assert!(std::rc::Rc::ptr_eq(&first.content, &again.content));
+            assert!(
+                observation
+                    .native_content(child.frame(), parent.native_root().unwrap())
+                    .is_err()
+            );
+            let binding = branch.child_slots()[0].anchor_binding();
+            assert_eq!(
+                binding.is_current_with_manifest_policy(app.world(), parent.frame(), true, false),
+                binding.is_current_with_observation(
+                    app.world(),
+                    parent.frame(),
+                    true,
+                    false,
+                    Some(&observation)
+                ),
+            );
+        }
+
         let focus = crate::frame_local::validate_active_branch_with_entering(
             app.world(),
             &branch,
@@ -1105,6 +1162,44 @@ mod tests {
             )
             .is_ok()
         );
+
+        // Outlet markers remain application-controlled between observations even
+        // when managed containment itself does not change.
+        let duplicate_outlet = app
+            .world_mut()
+            .spawn((
+                Node::default(),
+                DefaultOutlet,
+                ChildOf(parent.native_root().unwrap()),
+            ))
+            .id();
+        for duplicate in [true, false] {
+            if !duplicate {
+                app.world_mut()
+                    .entity_mut(duplicate_outlet)
+                    .remove::<DefaultOutlet>();
+            }
+            assert_eq!(
+                crate::frame_local::validate_active_branch_with_entering(
+                    app.world(),
+                    &branch,
+                    None,
+                    None
+                )
+                .is_ok(),
+                !duplicate,
+            );
+            assert_eq!(
+                crate::frame_local::observe_active_branch_with_entering(
+                    app.world(),
+                    &branch,
+                    None,
+                    None
+                )
+                .is_ok(),
+                !duplicate,
+            );
+        }
 
         app.world_mut().spawn(ChildOf(parent.shell()));
         assert!(

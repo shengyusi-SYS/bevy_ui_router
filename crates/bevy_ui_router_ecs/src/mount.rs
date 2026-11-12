@@ -1014,6 +1014,7 @@ pub(crate) fn mounted_child_slot_structure_is_isolated(
         EntityLifecycle::PreparedInert,
         false,
         false,
+        None,
     )
 }
 
@@ -1047,7 +1048,7 @@ pub(crate) fn validate_mounted_child_slot(
     slot: &MountedChildSlot,
     lifecycle: EntityLifecycle,
 ) -> bool {
-    validate_mounted_child_slot_with_policy(world, slot, lifecycle, false, true)
+    validate_mounted_child_slot_with_policy(world, slot, lifecycle, false, true, None)
 }
 
 pub(crate) fn validate_leaving_mounted_child_slot(
@@ -1055,7 +1056,23 @@ pub(crate) fn validate_leaving_mounted_child_slot(
     slot: &MountedChildSlot,
     lifecycle: EntityLifecycle,
 ) -> bool {
-    validate_mounted_child_slot_with_policy(world, slot, lifecycle, true, true)
+    validate_mounted_child_slot_with_policy(world, slot, lifecycle, true, true, None)
+}
+
+pub(crate) fn validate_mounted_child_slot_with_observation(
+    observation: &crate::read_observation::ReadObservation<'_>,
+    slot: &MountedChildSlot,
+    lifecycle: EntityLifecycle,
+    allow_foreign_additions: bool,
+) -> bool {
+    validate_mounted_child_slot_with_policy(
+        observation.world(),
+        slot,
+        lifecycle,
+        allow_foreign_additions,
+        true,
+        Some(observation),
+    )
 }
 
 fn validate_mounted_child_slot_with_policy(
@@ -1064,6 +1081,7 @@ fn validate_mounted_child_slot_with_policy(
     lifecycle: EntityLifecycle,
     allow_foreign_additions: bool,
     require_focus_outside: bool,
+    observation: Option<&crate::read_observation::ReadObservation<'_>>,
 ) -> bool {
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return false;
@@ -1094,11 +1112,12 @@ fn validate_mounted_child_slot_with_policy(
                 outlet: slot.outlet.clone(),
                 slot: slot.slot_id,
             })
-        && slot.anchor_binding.is_current_with_manifest_policy(
+        && slot.anchor_binding.is_current_with_observation(
             world,
             &slot.parent,
             true,
             allow_foreign_additions,
+            observation,
         )
         && world.get::<Visibility>(slot.slot) == Some(&visibility)
         && world.get::<Pickable>(slot.slot) == Some(&Pickable::IGNORE)

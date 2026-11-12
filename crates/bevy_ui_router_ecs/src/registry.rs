@@ -800,6 +800,16 @@ impl RouteEntityRegistry {
         parent: &RouteFrameVersion,
         slot: &ExactRegistryClaim,
     ) -> bool {
+        self.retained_parent_owns_slot_with_observation(world, parent, slot, None)
+    }
+
+    pub(crate) fn retained_parent_owns_slot_with_observation(
+        &self,
+        world: &World,
+        parent: &RouteFrameVersion,
+        slot: &ExactRegistryClaim,
+        observation: Option<&crate::read_observation::ReadObservation<'_>>,
+    ) -> bool {
         let mut current_parent = parent;
         let mut current_slot = slot;
         // A dependency must reach a live external parent in at most inventory
@@ -823,7 +833,8 @@ impl RouteEntityRegistry {
             };
             match record.lifecycle() {
                 EntityLifecycle::Active | EntityLifecycle::PreparedInert => {
-                    return boundary.is_shared_authority_current(world);
+                    return boundary
+                        .shared_authority_is_current_with_observation(world, observation);
                 }
                 EntityLifecycle::Retained => {
                     current_parent = boundary.projection().parent();
@@ -894,14 +905,21 @@ impl RouteEntityRegistry {
         shell: Entity,
         slot: Entity,
     ) -> bool {
+        self.retained_boundary_for_shell(shell, slot)
+            .is_some_and(|boundary| boundary.preservation_is_current(world))
+    }
+
+    pub(crate) fn retained_boundary_for_shell(
+        &self,
+        shell: Entity,
+        slot: Entity,
+    ) -> Option<&RetainedBoundaryProof> {
         let mut matches = self
             .retained_boundaries
             .iter()
             .filter(|boundary| boundary.shell() == shell && boundary.slot_entity() == slot);
-        let Some(boundary) = matches.next() else {
-            return false;
-        };
-        matches.next().is_none() && boundary.preservation_is_current(world)
+        let boundary = matches.next()?;
+        matches.next().is_none().then_some(boundary)
     }
 
     pub(crate) fn retained_shell_claims_for_mount(

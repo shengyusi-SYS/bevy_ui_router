@@ -137,6 +137,19 @@ impl OutletBinding {
         _require_outlet: bool,
         allow_additions: bool,
     ) -> bool {
+        self.is_current_with_observation(world, parent, _require_outlet, allow_additions, None)
+    }
+
+    pub(crate) fn is_current_with_observation(
+        &self,
+        world: &World,
+        parent: &RouteFrameVersion,
+        _require_outlet: bool,
+        allow_additions: bool,
+        observation: Option<&crate::read_observation::ReadObservation<'_>>,
+    ) -> bool {
+        #[cfg(not(feature = "bsn"))]
+        let _ = observation;
         match self {
             Self::RegisteredOutput(claim) => world.get_resource::<RouteEntityRegistry>()
                 .and_then(|registry| registry.record(claim.entity()))
@@ -148,8 +161,15 @@ impl OutletBinding {
             Self::NativeContent { anchor, root } => world.get_resource::<RouteEntityRegistry>()
                 .and_then(|registry| registry.record(root.entity()))
                 .is_some_and(|record| record.claim() == *root)
-                && native_frame::collect_content(world, parent, root.entity()).is_ok_and(|content| content.contains(anchor)
-                    && (!_require_outlet || content.iter().filter(|entity| world.get::<bevy_ui_router_bsn::DefaultOutlet>(**entity).is_some()).count() == 1))
+                && (if let Some(observation) = observation {
+                    observation.native_content(parent, root.entity()).is_ok_and(|facts| {
+                        facts.content.membership.contains(anchor)
+                            && (!_require_outlet || facts.default_outlets == 1)
+                    })
+                } else {
+                    native_frame::collect_content(world, parent, root.entity()).is_ok_and(|content| content.contains(anchor)
+                        && (!_require_outlet || content.iter().filter(|entity| world.get::<bevy_ui_router_bsn::DefaultOutlet>(**entity).is_some()).count() == 1))
+                })
                 && (!_require_outlet || world.get::<Node>(*anchor).is_some()
                     && world.get::<bevy_ui_router_bsn::DefaultOutlet>(*anchor).is_some()),
         }
@@ -866,6 +886,14 @@ impl RetainedBoundaryProof {
     }
 
     fn shared_authority_is_current(&self, world: &World) -> bool {
+        self.shared_authority_is_current_with_observation(world, None)
+    }
+
+    pub(crate) fn shared_authority_is_current_with_observation(
+        &self,
+        world: &World,
+        observation: Option<&crate::read_observation::ReadObservation<'_>>,
+    ) -> bool {
         let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
             return false;
         };
@@ -906,7 +934,12 @@ impl RetainedBoundaryProof {
                 (ChildSlotLifecycle::RegisteredInert, Visibility::Hidden)
             }
             EntityLifecycle::Retained
-                if registry.retained_parent_owns_slot(world, parent, &slot_claim) =>
+                if registry.retained_parent_owns_slot_with_observation(
+                    world,
+                    parent,
+                    &slot_claim,
+                    observation,
+                ) =>
             {
                 (ChildSlotLifecycle::Retained, Visibility::Hidden)
             }
@@ -932,7 +965,7 @@ impl RetainedBoundaryProof {
             return false;
         }
         *current_anchor.source_claim_mut() = current;
-        if validate_child_mount_slot(
+        if validate_child_mount_slot_with_observation(
             world,
             &self.host_candidate,
             self.mount.slot,
@@ -948,6 +981,7 @@ impl RetainedBoundaryProof {
             slot_lifecycle,
             slot_component,
             slot_visibility,
+            observation,
         )
         .is_err()
         {
@@ -1039,6 +1073,14 @@ impl RetainedBoundaryProof {
     /// Certifies only an inert, protected sibling boundary. Its content may
     /// need retirement and is never authorized for activation by this proof.
     pub(crate) fn preservation_is_current(&self, world: &World) -> bool {
+        self.preservation_is_current_with_observation(world, None)
+    }
+
+    pub(crate) fn preservation_is_current_with_observation(
+        &self,
+        world: &World,
+        observation: Option<&crate::read_observation::ReadObservation<'_>>,
+    ) -> bool {
         let Some(shell) = self
             .entities
             .iter()
@@ -1049,7 +1091,7 @@ impl RetainedBoundaryProof {
         let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
             return false;
         };
-        if !self.shared_authority_is_current(world)
+        if !self.shared_authority_is_current_with_observation(world, observation)
             || !registry
                 .record(self.shell)
                 .is_some_and(|record| record.claim() == shell.claim)
@@ -1113,9 +1155,6 @@ impl RetainedBoundaryProof {
                 .is_some_and(|focus| focus.focused().is_some_and(|entity| seen.contains(&entity)))
     }
 
-    pub(crate) fn is_shared_authority_current(&self, world: &World) -> bool {
-        self.shared_authority_is_current(world)
-    }
     pub(crate) fn own_slot_claim(&self, entity: Entity) -> Option<&ExactRegistryClaim> {
         self.empty_slots
             .iter()
@@ -2918,6 +2957,24 @@ fn validate_committed_mount_binding(
     frame: &RouteFrameVersion,
     allow_leaving_child_boundary_drift: bool,
 ) -> Result<(), RealizationError> {
+    validate_committed_mount_binding_with_observation(
+        world,
+        host_candidate,
+        mount,
+        frame,
+        allow_leaving_child_boundary_drift,
+        None,
+    )
+}
+
+fn validate_committed_mount_binding_with_observation(
+    world: &World,
+    host_candidate: &ValidatedHostCandidate,
+    mount: &FrameMountBinding,
+    frame: &RouteFrameVersion,
+    allow_leaving_child_boundary_drift: bool,
+    observation: Option<&crate::read_observation::ReadObservation<'_>>,
+) -> Result<(), RealizationError> {
     match &mount.kind {
         FrameMountBindingKind::HostTop { .. } => validate_top_slot(
             world,
@@ -2934,7 +2991,7 @@ fn validate_committed_mount_binding(
             anchor_binding,
             expected_anchor_children,
             ..
-        } => validate_child_mount_slot(
+        } => validate_child_mount_slot_with_observation(
             world,
             host_candidate,
             mount.slot,
@@ -2950,6 +3007,7 @@ fn validate_committed_mount_binding(
             EntityLifecycle::Active,
             ChildSlotLifecycle::Active,
             Visibility::Visible,
+            observation,
         ),
     }
 }
@@ -2971,6 +3029,45 @@ fn validate_child_mount_slot(
     expected_registry_lifecycle: EntityLifecycle,
     expected_component_lifecycle: ChildSlotLifecycle,
     expected_visibility: Visibility,
+) -> Result<(), RealizationError> {
+    validate_child_mount_slot_with_observation(
+        world,
+        host_candidate,
+        slot_entity,
+        slot_claim,
+        parent,
+        outlet,
+        anchor,
+        anchor_binding,
+        expected_anchor_children,
+        frame,
+        allowed_manifest_additions,
+        allow_arbitrary_manifest_additions,
+        expected_registry_lifecycle,
+        expected_component_lifecycle,
+        expected_visibility,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_child_mount_slot_with_observation(
+    world: &World,
+    host_candidate: &ValidatedHostCandidate,
+    slot_entity: Entity,
+    slot_claim: &ExactRegistryClaim,
+    parent: &RouteFrameVersion,
+    outlet: &bevy_ui_router_core::slot::RouteSlotKey,
+    anchor: Entity,
+    anchor_binding: &OutletBinding,
+    expected_anchor_children: &[Entity],
+    frame: &RouteFrameVersion,
+    allowed_manifest_additions: &[ComponentId],
+    allow_arbitrary_manifest_additions: bool,
+    expected_registry_lifecycle: EntityLifecycle,
+    expected_component_lifecycle: ChildSlotLifecycle,
+    expected_visibility: Visibility,
+    observation: Option<&crate::read_observation::ReadObservation<'_>>,
 ) -> Result<(), RealizationError> {
     let Some(registry) = world.get_resource::<RouteEntityRegistry>() else {
         return Err(RealizationError::InvalidMount);
@@ -3024,11 +3121,12 @@ fn validate_child_mount_slot(
             })
         || world.get::<ChildOf>(slot_entity).map(ChildOf::parent) != Some(anchor)
         || anchor_binding.anchor() != anchor
-        || !anchor_binding.is_current_with_manifest_policy(
+        || !anchor_binding.is_current_with_observation(
             world,
             parent,
             true,
             allow_arbitrary_manifest_additions,
+            observation,
         )
         || !anchor_binding.children_are_current(world, slot_entity, expected_anchor_children)
         || !validated_host_candidate_is_current(world, host_candidate)
@@ -4022,23 +4120,35 @@ fn committed_frame_boundary_is_valid(
     role: CommittedFrameRole,
     entering_shells: &[ExactRegistryClaim],
 ) -> bool {
+    committed_frame_boundary_is_valid_with_observation(world, frame, role, entering_shells, None)
+}
+
+fn committed_frame_boundary_is_valid_with_observation(
+    world: &World,
+    frame: &RealizedFrame,
+    role: CommittedFrameRole,
+    entering_shells: &[ExactRegistryClaim],
+    observation: Option<&crate::read_observation::ReadObservation<'_>>,
+) -> bool {
     let leaving_child_boundary = matches!(role, CommittedFrameRole::Leaving)
         && matches!(frame.mount.kind, FrameMountBindingKind::ChildOutlet { .. });
-    let binding_valid = validate_committed_mount_binding(
+    let binding_valid = validate_committed_mount_binding_with_observation(
         world,
         &frame.host_candidate,
         &frame.mount,
         frame.frame(),
         leaving_child_boundary,
+        observation,
     )
     .is_ok();
-    let mount_children_valid = mount_slot_children_are_acceptable(
+    let mount_children_valid = mount_slot_children_are_acceptable_with_observation(
         world,
         frame,
         CurrentShellManifestPolicy::ObserveAdditions,
         leaving_child_boundary,
         entering_shells,
         &[],
+        observation,
     );
     binding_valid && mount_children_valid
 }
@@ -4046,19 +4156,25 @@ fn committed_frame_boundary_is_valid(
 /// Reuse the native values/content proof only within the active read observation.
 #[cfg(feature = "bsn")]
 pub(crate) fn observe_active_native_frame<'w>(
-    world: &'w World,
+    observation: &crate::read_observation::ReadObservation<'w>,
     frame: &RealizedFrame,
     entering_shells: &[ExactRegistryClaim],
-) -> Option<native_frame::NativeContentObservation<'w>> {
-    if !committed_frame_boundary_is_valid(
+) -> Option<std::rc::Rc<native_frame::NativeContentObservation<'w>>> {
+    let world = observation.world();
+    if !committed_frame_boundary_is_valid_with_observation(
         world,
         frame,
         CommittedFrameRole::Preserved,
         entering_shells,
+        Some(observation),
     ) {
         return None;
     }
-    native_frame::observe_native_values(world, frame, EntityLifecycle::Active)
+    native_frame::observe_native_values_with_observation(
+        observation,
+        frame,
+        EntityLifecycle::Active,
+    )
 }
 
 fn classify_committed_frame(
@@ -4538,6 +4654,26 @@ fn mount_slot_children_are_acceptable(
     entering_shells: &[ExactRegistryClaim],
     observed_leaving_shells: &[ExactRegistryClaim],
 ) -> bool {
+    mount_slot_children_are_acceptable_with_observation(
+        world,
+        frame,
+        current_shell_manifest,
+        allow_foreign_children,
+        entering_shells,
+        observed_leaving_shells,
+        None,
+    )
+}
+
+fn mount_slot_children_are_acceptable_with_observation(
+    world: &World,
+    frame: &RealizedFrame,
+    current_shell_manifest: CurrentShellManifestPolicy,
+    allow_foreign_children: bool,
+    entering_shells: &[ExactRegistryClaim],
+    observed_leaving_shells: &[ExactRegistryClaim],
+    observation: Option<&crate::read_observation::ReadObservation<'_>>,
+) -> bool {
     let slot_entity = frame.mount.slot();
     let registry = world.resource::<RouteEntityRegistry>();
     let Some(mount_record) = registry.record(slot_entity) else {
@@ -4567,7 +4703,10 @@ fn mount_slot_children_are_acceptable(
                 if child == frame.shell
                     || child_frame == &frame.frame
                     || !frame_version_matches_mount(&frame.mount, mount_owner, child_frame)
-                    || !registry.retained_shell_is_current(world, child, slot_entity)
+                    || !observation.map_or_else(
+                        || registry.retained_shell_is_current(world, child, slot_entity),
+                        |observation| observation.retained_shell_is_current(child, slot_entity),
+                    )
                 {
                     return false;
                 }

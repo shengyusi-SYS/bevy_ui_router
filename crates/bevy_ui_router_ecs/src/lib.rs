@@ -24,6 +24,7 @@ mod navigation;
 mod navigation_commands;
 mod plugin;
 mod presentation;
+mod read_observation;
 mod registry;
 mod retained;
 mod route_inputs;
