@@ -434,9 +434,14 @@ impl ScrollState {
                 state.records.insert(entry, positions);
             }
         }
-        state
-            .records
-            .retain(|entry, _| facts.surviving_entries().contains(entry));
+        if !state.records.is_empty() {
+            let surviving = facts
+                .surviving_entries()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            state.records.retain(|entry, _| surviving.contains(entry));
+        }
         state.displayed.retain(|displayed| {
             observation
                 .target
