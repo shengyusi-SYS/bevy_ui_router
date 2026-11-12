@@ -15,6 +15,7 @@ Public benchmark data is retained with complete source commits. See [performance
 | [Window / 窗口过渡](performance-transition-window-2026-10-25.csv) | 4800 | Same sources; optimized window build without BRP |
 | [Retained steady updates](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
 | [Observation controls](performance-observation-controls-2026-11-12.csv) | 194 | Same sources; ordinary navigation and initial dynamic pages |
+| [Public query consumers](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
 
 ## Measurement environment
 
@@ -93,6 +94,29 @@ For nested content with 1024 descendants per retained page, final idle p50 range
 The corresponding UI / 4 scroll-update p50 falls from 1191.3–1194.1 to 715.2–739.3 microseconds. Controls do not establish a universal speedup: ordinary initial-page cases vary by a few percent, and UI totals still include Bevy work. The lazy outlet count avoids an unnecessary full leaf scan introduced by eager fact preparation. Content vectors and membership sets are shared without copying within the observation; allocation counts and bytes were not instrumented, so no numeric allocation reduction is claimed.
 
 The retained changes share parent content and identical preservation proofs inside one immutable World borrow, index registry reads, and use Bevy's Entity hash set. Role-specific checks and fresh observations after writes remain. An exploratory single-entry memo replacement did not produce a repeatable CPU benefit and was reverted. Remaining retained content still receives one complete preservation observation per required phase; cross-frame invalidation machinery and speculative multi-router optimization were deferred. These results establish library CPU improvements, not application FPS or battery gains.
+
+## Public query consumers: 2026-11-12
+
+The `public_queries` fixture has 32 or 1024 active dynamic descendants and the same number of retained descendants. It measures resident consumer systems after publication, including their application-component writes and normal Router updates. `per_target` queries each descendant; `same_root` repeats the active-root query the same number of times. Scroll rows measure a missing intent. See the [method](../../performance.md#application-query-consumers).
+
+These runs use the November environment above, Bevy 0.20.1, `bsn`, the same root lock, optimized bench profile, and two build jobs. Each row has 32 samples averaging four updates, after 16 warmup updates. No renderer, UI layout, pointer injection, device measurement, or heap-allocation counter is included.
+
+| Variant | Source | Binary SHA-256 |
+| --- | --- | --- |
+| Before fixture | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` | `d1e9e135720d4873570863246facf4e23661fb1e1e8ef1c18566566858c3b632` |
+| Shared reader | `96787c790507cca1ee3b8e474edafcf75dbbe7fc` | `c897092c27c575ad5110063671971b866d748c9cb7296e79d3316d1f4070306b` |
+
+Build with the existing `cargo bench ... --no-run` command, then run the fixed executable with `ROUTER_BENCH_MODE=public_queries` and `ROUTER_BENCH_SHAPE=flat|nested`. Builds and timings were serial. Run order was before flat/nested rounds 1–2, exploratory reader work, before replay 3, then shipped-reader round 1 → before replay 4 → shipped-reader round 2. All before and shipped-reader rows remain in the CSV. Preliminary uncommitted reader experiments are separate from this dataset. Some flat control and repeated-root rows vary substantially; no cause is established.
+
+The primary comparison uses old entry points and the shared reader **inside the shipped binary**, with identical content, writes, and run conditions. The before fixture has four run conditions; the shipped fixture has five, so cross-binary controls also include that small scheduling difference. Per-update p50 ranges in microseconds across the two final rounds are:
+
+| Shape / per-target queries | Empty loop | Individual activity | Shared activity | Individual inputs | Shared inputs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flat / 2048 | 158.2–160.9 | 1383.2–1508.7 | 349.3–350.1 | 1389.3–1427.8 | 351.2–353.2 |
+| Nested / 2048 | 153.1–156.2 | 1488.8–1498.4 | 650.2–653.4 | 1489.3–1506.7 | 652.3–659.0 |
+| Nested / 64 | 18.1–18.2 | 57.0–57.1 | 34.1–34.2 | 56.9–57.1 | 34.1–34.4 |
+
+For nested repeated-root activity, p50 changes from 2096.4–2122.3 to 162.1–164.8 microseconds. Nested per-target scroll misses change from 1483.0–1497.5 to 667.8–669.7 microseconds. These gains require creating one reader outside the loop; existing individual methods remain available. They establish CPU cost for this consumer workload, not isolated method latency or application FPS. Small-list special casing did not establish a repeatable additional gain and was removed.
 
 ## Maintenance
 

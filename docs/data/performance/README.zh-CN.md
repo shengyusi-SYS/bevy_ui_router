@@ -15,6 +15,7 @@
 | [Window / 窗口过渡](performance-transition-window-2026-10-25.csv) | 4800 | 同上；无 BRP 的优化窗口构建 |
 | [保留页稳态更新](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
 | [观察路径控制组](performance-observation-controls-2026-11-12.csv) | 194 | 同上；普通导航及初始动态页面 |
+| [公开查询消费者](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
 
 ## 测量环境
 
@@ -93,6 +94,29 @@ nested、每个保留页 1024 后代时，最终 idle p50 范围如下，单位�
 对应 UI / 4 的 scroll-update p50 从 1191.3–1194.1 降至 715.2–739.3 微秒。控制组不支持普遍加速结论：普通初始页面有几个百分点的波动，UI 总时间仍包含 Bevy 工作。按需 outlet 计数消除了提前准备 facts 时额外引入的完整叶页扫描。观察内共享内容 Vec 和 membership 集合，不复制大集合；未插桩测量分配次数或字节数，因此不宣称数值化分配收益。
 
 保留的修改包括同次不可变 World 借用内的父内容和相同目的 preservation 复用、registry 读取索引及 Bevy Entity 集合。角色相关校验和写后重新观察保留。单条 memo 替代分桶 Vec 的探索候选没有产生可重复的 CPU 收益，已撤回。每个必要阶段仍完整观察保留内容一次；跨帧失效机制和未证实必要的多 Router 优化后置。本次证实的是库内 CPU 改善，不是应用 FPS 或电池收益。
+
+## 公开查询消费者：2026-11-12
+
+`public_queries` 夹具包含 32 或 1024 个活动动态后代，以及同量保留后代。计时覆盖 publication 后的常驻消费者系统，包括应用组件写入和普通 Router update。`per_target` 逐后代查询，`same_root` 以同样次数重复查询活动根。滚动行测量没有待恢复意图的情况，详见[测量方法](../../performance.zh-CN.md#应用查询消费者)。
+
+环境沿用上文 November 记录，使用 Bevy 0.20.1、`bsn`、同一根 lock、优化 bench profile 与两个构建 job。每行预热 16 次 update，采样 32 次，每次平均 4 次 update。未包含 renderer、UI layout、pointer 注入、设备测量或 heap 分配计数。
+
+| 变体 | 源码 | 二进制 SHA-256 |
+| --- | --- | --- |
+| 变更前夹具 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` | `d1e9e135720d4873570863246facf4e23661fb1e1e8ef1c18566566858c3b632` |
+| 共享 reader | `96787c790507cca1ee3b8e474edafcf75dbbe7fc` | `c897092c27c575ad5110063671971b866d748c9cb7296e79d3316d1f4070306b` |
+
+用现有 `cargo bench ... --no-run` 命令构建，再通过 `ROUTER_BENCH_MODE=public_queries` 与 `ROUTER_BENCH_SHAPE=flat|nested` 运行固定二进制。构建与测量串行进行。顺序为 before flat/nested 第 1–2 轮、探索性 reader 工作、before 第 3 轮回放，随后为最终 reader 第 1 轮 → before 第 4 轮回放 → 最终 reader 第 2 轮。CSV 保留全部 before 和最终 reader 行，未提交的初期 reader 试验另行保存。部分 flat 控制组与重复根行波动明显，尚未确定原因。
+
+主要比较来自**最终二进制内**相同内容、写入和运行条件下的旧入口与共享 reader。before 夹具有 4 个运行条件，最终夹具有 5 个，跨二进制对照也包含这一小段调度差异。最终两轮的每 update p50 范围如下，单位微秒：
+
+| 形状／逐实体查询数 | 空循环 | 单次 activity | 共享 activity | 单次 inputs | 共享 inputs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 平铺／2048 | 158.2–160.9 | 1383.2–1508.7 | 349.3–350.1 | 1389.3–1427.8 | 351.2–353.2 |
+| 嵌套／2048 | 153.1–156.2 | 1488.8–1498.4 | 650.2–653.4 | 1489.3–1506.7 | 652.3–659.0 |
+| 嵌套／64 | 18.1–18.2 | 57.0–57.1 | 34.1–34.2 | 56.9–57.1 | 34.1–34.4 |
+
+嵌套的重复根 activity p50 从 2096.4–2122.3 降至 162.1–164.8 微秒；嵌套逐实体滚动 miss 从 1483.0–1497.5 降至 667.8–669.7 微秒。收益要求在循环外创建一次 reader，原单次方法仍可使用。这些结果表示本消费者工作负载的 CPU 成本，不是独立方法耗时或应用 FPS。小列表特殊快路未得到可重复的额外收益，已移除。
 
 ## 维护
 

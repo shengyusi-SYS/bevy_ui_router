@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-默认每个普通场景采样 128 次，`retained_steady` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
+默认每个普通场景采样 128 次，`retained_steady` 与 `public_queries` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
 
 固定机器、工具链、依赖、features 和优化参数，至少重复两轮。串行完成构建与计时，保存全部配对输出。先比较相同工作的绝对 p50/p95、update 次数及波动，再选择需要 profile 的路径。
 
@@ -27,6 +27,7 @@ cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locke
 | `instances` | 父子 fresh、原父/新子、父子命中、父依赖淘汰 | 父和子各自 1/32/128 节点 |
 | `steady` | 首次导航后的动态内容，比较两层/三层 frame、普通滚动 marker 和无 Router 控制 | 128/1024 节点 |
 | `retained_steady` | 固定活动页和共同父布局，积累 0/1/4 个保留兄弟页；空闲与滚动位置更新 | 父布局 128、活动页 32；每个保留页 32/1024 个动态节点 |
+| `public_queries` | 常驻应用消费者：空循环、单次入口、共享 reader；重复根与逐实体查询 | 32/1024 个活动后代及同量保留后代 |
 | `transitions` | 关闭过渡、仅进入、持有退出；分别测发布、逐帧更新、释放、完成与空闲 | 每页 32/128/1024 节点 |
 
 ### 动画全路径
@@ -83,6 +84,17 @@ ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 ca
 
 每个阶段预热 64 次 update，随后分别测量空闲更新和仅改变活动页 `ScrollPosition` 的更新。每个样本取 32 次 update 的均值，滚动行包含 component 写入。`ROUTER_BENCH_UI=1` 安装正常 layout、UiStack、picking 系统及相机输入，并检查真实滚动溢出和计算后的显示位置；`0` 或不设置时测量无 UI layout 的 Router。夹具不注入 pointer。CSV 记录节点预算、保留页、活实体、请求记录、factory 构建和正式样本的滚动写入数。计时外断言检查 activity/输入资格、Entity 和数量保持不变、采样期间无 factory 重建，以及退出父作用域时完整清理内容。
 
+### 应用查询消费者
+
+```sh
+ROUTER_BENCH_MODE=public_queries cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > queries-flat.csv
+ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > queries-nested.csv
+```
+
+常驻应用系统在 `PublishSnapshots` 后运行，同时持有可变应用组件 Query。每次 update 重复查询同一活动根，或逐个查询活动／保留页的动态后代。共享 `RouteQueries` 消费者每次系统调用只创建一个 reader；单次入口消费者执行相同的目标选择和应用组件写入。空循环对照包含同样的写入与运行条件。滚动查询测量没有待恢复意图的情况；pending 正向命中由公开滚动 journey 验证。
+
+每个夹具固定一个活动页、一个保留页、两条 history，实体数与 factory 次数保持不变。默认预热 16 次 update，随后取 32 个样本，每个样本平均 4 次 update；`ROUTER_BENCH_BATCH=1` 可逐 update 采样。CSV 的 `frames_per_sample` 记录实际批量。分位数包含正常 Router 调度与应用消费者，表示样本均值，不是独立方法耗时。activity、当前输入与非活动拒绝在计时外验证。本模式无 UI layout 和 pointer 输入。
+
 ## 计时边界
 
 Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::update`、导航 API 和快照推进。导航从 enqueue 前计时到请求终态、无 running request 且前台 cleanup 清空，包含构建、resolve/apply、输入授权刷新、publication 和旧内容清理。初始化、目标字符串构造、详细断言与 CSV 输出在计时外。
@@ -107,6 +119,7 @@ cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control
 ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
 `instances`、`steady` 和 `transitions` 同样支持 `-- --test`。`retained_steady` 的 smoke 保留两种更新工作负载，以及 0/4 个各有 32 个后代的保留页，每组为两个样本、每样本四次 update。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。

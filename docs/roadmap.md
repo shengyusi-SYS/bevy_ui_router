@@ -9,7 +9,6 @@ See the [overview](overview.md) for available features and the [behavior contrac
 | Work | Deliverable |
 | --- | --- |
 | Public documentation | English and Chinese user and developer guides, runnable examples, file cleanup, and privacy checks |
-| Public query performance | A borrowed read session shared by activity, current-input, and pending-scroll queries; [delivery and verification plan](changes/query-performance/plan.md) |
 | Release preparation | MIT OR Apache-2.0 dual licensing is selected; choose the release version, then validate the final packages with an independent consumer |
 
 Applications and UI code implement animation effects. The project uses MIT OR Apache-2.0 dual licensing. Maintainers will choose the release version; applications currently use a local checkout dependency.
