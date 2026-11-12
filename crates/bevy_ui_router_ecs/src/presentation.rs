@@ -7,7 +7,7 @@ use bevy_color::Color;
 use bevy_ecs::{
     change_detection::Mut,
     component::{Component, ComponentId},
-    entity::EntityHashMap,
+    entity::{EntityHashMap, EntityHashSet},
     hierarchy::{ChildOf, Children},
     prelude::{Entity, World},
 };
@@ -1123,7 +1123,7 @@ impl RetainedBoundaryProof {
             return false;
         }
         let mut pending = vec![self.shell];
-        let mut seen = HashSet::new();
+        let mut seen = EntityHashSet::default();
         while let Some(entity) = pending.pop() {
             if !seen.insert(entity) || world.get_entity(entity).is_err() {
                 return false;
