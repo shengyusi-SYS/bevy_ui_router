@@ -403,7 +403,19 @@ pub(crate) struct NativeContentObservation<'w> {
     pub(crate) managed: Vec<Entity>,
     pub(crate) child_slots: Vec<Entity>,
     pub(crate) membership: EntityHashSet,
-    _world: &'w World,
+    world: &'w World,
+    default_outlets: std::cell::OnceCell<usize>,
+}
+
+impl NativeContentObservation<'_> {
+    pub(crate) fn has_unique_default_outlet(&self) -> bool {
+        *self.default_outlets.get_or_init(|| {
+            self.managed
+                .iter()
+                .filter(|entity| self.world.get::<DefaultOutlet>(**entity).is_some())
+                .count()
+        }) == 1
+    }
 }
 
 pub(crate) fn collect_content(
@@ -501,7 +513,8 @@ pub(crate) fn observe_content_with_records<'w>(
         managed: content,
         child_slots,
         membership: seen,
-        _world: world,
+        world,
+        default_outlets: std::cell::OnceCell::new(),
     })
 }
 
@@ -908,10 +921,7 @@ pub(super) fn observe_native_values_with_observation<'w>(
     if !native_values_are_current(observation.world(), frame, root, lifecycle) {
         return None;
     }
-    observation
-        .native_content(frame.frame(), root)
-        .ok()
-        .map(|facts| facts.content)
+    observation.native_content(frame.frame(), root).ok()
 }
 
 fn native_values_are_current(
@@ -1063,7 +1073,7 @@ mod tests {
             let again = observation
                 .native_content(parent.frame(), parent.native_root().unwrap())
                 .unwrap();
-            assert!(std::rc::Rc::ptr_eq(&first.content, &again.content));
+            assert!(std::rc::Rc::ptr_eq(&first, &again));
             assert!(
                 observation
                     .native_content(child.frame(), parent.native_root().unwrap())

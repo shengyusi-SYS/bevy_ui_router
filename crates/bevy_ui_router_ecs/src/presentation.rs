@@ -163,8 +163,8 @@ impl OutletBinding {
                 .is_some_and(|record| record.claim() == *root)
                 && (if let Some(observation) = observation {
                     observation.native_content(parent, root.entity()).is_ok_and(|facts| {
-                        facts.content.membership.contains(anchor)
-                            && (!_require_outlet || facts.default_outlets == 1)
+                        facts.membership.contains(anchor)
+                            && (!_require_outlet || facts.has_unique_default_outlet())
                     })
                 } else {
                     native_frame::collect_content(world, parent, root.entity()).is_ok_and(|content| content.contains(anchor)

@@ -33,17 +33,10 @@ struct RetainedPreservation<'w> {
 }
 
 #[cfg(feature = "bsn")]
-#[derive(Clone)]
-pub(crate) struct NativeContentFacts<'w> {
-    pub(crate) content: std::rc::Rc<NativeContentObservation<'w>>,
-    pub(crate) default_outlets: usize,
-}
-
-#[cfg(feature = "bsn")]
 struct CachedNativeContent<'w> {
     frame: RouteFrameVersion,
     root_claim: Option<ExactRegistryClaim>,
-    result: Result<NativeContentFacts<'w>, FrameLocalError>,
+    result: Result<std::rc::Rc<NativeContentObservation<'w>>, FrameLocalError>,
 }
 
 impl<'w> ReadObservation<'w> {
@@ -83,7 +76,7 @@ impl<'w> ReadObservation<'w> {
         &self,
         frame: &RouteFrameVersion,
         root: Entity,
-    ) -> Result<NativeContentFacts<'w>, FrameLocalError> {
+    ) -> Result<std::rc::Rc<NativeContentObservation<'w>>, FrameLocalError> {
         let root_claim = self.record(root).map(RouteEntityRecord::claim);
         if let Some(result) = self.native.borrow().get(&root).and_then(|entries| {
             entries
@@ -100,21 +93,7 @@ impl<'w> ReadObservation<'w> {
             root,
             |entity| self.record(entity),
         )
-        .map(|content| {
-            let default_outlets = content
-                .managed
-                .iter()
-                .filter(|entity| {
-                    self.world
-                        .get::<bevy_ui_router_bsn::DefaultOutlet>(**entity)
-                        .is_some()
-                })
-                .count();
-            NativeContentFacts {
-                content: std::rc::Rc::new(content),
-                default_outlets,
-            }
-        });
+        .map(std::rc::Rc::new);
         self.native
             .borrow_mut()
             .entry(root)
