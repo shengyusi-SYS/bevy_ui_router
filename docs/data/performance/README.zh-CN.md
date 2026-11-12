@@ -13,8 +13,12 @@
 | [Initial dynamic page / 初始动态页面](performance-initial-steady-2026-10-18.csv) | 40 | before `2037699a1463f997cc506bbc43da94d5f09526c4` → after `9c222bb636b76bea62adc5ec30402a306ea133d6` |
 | [Transitions / 过渡全路径](performance-transitions-2026-10-25.csv) | 750 | before `9ac27b8c3f154b9ac5a524470ae8f540c21b2237` → after `7e12ae72654acbe6649eaee832c4670d28d9be9e` |
 | [Window / 窗口过渡](performance-transition-window-2026-10-25.csv) | 4800 | 同上；无 BRP 的优化窗口构建 |
+| [保留页稳态更新](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
+| [观察路径控制组](performance-observation-controls-2026-11-12.csv) | 194 | 同上；普通导航及初始动态页面 |
 
 ## 测量环境
+
+本节环境对应截至 2026 年 10 月的数据；11 月测量另记于下文。
 
 这些数据使用 Linux WSL2 `6.18.33.2-microsoft-standard-WSL2`、AMD Ryzen 9 9950X、24 个可见逻辑 CPU；Rust 为 `1.99.0-nightly (ba28ff76f 2026-08-13)` / LLVM 23.1.0，Bevy 为 0.19.1。使用 `bsn` feature 与默认 bench 优化 profile：opt-level 3、debuginfo 0、debug assertions/overflow checks 关闭。CPU affinity 和频率由系统管理。
 
@@ -59,6 +63,36 @@
 结果保留全部行与离群值。headless 的 1024 节点缓存命中、持有退出阶段，p50 从 1.009–1.022 ms/update 降到 0.492–0.534 ms/update；每个样本是 32 update 的均值。1024 节点 fresh、关闭过渡时，发布所在 update 包含立即清理，p50 从 392–403 ms 降到 199–214 ms。前者来自批次输入资格/祖先观察，后者来自单次不可变 adoption 校验中的登记表索引；全部原校验与逐写复验保留。
 
 小场景和控制组存在波动，`after 1` 的部分控制行较慢，不能把所有差值归因于修改。窗口空闲与动画耗时也同步变化，因此本组窗口数据用于检查真实调度和提交行为，不支持硬件 GPU 或实际呈现 FPS 的提升结论。退出清理的 EntityRef 读取候选仅约 5% 收益，未达到本轮 10% 保留门槛，已撤销；未增加跨写缓存或减少复验。
+
+## 保留页稳态更新：2026-11-12
+
+新增 `retained_steady` 模式保持同一活动页 Entity、128 节点的共同父布局和 32 节点的活动叶页，依次积累 0/1/4 个各有 32/1024 动态后代的保留兄弟页。分别测空闲更新及仅修改请求滚动位置的更新；factory、activity、输入资格、history、布局几何及退出作用域后的清理在计时外检查。`ui=1` 安装真实布局和 picking 系统，不创建 renderer、不注入 pointer。不同库存阶段分别有 1/3/9 条请求记录；跨版本比较相同行，保持该项工作量一致。
+
+本次使用 Bevy 0.20.1，上述 Rust、CPU 和 OS，`bsn`、默认 bench 优化 profile 及两个构建 job。根 lock SHA-256：`f34d67d2d70b85a1c113d08f321f018e4c39d72f6c5de6a0b6fa1bf62f6cf227`。CPU affinity 和频率由系统管理。没有设备、renderer、GPU 或功耗测量。
+
+| Variant | 生产源码 | Benchmark binary SHA-256 |
+| --- | --- | --- |
+| `before` | `c96836592f553a3e2b8c898063280e013f1764a1` | `30e5654fc1f1600bf6c38fab2cc3863a75e22d7774fa63e16f81fc1c67a6cce3` |
+| `shared_observation` | `891ee53be78da05a0a782131e08d376739294f8f` | `27aee61efc82381005b7967250361894e664f3f224fa018f7b93a2c1cc677086` |
+| `entity_hash` | `2282510fc9d14253297c0d6f701bf28ac806a6d7` | `7ea6283be4ced98d5d8b3ad58bff5ebb7617c130a0d687474ab3d7409ca6c204` |
+| `after` | `bd937055bd5cf218b5c398e89a55a5437f7818b2` | `4b46b752bbeae9900ccc744d4303e17dea752c487958dcbd37bf8cab35cca9ec` |
+
+先用 `CARGO_BUILD_JOBS=2 cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked --no-run` 构建，比较时固定各版本的可执行文件。命令及参数见[测量指南](../../performance.zh-CN.md#固定活动内容的保留兄弟页对照)。nested 正式运行使用 32 样本、每样本 32 次 update，预热 64 次；flat 和普通控制组使用 16 样本，后期配对的初始页面控制组使用 32 样本。分位数描述 update 批次均值的 CPU wall time，不是逐帧呈现分位数。
+
+计时均串行且与构建分开。先完成两轮 `before` router/UI 对照，再运行观察复用版并穿插 `before` UI 回测；Entity 集合候选与观察复用版回测对照。最后分别对 UI 和 router-only 完成两轮 `before → entity_hash`，随后运行两轮 `after` router/UI 及普通控制组。CSV 保留已提交版本的全部测量行，包括标记为 `variable_round` 的早期集合候选轮次；该标记表示观测到波动，不证明某个外部原因。后续稳定回测支撑结论，未删除这些行。
+
+nested、每个保留页 1024 后代时，最终 idle p50 范围如下，单位为微秒：
+
+| 模式 / 保留页数 | 修改前回测 | 修改后 |
+| --- | ---: | ---: |
+| Router-only / 0 | 55.8–56.7 | 43.1–43.9 |
+| Router-only / 4 | 650.4–659.7 | 192.8–200.5 |
+| UI / 0 | 90.5–93.2 | 76.9–78.1 |
+| UI / 4 | 1182.6–1204.4 | 717.4–737.9 |
+
+对应 UI / 4 的 scroll-update p50 从 1191.3–1194.1 降至 715.2–739.3 微秒。控制组不支持普遍加速结论：普通初始页面有几个百分点的波动，UI 总时间仍包含 Bevy 工作。按需 outlet 计数消除了提前准备 facts 时额外引入的完整叶页扫描。观察内共享内容 Vec 和 membership 集合，不复制大集合；未插桩测量分配次数或字节数，因此不宣称数值化分配收益。
+
+保留的修改包括同次不可变 World 借用内的父内容和相同目的 preservation 复用、registry 读取索引及 Bevy Entity 集合。角色相关校验和写后重新观察保留。单条 memo 替代分桶 Vec 的探索候选没有产生可重复的 CPU 收益，已撤回。每个必要阶段仍完整观察保留内容一次；跨帧失效机制和未证实必要的多 Router 优化后置。本次证实的是库内 CPU 改善，不是应用 FPS 或电池收益。
 
 ## 维护
 

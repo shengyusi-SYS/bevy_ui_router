@@ -137,6 +137,6 @@ flowchart TB
 
 输入在 picking Backend 前刷新资格；有可见退出页时暂时排除其原生 UI 候选，Backend 后恢复完整栈，避免旧页阻挡新页命中。随后在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[输入接入](../guides/pages.zh-CN.md#输入与焦点接入)。
 
-只读阶段可复用本轮 frame 内容、membership 和 child-slot 切口，写入后或进入新调度阶段重新观察。focus 还验证 shell、已提交切口和 slot 外侧闭包；保留实例验证完整后代及其与输入/focus 的隔离。
+活动分支观察通过私有[读取上下文](../../crates/bevy_ui_router_ecs/src/read_observation.rs)，在一次不可变 World 借用内共享 registry 索引、原生内容 membership、outlet 数量及相同目的的保留边界检查。各角色的值、挂载绑定和 manifest 策略仍分别校验；保留边界检查不授权激活或清理。写入后或进入新调度阶段重新观察。focus 还验证 shell、已提交切口和 slot 外侧闭包；保留实例验证完整后代及其与输入/focus 的隔离。
 
 空工作阶段直接返回，空闲 host 仍每轮观察。滚动 Prepare 在无意图时返回，Settle 继续采样实际布局；所有 `RouteScroll` marker 先参与 key 判重，再筛选布局资格。snapshots 仅在值变化时标记 changed，输入 gate 仅在权限变化或需要撤权时写入。BSN focus 桥在首次使用或 `PostUpdate` 调度图变化后核查官方 drain，稳定调度继续观察焦点队列。
