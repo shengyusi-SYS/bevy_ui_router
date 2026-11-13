@@ -76,23 +76,26 @@ impl<'w, 's> ActiveRouteScope<'w, 's> {
     ) -> Option<(&'a RouterEntry, &'a RealizedFrame)> {
         let mut current = target;
         let mut seen = EntityHashSet::default();
-        while seen.insert(current) {
+        let resolved = loop {
             if self.is_quarantined(current) || self.entities.get(current).is_err() {
-                return None;
+                break None;
             }
             if let Some(record) = self.record(current, facts) {
                 // The nearest registered boundary controls inheritance. A direct
-                // registered target and an ordinary descendant have different roles.
-                let Boundary {
+                // target has a different role, so do not propagate its answer.
+                let Some(Boundary {
                     entry,
                     frame,
                     claim,
-                } = self.boundary(current, facts)?;
+                }) = self.boundary(current, facts)
+                else {
+                    break None;
+                };
                 if claim.lifecycle() != EntityLifecycle::Active
                     || !record.matches_claim(claim)
                     || !self.frame_scope_is_current(entry, frame, facts)
                 {
-                    return None;
+                    break None;
                 }
                 let valid = if current == target {
                     self.registered_content_is_current(frame, target, facts)
@@ -101,16 +104,35 @@ impl<'w, 's> ActiveRouteScope<'w, 's> {
                         && self.is_native_root(current)
                         && self.claim_is_current(claim, facts)
                 };
-                return valid.then_some((entry, frame));
+                break valid.then_some((entry, frame));
             }
-            let entity = self.entities.get(current).ok()?;
-            let parent = entity.parent.map(ChildOf::parent)?;
+            if !seen.insert(current) {
+                break None;
+            }
+            // Only ordinary unregistered ancestors can share their completed
+            // result with descendants during this immutable reader borrow.
+            if current != target
+                && let Some(resolved) = facts.and_then(|facts| facts.target_result(current))
+            {
+                break resolved;
+            }
+            let Ok(entity) = self.entities.get(current) else {
+                break None;
+            };
+            let Some(parent) = entity.parent.map(ChildOf::parent) else {
+                break None;
+            };
             if !self.edge_is_current(current, parent, facts) {
-                return None;
+                break None;
             }
             current = parent;
+        };
+        if let Some(facts) = facts {
+            // The walk is complete. Its ordinary nodes have the same answer;
+            // the originally queried target also keeps its own exact role.
+            facts.remember_targets(target, seen, resolved);
         }
-        None
+        resolved
     }
 
     fn record<'a>(

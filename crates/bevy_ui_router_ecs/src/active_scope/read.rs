@@ -25,6 +25,7 @@ pub(super) struct ReadFacts<'a> {
     boundaries: OnceCell<EntityHashMap<Boundary<'a>>>,
     children: RefCell<EntityHashMap<EntityHashSet>>,
     frames: RefCell<Vec<FrameResult<'a>>>,
+    targets: RefCell<EntityHashMap<Resolved<'a>>>,
 }
 
 struct FrameResult<'a> {
@@ -96,12 +97,32 @@ impl<'a> ReadFacts<'a> {
             valid,
         });
     }
+
+    pub fn target_result(&self, target: Entity) -> Option<Resolved<'a>> {
+        self.targets.borrow().get(&target).copied()
+    }
+
+    pub fn remember_targets(
+        &self,
+        target: Entity,
+        ordinary: EntityHashSet,
+        resolved: Resolved<'a>,
+    ) {
+        let mut targets = self.targets.borrow_mut();
+        if ordinary.is_empty() {
+            // Registered, quarantined, and missing targets stop before an
+            // ordinary path starts, but still retain their direct answer.
+            targets.insert(target, resolved);
+        } else {
+            // The first ordinary node is already the original target.
+            targets.extend(ordinary.into_iter().map(|entity| (entity, resolved)));
+        }
+    }
 }
 
 pub(crate) struct ActiveScopeRead<'a, 'w, 's> {
     scope: &'a ActiveRouteScope<'w, 's>,
     facts: ReadFacts<'a>,
-    targets: RefCell<EntityHashMap<Resolved<'a>>>,
 }
 
 impl<'a, 'w, 's> ActiveScopeRead<'a, 'w, 's> {
@@ -109,19 +130,14 @@ impl<'a, 'w, 's> ActiveScopeRead<'a, 'w, 's> {
         Self {
             scope,
             facts: ReadFacts::default(),
-            targets: RefCell::default(),
         }
     }
 
     pub(crate) fn resolve(&self, target: Entity) -> Resolved<'a> {
-        if let Some(resolved) = self.targets.borrow().get(&target) {
-            return *resolved;
+        if let Some(resolved) = self.facts.target_result(target) {
+            return resolved;
         }
-        let resolved = self.scope.resolve_with_facts(target, Some(&self.facts));
-        // Cache final target answers only. A directly queried registered output
-        // can be active without allowing ordinary descendants to inherit it.
-        self.targets.borrow_mut().insert(target, resolved);
-        resolved
+        self.scope.resolve_with_facts(target, Some(&self.facts))
     }
 }
 
@@ -134,9 +150,10 @@ mod tests {
     fn direct_registered_output_does_not_authorize_its_ordinary_descendants() {
         let (mut app, output) = crate::input::tests::active_atomic_app("query-reader");
         let child = app.world_mut().spawn(ChildOf(output)).id();
+        let grandchild = app.world_mut().spawn(ChildOf(child)).id();
         app.world_mut()
             .run_system_once(move |queries: RouteQueries, activity: RouteActivity| {
-                for targets in [[output, child], [child, output]] {
+                for targets in [[output, child, grandchild], [grandchild, child, output]] {
                     let routes = queries.read();
                     for target in targets {
                         assert_eq!(routes.is_active(target), target == output);
