@@ -240,6 +240,17 @@ impl ScrollObservation {
         target: impl Iterator<Item = &'a RealizedFrame>,
         eligible: &HashSet<Entity>,
     ) -> Self {
+        // Disabled and incomplete markers still participate in duplicate-key
+        // detection. Marker presence is separate from layout eligibility.
+        let marked = world.component_id::<RouteScroll>().is_some_and(|marker| {
+            world
+                .archetypes()
+                .iter()
+                .any(|archetype| archetype.contains(marker) && !archetype.is_empty())
+        });
+        if !marked {
+            return Self::default();
+        }
         let (source, source_duplicates) = containers(world, source, eligible);
         let (target, target_duplicates) = containers(world, target, eligible);
         Self {
@@ -886,4 +897,44 @@ fn laid_out_containers(
             computed_layout.has_layout().then_some(container.entity)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::entity_disabling::Disabled;
+    use std::cell::Cell;
+
+    #[test]
+    fn capture_skips_frame_walks_only_when_no_marker_entities_exist() {
+        fn walks(world: &World) -> (bool, bool) {
+            let source = Cell::new(false);
+            let target = Cell::new(false);
+            ScrollObservation::capture(
+                world,
+                std::iter::from_fn(|| {
+                    source.set(true);
+                    None
+                }),
+                std::iter::from_fn(|| {
+                    target.set(true);
+                    None
+                }),
+                &HashSet::new(),
+            );
+            (source.get(), target.get())
+        }
+
+        let mut world = World::new();
+        world.register_component::<RouteScroll>();
+        assert_eq!(walks(&world), (false, false));
+
+        let marker = world.spawn((RouteScroll::new("body"), Disabled)).id();
+        assert!(world.get::<Node>(marker).is_none());
+        assert!(world.get::<ScrollPosition>(marker).is_none());
+        assert_eq!(walks(&world), (true, true));
+
+        world.entity_mut(marker).remove::<RouteScroll>();
+        assert_eq!(walks(&world), (false, false));
+    }
 }
