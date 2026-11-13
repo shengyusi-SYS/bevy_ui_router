@@ -1335,6 +1335,10 @@ impl RetainedBoundaryProof {
                 return false;
             }
         }
+        let input_allowed: EntityHashSet = world
+            .get_resource::<crate::input::RouterInputGate>()
+            .map(|gate| gate.allowed_projection().iter().copied().collect())
+            .unwrap_or_default();
         let mut pending = vec![self.shell];
         let mut seen = HashSet::new();
         while let Some(entity) = pending.pop() {
@@ -1423,13 +1427,7 @@ impl RetainedBoundaryProof {
             {
                 return false;
             }
-            if world
-                .get_resource::<crate::input::RouterInputGate>()
-                .is_some_and(|gate| {
-                    gate.allows_pointer(entity)
-                        || gate.allows_keyboard(entity)
-                        || gate.allows_gamepad(entity)
-                })
+            if input_allowed.contains(&entity)
                 || world
                     .get_resource::<InputFocus>()
                     .is_some_and(|focus| focus.get() == Some(entity))
