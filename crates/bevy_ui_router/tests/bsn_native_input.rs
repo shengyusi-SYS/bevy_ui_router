@@ -355,10 +355,15 @@ fn native_input_journey_with_target(
             ))
             .id();
         app.update();
-        // Keep ordinary computed layout facts, then exercise the same native
-        // input boundary as widgets whose geometry is supplied without Node.
+        let geometry = (
+            *app.world().get::<ComputedNode>(child).unwrap(),
+            *app.world().get::<UiGlobalTransform>(child).unwrap(),
+        );
+        // Removing Node invalidates the native layout cache. An external widget
+        // supplies its geometry after that invalidation, before native picking.
         app.world_mut().entity_mut(child).remove::<Node>();
         app.update();
+        app.world_mut().entity_mut(child).insert(geometry);
         child
     } else {
         router_target
