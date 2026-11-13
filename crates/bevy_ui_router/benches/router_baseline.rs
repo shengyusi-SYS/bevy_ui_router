@@ -7,6 +7,9 @@
 //! ROUTER_BENCH_MODE=steady isolates initial dynamic content and ordinary scroll observation.
 //! ROUTER_BENCH_MODE=retained_steady fixes active content while growing retained siblings.
 //! ROUTER_BENCH_MODE=public_queries measures ordinary systems calling public read APIs.
+//! ROUTER_BENCH_MODE=maintenance isolates closed-trace idle work and retained hits.
+#[path = "router_baseline/maintenance.rs"]
+mod maintenance;
 #[path = "router_baseline/public_queries.rs"]
 mod public_queries;
 #[path = "router_baseline/retained_instances.rs"]
@@ -793,7 +796,7 @@ fn main() {
             "use cargo bench for optimized measurements; --test runs a smoke check"
         );
         let default_samples = match std::env::var("ROUTER_BENCH_MODE").as_deref() {
-            Ok("retained_steady" | "public_queries") => 32,
+            Ok("retained_steady" | "public_queries" | "maintenance") => 32,
             _ => 128,
         };
         std::env::var("ROUTER_BENCH_SAMPLES").map_or(default_samples, |value| {
@@ -813,6 +816,10 @@ fn main() {
         }
     );
     match std::env::var("ROUTER_BENCH_MODE") {
+        Ok(mode) if mode == "maintenance" => {
+            maintenance::run(shape, samples, smoke);
+            return;
+        }
         Ok(mode) if mode == "transitions" => {
             transitions::run(shape, samples);
             return;
@@ -845,7 +852,7 @@ fn main() {
         Err(std::env::VarError::NotPresent) => {}
         mode => {
             panic!(
-                "ROUTER_BENCH_MODE must be unset, steady, retained_steady, public_queries, keep_alive, instances or transitions, got {mode:?}"
+                "ROUTER_BENCH_MODE must be unset, steady, retained_steady, public_queries, maintenance, keep_alive, instances or transitions, got {mode:?}"
             )
         }
     }
