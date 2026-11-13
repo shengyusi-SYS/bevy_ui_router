@@ -6391,6 +6391,12 @@ impl NavigationRequestView<'_> {
         self.record.trace()
     }
 
+    /// A closed trace is immutable for this exact request identity. Diagnostics
+    /// may still change after closure and must be observed separately.
+    pub const fn trace_closed(&self) -> bool {
+        self.record.trace_closed()
+    }
+
     pub fn diagnostics(&self) -> &[DiagnosticEvent] {
         self.record.diagnostics()
     }

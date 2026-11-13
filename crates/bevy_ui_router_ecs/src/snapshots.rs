@@ -25,14 +25,6 @@ pub struct NavigationRequestSnapshot {
 }
 
 impl NavigationRequestSnapshot {
-    fn matches(&self, view: &NavigationRequestView<'_>) -> bool {
-        self.requested.as_ref() == view.requested()
-            && self.matched.as_ref() == view.matched()
-            && &self.status == view.status()
-            && self.trace == view.trace()
-            && self.diagnostics == view.diagnostics()
-    }
-
     fn new(
         requested: Option<RouteLocation>,
         matched: Option<RouteBranchFingerprint>,
@@ -67,6 +59,68 @@ impl NavigationRequestSnapshot {
 
     pub fn diagnostics(&self) -> &[DiagnosticEvent] {
         &self.diagnostics
+    }
+}
+
+// Coherence metadata belongs to the request-keyed store, not the public value.
+// In particular it must not affect Snapshot equality or resource change ticks.
+struct StoredRequest {
+    snapshot: NavigationRequestSnapshot,
+    trace_closed: bool,
+}
+
+impl StoredRequest {
+    fn from_view(view: &NavigationRequestView<'_>) -> Self {
+        Self {
+            snapshot: NavigationRequestSnapshot::new(
+                view.requested().cloned(),
+                view.matched().cloned(),
+                view.status().clone(),
+                view.trace().to_vec(),
+                view.diagnostics().to_vec(),
+            ),
+            trace_closed: view.trace_closed(),
+        }
+    }
+
+    fn trace_matches(&self, view: &NavigationRequestView<'_>) -> bool {
+        // Callers select the exact (RouterHandle, NavigationRequestId) first.
+        // Core never reopens or replaces a closed trace for that request.
+        (self.trace_closed && view.trace_closed()) || self.snapshot.trace == view.trace()
+    }
+
+    fn matches(&self, view: &NavigationRequestView<'_>) -> bool {
+        self.snapshot.requested.as_ref() == view.requested()
+            && self.snapshot.matched.as_ref() == view.matched()
+            && &self.snapshot.status == view.status()
+            && self.trace_matches(view)
+            && self.snapshot.diagnostics == view.diagnostics()
+    }
+
+    fn refresh(&mut self, view: &NavigationRequestView<'_>) -> bool {
+        let mut changed = false;
+        if self.snapshot.requested.as_ref() != view.requested() {
+            self.snapshot.requested = view.requested().cloned();
+            changed = true;
+        }
+        if self.snapshot.matched.as_ref() != view.matched() {
+            self.snapshot.matched = view.matched().cloned();
+            changed = true;
+        }
+        if &self.snapshot.status != view.status() {
+            self.snapshot.status = view.status().clone();
+            changed = true;
+        }
+        if !self.trace_matches(view) {
+            self.snapshot.trace = view.trace().to_vec();
+            changed = true;
+        }
+        if self.snapshot.diagnostics != view.diagnostics() {
+            self.snapshot.diagnostics = view.diagnostics().to_vec();
+            changed = true;
+        }
+        self.trace_closed = view.trace_closed();
+        changed
     }
 }
 
@@ -139,7 +193,7 @@ pub enum RequestLookup<'a> {
 #[derive(Resource)]
 pub struct RouterSnapshots {
     routers: Vec<(RouterHandle, RouterSnapshot)>,
-    requests: HashMap<(RouterHandle, NavigationRequestId), NavigationRequestSnapshot>,
+    requests: HashMap<(RouterHandle, NavigationRequestId), StoredRequest>,
 }
 
 impl RouterSnapshots {
@@ -161,7 +215,7 @@ impl RouterSnapshots {
             return RequestLookup::Unknown;
         };
         if let Some(snapshot) = self.requests.get(&(router, request)) {
-            return RequestLookup::Found(snapshot);
+            return RequestLookup::Found(&snapshot.snapshot);
         }
         match router_snapshot
             .projection
@@ -265,24 +319,12 @@ impl RouterSnapshots {
                 let view = &views[request];
                 let key = (entry.handle, *request);
                 retained.insert(key);
-                if self
-                    .requests
-                    .get(&key)
-                    .is_some_and(|stored| stored.matches(view))
-                {
-                    continue;
+                if let Some(stored) = self.requests.get_mut(&key) {
+                    changed |= stored.refresh(view);
+                } else {
+                    self.requests.insert(key, StoredRequest::from_view(view));
+                    changed = true;
                 }
-                self.requests.insert(
-                    key,
-                    NavigationRequestSnapshot::new(
-                        view.requested().cloned(),
-                        view.matched().cloned(),
-                        view.status().clone(),
-                        view.trace().to_vec(),
-                        view.diagnostics().to_vec(),
-                    ),
-                );
-                changed = true;
             }
         }
         let previous_count = self.requests.len();
@@ -452,20 +494,23 @@ mod tests {
             .publish(|| {});
         engine.complete_cleanup(cleanup.complete_empty()).unwrap();
         let view = engine.request(request).unwrap();
-        let frozen = NavigationRequestSnapshot::new(
-            view.requested().cloned(),
-            view.matched().cloned(),
-            view.status().clone(),
-            view.trace().to_vec(),
-            view.diagnostics().to_vec(),
-        );
+        let mut frozen = StoredRequest::from_view(&view);
+        let trace = frozen.snapshot.trace().as_ptr();
         assert!(frozen.matches(&view));
         assert!(engine.validate_report_identity(&duplicate).is_err());
         let observed = engine.requests().find(|view| view.id() == request).unwrap();
         assert_eq!(observed.status(), &RequestStatus::Succeeded);
-        assert_eq!(observed.trace(), frozen.trace());
-        assert_eq!(observed.diagnostics().len(), frozen.diagnostics().len() + 1);
+        assert_eq!(observed.trace(), frozen.snapshot.trace());
+        assert_eq!(
+            observed.diagnostics().len(),
+            frozen.snapshot.diagnostics().len() + 1
+        );
         assert!(!frozen.matches(&observed));
+        assert!(frozen.refresh(&observed));
+        assert_eq!(frozen.snapshot.trace().as_ptr(), trace);
+        assert_eq!(frozen.snapshot.diagnostics(), observed.diagnostics());
+        assert!(frozen.matches(&observed));
+        assert!(!frozen.refresh(&observed));
     }
 
     #[test]
@@ -529,16 +574,9 @@ mod tests {
         let router = crate::app_ext::RouterHandle::fixture(3, 5);
         let mut snapshots = RouterSnapshots::new();
         snapshots.install_router(router, frozen);
-        snapshots.requests.insert(
-            (router, newest),
-            NavigationRequestSnapshot::new(
-                newest_view.requested().cloned(),
-                newest_view.matched().cloned(),
-                newest_view.status().clone(),
-                newest_view.trace().to_vec(),
-                newest_view.diagnostics().to_vec(),
-            ),
-        );
+        snapshots
+            .requests
+            .insert((router, newest), StoredRequest::from_view(&newest_view));
 
         assert!(matches!(
             snapshots.request(router, newest),
