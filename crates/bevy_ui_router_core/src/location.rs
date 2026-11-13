@@ -1,8 +1,26 @@
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+use std::{fmt, sync::Arc};
+
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct RouteLocation {
+    parts: Arc<LocationParts>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct LocationParts {
     path: String,
     search: Option<String>,
     fragment: Option<String>,
+}
+
+impl fmt::Debug for RouteLocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteLocation")
+            .field("path", &self.parts.path)
+            .field("search", &self.parts.search)
+            .field("fragment", &self.parts.fragment)
+            .finish()
+    }
 }
 
 impl RouteLocation {
@@ -11,9 +29,11 @@ impl RouteLocation {
     /// Use [`Self::from_address`] to split an internal address containing `?` or `#`.
     pub fn new(path: impl Into<String>) -> Self {
         Self {
-            path: normalize_path(path.into()),
-            search: None,
-            fragment: None,
+            parts: Arc::new(LocationParts {
+                path: normalize_path(path.into()),
+                search: None,
+                fragment: None,
+            }),
         }
     }
 
@@ -46,32 +66,36 @@ impl RouteLocation {
                 (path, Some(search))
             });
         Self {
-            path: normalize_path(path.to_owned()),
-            search: search.map(str::to_owned),
-            fragment: fragment.map(str::to_owned),
+            parts: Arc::new(LocationParts {
+                path: normalize_path(path.to_owned()),
+                search: search.map(str::to_owned),
+                fragment: fragment.map(str::to_owned),
+            }),
         }
     }
 
     pub fn with_search(mut self, search: impl Into<String>) -> Self {
-        self.search = Some(search.into());
+        let search = search.into();
+        Arc::make_mut(&mut self.parts).search = Some(search);
         self
     }
 
     pub fn with_fragment(mut self, fragment: impl Into<String>) -> Self {
-        self.fragment = Some(fragment.into());
+        let fragment = fragment.into();
+        Arc::make_mut(&mut self.parts).fragment = Some(fragment);
         self
     }
 
     pub fn path(&self) -> &str {
-        &self.path
+        &self.parts.path
     }
 
     pub fn search(&self) -> Option<&str> {
-        self.search.as_deref()
+        self.parts.search.as_deref()
     }
 
     pub fn fragment(&self) -> Option<&str> {
-        self.fragment.as_deref()
+        self.parts.fragment.as_deref()
     }
 }
 
@@ -132,6 +156,35 @@ mod tests {
         assert_eq!(location.path(), "/items");
         assert_eq!(location.search(), Some("?a=1&a=2"));
         assert_eq!(location.fragment(), Some("#details"));
+    }
+
+    #[test]
+    fn clones_keep_value_traits_and_independent_edits() {
+        use std::{collections::hash_map::DefaultHasher, hash::Hasher};
+
+        let original = RouteLocation::from_address("/items?a=1#details");
+        let equivalent = RouteLocation::new("/items")
+            .with_search("a=1")
+            .with_fragment("details");
+        assert_eq!(original, equivalent);
+        let hash = |location: &RouteLocation| {
+            let mut state = DefaultHasher::new();
+            std::hash::Hash::hash(location, &mut state);
+            state.finish()
+        };
+        assert_eq!(hash(&original), hash(&equivalent));
+        assert_eq!(
+            format!("{original:?}"),
+            r#"RouteLocation { path: "/items", search: Some("a=1"), fragment: Some("details") }"#
+        );
+
+        let edited = original.clone().with_search("").with_fragment("next");
+        assert_eq!(original.search(), Some("a=1"));
+        assert_eq!(original.fragment(), Some("details"));
+        assert_eq!(edited.path(), original.path());
+        assert_eq!(edited.search(), Some(""));
+        assert_eq!(edited.fragment(), Some("next"));
+        assert_ne!(original, edited);
     }
 
     #[test]
