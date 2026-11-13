@@ -138,6 +138,8 @@ flowchart TB
 
 输入在 picking Backend 前刷新资格；有可见退出页时暂时排除其原生 UI 候选，Backend 后恢复完整栈，避免旧页阻挡新页命中。随后在 hover 生成后、interaction 前过滤非活动目标。publication 同次调用撤销离场目标的历史 hover、press、click、drag 和 focus。原生 TabNavigation/InputDispatch 的目标过滤由应用接入，具体步骤见[输入接入](../guides/pages.zh-CN.md#输入与焦点接入)。
 
+输入 gate 保留有序的权限 projection。publication 只准备一次纯变更数据，取得可变资源 receiver 后，仅在原 allowed 与 revoked projection 仍精确相等时绑定，再由既有 atomic tail 应用。gate 仅在权限变化或需要撤权时写入。
+
 应用的[公开读取器](../../crates/bevy_ui_router_ecs/src/route_queries.rs)借用当前 Router 元数据和 typed hierarchy Query。循环前调用一次 `RouteQueries::read()`，共享 frame/mount 检查、目标结果与查找，可与应用 Query 及 Commands 共用。
 
 ```mermaid
@@ -153,4 +155,6 @@ flowchart LR
 
 内部活动分支观察另用私有 [ReadObservation](../../crates/bevy_ui_router_ecs/src/read_observation.rs)，在一次不可变 World 借用内共享 registry 索引、原生内容 membership、outlet 数量及相同目的的保留边界检查。各角色的值、挂载绑定和 manifest 策略仍分别校验；保留边界检查不授权激活或清理。写入后或进入新调度阶段重新观察。focus 还验证 shell、已提交切口和 slot 外侧闭包；保留实例验证完整后代及其与输入/focus 的隔离。
 
-空工作阶段直接返回，空闲 host 仍每轮观察。滚动 Prepare 在无意图时返回，Settle 继续采样实际布局；所有 `RouteScroll` marker 先参与 key 判重，再筛选布局资格。snapshots 仅在值变化时标记 changed，输入 gate 仅在权限变化或需要撤权时写入。BSN focus 桥在首次使用或 `PostUpdate` 调度图变化后核查官方 drain，稳定调度继续观察焦点队列。
+snapshots 以 Router 和 request 身份为 key 的私有存储复用已关闭、不可变的 trace；diagnostics 继续按实际值变化更新。公开 snapshot 值、相等性与 `Changed` 仍保持按值判断的语义。
+
+空工作阶段直接返回，空闲 host 仍每轮观察。没有 `RouteScroll` marker 时跳过滚动专用的容器采集，history 维护和待恢复意图仍正常处理。滚动 Prepare 在无意图时返回，Settle 继续采样实际布局；所有 marker 先参与 key 判重，再筛选布局资格。BSN focus 桥在首次使用或 `PostUpdate` 调度图变化后核查官方 drain，稳定调度继续观察焦点队列。

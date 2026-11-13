@@ -16,6 +16,7 @@ Public benchmark data is retained with complete source commits. See [performance
 | [Retained steady updates](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
 | [Observation controls](performance-observation-controls-2026-11-12.csv) | 194 | Same sources; ordinary navigation and initial dynamic pages |
 | [Public query consumers](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
+| [Completed-request maintenance and retained hits](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
 
 ## Measurement environment
 
@@ -117,6 +118,24 @@ The primary comparison uses old entry points and the shared reader **inside the 
 | Nested / 64 | 18.1–18.2 | 57.0–57.1 | 34.1–34.2 | 56.9–57.1 | 34.1–34.4 |
 
 For nested repeated-root activity, p50 changes from 2096.4–2122.3 to 162.1–164.8 microseconds. Nested per-target scroll misses change from 1483.0–1497.5 to 667.8–669.7 microseconds. These gains require creating one reader outside the loop; existing individual methods remain available. They establish CPU cost for this consumer workload, not isolated method latency or application FPS. Small-list special casing did not establish a repeatable additional gain and was removed.
+
+## Completed-request maintenance and retained hits: 2026-11-14
+
+The `maintenance` fixture separates historical trace size from live content, then measures warmed retained navigation. See the [method](../../performance.md#closed-traces-and-warmed-cache-hits). These runs use the November environment, Bevy 0.20.1, the same root lock, `bsn`, the default optimized bench profile, and two build jobs. Each row has 32 samples. No renderer, UI layout, pointer injection, device measurement, or allocation counter is included.
+
+| Variant | Source | Binary SHA-256 |
+| --- | --- | --- |
+| `before` | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` | `c3a958db4124f354e8a15c2c0f77245e71dabbb959bad6732f25a112f9b7a459` |
+| `prepared_publication` | `3cda2f803bacec6714044d26ea0a594df681ce87` | `8cb51b4d925194232509de93ed61957d302cb51b11801877585ce0d70c4bd2e1` |
+| `local_input_index` | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` | `162efbaf516e0c399b318964a49cf41348753616b8f4701145f84111bbe26846` |
+
+Build and freeze executables with the existing `cargo bench ... --no-run` command, then select `ROUTER_BENCH_MODE=maintenance` and `ROUTER_BENCH_SHAPE=flat|nested`. Builds and timing runs were separate and serial. Run order was before rounds 1–2 → prepared-publication round 1 → before round 3 → prepared-publication round 2 → local-input-index round 1 → prepared-publication round 3 → local-input-index round 2. Each round ran flat then nested. All 80 rows, including variable small cases, are retained.
+
+With 54 live entities, one history entry, and 64 terminal requests, idle p50 previously grew from 14.8–16.3 µs at 768 trace events to 35.9–36.8 µs at 8960 events. The final variant spans 13.0–14.6 µs across all trace sizes. Reusing exact-request closed traces removes that payload-dependent comparison; late diagnostics still update independently. These idle samples average 32 updates each.
+
+For two warmed pages with 1024 dynamic descendants each, complete Replace-hit p50 changes from 5.81–5.92 ms to 3.59–3.62 ms with prepared input changes and absent-marker capture skipping, then to 1.05–1.09 ms with a local input-membership index during retained validation. Each operation takes one update; entities, history, and factories stay fixed. The combined result is about 82% lower CPU wall time for this workload. The three changes in the middle variant were measured together, so their individual contributions are not inferred. Small 32-node cases vary and do not establish a general speedup.
+
+The input gate keeps its ordered projection and checks the complete source again when binding prepared values. The retained index exists only during one immutable validation, at the original role-specific predicate. Neither change removes post-write proofs or adds persistent cache invalidation. These measurements describe library CPU work, not application FPS.
 
 ## Maintenance
 

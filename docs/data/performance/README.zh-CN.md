@@ -16,6 +16,7 @@
 | [保留页稳态更新](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
 | [观察路径控制组](performance-observation-controls-2026-11-12.csv) | 194 | 同上；普通导航及初始动态页面 |
 | [公开查询消费者](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
+| [终结请求维护与缓存命中](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
 
 ## 测量环境
 
@@ -117,6 +118,24 @@ nested、每个保留页 1024 后代时，最终 idle p50 范围如下，单位�
 | 嵌套／64 | 18.1–18.2 | 57.0–57.1 | 34.1–34.2 | 56.9–57.1 | 34.1–34.4 |
 
 嵌套的重复根 activity p50 从 2096.4–2122.3 降至 162.1–164.8 微秒；嵌套逐实体滚动 miss 从 1483.0–1497.5 降至 667.8–669.7 微秒。收益要求在循环外创建一次 reader，原单次方法仍可使用。这些结果表示本消费者工作负载的 CPU 成本，不是独立方法耗时或应用 FPS。小列表特殊快路未得到可重复的额外收益，已移除。
+
+## 终结请求维护与缓存命中：2026-11-14
+
+`maintenance` 基准先分离历史 trace 大小与当前内容，再测预热后的缓存导航；见[方法](../../performance.zh-CN.md#已关闭-trace-与预热缓存命中)。使用上述 11 月环境、Bevy 0.20.1、同一根 lock、`bsn`、默认 bench 优化 profile 与两个构建任务，每行 32 样本。不含 renderer、UI layout、pointer 注入、设备测量或分配计数。
+
+| Variant | Source | Binary SHA-256 |
+| --- | --- | --- |
+| `before` | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` | `c3a958db4124f354e8a15c2c0f77245e71dabbb959bad6732f25a112f9b7a459` |
+| `prepared_publication` | `3cda2f803bacec6714044d26ea0a594df681ce87` | `8cb51b4d925194232509de93ed61957d302cb51b11801877585ce0d70c4bd2e1` |
+| `local_input_index` | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` | `162efbaf516e0c399b318964a49cf41348753616b8f4701145f84111bbe26846` |
+
+用既有 `cargo bench ... --no-run` 命令构建并固定二进制，再指定 `ROUTER_BENCH_MODE=maintenance`、`ROUTER_BENCH_SHAPE=flat|nested`。构建与计时分开串行执行，顺序为 before 第 1–2 轮 → prepared-publication 第 1 轮 → before 第 3 轮 → prepared-publication 第 2 轮 → local-input-index 第 1 轮 → prepared-publication 第 3 轮 → local-input-index 第 2 轮；每轮先 flat 后 nested。保留全部 80 行，包括波动较大的小规模场景。
+
+固定 54 个存活实体、一个 history entry、64 个终结请求后，原 idle p50 随 trace 从 768 events 增至 8960 events，由 14.8–16.3 µs 增至 35.9–36.8 µs。最终版本各规模为 13.0–14.6 µs。按精确请求身份复用已闭合 trace，消除了与其长度相关的比较；晚到 diagnostics 仍独立更新。idle 每个样本平均 32 次更新。
+
+两个页面各有 1024 个动态后代时，完整 Replace 命中的 p50 从 5.81–5.92 ms，经输入变更预备复用及无 marker 采集快路降至 3.59–3.62 ms，再经保留页验证的局部输入集合索引降至 1.05–1.09 ms。每次操作一次 update；实体、history 和工厂数固定。该负载合计约减少 82% CPU wall time。中间版本的三项改造一起测量，不推断各项独立贡献。32 节点小场景有波动，不能据此认定普遍加速。
+
+Input gate 保留有序 projection，绑定预备值时复核完整 source；保留页索引只活于一次不可变校验，仍位于原有角色 predicate。没有删除写后证明或新增持久缓存失效机制。测量表示库内 CPU 工作，不是应用 FPS。
 
 ## 维护
 

@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-Ordinary scenarios use 128 samples by default; `retained_steady` and `public_queries` use 32. Set a positive `ROUTER_BENCH_SAMPLES` to adjust this. `ROUTER_BENCH_SHAPE` accepts `flat` (default) or `nested`; both use the same content-node budget, with the latter forming a shallow four-level tree.
+Ordinary scenarios use 128 samples by default; `retained_steady`, `public_queries`, and `maintenance` use 32. Set a positive `ROUTER_BENCH_SAMPLES` to adjust this. `ROUTER_BENCH_SHAPE` accepts `flat` (default) or `nested`; both use the same content-node budget, with the latter forming a shallow four-level tree.
 
 Fix the machine, toolchain, dependencies, features, and optimization settings, and repeat at least twice. Build and measure sequentially, preserving all paired output. Compare absolute p50/p95, update counts, and variation for equivalent work before choosing a path to profile.
 
@@ -28,6 +28,7 @@ Fix the machine, toolchain, dependencies, features, and optimization settings, a
 | `steady` | Dynamic content after initial navigation, comparing two/three frames, ordinary scroll markers, and a no-Router control | 128/1024 nodes |
 | `retained_steady` | The same active leaf and shared parent with 0/1/4 retained siblings; idle and scroll-position updates | Parent 128, active leaf 32; each retained leaf 32/1024 dynamic nodes |
 | `public_queries` | Resident application consumers: empty loop, individual entry points, shared reader; repeated root and distinct targets | 32/1024 active descendants and the same number of retained descendants |
+| `maintenance` | Idle updates after completed cleanup, and warmed retained Replace hits | 0/32/128 retired descendants per request with no current descendants; 32/1024 descendants per retained page |
 | `transitions` | Disabled, enter-only, and held exit; publication, animation updates, release, finish, and idle | 32/128/1024 nodes per page |
 
 ### Full animation path
@@ -95,6 +96,19 @@ A resident application system runs after `PublishSnapshots` with a mutable appli
 
 Each fixture keeps one active page, one retained sibling, two history entries, and fixed entities/factory counts. Default sampling is 32 samples of four updates after 16 warmup updates; `ROUTER_BENCH_BATCH=1` samples individual updates. CSV `frames_per_sample` records the actual batch. Percentiles describe those sample means, including normal Router scheduling and the consumer, not isolated method latency. Activity, inputs, and inactive rejection are checked outside timing. This headless mode includes no UI layout or pointer input.
 
+### Closed traces and warmed cache hits
+
+```sh
+ROUTER_BENCH_MODE=maintenance cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > maintenance-flat.csv
+ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > maintenance-nested.csv
+```
+
+`terminal_history_idle` completes 64 Replace navigations, retiring 0, 32, or 128 dynamic descendants each time. The current page has no content descendants, history has one entry, and the latest 64 terminal requests remain. After 64 idle warmup updates, each sample averages 32 ordinary updates. CSV records trace-event and diagnostic counts outside timing, separating historical payload size from the current entity budget.
+
+`retained_hit` creates two pages and adds 32 or 1024 dynamic descendants to each after publication. It warms 64 alternating Replace hits, then times complete alternating navigations with one active and one retained page. The page entities and factory count stay unchanged; the group finally leaves the parent scope and checks content release. Both groups are headless and perform content census queries outside timing.
+
+`sample_scope` distinguishes `mean_update` from `complete_navigation`. In navigation rows, `updates_per_sample=0` denotes operation-scoped sampling; `min_updates` and `max_updates` give the actual update range. Trace counts, current content, history, and factories are checked outside the measured samples.
+
 ## Timing boundaries
 
 The Router fixture installs TaskPool, Asset, and Scene runtime and advances through ordinary `App::update`, navigation APIs, and snapshots. Navigation timing starts before enqueue and ends at a terminal request, no running request, and completed foreground cleanup. It includes building, resolve/apply, input authorization refresh, publication, and old-content cleanup. Initialization, target-string construction, detailed assertions, and CSV output are untimed.
@@ -112,7 +126,7 @@ The direct BSN control keeps the host/layout/outlet and measures Scene construct
 
 ## Behavior checks
 
-CI runs the benchmark fixtures' behavior assertions:
+Extended checks run the benchmark fixtures' behavior assertions without timing thresholds:
 
 ```sh
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
@@ -120,9 +134,10 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances`, `steady`, and `transitions` also support `-- --test`. The `retained_steady` smoke check keeps both workloads and 0/4 retained siblings with 32 descendants each, using two samples of four updates. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
+`instances`, `steady`, and `transitions` also support `-- --test`. The `retained_steady` smoke check keeps both workloads and 0/4 retained siblings with 32 descendants each, using two samples of four updates. `maintenance` smoke retains 64 terminal records, retiring 0/32 descendants and using 32 descendants per cached page; it takes two samples, with two updates per idle sample. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
 
 ## Save and read results
 

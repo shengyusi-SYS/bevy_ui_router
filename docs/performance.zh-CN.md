@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-默认每个普通场景采样 128 次，`retained_steady` 与 `public_queries` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
+默认每个普通场景采样 128 次，`retained_steady`、`public_queries` 与 `maintenance` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
 
 固定机器、工具链、依赖、features 和优化参数，至少重复两轮。串行完成构建与计时，保存全部配对输出。先比较相同工作的绝对 p50/p95、update 次数及波动，再选择需要 profile 的路径。
 
@@ -28,6 +28,7 @@ cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locke
 | `steady` | 首次导航后的动态内容，比较两层/三层 frame、普通滚动 marker 和无 Router 控制 | 128/1024 节点 |
 | `retained_steady` | 固定活动页和共同父布局，积累 0/1/4 个保留兄弟页；空闲与滚动位置更新 | 父布局 128、活动页 32；每个保留页 32/1024 个动态节点 |
 | `public_queries` | 常驻应用消费者：空循环、单次入口、共享 reader；重复根与逐实体查询 | 32/1024 个活动后代及同量保留后代 |
+| `maintenance` | 清理完成后的空闲更新，以及预热后的缓存 Replace 命中 | 每请求退休 0/32/128 个后代，当前无内容后代；每个保留页 32/1024 个后代 |
 | `transitions` | 关闭过渡、仅进入、持有退出；分别测发布、逐帧更新、释放、完成与空闲 | 每页 32/128/1024 节点 |
 
 ### 动画全路径
@@ -95,6 +96,19 @@ ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_u
 
 每个夹具固定一个活动页、一个保留页、两条 history，实体数与 factory 次数保持不变。默认预热 16 次 update，随后取 32 个样本，每个样本平均 4 次 update；`ROUTER_BENCH_BATCH=1` 可逐 update 采样。CSV 的 `frames_per_sample` 记录实际批量。分位数包含正常 Router 调度与应用消费者，表示样本均值，不是独立方法耗时。activity、当前输入与非活动拒绝在计时外验证。本模式无 UI layout 和 pointer 输入。
 
+### 已关闭 trace 与预热缓存命中
+
+```sh
+ROUTER_BENCH_MODE=maintenance cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > maintenance-flat.csv
+ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > maintenance-nested.csv
+```
+
+`terminal_history_idle` 完成 64 次 Replace，每次退休 0、32 或 128 个动态后代。当前页面没有内容后代，history 只有一条记录，保留最新 64 条终态请求。再预热 64 次空闲更新后，每个样本平均 32 次普通 update。CSV 在计时外统计 trace 事件与诊断数量，区分历史数据体积和当前实体预算。
+
+`retained_hit` 创建两个页面，在 publication 后给每页追加 32 或 1024 个动态后代。先预热 64 次交替 Replace 命中，再测交替导航的完整耗时，保持一个活动页和一个保留页。页面 Entity 与 factory 次数不变，场景组最后退出父作用域并检查内容释放。两组均为 headless，内容 census 查询在计时外执行。
+
+`sample_scope` 区分 `mean_update` 和 `complete_navigation`。导航行的 `updates_per_sample=0` 表示按完整操作采样，实际更新范围见 `min_updates` 和 `max_updates`。trace 数量、当前内容、history 和 factory 检查均在测量样本之外。
+
 ## 计时边界
 
 Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::update`、导航 API 和快照推进。导航从 enqueue 前计时到请求终态、无 running request 且前台 cleanup 清空，包含构建、resolve/apply、输入授权刷新、publication 和旧内容清理。初始化、目标字符串构造、详细断言与 CSV 输出在计时外。
@@ -112,7 +126,7 @@ Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::upda
 
 ## 行为检查
 
-CI 运行基准夹具的行为断言：
+扩展检查运行基准夹具的行为断言，不设置耗时阈值：
 
 ```sh
 cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
@@ -120,9 +134,10 @@ ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline -
 ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。`retained_steady` 的 smoke 保留两种更新工作负载，以及 0/4 个各有 32 个后代的保留页，每组为两个样本、每样本四次 update。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
+`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。`retained_steady` 的 smoke 保留两种更新工作负载，以及 0/4 个各有 32 个后代的保留页，每组为两个样本、每样本四次 update。`maintenance` smoke 保持 64 条终态记录，退休 0/32 个后代、每个缓存页含 32 个后代，取两个样本，空闲样本各平均两次 update。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
 
 ## 保存与阅读结果
 
