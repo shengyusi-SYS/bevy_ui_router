@@ -16,8 +16,8 @@ Public benchmark data is retained with complete source commits. See [performance
 | [Retained steady updates](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
 | [Observation controls](performance-observation-controls-2026-11-12.csv) | 194 | Same sources; ordinary navigation and initial dynamic pages |
 | [Public query consumers](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
-| [Completed-request maintenance and retained hits](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
-| [Shared ordinary ancestors](performance-query-ancestors-2026-11-14.csv) | 280 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` |
+| [Completed-request maintenance and retained hits](performance-maintenance-2026-11-14.csv) | 100 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
+| [Shared ordinary ancestors](performance-query-ancestors-2026-11-14.csv) | 392 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
 | [History value sharing](performance-history-values-2026-11-14.csv) | 114 | `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
 | [Value-sharing navigation controls](performance-value-controls-2026-11-14.csv) | 768 | Same sources; ordinary navigation and idle updates |
 
@@ -131,6 +131,7 @@ The `maintenance` fixture separates historical trace size from live content, the
 | `before` | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` | `c3a958db4124f354e8a15c2c0f77245e71dabbb959bad6732f25a112f9b7a459` |
 | `prepared_publication` | `3cda2f803bacec6714044d26ea0a594df681ce87` | `8cb51b4d925194232509de93ed61957d302cb51b11801877585ce0d70c4bd2e1` |
 | `local_input_index` | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` | `162efbaf516e0c399b318964a49cf41348753616b8f4701145f84111bbe26846` |
+| `final_values` | `71d1b2f2a72a7d0a4924154d18350f4c9315152e` | `a2f724a226ff16db30b7898072c2db6418d4f7d06900c5613cf79158a0d5e63e` |
 
 Build and freeze executables with the existing `cargo bench ... --no-run` command, then select `ROUTER_BENCH_MODE=maintenance` and `ROUTER_BENCH_SHAPE=flat|nested`. Builds and timing runs were separate and serial. Run order was before rounds 1–2 → prepared-publication round 1 → before round 3 → prepared-publication round 2 → local-input-index round 1 → prepared-publication round 3 → local-input-index round 2. Each round ran flat then nested. All 80 rows, including variable small cases, are retained.
 
@@ -139,6 +140,8 @@ With 54 live entities, one history entry, and 64 terminal requests, idle p50 pre
 For two warmed pages with 1024 dynamic descendants each, complete Replace-hit p50 changes from 5.81–5.92 ms to 3.59–3.62 ms with prepared input changes and absent-marker capture skipping, then to 1.05–1.09 ms with a local input-membership index during retained validation. Each operation takes one update; entities, history, and factories stay fixed. The combined result is about 82% lower CPU wall time for this workload. The three changes in the middle variant were measured together, so their individual contributions are not inferred. Small 32-node cases vary and do not establish a general speedup.
 
 The input gate keeps its ordered projection and checks the complete source again when binding prepared values. The retained index exists only during one immutable validation, at the original role-specific predicate. Neither change removes post-write proofs or adds persistent cache invalidation. These measurements describe library CPU work, not application FPS.
+
+After the history-value changes below, two final flat/nested replay rounds add 20 `final_values` rows, bringing this dataset to 100. Idle p50 is 13.0–13.2 µs across trace sizes, and the 1024-node complete cache hit is 1.055–1.082 ms. The earlier gains remain in the combined implementation.
 
 ## Shared ordinary ancestors: 2026-11-14
 
@@ -158,6 +161,8 @@ For 2048 distinct targets, p50 ranges in microseconds are:
 | Flat / scroll miss | 346.6–356.2 | 355.4–362.1 |
 
 Nested activity totals fall about 45%; flat input and scroll cases retain a small overhead and establish no additional gain. Repeated-root queries and empty-loop controls stay near their existing cost. The reader shares completed resolutions only for ordinary ancestors within one immutable borrow. Registered boundaries still distinguish direct targets from inherited content, including negative results and query order. This does not add a persistent index or change the public API.
+
+Two later flat/nested replay rounds on the final value-sharing source `71d1b2f2a72a7d0a4924154d18350f4c9315152e` use binary SHA-256 `a2f724a226ff16db30b7898072c2db6418d4f7d06900c5613cf79158a0d5e63e`. They add 112 `final_values` rows, bringing this dataset to 392. Distinct-target activity p50 is 361.5–362.2 µs flat and 359.4–363.6 µs nested. The combined implementation retains the nested benefit; flat queries show no additional gain.
 
 ## History value sharing: 2026-11-14
 

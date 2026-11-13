@@ -16,8 +16,8 @@
 | [保留页稳态更新](performance-retained-steady-2026-11-12.csv) | 372 | `c96836592f553a3e2b8c898063280e013f1764a1` → `bd937055bd5cf218b5c398e89a55a5437f7818b2` |
 | [观察路径控制组](performance-observation-controls-2026-11-12.csv) | 194 | 同上；普通导航及初始动态页面 |
 | [公开查询消费者](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
-| [终结请求维护与缓存命中](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
-| [普通祖先共享](performance-query-ancestors-2026-11-14.csv) | 280 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` |
+| [终结请求维护与缓存命中](performance-maintenance-2026-11-14.csv) | 100 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
+| [普通祖先共享](performance-query-ancestors-2026-11-14.csv) | 392 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
 | [历史值共享](performance-history-values-2026-11-14.csv) | 114 | `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
 | [值共享导航控制组](performance-value-controls-2026-11-14.csv) | 768 | 同上；普通导航及空闲更新 |
 
@@ -131,6 +131,7 @@ nested、每个保留页 1024 后代时，最终 idle p50 范围如下，单位�
 | `before` | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` | `c3a958db4124f354e8a15c2c0f77245e71dabbb959bad6732f25a112f9b7a459` |
 | `prepared_publication` | `3cda2f803bacec6714044d26ea0a594df681ce87` | `8cb51b4d925194232509de93ed61957d302cb51b11801877585ce0d70c4bd2e1` |
 | `local_input_index` | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` | `162efbaf516e0c399b318964a49cf41348753616b8f4701145f84111bbe26846` |
+| `final_values` | `71d1b2f2a72a7d0a4924154d18350f4c9315152e` | `a2f724a226ff16db30b7898072c2db6418d4f7d06900c5613cf79158a0d5e63e` |
 
 用既有 `cargo bench ... --no-run` 命令构建并固定二进制，再指定 `ROUTER_BENCH_MODE=maintenance`、`ROUTER_BENCH_SHAPE=flat|nested`。构建与计时分开串行执行，顺序为 before 第 1–2 轮 → prepared-publication 第 1 轮 → before 第 3 轮 → prepared-publication 第 2 轮 → local-input-index 第 1 轮 → prepared-publication 第 3 轮 → local-input-index 第 2 轮；每轮先 flat 后 nested。保留全部 80 行，包括波动较大的小规模场景。
 
@@ -139,6 +140,8 @@ nested、每个保留页 1024 后代时，最终 idle p50 范围如下，单位�
 两个页面各有 1024 个动态后代时，完整 Replace 命中的 p50 从 5.81–5.92 ms，经输入变更预备复用及无 marker 采集快路降至 3.59–3.62 ms，再经保留页验证的局部输入集合索引降至 1.05–1.09 ms。每次操作一次 update；实体、history 和工厂数固定。该负载合计约减少 82% CPU wall time。中间版本的三项改造一起测量，不推断各项独立贡献。32 节点小场景有波动，不能据此认定普遍加速。
 
 Input gate 保留有序 projection，绑定预备值时复核完整 source；保留页索引只活于一次不可变校验，仍位于原有角色 predicate。没有删除写后证明或新增持久缓存失效机制。测量表示库内 CPU 工作，不是应用 FPS。
+
+下述历史值共享落地后，最终版本又按 flat/nested 重放两轮，增加 20 行 `final_values`，数据总计 100 行。各 trace 规模的 idle p50 为 13.0–13.2 µs，1024 节点完整缓存命中为 1.055–1.082 ms；组合实现保留了前面的收益。
 
 ## 普通祖先共享：2026-11-14
 
@@ -158,6 +161,8 @@ Input gate 保留有序 projection，绑定预备值时复核完整 source；保
 | 平铺／scroll miss | 346.6–356.2 | 355.4–362.1 |
 
 嵌套 activity 总耗时约减少 45%；平铺输入和滚动查询仍有少量开销，不认定额外收益。重复根查询和空循环控制组接近原有成本。reader 仅在一次不可变借用内共享完整解析后的普通祖先结果；注册边界仍区分直接目标和继承内容，包括负结果与查询顺序。没有新增持久索引或改变公开 API。
+
+随后在最终值共享源码 `71d1b2f2a72a7d0a4924154d18350f4c9315152e` 上按 flat/nested 重放两轮，二进制 SHA-256 为 `a2f724a226ff16db30b7898072c2db6418d4f7d06900c5613cf79158a0d5e63e`。增加 112 行 `final_values`，总计 392 行。逐目标 activity p50 为平铺 361.5–362.2 µs、嵌套 359.4–363.6 µs；组合实现保留嵌套收益，平铺没有额外收益。
 
 ## 历史值共享：2026-11-14
 
