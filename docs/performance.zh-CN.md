@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-默认每个普通场景采样 128 次，`retained_steady`、`public_queries` 与 `maintenance` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
+默认每个普通场景采样 128 次，`retained_steady`、`public_queries`、`maintenance` 与 `history` 为 32 次，用正整数 `ROUTER_BENCH_SAMPLES` 调整。`ROUTER_BENCH_SHAPE` 可选 `flat`（默认）或 `nested`；两者内容节点数相同，后者形成四层浅树。
 
 固定机器、工具链、依赖、features 和优化参数，至少重复两轮。串行完成构建与计时，保存全部配对输出。先比较相同工作的绝对 p50/p95、update 次数及波动，再选择需要 profile 的路径。
 
@@ -29,6 +29,7 @@ cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locke
 | `retained_steady` | 固定活动页和共同父布局，积累 0/1/4 个保留兄弟页；空闲与滚动位置更新 | 父布局 128、活动页 32；每个保留页 32/1024 个动态节点 |
 | `public_queries` | 常驻应用消费者：空循环、单次入口、共享 reader；重复根与逐实体查询 | 32/1024 个活动后代及同量保留后代 |
 | `maintenance` | 清理完成后的空闲更新，以及预热后的缓存 Replace 命中 | 每请求退休 0/32/128 个后代，当前无内容后代；每个保留页 32/1024 个后代 |
+| `history` | 固定访问历史的同页 Replace，比较有滚动记录与无 marker 的对照 | 1/128/1024 次访问；父布局 128、活动页 32 个动态后代 |
 | `transitions` | 关闭过渡、仅进入、持有退出；分别测发布、逐帧更新、释放、完成与空闲 | 每页 32/128/1024 节点 |
 
 ### 动画全路径
@@ -109,6 +110,19 @@ ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_r
 
 `sample_scope` 区分 `mean_update` 和 `complete_navigation`。导航行的 `updates_per_sample=0` 表示按完整操作采样，实际更新范围见 `min_updates` 和 `max_updates`。trace 数量、当前内容、history 和 factory 检查均在测量样本之外。
 
+### 多次访问的滚动记录
+
+```sh
+ROUTER_BENCH_MODE=history cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > history-flat.csv
+ROUTER_BENCH_MODE=history ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > history-nested.csv
+```
+
+此模式始终安装正常 UI layout、picking 系统和相机输入，不创建 renderer。同一 URL 重复 Push 形成 1、128 或 1024 次访问，复用同一页面和父布局；每次访问通过真实布局采样不同的整数滚动位置。有 marker 与无 marker 两组保持相同的动态内容预算、Entity 和 factory 次数。
+
+预热 64 次 Replace 后，每个样本测量一次完整的同 URL Replace，history 长度固定。计时包含 enqueue、普通 update 和 UI layout、publication，以及请求终态和前台 cleanup 清空；用于观察保存的访问记录增长时的完整导航成本。无 marker 对照包含相同的 canonical history 工作。
+
+计时外检查实际显示位置、history、Entity 不变和无 factory 重建；最多两次 Back 验证有 marker 页面恢复不同旧访问的位置，无 marker 页面保留当前值。单次访问的对照仅在计时后增加第二次访问来完成此检查。CSV 记录 marker 开关、history 和实体数量、update 范围、factory 次数及 Back 检查数；每组最后释放内容。
+
 ## 计时边界
 
 Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::update`、导航 API 和快照推进。导航从 enqueue 前计时到请求终态、无 running request 且前台 cleanup 清空，包含构建、resolve/apply、输入授权刷新、publication 和旧内容清理。初始化、目标字符串构造、详细断言与 CSV 输出在计时外。
@@ -120,7 +134,7 @@ Router 夹具安装 TaskPool、Asset 和 Scene runtime，通过普通 `App::upda
 | 实体和请求数量 | 场景组完成后读取的稳定状态；failure 行在对应 recover 完成后读取 |
 | update 上限 | 每步 32 次更新的防挂起断言 |
 
-普通模式是 headless CPU 侧测量，覆盖 Router 与基础调度；`transitions` 和 `retained_steady` 的 UI 开关额外覆盖正常布局和输入候选投影，未注入 pointer 时不测实际命中。窗口提交另用上述窗口模式，GPU 执行、实际呈现和 I/O 需在对应环境单独测量。根 workspace 与独立窗口可能使用不同 executor/features，比较前记录实际构建配置。
+普通模式是 headless CPU 侧测量，覆盖 Router 与基础调度；`transitions` 和 `retained_steady` 的 UI 开关，以及 `history` 模式额外覆盖正常布局和输入候选投影，未注入 pointer 时不测实际命中。窗口提交另用上述窗口模式，GPU 执行、实际呈现和 I/O 需在对应环境单独测量。根 workspace 与独立窗口可能使用不同 executor/features，比较前记录实际构建配置。
 
 直接 BSN 对照保留 host/layout/outlet，测 Scene 构造、resolve/apply、旧页删除和普通 update。它用于观察引擎构建成本；Router 基准还包含 history、授权、隔离和恢复工作。
 
@@ -135,9 +149,10 @@ ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baselin
 ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=history ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。`retained_steady` 的 smoke 保留两种更新工作负载，以及 0/4 个各有 32 个后代的保留页，每组为两个样本、每样本四次 update。`maintenance` smoke 保持 64 条终态记录，退休 0/32 个后代、每个缓存页含 32 个后代，取两个样本，空闲样本各平均两次 update。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
+`instances`、`steady` 和 `transitions` 同样支持 `-- --test`。`retained_steady` 的 smoke 保留两种更新工作负载，以及 0/4 个各有 32 个后代的保留页，每组为两个样本、每样本四次 update。`maintenance` smoke 保持 64 条终态记录，退休 0/32 个后代、每个缓存页含 32 个后代，取两个样本，空闲样本各平均两次 update。`history` smoke 使用 1/32 次访问、有无 marker 两组，以及经过真实 UI layout 的两个样本。检查过渡夹具时可加 `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32`，以较小内容验证真实布局路径。正式计时使用上面的 `cargo bench` 命令。
 
 ## 保存与阅读结果
 

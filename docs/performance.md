@@ -14,7 +14,7 @@ ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline 
 cargo bench -p bevy_ui_router --bench bsn_content_control --features bsn --locked > control.csv
 ```
 
-Ordinary scenarios use 128 samples by default; `retained_steady`, `public_queries`, and `maintenance` use 32. Set a positive `ROUTER_BENCH_SAMPLES` to adjust this. `ROUTER_BENCH_SHAPE` accepts `flat` (default) or `nested`; both use the same content-node budget, with the latter forming a shallow four-level tree.
+Ordinary scenarios use 128 samples by default; `retained_steady`, `public_queries`, `maintenance`, and `history` use 32. Set a positive `ROUTER_BENCH_SAMPLES` to adjust this. `ROUTER_BENCH_SHAPE` accepts `flat` (default) or `nested`; both use the same content-node budget, with the latter forming a shallow four-level tree.
 
 Fix the machine, toolchain, dependencies, features, and optimization settings, and repeat at least twice. Build and measure sequentially, preserving all paired output. Compare absolute p50/p95, update counts, and variation for equivalent work before choosing a path to profile.
 
@@ -29,6 +29,7 @@ Fix the machine, toolchain, dependencies, features, and optimization settings, a
 | `retained_steady` | The same active leaf and shared parent with 0/1/4 retained siblings; idle and scroll-position updates | Parent 128, active leaf 32; each retained leaf 32/1024 dynamic nodes |
 | `public_queries` | Resident application consumers: empty loop, individual entry points, shared reader; repeated root and distinct targets | 32/1024 active descendants and the same number of retained descendants |
 | `maintenance` | Idle updates after completed cleanup, and warmed retained Replace hits | 0/32/128 retired descendants per request with no current descendants; 32/1024 descendants per retained page |
+| `history` | Same-page Replace with fixed visit history, comparing saved scroll records with an unmarked control | 1/128/1024 visits; parent 128 and active leaf 32 dynamic descendants |
 | `transitions` | Disabled, enter-only, and held exit; publication, animation updates, release, finish, and idle | 32/128/1024 nodes per page |
 
 ### Full animation path
@@ -109,6 +110,19 @@ ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_r
 
 `sample_scope` distinguishes `mean_update` from `complete_navigation`. In navigation rows, `updates_per_sample=0` denotes operation-scoped sampling; `min_updates` and `max_updates` give the actual update range. Trace counts, current content, history, and factories are checked outside the measured samples.
 
+### Scroll records across visits
+
+```sh
+ROUTER_BENCH_MODE=history cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > history-flat.csv
+ROUTER_BENCH_MODE=history ROUTER_BENCH_SHAPE=nested cargo bench -p bevy_ui_router --bench router_baseline --features bsn --locked > history-nested.csv
+```
+
+This mode always installs normal UI layout, picking systems, and camera input without a renderer. Repeated Push to the same URL creates 1, 128, or 1024 visits while reusing one page and its parent. Each visit samples a distinct integral scroll position through real layout. The marked and unmarked groups keep the same dynamic content budget, entities, and factory count.
+
+After 64 Replace warmups, each sample times one complete same-URL Replace while keeping the history length fixed. Timing includes enqueue, ordinary updates and UI layout, publication, and terminal completion with no foreground cleanup. This measures the complete navigation cost as saved visit records grow. The unmarked control includes the same canonical history work.
+
+Untimed checks verify real displayed positions, history, unchanged entities, and no factory rebuild. At most two Back navigations check that marked pages restore different earlier visit positions while unmarked pages keep their current value. The one-visit control adds a second visit only after timing for this check. CSV records the marker flag, history and entity counts, update range, factory calls, and Back checks; each group finally releases its content.
+
 ## Timing boundaries
 
 The Router fixture installs TaskPool, Asset, and Scene runtime and advances through ordinary `App::update`, navigation APIs, and snapshots. Navigation timing starts before enqueue and ends at a terminal request, no running request, and completed foreground cleanup. It includes building, resolve/apply, input authorization refresh, publication, and old-content cleanup. Initialization, target-string construction, detailed assertions, and CSV output are untimed.
@@ -120,7 +134,7 @@ The Router fixture installs TaskPool, Asset, and Scene runtime and advances thro
 | Entity and request counts | Stable state at the end of a scenario group; failure rows are read after their corresponding recovery |
 | Update limit | An assertion that each step settles within 32 updates |
 
-Ordinary modes measure headless Router and basic scheduling. The `transitions` and `retained_steady` UI options additionally cover normal layout and input candidate projection; without injected pointers they do not measure actual hit testing. Use the window mode above for submission; GPU execution, actual presentation, and I/O require their corresponding environment. The root workspace and separate window application can use different executors/features, so record the actual build configuration before comparisons.
+Ordinary modes measure headless Router and basic scheduling. The `transitions` and `retained_steady` UI options, and the `history` mode, additionally cover normal layout and input candidate projection; without injected pointers they do not measure actual hit testing. Use the window mode above for submission; GPU execution, actual presentation, and I/O require their corresponding environment. The root workspace and separate window application can use different executors/features, so record the actual build configuration before comparisons.
 
 The direct BSN control keeps the host/layout/outlet and measures Scene construction, resolve/apply, old-page deletion, and ordinary updates. It shows engine construction cost; Router benchmarks additionally perform history, authorization, isolation, and recovery work.
 
@@ -135,9 +149,10 @@ ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baselin
 ROUTER_BENCH_MODE=retained_steady ROUTER_BENCH_SHAPE=nested ROUTER_BENCH_UI=1 cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=public_queries ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ROUTER_BENCH_MODE=maintenance ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
+ROUTER_BENCH_MODE=history ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
 ```
 
-`instances`, `steady`, and `transitions` also support `-- --test`. The `retained_steady` smoke check keeps both workloads and 0/4 retained siblings with 32 descendants each, using two samples of four updates. `maintenance` smoke retains 64 terminal records, retiring 0/32 descendants and using 32 descendants per cached page; it takes two samples, with two updates per idle sample. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
+`instances`, `steady`, and `transitions` also support `-- --test`. The `retained_steady` smoke check keeps both workloads and 0/4 retained siblings with 32 descendants each, using two samples of four updates. `maintenance` smoke retains 64 terminal records, retiring 0/32 descendants and using 32 descendants per cached page; it takes two samples, with two updates per idle sample. `history` smoke uses 1/32 visits, both marker groups, and two samples through real UI layout. Add `ROUTER_BENCH_UI=1 ROUTER_BENCH_CONTENT=32` to check the transition fixture through real layout with a small content budget. Use the `cargo bench` commands above for timing.
 
 ## Save and read results
 

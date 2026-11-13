@@ -1,4 +1,7 @@
 //! Keep one active leaf and parent unchanged while accumulating retained siblings.
+#[path = "retained_steady/history.rs"]
+mod history;
+
 use super::*;
 use bevy_internal::math::Vec2;
 use bevy_ui::{
@@ -339,6 +342,10 @@ fn position(alternate: bool) -> Vec2 {
     } else {
         Vec2::new(8.0, 16.0)
     }
+}
+
+pub(super) fn run_history(shape: ContentShape, samples: usize, smoke: bool) {
+    history::run(shape, samples, smoke);
 }
 
 pub(super) fn run(shape: ContentShape, samples: usize, smoke: bool) {
