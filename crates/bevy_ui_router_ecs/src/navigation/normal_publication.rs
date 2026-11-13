@@ -591,15 +591,16 @@ pub(super) fn publish_normal_work(
                 visible_claims.clone(),
             );
         }
-        let pointer_targets = prepare_input_gate_mutation(
-            world.get_resource_mut::<RouterInputGate>()?,
+        let gate_change = InputGateChange::prepare(
+            world.get_resource::<RouterInputGate>()?,
             &gate_before,
-            gate_after.clone(),
-        )?
-        .revoked_targets()
-        .to_vec();
-        let (presentation, resources) =
-            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
+            gate_after,
+        )?;
+        let (presentation, resources) = crate::presentation::prepare_publication_access(
+            world,
+            &targets,
+            gate_change.revoked_targets(),
+        )?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -685,7 +686,7 @@ pub(super) fn publish_normal_work(
             None
         };
 
-        let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
+        let gate_plan = gate_change.bind(gate)?;
         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
         #[cfg(feature = "bsn")]
         let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;

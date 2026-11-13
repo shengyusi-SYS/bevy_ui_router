@@ -1,6 +1,11 @@
 use std::collections::HashSet;
 
 mod boundary;
+mod gate;
+pub use gate::RouterInputGate;
+pub(crate) use gate::{
+    InputGateChange, PreparedInputGateIsolation, try_prepare_input_gate_isolation,
+};
 pub(crate) mod native_ui_candidates;
 
 use boundary::{RouterInputObservation, target_is_denied_router_input};
@@ -44,119 +49,6 @@ impl RouteFocusState {
 
     pub(crate) fn set_focused(&mut self, focused: Option<Entity>) {
         self.focused = focused;
-    }
-}
-
-#[derive(Resource)]
-pub struct RouterInputGate {
-    allowed: Vec<Entity>,
-    /// Targets that were previously authorized and must have all retained
-    /// native pointer state removed before the next dispatch.
-    revoked: Vec<Entity>,
-}
-
-impl RouterInputGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            allowed: Vec::new(),
-            revoked: Vec::new(),
-        }
-    }
-
-    pub fn allows_pointer(&self, target: Entity) -> bool {
-        self.allowed.contains(&target)
-    }
-
-    pub fn allows_keyboard(&self, target: Entity) -> bool {
-        self.allowed.contains(&target)
-    }
-
-    pub fn allows_gamepad(&self, target: Entity) -> bool {
-        self.allowed.contains(&target)
-    }
-
-    pub(crate) fn allowed_projection(&self) -> &[Entity] {
-        &self.allowed
-    }
-
-    fn replace_allowed(&mut self, next: Vec<Entity>, revoked: Vec<Entity>) {
-        self.allowed = next;
-        self.revoked = revoked;
-    }
-
-    fn refresh_allowed(&mut self, allowed: &EntityHashSet, grants: &EntityHashSet) -> bool {
-        if self.allowed.iter().all(|entity| allowed.contains(entity))
-            && (self.allowed.len() == allowed.len()
-                || grants
-                    .iter()
-                    .all(|entity| !allowed.contains(entity) || self.allowed.contains(entity)))
-            && self.revoked.iter().all(|entity| !allowed.contains(entity))
-        {
-            return false;
-        }
-        for entity in self.allowed.iter().copied() {
-            if !allowed.contains(&entity) && !self.revoked.contains(&entity) {
-                self.revoked.push(entity);
-            }
-        }
-        self.allowed.retain(|entity| allowed.contains(entity));
-        self.allowed.extend(
-            grants
-                .iter()
-                .copied()
-                .filter(|entity| allowed.contains(entity)),
-        );
-        self.allowed.sort_by_key(|entity| entity.to_bits());
-        self.allowed.dedup();
-        self.revoked.retain(|entity| !allowed.contains(entity));
-        true
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct PreparedInputGateIsolation {
-    next: Vec<Entity>,
-    revoked: Vec<Entity>,
-}
-
-impl PreparedInputGateIsolation {
-    pub(crate) fn revoked_targets(&self) -> &[Entity] {
-        &self.revoked
-    }
-
-    pub(crate) fn apply(self, gate: &mut RouterInputGate) {
-        gate.replace_allowed(self.next, self.revoked);
-    }
-}
-
-pub(crate) fn try_prepare_input_gate_isolation(
-    gate: &RouterInputGate,
-    targets: &[Entity],
-) -> Result<PreparedInputGateIsolation, ()> {
-    let mut next = Vec::new();
-    next.try_reserve_exact(gate.allowed.len()).map_err(|_| ())?;
-    next.extend(gate.allowed.iter().copied());
-    next.retain(|entity| !targets.contains(entity));
-    let revoked = try_prepare_pointer_revocations(gate, &next)?;
-    Ok(PreparedInputGateIsolation { next, revoked })
-}
-
-pub(crate) struct PreparedInputGateMutation<'w> {
-    gate: Mut<'w, RouterInputGate>,
-    next: Vec<Entity>,
-    revoked: Vec<Entity>,
-    changed: bool,
-}
-
-impl PreparedInputGateMutation<'_> {
-    pub(crate) fn revoked_targets(&self) -> &[Entity] {
-        &self.revoked
-    }
-
-    pub(crate) fn apply(mut self) {
-        if self.changed {
-            self.gate.replace_allowed(self.next, self.revoked);
-        }
     }
 }
 
@@ -334,62 +226,6 @@ pub(crate) fn prepare_focus_mutation<'w>(
         next_input,
         clear_route,
     }
-}
-
-pub(crate) fn prepare_input_gate_mutation<'w>(
-    gate: Mut<'w, RouterInputGate>,
-    remove: &[Entity],
-    add: Vec<Entity>,
-) -> Option<PreparedInputGateMutation<'w>> {
-    if remove.iter().any(|entity| !gate.allowed.contains(entity))
-        || remove
-            .iter()
-            .enumerate()
-            .any(|(index, entity)| remove[index + 1..].contains(entity))
-        || add
-            .iter()
-            .enumerate()
-            .any(|(index, entity)| add[index + 1..].contains(entity))
-        || add
-            .iter()
-            .any(|entity| gate.allowed.contains(entity) && !remove.contains(entity))
-    {
-        return None;
-    }
-    let mut next = gate.allowed.clone();
-    next.retain(|entity| !remove.contains(entity));
-    next.extend(add);
-    let revoked = try_prepare_pointer_revocations(&gate, &next).ok()?;
-    let same_permissions =
-        gate.allowed.len() == next.len() && next.iter().all(|entity| gate.allowed.contains(entity));
-    let changed = !same_permissions || gate.revoked != revoked;
-    Some(PreparedInputGateMutation {
-        gate,
-        next,
-        revoked,
-        changed,
-    })
-}
-
-fn try_prepare_pointer_revocations(
-    gate: &RouterInputGate,
-    next: &[Entity],
-) -> Result<Vec<Entity>, ()> {
-    let capacity = gate
-        .revoked
-        .len()
-        .checked_add(gate.allowed.len())
-        .ok_or(())?;
-    let mut revoked = Vec::new();
-    revoked.try_reserve_exact(capacity).map_err(|_| ())?;
-    revoked.extend(gate.revoked.iter().copied());
-    for entity in gate.allowed.iter().copied() {
-        if !next.contains(&entity) && !revoked.contains(&entity) {
-            revoked.push(entity);
-        }
-    }
-    revoked.retain(|entity| !next.contains(entity));
-    Ok(revoked)
 }
 
 pub(crate) fn refresh_input_gate_system(world: &mut World) {
@@ -975,6 +811,14 @@ pub(crate) mod tests {
     use bevy_ui_router_view::{
         RouteViewDescriptor, RouteViewRegistry, ViewBuildEffect, ViewDriverKey,
     };
+
+    fn prepare_input_gate_mutation<'w>(
+        gate: Mut<'w, RouterInputGate>,
+        remove: &[Entity],
+        add: Vec<Entity>,
+    ) -> Option<gate::PreparedInputGateMutation<'w>> {
+        InputGateChange::prepare(&gate, remove, add)?.bind(gate)
+    }
 
     struct InputTestDriver {
         key: ViewDriverKey,

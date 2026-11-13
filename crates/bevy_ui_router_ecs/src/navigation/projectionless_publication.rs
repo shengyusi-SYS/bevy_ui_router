@@ -725,8 +725,8 @@ pub(super) fn prepare_projectionless_branch(
         return Err(pending);
     };
 
-    if prepare_input_gate_mutation(
-        world.resource_mut::<RouterInputGate>(),
+    if InputGateChange::prepare(
+        world.resource::<RouterInputGate>(),
         &gate_before,
         Vec::new(),
     )
@@ -738,8 +738,8 @@ pub(super) fn prepare_projectionless_branch(
             Err(pending)
         };
     }
-    if prepare_input_gate_mutation(
-        world.resource_mut::<RouterInputGate>(),
+    if InputGateChange::prepare(
+        world.resource::<RouterInputGate>(),
         &gate_before,
         gate_after.clone(),
     )
@@ -1055,10 +1055,9 @@ pub(super) fn publish_projectionless_work(
     #[cfg(feature = "bsn")]
     let native_focus =
         crate::native_focus::prepare_publication(world, pending.branch.frames(), &gate_after);
-    let pointer_targets = world
-        .get_resource_mut::<RouterInputGate>()
-        .and_then(|gate| prepare_input_gate_mutation(gate, &gate_before, gate_after.clone()))
-        .map(|plan| plan.revoked_targets().to_vec());
+    let gate_change = world
+        .get_resource::<RouterInputGate>()
+        .and_then(|gate| InputGateChange::prepare(gate, &gate_before, gate_after));
     let scroll_eligible = crate::scroll::eligible_containers(world);
     let scroll_observation = {
         let navigation = world.resource::<RouterNavigation>();
@@ -1078,10 +1077,11 @@ pub(super) fn publish_projectionless_work(
     let mut failure = None;
     let mut rejected_publication = None;
     let committed = (|| {
+        let gate_change = gate_change?;
         let (presentation, resources) = crate::presentation::prepare_publication_access(
             world,
             &targets,
-            pointer_targets.as_ref()?,
+            gate_change.revoked_targets(),
         )?;
         let crate::presentation::PublicationResources {
             mut navigation,
@@ -1095,7 +1095,7 @@ pub(super) fn publish_projectionless_work(
             .iter_mut()
             .find(|entry| entry.handle == handle)?;
         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
-        let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
+        let gate_plan = gate_change.bind(gate)?;
         let focus_plan = prepare_focus_mutation(input_focus, route_focus, &focus_leaving);
         #[cfg(feature = "bsn")]
         let focus_plan = focus_plan.with_native_publication(native_focus.as_ref()?)?;

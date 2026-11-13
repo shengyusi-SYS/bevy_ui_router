@@ -44499,7 +44499,9 @@ fn publication_borrow_uses_exact_resource_mapping_and_is_inert_until_applied() {
         let (presentation, resources) =
             crate::presentation::prepare_publication_access(world, &[], &[]).unwrap();
         prepare_focus_mutation(resources.input_focus, resources.route_focus, &[]).apply();
-        prepare_input_gate_mutation(resources.gate, &[], Vec::new())
+        InputGateChange::prepare(&resources.gate, &[], Vec::new())
+            .unwrap()
+            .bind(resources.gate)
             .unwrap()
             .apply();
         presentation.apply();

@@ -153,8 +153,8 @@ use crate::{
         stage_source_bound_granted_top_slot, validated_host_candidate_is_current,
     },
     input::{
-        RouteFocusState, RouterInputGate, observed_descendant_closure, prepare_focus_mutation,
-        prepare_input_gate_mutation,
+        InputGateChange, RouteFocusState, RouterInputGate, observed_descendant_closure,
+        prepare_focus_mutation,
     },
     lifecycle_preparation::{
         LifecyclePreflightEvidence, LifecyclePreflightExpectation, LifecyclePreflightObserved,
@@ -15398,15 +15398,16 @@ fn publish_ready_back_target(
         if !frozen_is_exact {
             return None;
         }
-        let pointer_targets = prepare_input_gate_mutation(
-            world.get_resource_mut::<RouterInputGate>()?,
+        let gate_change = InputGateChange::prepare(
+            world.get_resource::<RouterInputGate>()?,
             &gate_before,
-            gate_after.clone(),
-        )?
-        .revoked_targets()
-        .to_vec();
-        let (presentation, resources) =
-            crate::presentation::prepare_publication_access(world, &targets, &pointer_targets)?;
+            gate_after,
+        )?;
+        let (presentation, resources) = crate::presentation::prepare_publication_access(
+            world,
+            &targets,
+            gate_change.revoked_targets(),
+        )?;
         let crate::presentation::PublicationResources {
             mut navigation,
             mut registry,
@@ -15422,7 +15423,7 @@ fn publish_ready_back_target(
         let splice = &ready.physical.classified.splice;
         let registry_plan = registry.prepare_lifecycle_mutation(&transitions)?;
         let resulting_claims = registry_plan.resulting_claims().to_vec();
-        let gate_plan = prepare_input_gate_mutation(gate, &gate_before, gate_after)?;
+        let gate_plan = gate_change.bind(gate)?;
         let focus_plan =
             prepare_focus_mutation(input_focus, route_focus, &ready.physical.focus_leaving);
         #[cfg(feature = "bsn")]
