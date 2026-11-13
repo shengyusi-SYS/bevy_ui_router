@@ -219,7 +219,7 @@ pub(crate) struct ScrollObservation {
 
 #[derive(Clone, Default)]
 pub(crate) struct ScrollState {
-    records: HashMap<HistoryEntryKey, HashMap<(RouteSegmentReuseKey, String), ScrollPosition>>,
+    records: HashMap<HistoryEntryKey, Arc<HashMap<(RouteSegmentReuseKey, String), ScrollPosition>>>,
     // Latest valid displays survive layout gaps only while the exact marked
     // containers remain active; they never supply history or frame authority.
     displayed: Vec<Container>,
@@ -382,8 +382,14 @@ impl ScrollState {
         facts: &HistoryPublicationFacts,
         observation: ScrollObservation,
     ) -> PreparedScroll {
-        let mut state = self.clone();
-        state.pending.clear();
+        let mut state = Self {
+            records: self.records.clone(),
+            displayed: self.displayed.clone(),
+            published: None,
+            pending: Vec::new(),
+            warned_duplicate: self.warned_duplicate,
+            warned_layout: self.warned_layout,
+        };
         state.warn_duplicate(
             observation
                 .source_duplicates
@@ -442,7 +448,7 @@ impl ScrollState {
             if positions.is_empty() {
                 state.records.remove(&entry);
             } else {
-                state.records.insert(entry, positions);
+                state.records.insert(entry, Arc::new(positions));
             }
         }
         if !state.records.is_empty() {
@@ -532,10 +538,7 @@ impl ScrollState {
                 })
                 .collect::<HashMap<_, _>>();
             if !positions.is_empty() {
-                self.records
-                    .entry(published.entry)
-                    .or_default()
-                    .extend(positions);
+                Arc::make_mut(self.records.entry(published.entry).or_default()).extend(positions);
             }
         }
         for container in observed {
