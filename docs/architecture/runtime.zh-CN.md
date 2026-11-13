@@ -90,7 +90,7 @@ fresh 路径通过官方 `ScenePatch::load/resolve` 和 Scene executor 应用新
 
 可选过渡把应用展示会话与物理退出 owner 分开。应用先写初始样式，发布后才推进自己的动画；只做进入动画不延后请求终态。需要退出存续时，旧页可见但已非 active，原清理责任延至 release；动态内容此时才按真实 containment 冻结。具体接入见[过渡指南](../guides/transitions.zh-CN.md)。
 
-滚动记录归 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 提供 entry 与目标 frame/reuse 事实；准备阶段冻结恢复意图，tail 安装意图。早已存在和后来出现的容器都在正常布局前写入恢复位置，布局后结算一次。等待期间分别保存恢复目标与实际显示位置，离场时复验绑定和应用的新值。详见[按访问恢复滚动](../contracts/navigation.zh-CN.md#按访问恢复滚动)。
+滚动记录归 ECS [scroll.rs](../../crates/bevy_ui_router_ecs/src/scroll.rs) 管理。Core 提供 entry 与目标 frame/reuse 事实；准备阶段冻结恢复意图，tail 安装意图。准备时复制 entry 索引，通过 `Arc` 共享各次访问的不可变位置表；替换来源记录时创建新值，布局采样时按需复制，保持准备状态与当前状态隔离。早已存在和后来出现的容器都在正常布局前写入恢复位置，布局后结算一次。等待期间分别保存恢复目标与实际显示位置，离场时复验绑定和应用的新值。详见[按访问恢复滚动](../contracts/navigation.zh-CN.md#按访问恢复滚动)。
 
 失败先结算本次物理责任，再进入 error boundary、fallback 或 authority settlement。清理分别验证 target 与 protected 内容，写后重新检查。无法安全删除的内容转入明确的残留责任；Router shell 和输入 gate 负责隔离，Scene 原有 `Node`、`Visibility`、`Pickable` 保持其定义值。
 

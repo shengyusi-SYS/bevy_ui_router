@@ -18,6 +18,8 @@ Public benchmark data is retained with complete source commits. See [performance
 | [Public query consumers](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
 | [Completed-request maintenance and retained hits](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
 | [Shared ordinary ancestors](performance-query-ancestors-2026-11-14.csv) | 280 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` |
+| [History value sharing](performance-history-values-2026-11-14.csv) | 114 | `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
+| [Value-sharing navigation controls](performance-value-controls-2026-11-14.csv) | 768 | Same sources; ordinary navigation and idle updates |
 
 ## Measurement environment
 
@@ -156,6 +158,33 @@ For 2048 distinct targets, p50 ranges in microseconds are:
 | Flat / scroll miss | 346.6–356.2 | 355.4–362.1 |
 
 Nested activity totals fall about 45%; flat input and scroll cases retain a small overhead and establish no additional gain. Repeated-root queries and empty-loop controls stay near their existing cost. The reader shares completed resolutions only for ordinary ancestors within one immutable borrow. Registered boundaries still distinguish direct targets from inherited content, including negative results and query order. This does not add a persistent index or change the public API.
+
+## History value sharing: 2026-11-14
+
+The [history fixture](../../performance.md#scroll-records-across-visits) uses real UI layout, one unchanged page, and fixed-length 1/128/1024-visit histories, with and without scroll markers. Each row has 32 complete-navigation samples. Ordinary controls use the default fixture with 16 samples per row and no UI layout. Both use the November machine, Rust, Bevy 0.20.1, root lock, `bsn`, optimized bench profile, and two build jobs. There is no renderer, pointer injection, GPU measurement, or allocation counter.
+
+| Variant | Source | Binary SHA-256 |
+| --- | --- | --- |
+| `before` | `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` | `9c565eb3042804d785db0c5c020c50d981fec40bfb632cfdd03a64673917d29d` |
+| `scroll_values` | `67ba5ea9dc7eb6a3559e02a58c7c975def283935` | `7503772ae5e14a30ca638d292baa18e099a6e75fa0df65e74b52a77c8f52465f` |
+| `location_values` | `71d1b2f2a72a7d0a4924154d18350f4c9315152e` | `a2f724a226ff16db30b7898072c2db6418d4f7d06900c5613cf79158a0d5e63e` |
+
+Build and freeze executables as above. Select `ROUTER_BENCH_MODE=history` and `ROUTER_BENCH_SHAPE=flat|nested`; controls leave mode unset and set `ROUTER_BENCH_SAMPLES=16`. Builds and measurements were serial and separate. History order was baseline rounds 1–2 around exploratory work → scroll-values round 1 → baseline nested replay → scroll-values round 2 → location-values round 1 → scroll-values round 3 → location-values round 2 → scroll-values round 4 → location-values round 3. Paired rounds ran flat then nested. Controls have two baseline rounds and three rounds of each value-sharing variant, interleaved with those history runs.
+
+All 114 history and 768 control rows remain. `variable_round` marks observed variation, not an established external cause, and no rows were filtered. This includes a 470.5 µs scroll-values flat unmarked result and a 560.4 µs final nested marked result. The final control round 2 also has slower navigation and some slower empty controls; a subsequent before/after replay returned near the earlier range.
+
+For 1024 visits, the median of each variant's **run p50 values**, in microseconds, is:
+
+| Shape / scroll markers | Before | Shared scroll values | Also shared locations |
+| --- | ---: | ---: | ---: |
+| Flat / absent | 254.4 | 268.3 | 212.2 |
+| Nested / absent | 274.4 | 273.3 | 231.9 |
+| Flat / present | 408.0 | 352.0 | 284.9 |
+| Nested / present | 434.2 | 357.8 | 298.0 |
+
+Scroll preparation shares immutable per-visit position maps and copies only the outer index; sampling uses copy-on-write. It also avoids cloning pending intents and the published projection immediately before rebuilding them. Address values share immutable path/query/fragment storage; builders preserve independent edits, value equality/hash, and Debug output. History still freezes and compares its complete source and identities. The marked history totals improve about 30% by the across-run medians; the unmarked control also benefits from cheaper address copies. Small histories and ordinary navigation have less work to remove, and their controls do not prove a general speedup. Each new address now adds one shared-storage allocation.
+
+A cleanup receipt-preparer candidate was removed after its complete-navigation gain proved small and inconsistent. Remaining history-index work stays linear. Existing examples use the same API.
 
 ## Maintenance
 

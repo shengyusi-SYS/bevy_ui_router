@@ -125,15 +125,7 @@ The example's keyboard handler explicitly queries the gate after `RouterInputSet
 
 ## Performance fixtures and packages
 
-Run window compilation and performance fixtures manually through [Extended checks](../../.github/workflows/extended.yml) in Actions. They are excluded from daily automatic CI. The performance job runs the first three commands below to check behavior, not timing; instance and steady-state changes can also use the last two:
-
-```sh
-cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
-ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-ROUTER_BENCH_MODE=instances cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-```
+Run window compilation and performance fixtures manually through [Extended checks](../../.github/workflows/extended.yml) in Actions. They are excluded from daily automatic CI. Fixture commands and their coverage are maintained in the [performance guide](../performance.md#behavior-checks); the job checks behavior without timing thresholds.
 
 For timing comparisons, use the optimized builds in the [performance guide](../performance.md) and record the same workload on the same machine.
 

@@ -18,6 +18,8 @@
 | [公开查询消费者](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
 | [终结请求维护与缓存命中](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
 | [普通祖先共享](performance-query-ancestors-2026-11-14.csv) | 280 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` |
+| [历史值共享](performance-history-values-2026-11-14.csv) | 114 | `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` → `71d1b2f2a72a7d0a4924154d18350f4c9315152e` |
+| [值共享导航控制组](performance-value-controls-2026-11-14.csv) | 768 | 同上；普通导航及空闲更新 |
 
 ## 测量环境
 
@@ -156,6 +158,33 @@ Input gate 保留有序 projection，绑定预备值时复核完整 source；保
 | 平铺／scroll miss | 346.6–356.2 | 355.4–362.1 |
 
 嵌套 activity 总耗时约减少 45%；平铺输入和滚动查询仍有少量开销，不认定额外收益。重复根查询和空循环控制组接近原有成本。reader 仅在一次不可变借用内共享完整解析后的普通祖先结果；注册边界仍区分直接目标和继承内容，包括负结果与查询顺序。没有新增持久索引或改变公开 API。
+
+## 历史值共享：2026-11-14
+
+[History 夹具](../../performance.zh-CN.md#多次访问的滚动记录)使用真实 UI layout、同一页面和固定长度的 1/128/1024 次访问，分别保留与移除滚动 marker；每行 32 个完整导航样本。普通控制组使用默认夹具，每行 16 样本、不安装 UI layout。两者沿用上述 11 月机器、Rust、Bevy 0.20.1、根 lock、`bsn`、bench 优化 profile 和两个构建任务，不含 renderer、pointer 注入、GPU 测量或分配计数。
+
+| Variant | Source | Binary SHA-256 |
+| --- | --- | --- |
+| `before` | `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` | `9c565eb3042804d785db0c5c020c50d981fec40bfb632cfdd03a64673917d29d` |
+| `scroll_values` | `67ba5ea9dc7eb6a3559e02a58c7c975def283935` | `7503772ae5e14a30ca638d292baa18e099a6e75fa0df65e74b52a77c8f52465f` |
+| `location_values` | `71d1b2f2a72a7d0a4924154d18350f4c9315152e` | `a2f724a226ff16db30b7898072c2db6418d4f7d06900c5613cf79158a0d5e63e` |
+
+按上述方法构建并固定二进制，指定 `ROUTER_BENCH_MODE=history`、`ROUTER_BENCH_SHAPE=flat|nested`；普通控制组不设 mode，指定 `ROUTER_BENCH_SAMPLES=16`。构建和计时分开串行执行。History 顺序为探索前后的 baseline 第 1–2 轮 → scroll-values 第 1 轮 → baseline nested 重放 → scroll-values 第 2 轮 → location-values 第 1 轮 → scroll-values 第 3 轮 → location-values 第 2 轮 → scroll-values 第 4 轮 → location-values 第 3 轮，每个配对轮先 flat 后 nested。普通控制组包含两轮 baseline 和各三轮值共享版本，与这些 history 测量交错执行。
+
+保留全部 114 行 history 和 768 行控制组数据。`variable_round` 只标记观察到的波动，不代表已经确定外部原因，也未据此过滤数据。其中包括 scroll-values 的一次 flat 无 marker 470.5 µs，以及最终版本的一次 nested 有 marker 560.4 µs。最终控制组第 2 轮也有较慢导航和部分较慢空循环，随后前后配对重放回到较早范围。
+
+1024 次访问时，各版本**每轮 p50 的中位数**如下，单位微秒：
+
+| 结构／滚动 marker | Before | 共享滚动值 | 再共享地址值 |
+| --- | ---: | ---: | ---: |
+| 平铺／无 | 254.4 | 268.3 | 212.2 |
+| 嵌套／无 | 274.4 | 273.3 | 231.9 |
+| 平铺／有 | 408.0 | 352.0 | 284.9 |
+| 嵌套／有 | 434.2 | 357.8 | 298.0 |
+
+滚动准备共享每次访问的不可变位置 map，仅复制外层索引；采样时写时复制。同时省去立即清空或重建的 pending intent 与 published projection 拷贝。地址值共享不可变 path/query/fragment，builder 仍独立修改，保留值相等、Hash 和 Debug 形状；history 仍冻结并比较完整 source 与身份。有 marker 的 history 总耗时按跨轮中位数约减少 30%，无 marker 控制也从更便宜的地址复制中获益。短 history 和普通导航可移除的工作较少，其控制组不能证明普遍加速。每个新地址增加一次共享存储分配。
+
+Cleanup receipt-preparer 候选因完整导航收益偏小且不一致而撤回。剩余 history 索引工作仍为线性；现有示例继续使用相同 API。
 
 ## 维护
 

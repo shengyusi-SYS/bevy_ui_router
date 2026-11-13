@@ -70,7 +70,7 @@ Input tests first establish a positive hit, then begin a real gesture and revoke
 
 ## Compare performance for equivalent work
 
-Start by removing repeated collection and classification, reusing complete facts within a single read-only phase. Revalidate after relevant writes. Compare complete observable snapshot values and preserve resource change detection when equal; diagnostics can still update after request completion.
+Remove repeated collection and classification by sharing complete World observations within the current immutable borrow, then revalidate after relevant writes. Immutable stored values, such as saved scroll positions, can share storage for their own lifetime; copy-on-write keeps prepared and current states isolated. Compare complete observable snapshot values and preserve resource change detection when equal; diagnostics can still update after request completion.
 
 Empty work exits at read-only entry points. Layout and World-structure queries keep the filtering rules each needs. Membership includes disabled or incomplete markers involved in duplicate detection. Schedule checks follow actual graph build/change events, covering late installation and external rebuilds.
 

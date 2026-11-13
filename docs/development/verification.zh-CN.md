@@ -125,15 +125,7 @@ Linux 构建采用 X11；手动窗口检查安装 `libxkbcommon-dev`、`libx11-d
 
 ## 性能夹具与发布产物
 
-窗口编译和性能夹具通过 Actions 的 [Extended checks](../../.github/workflows/extended.yml) 手动选择运行，不参与日常自动 CI。性能任务执行下面前三条命令，检查行为而非性能耗时；实例与稳态改动可补充后两条：
-
-```sh
-cargo test -p bevy_ui_router --bench router_baseline --bench bsn_content_control --features bsn --locked -- --test
-ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-ROUTER_BENCH_MODE=keep_alive cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-ROUTER_BENCH_MODE=instances cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-ROUTER_BENCH_MODE=steady ROUTER_BENCH_SHAPE=nested cargo test -p bevy_ui_router --bench router_baseline --features bsn --locked -- --test
-```
+窗口编译和性能夹具通过 Actions 的 [Extended checks](../../.github/workflows/extended.yml) 手动选择运行，不参与日常自动 CI。各夹具命令与覆盖范围统一维护在[性能指南](../performance.zh-CN.md#行为检查)中；任务只检查行为，不设耗时阈值。
 
 正式耗时比较使用[性能指南](../performance.zh-CN.md)的优化构建方式，记录同机相同场景的结果。
 
