@@ -151,7 +151,7 @@ flowchart LR
     Resolve --> Facts["借用 Router 元数据 + typed hierarchy Query"]
 ```
 
-观察事实只在读取器借用期内保留；每次 `read()` 都从当前元数据和层级开始。原三个查询入口沿用同一 resolver；循环和混合查询通过读取器共享工作。
+观察事实只在读取器借用期内保留；每次 `read()` 都从当前元数据和层级开始。完整解析后的普通祖先结果在此借用内共享；注册边界仍按角色校验，直接 output 查询不能授权其后代。原三个查询入口沿用同一 resolver；循环和混合查询通过读取器共享工作。
 
 内部活动分支观察另用私有 [ReadObservation](../../crates/bevy_ui_router_ecs/src/read_observation.rs)，在一次不可变 World 借用内共享 registry 索引、原生内容 membership、outlet 数量及相同目的的保留边界检查。各角色的值、挂载绑定和 manifest 策略仍分别校验；保留边界检查不授权激活或清理。写入后或进入新调度阶段重新观察。focus 还验证 shell、已提交切口和 slot 外侧闭包；保留实例验证完整后代及其与输入/focus 的隔离。
 

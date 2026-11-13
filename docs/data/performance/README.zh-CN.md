@@ -17,6 +17,7 @@
 | [观察路径控制组](performance-observation-controls-2026-11-12.csv) | 194 | 同上；普通导航及初始动态页面 |
 | [公开查询消费者](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
 | [终结请求维护与缓存命中](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
+| [普通祖先共享](performance-query-ancestors-2026-11-14.csv) | 280 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` |
 
 ## 测量环境
 
@@ -136,6 +137,25 @@ nested、每个保留页 1024 后代时，最终 idle p50 范围如下，单位�
 两个页面各有 1024 个动态后代时，完整 Replace 命中的 p50 从 5.81–5.92 ms，经输入变更预备复用及无 marker 采集快路降至 3.59–3.62 ms，再经保留页验证的局部输入集合索引降至 1.05–1.09 ms。每次操作一次 update；实体、history 和工厂数固定。该负载合计约减少 82% CPU wall time。中间版本的三项改造一起测量，不推断各项独立贡献。32 节点小场景有波动，不能据此认定普遍加速。
 
 Input gate 保留有序 projection，绑定预备值时复核完整 source；保留页索引只活于一次不可变校验，仍位于原有角色 predicate。没有删除写后证明或新增持久缓存失效机制。测量表示库内 CPU 工作，不是应用 FPS。
+
+## 普通祖先共享：2026-11-14
+
+沿用上述 `public_queries` 夹具、11 月环境、Bevy 0.20.1、根 lock、`bsn` 和优化 profile，每行 32 样本、每样本平均四次更新。before 源码为 `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79`，二进制 SHA-256 为 `162efbaf516e0c399b318964a49cf41348753616b8f4701145f84111bbe26846`；交付 reader 源码为 `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8`，二进制为 `9c565eb3042804d785db0c5c020c50d981fec40bfb632cfdd03a64673917d29d`。
+
+固定二进制后指定 `ROUTER_BENCH_MODE=public_queries`、`ROUTER_BENCH_SHAPE=flat|nested`。构建和计时分开串行执行，顺序为 before 第 1 轮 → reader 探索 → before 第 2 轮 → 交付 reader 第 1 轮 → before 第 3 轮 → 交付 reader 第 2 轮，每轮先 flat 后 nested。保留全部 280 行 before 和交付版本数据。未提交的首个候选改善了嵌套读取，但增加平铺成本；最终仅用现有环检测集合记录普通节点，省去注册终点的插入/移除和原目标的重复插入。
+
+2048 个不同目标的 p50 范围，单位微秒：
+
+| 结构／API | Before | 祖先共享 |
+| --- | ---: | ---: |
+| 嵌套／activity | 640.7–650.6 | 349.9–351.1 |
+| 嵌套／当前输入 | 643.9–652.7 | 347.5–349.1 |
+| 嵌套／scroll miss | 638.8–650.7 | 356.9–358.0 |
+| 平铺／activity | 340.1–355.4 | 348.7–348.9 |
+| 平铺／当前输入 | 342.3–347.6 | 349.6–351.0 |
+| 平铺／scroll miss | 346.6–356.2 | 355.4–362.1 |
+
+嵌套 activity 总耗时约减少 45%；平铺输入和滚动查询仍有少量开销，不认定额外收益。重复根查询和空循环控制组接近原有成本。reader 仅在一次不可变借用内共享完整解析后的普通祖先结果；注册边界仍区分直接目标和继承内容，包括负结果与查询顺序。没有新增持久索引或改变公开 API。
 
 ## 维护
 

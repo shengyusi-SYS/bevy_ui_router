@@ -151,7 +151,7 @@ flowchart LR
     Resolve --> Facts["borrowed Router metadata + typed hierarchy queries"]
 ```
 
-Observations are scoped to the reader borrow; each new `read()` starts from current metadata and hierarchy. The three existing query entry points use the same resolver; repeated and mixed lookups share work through the reader.
+Observations are scoped to the reader borrow; each new `read()` starts from current metadata and hierarchy. Completed ordinary-ancestor resolutions are shared within that borrow. Registered boundaries retain their role checks, so a direct output query cannot authorize its descendants. The three existing query entry points use the same resolver; repeated and mixed lookups share work through the reader.
 
 Internal active-branch observation separately uses a private [ReadObservation](../../crates/bevy_ui_router_ecs/src/read_observation.rs) to share the registry index, native content membership, outlet counts, and identical retained-preservation checks within one immutable World borrow. Role-specific values, mount bindings, and manifest policies remain separate checks; preservation never authorizes activation or cleanup. Writes and new scheduling phases require a new observation. Focus also validates shells, committed boundaries, and the closure outside slots; retained instances validate all descendants and their separation from input/focus.
 

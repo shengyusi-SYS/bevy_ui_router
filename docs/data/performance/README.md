@@ -17,6 +17,7 @@ Public benchmark data is retained with complete source commits. See [performance
 | [Observation controls](performance-observation-controls-2026-11-12.csv) | 194 | Same sources; ordinary navigation and initial dynamic pages |
 | [Public query consumers](performance-public-queries-2026-11-12.csv) | 240 | `4ad3c77f9bdc0b38159f03ae5b141bcd91520a88` → `96787c790507cca1ee3b8e474edafcf75dbbe7fc` |
 | [Completed-request maintenance and retained hits](performance-maintenance-2026-11-14.csv) | 80 | `aaca8de7bdfaa7c874ab00b5fc6f4c63a921f576` → `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` |
+| [Shared ordinary ancestors](performance-query-ancestors-2026-11-14.csv) | 280 | `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79` → `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8` |
 
 ## Measurement environment
 
@@ -136,6 +137,25 @@ With 54 live entities, one history entry, and 64 terminal requests, idle p50 pre
 For two warmed pages with 1024 dynamic descendants each, complete Replace-hit p50 changes from 5.81–5.92 ms to 3.59–3.62 ms with prepared input changes and absent-marker capture skipping, then to 1.05–1.09 ms with a local input-membership index during retained validation. Each operation takes one update; entities, history, and factories stay fixed. The combined result is about 82% lower CPU wall time for this workload. The three changes in the middle variant were measured together, so their individual contributions are not inferred. Small 32-node cases vary and do not establish a general speedup.
 
 The input gate keeps its ordered projection and checks the complete source again when binding prepared values. The retained index exists only during one immutable validation, at the original role-specific predicate. Neither change removes post-write proofs or adds persistent cache invalidation. These measurements describe library CPU work, not application FPS.
+
+## Shared ordinary ancestors: 2026-11-14
+
+The existing `public_queries` fixture, November environment, Bevy 0.20.1, root lock, `bsn`, and optimized profile remain as described above. Each row has 32 samples averaging four updates. The before source is `91fbcf3fbbf8dfebd005c5a9c89d675d4db7df79`, binary SHA-256 `162efbaf516e0c399b318964a49cf41348753616b8f4701145f84111bbe26846`. The shipped reader source is `f409d6f1f9295086c56dbbf0a818cf4c9fcc0ea8`, binary SHA-256 `9c565eb3042804d785db0c5c020c50d981fec40bfb632cfdd03a64673917d29d`.
+
+Run fixed executables with `ROUTER_BENCH_MODE=public_queries` and `ROUTER_BENCH_SHAPE=flat|nested`. Builds and timings were separate and serial. Order: before round 1 → exploratory reader work → before round 2 → shipped reader round 1 → before round 3 → shipped reader round 2, flat then nested each round. All 280 before and shipped-reader rows are retained. An uncommitted first candidate reduced nested cost but added flat overhead; it was replaced by recording only ordinary nodes in the existing cycle set, avoiding terminal registered-node insertion/removal and duplicate target insertion.
+
+For 2048 distinct targets, p50 ranges in microseconds are:
+
+| Shape / API | Before | Shared ancestors |
+| --- | ---: | ---: |
+| Nested / activity | 640.7–650.6 | 349.9–351.1 |
+| Nested / current inputs | 643.9–652.7 | 347.5–349.1 |
+| Nested / scroll miss | 638.8–650.7 | 356.9–358.0 |
+| Flat / activity | 340.1–355.4 | 348.7–348.9 |
+| Flat / current inputs | 342.3–347.6 | 349.6–351.0 |
+| Flat / scroll miss | 346.6–356.2 | 355.4–362.1 |
+
+Nested activity totals fall about 45%; flat input and scroll cases retain a small overhead and establish no additional gain. Repeated-root queries and empty-loop controls stay near their existing cost. The reader shares completed resolutions only for ordinary ancestors within one immutable borrow. Registered boundaries still distinguish direct targets from inherited content, including negative results and query order. This does not add a persistent index or change the public API.
 
 ## Maintenance
 
