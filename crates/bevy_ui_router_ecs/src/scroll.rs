@@ -744,7 +744,14 @@ pub(crate) fn settle_scroll_system(
     world: &mut World,
     layout: &mut SystemState<ScrollLayout<'static, 'static>>,
 ) {
-    let eligible = eligible_containers(world);
+    let eligible = {
+        let Ok(queries) = layout.get(world) else {
+            return;
+        };
+        // Retain query matching state, not eligibility facts: component changes
+        // and new archetypes must still be observed after this frame's layout.
+        queries.eligible.iter().collect::<HashSet<_>>()
+    };
     if eligible.is_empty()
         && world
             .resource::<RouterNavigation>()
@@ -845,6 +852,7 @@ pub(crate) fn settle_scroll_system(
 
 #[derive(SystemParam)]
 pub(crate) struct ScrollLayout<'w, 's> {
+    eligible: Query<'w, 's, Entity, (With<RouteScroll>, With<Node>, With<ScrollPosition>)>,
     nodes: Query<
         'w,
         's,
@@ -875,6 +883,7 @@ fn laid_out_containers(
     let Ok(ScrollLayout {
         nodes: layout_nodes,
         cameras,
+        ..
     }) = layout.get(world)
     else {
         return HashSet::new();
